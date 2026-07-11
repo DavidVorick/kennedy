@@ -1,162 +1,203 @@
-# Kweb Rust Backend Specification
+# Kweb Backend Specification
 
 ## 1. Scope
 
-The kweb backend is a Rust HTTP service that owns the SQLite database, serves the static frontend, and exposes durable kweb APIs to the frontend. It stores knowledge nodes, data provenance nodes, and data history nodes. It implements kweb graph mutation rules, but it does not manage UI sessions, LLM conversations, context windows, short identifiers, or chat transcripts.
+The Kweb backend is a Rust HTTP service that owns all durable Kennedy memory.
+It stores the kweb in SQLite, enforces graph and history invariants, exposes a
+JSON API to the frontend, and serves the frontend's static files and system
+prompt manuals.
 
-## 2. Responsibilities
+It does not know about LLM providers, chatends, short identifiers, frontend
+sessions, or agent call budgets.
 
-- Store all kweb data in SQLite.
-- Create and migrate the SQLite schema.
-- Bootstrap the hardcoded user node for David Vorick when no history exists.
-- Provide atomic knowledge-node mutations.
-- Preserve immutable data provenance records.
-- Preserve append-only data history linked lists.
-- Apply active/fanout connection rules when nodes are connected.
-- Provide APIs for frontend memory exploration and frontend-orchestrated agent tools.
+## 2. Runtime Configuration
 
-## 3. Runtime Configuration
+Configuration values must have code defaults and may be overridden by command
+line flags.
 
-The backend must accept configuration from CLI flags and environment variables. CLI flags take precedence.
+| Setting | Flag | Default |
+| --- | --- | --- |
+| Bind address | `--bind` | `127.0.0.1:4321` |
+| SQLite file | `--database` | `./kennedy.sqlite3` |
+| Frontend directory | `--frontend-dir` | `./Frontend/public` |
+| System prompts directory | `--system-prompts-dir` | `./Frontend/SystemPrompts` |
+| Active connection limit | `--active-limit` | `12` |
+| Fanout connection target | `--fanout-limit` | `60` |
 
-| Setting | CLI flag | Environment | Default |
-| --- | --- | --- | --- |
-| Bind host | `--host` | `KWEB_HOST` | `127.0.0.1` |
-| Bind port | `--port` | `KWEB_PORT` | `4321` |
-| SQLite path | `--database` | `KWEB_DATABASE` | `./kennedy.sqlite3` |
-| Static frontend dir | `--static-dir` | `KWEB_STATIC_DIR` | `./Frontend/public` |
-| Active connection limit | `--active-connection-limit` | `KWEB_ACTIVE_CONNECTION_LIMIT` | `12` |
-| Fanout connection limit | `--fanout-connection-limit` | `KWEB_FANOUT_CONNECTION_LIMIT` | `60` |
+The fanout value is exposed as configuration even though overflow is not
+enforced in the MVP.
 
-Hardcoded numbers from the user specification must be constants or config-derived values, not scattered literals.
+## 3. SQLite Model
 
-## 4. SQLite Data Model
+The backend runs schema migrations at startup and configures every SQLite
+connection with foreign keys enabled, WAL journaling, and a five-second busy
+timeout. All identifiers are generated with the operating system's secure
+random source, stored as 20-byte SQLite `BLOB`s, and encoded as 40 lowercase
+hexadecimal characters at the API boundary.
 
-### 4.1 Encoding Rules
+### 3.1 Knowledge Nodes
 
-- Durable node identifiers are 20 random bytes stored as `BLOB` and exposed as lowercase 40-character hex strings.
-- JSON arrays may be used for ordered connection lists in v1, but updates must be transactional.
-- Text is UTF-8.
-- Timestamps are UTC RFC 3339 in API responses.
+`knowledge_nodes` contains:
 
-### 4.2 Tables
+| Column | Meaning |
+| --- | --- |
+| `id` | Primary key, exactly 20 bytes |
+| `short_name` | Trimmed text, 4–50 characters |
+| `short_description` | Trimmed text, 0–200 characters |
+| `long_description` | Text, at most 1000 whitespace-delimited words |
+| `history_head_id` | Nullable reference to the newest data history node |
+| `is_user_root` | Internal marker for the single MVP user root |
 
-#### `knowledge_nodes`
+Exactly one knowledge node has `is_user_root = true`.
 
-| Column | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| `id` | `BLOB` | primary key, 20 bytes | Durable knowledge-node ID |
-| `short_name` | `TEXT` | not null, length 4-50 | Human-readable compact name |
-| `short_description` | `TEXT` | not null, length 0-200 | One-line description |
-| `long_description` | `TEXT` | not null, max 1000 words | Detailed memory summary |
-| `active_connections` | `TEXT` | not null JSON array | Ordered list of connected knowledge-node IDs |
-| `fanout_connections` | `TEXT` | not null JSON array | Ordered list of fanout knowledge-node IDs |
-| `history_head_id` | `BLOB` | nullable FK to `data_history_nodes.id` | Latest data-history entry |
-| `created_at` | `TEXT` | not null | Creation timestamp |
-| `updated_at` | `TEXT` | not null | Last mutation timestamp |
+### 3.2 Data Provenance Nodes
 
-Connection order is most-recently-active first. Active connections are capped at 12 by default. Fanout connections should be capped at 60 by design, but v1 may temporarily exceed this limit to match the user specification.
+`data_provenance_nodes` contains:
 
-#### `data_provenance_nodes`
+| Column | Meaning |
+| --- | --- |
+| `id` | Primary key, exactly 20 bytes |
+| `data` | Complete source material |
+| `source` | Source type or human-readable source description |
+| `source_created_at` | RFC 3339 timestamp supplied by the caller |
 
-| Column | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| `id` | `BLOB` | primary key, 20 bytes | Durable provenance ID |
-| `source_type` | `TEXT` | not null | Source category, such as `conversation`, `manual`, `email`, `telegram`, `meeting_recording` |
-| `source_ref` | `TEXT` | nullable | External source locator or human label |
-| `data` | `TEXT` | not null | Raw source data |
-| `data_sha256` | `TEXT` | not null | SHA-256 hex digest of `data` |
-| `created_at_source` | `TEXT` | not null | When the source data was created |
-| `ingested_at` | `TEXT` | not null | When the backend ingested the source |
-| `metadata_json` | `TEXT` | not null JSON object | Additional source metadata |
+Provenance rows are immutable. The backend exposes no update or delete API for
+them.
 
-Data provenance rows are immutable after insertion.
+### 3.3 Data History Nodes
 
-#### `data_history_nodes`
+`data_history_nodes` contains:
 
-| Column | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| `id` | `BLOB` | primary key, 20 bytes | Durable history ID |
-| `knowledge_node_id` | `BLOB` | not null FK | Knowledge node whose history this belongs to |
-| `previous_history_id` | `BLOB` | nullable FK to same table | Previous linked-list entry |
-| `provenance_id` | `BLOB` | not null FK | Source provenance for this update |
-| `change_summary` | `TEXT` | not null | Short summary of the update |
-| `snapshot_json` | `TEXT` | not null JSON object | Knowledge-node fields after the update |
-| `created_at` | `TEXT` | not null | History-entry timestamp |
+| Column | Meaning |
+| --- | --- |
+| `id` | Primary key, exactly 20 bytes |
+| `knowledge_node_id` | Knowledge node whose history contains this entry |
+| `previous_history_id` | Previous entry for that knowledge node, or null |
+| `provenance_id` | Provenance responsible for the create or update |
 
-Data history rows are append-only. Updating a knowledge node creates a new history row and points `knowledge_nodes.history_head_id` at it in the same transaction.
+History rows are append-only. A knowledge node's `history_head_id` points at
+its newest entry; following `previous_history_id` reaches older entries.
 
-## 5. Validation Rules
+### 3.4 Directed Connections
 
-- `short_name`: 4-50 Unicode scalar values after trimming leading/trailing whitespace.
-- `short_description`: 0-200 Unicode scalar values after trimming.
-- `long_description`: at most 1000 words, using whitespace tokenization for v1.
-- Knowledge IDs in connection lists must refer to existing knowledge nodes.
-- A node must not list itself as an active or fanout connection.
-- Duplicate connection IDs are removed while preserving first occurrence.
-- `CreateNode` and `UpdateNode` require a provenance ID supplied by the frontend.
-- The backend accepts only durable node IDs. Any short IDs used in prompts or UI state are translated by the frontend before API calls.
+`knowledge_connections` is a normalized implementation of the active and
+fanout lists on knowledge nodes. It contains:
 
-## 6. API Reference
+| Column | Meaning |
+| --- | --- |
+| `source_node_id` | Node containing the outgoing connection |
+| `target_node_id` | Destination node |
+| `tier` | `active` or `fanout` |
+| `activation_order` | Monotonically increasing integer used for recency |
 
-All endpoints are relative to the kweb backend base URL.
+The primary key is `(source_node_id, target_node_id)`. Self-connections are
+forbidden. A connection exists in only one tier. Connection rows are supporting
+structure, not an additional durable node type.
 
-### 6.1 Health
+Schema constraints enforce 20-byte IDs, valid connection tiers, non-self
+connections, required foreign keys, and a single user root. Foreign-key delete
+actions are restrictive; the MVP exposes no deletion path.
+
+## 4. Bootstrap
+
+After migrations, the backend checks for the user root. If none exists, it
+creates, in one transaction:
+
+1. a bootstrap provenance node,
+2. the minimal `David Vorick` knowledge node,
+3. its first history node pointing to the bootstrap provenance node,
+4. the knowledge node's history-head reference.
+
+Bootstrap is therefore complete before the HTTP listener begins accepting
+requests.
+
+## 5. Graph Rules
+
+`ConnectNodes` receives a set of at least two distinct knowledge-node IDs. For
+every ordered pair `(a, b)` where `a != b`, the backend:
+
+1. creates the directed connection if it does not exist,
+2. promotes it to active if it is fanout,
+3. assigns it the newest activation order.
+
+After promoting the pairs, each affected source node is processed separately.
+If it has more active connections than the configured limit, its oldest active
+connections are demoted to fanout until it is within the limit. A demotion from
+`a` to `b` does not change the connection from `b` to `a`.
+
+Fanout connections are not pruned in the MVP, even when they exceed the
+configured target.
+
+## 6. HTTP and Static Files
+
+The backend serves:
+
+- `GET /` and frontend assets from the configured frontend directory,
+- `GET /system-prompts/{filename}` from the configured system-prompts
+  directory,
+- JSON APIs under `/api/v1`.
+
+The system-prompt route serves only the three configured manual files and does
+not permit arbitrary filesystem paths.
+
+## 7. JSON Shapes
+
+### 7.1 Connection Summary
+
+```json
+{
+  "id": "0123456789abcdef0123456789abcdef01234567",
+  "short_name": "Example Node",
+  "short_description": "Short description."
+}
+```
+
+### 7.2 Knowledge Node
+
+```json
+{
+  "id": "0123456789abcdef0123456789abcdef01234567",
+  "short_name": "Example Node",
+  "short_description": "Short description.",
+  "long_description": "Long description.",
+  "active_connections": [],
+  "fanout_connections": [],
+  "history_head_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+```
+
+Connection arrays contain connection summaries in descending activation order.
+
+### 7.3 Error
+
+All API errors use the shared envelope from `TechnicalDesign.md`. The backend
+uses these status codes consistently:
+
+| Status | Use |
+| --- | --- |
+| `400` | Invalid JSON, identifier, field length, or request shape |
+| `404` | Referenced node or provenance does not exist |
+| `409` | The requested mutation conflicts with a Kweb invariant |
+| `500` | Unexpected database or server failure |
+
+## 8. API
+
+### 8.1 Health
 
 #### `GET /health`
 
-Returns service health.
-
-Response `200`:
-
 ```json
 {
-  "service": "kweb-backend",
-  "status": "ok",
-  "database": "ok",
-  "version": "0.1.0"
+  "service": "kweb",
+  "status": "ok"
 }
 ```
 
-### 6.2 Static Frontend
+Returns `503` if the database cannot be queried.
 
-#### `GET /`
+### 8.2 User Root
 
-Serves the frontend `index.html`.
-
-#### `GET /assets/*`
-
-Serves static CSS, JavaScript, prompt text files, and image assets.
-
-### 6.3 Bootstrap and User
-
-#### `POST /api/bootstrap`
-
-Ensures the initial David Vorick root node exists. Safe to call multiple times.
-
-Request:
-
-```json
-{}
-```
-
-Response `200`:
-
-```json
-{
-  "user": {
-    "name": "David Vorick",
-    "root_node_id": "0123456789abcdef0123456789abcdef01234567"
-  },
-  "created": true
-}
-```
-
-#### `GET /api/user`
-
-Returns the current hardcoded user.
-
-Response `200`:
+#### `GET /api/v1/user`
 
 ```json
 {
@@ -165,76 +206,41 @@ Response `200`:
 }
 ```
 
-### 6.4 Knowledge Nodes
+### 8.3 Read a Knowledge Node
 
-#### `GET /api/nodes/{node_id}`
+#### `GET /api/v1/nodes/{node_id}`
 
-Returns durable node details for frontend context loading and memory explorer views.
+Returns one knowledge node in the shape defined above. This endpoint powers the
+memory explorer.
 
-Response `200`:
+### 8.4 Load Context for a Knowledge Node
 
-```json
-{
-  "id": "0123456789abcdef0123456789abcdef01234567",
-  "short_name": "David Vorick",
-  "short_description": "Root user node.",
-  "long_description": "Minimal bootstrap information.",
-  "active_connections": [
-    {
-      "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "short_name": "Example Memory",
-      "short_description": "A concise summary."
-    }
-  ],
-  "fanout_connections": [],
-  "history_head_id": "cccccccccccccccccccccccccccccccccccccccc",
-  "created_at": "2026-07-11T00:00:00Z",
-  "updated_at": "2026-07-11T00:00:00Z"
-}
-```
+#### `GET /api/v1/nodes/{node_id}/context`
 
-#### `POST /api/nodes/load`
-
-Returns a node plus its active connections. This is the backend primitive the frontend uses to implement the agent-facing `LoadNode` tool.
-
-Request:
+Returns the requested node and the full knowledge node for each of its current
+active connections:
 
 ```json
 {
-  "node_id": "0123456789abcdef0123456789abcdef01234567"
-}
-```
-
-Response `200`:
-
-```json
-{
-  "requested_node": {
-    "id": "0123456789abcdef0123456789abcdef01234567",
-    "short_name": "David Vorick",
-    "short_description": "Root user node.",
-    "long_description": "Minimal bootstrap information.",
-    "active_connections": [],
-    "fanout_connections": []
-  },
+  "requested_node": {},
   "active_connection_nodes": []
 }
 ```
 
-#### `POST /api/nodes`
+All objects use the knowledge-node shape. The requested node appears only in
+`requested_node`; duplicate active destinations are impossible.
 
-Creates a knowledge node using an existing provenance record. This is the backend primitive the frontend uses to implement the agent-facing `CreateNode` tool during history ingress.
+### 8.5 Create a Provenance Node
+
+#### `POST /api/v1/provenance`
 
 Request:
 
 ```json
 {
-  "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "parent_node_ids": ["0123456789abcdef0123456789abcdef01234567"],
-  "short_name": "New Memory",
-  "short_description": "A concise summary.",
-  "long_description": "Detailed description.",
-  "change_summary": "Created from ingress source."
+  "data": "User: ...\nKennedy: ...",
+  "source": "conversation",
+  "source_created_at": "2026-07-11T00:00:00Z"
 }
 ```
 
@@ -242,57 +248,79 @@ Response `201`:
 
 ```json
 {
-  "node": {
-    "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "short_name": "New Memory",
-    "short_description": "A concise summary.",
-    "long_description": "Detailed description.",
-    "active_connections": [],
-    "fanout_connections": []
-  },
-  "history_id": "cccccccccccccccccccccccccccccccccccccccc"
+  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
 ```
 
-The backend creates the knowledge node, creates its first data-history node, and connects the new node with its parent nodes within one transaction.
+### 8.6 Read a Provenance Node
 
-#### `PATCH /api/nodes/{node_id}`
+#### `GET /api/v1/provenance/{provenance_id}`
 
-Updates mutable fields for a knowledge node using an existing provenance record. This is the backend primitive the frontend uses to implement the agent-facing `UpdateNode` tool during history ingress.
+```json
+{
+  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "data": "User: ...\nKennedy: ...",
+  "source": "conversation",
+  "source_created_at": "2026-07-11T00:00:00Z"
+}
+```
+
+### 8.7 Create a Knowledge Node
+
+#### `POST /api/v1/nodes`
 
 Request:
 
 ```json
 {
   "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "new_short_name": "Updated Memory",
-  "new_short_description": "Updated concise summary.",
-  "new_long_description": "Updated detailed description.",
-  "change_summary": "Updated from ingress source."
+  "parent_node_ids": [
+    "0123456789abcdef0123456789abcdef01234567"
+  ],
+  "short_name": "New Memory",
+  "short_description": "Short description.",
+  "long_description": "Long description."
 }
 ```
 
-Response `200`:
+The parent list must be non-empty and contain distinct existing nodes. In one
+transaction the backend creates the knowledge node, creates its first history
+node, updates its history head, and applies `ConnectNodes` to the new node and
+all parents.
+
+Response `201`:
 
 ```json
 {
-  "node": {
-    "id": "dddddddddddddddddddddddddddddddddddddddd",
-    "short_name": "Updated Memory",
-    "short_description": "Updated concise summary.",
-    "long_description": "Updated detailed description.",
-    "active_connections": [],
-    "fanout_connections": []
-  },
-  "history_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  "node": {},
+  "history_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 }
 ```
 
-### 6.5 Connections
+### 8.8 Update a Knowledge Node
 
-#### `POST /api/connections/connect-nodes`
+#### `PUT /api/v1/nodes/{node_id}`
 
-Connects a group of knowledge nodes according to kweb active/fanout rules. This is the backend primitive the frontend uses to implement the agent-facing `ConnectNodes` tool.
+Request:
+
+```json
+{
+  "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "short_name": "Updated Memory",
+  "short_description": "Updated description.",
+  "long_description": "Updated long description."
+}
+```
+
+All three mutable text fields are replaced. In one transaction the backend
+creates a history node pointing to the supplied provenance and previous history
+head, updates the knowledge node, and moves its history head to the new entry.
+
+Response `200` uses the same shape as knowledge-node creation.
+
+### 8.9 Connect Knowledge Nodes
+
+#### `POST /api/v1/connections`
 
 Request:
 
@@ -305,115 +333,58 @@ Request:
 }
 ```
 
-Response `200`:
+The IDs must be distinct and refer to existing nodes. The backend applies the
+graph rules in one transaction.
+
+Response:
 
 ```json
 {
-  "updated_nodes": [
-    {
-      "id": "0123456789abcdef0123456789abcdef01234567",
-      "active_connections": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
-      "demoted_to_fanout": []
-    }
-  ]
+  "nodes": [{}, {}]
 }
 ```
 
-For each ordered pair in the provided set, the backend promotes the other nodes into the node's active connections. If active connections exceed the configured limit, least-recently-active entries are demoted to fanout connections. Demotions are one-way and need not be mirrored.
+`nodes` contains the affected knowledge nodes after promotion and demotion.
 
-### 6.6 Provenance
+### 8.10 Read Knowledge History
 
-#### `POST /api/provenance`
+#### `GET /api/v1/nodes/{node_id}/history`
 
-Creates an immutable provenance node. The frontend calls this when a conversation or other source is ready for history ingress.
-
-Request:
-
-```json
-{
-  "source_type": "conversation",
-  "source_ref": "frontend-conversation-id",
-  "data": "User: ...\nKennedy: ...",
-  "created_at_source": "2026-07-11T00:00:00Z",
-  "metadata": {}
-}
-```
-
-Response `201`:
-
-```json
-{
-  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "data_sha256": "sha256hex",
-  "ingested_at": "2026-07-11T00:00:00Z"
-}
-```
-
-#### `GET /api/provenance/{provenance_id}`
-
-Returns provenance details.
-
-Response `200`:
-
-```json
-{
-  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "source_type": "conversation",
-  "source_ref": "frontend-conversation-id",
-  "data": "User: ...\nKennedy: ...",
-  "data_sha256": "sha256hex",
-  "created_at_source": "2026-07-11T00:00:00Z",
-  "ingested_at": "2026-07-11T00:00:00Z",
-  "metadata": {}
-}
-```
-
-### 6.7 History
-
-#### `GET /api/nodes/{node_id}/history`
-
-Returns history entries newest first.
-
-Response `200`:
+Returns newest first by following the linked list from the current head:
 
 ```json
 {
   "node_id": "0123456789abcdef0123456789abcdef01234567",
   "history": [
     {
-      "history_id": "cccccccccccccccccccccccccccccccccccccccc",
+      "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "previous_history_id": null,
-      "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "change_summary": "Initial bootstrap node.",
-      "created_at": "2026-07-11T00:00:00Z"
+      "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   ]
 }
 ```
 
-## 7. Transaction Semantics
+## 9. Transaction Requirements
 
-Each mutation API call is atomic. If any validation, database write, or invariant update fails, the backend rolls back the entire call and returns an error envelope.
+The following are single SQLite write transactions:
 
-`POST /api/nodes`, `PATCH /api/nodes/{node_id}`, `POST /api/connections/connect-nodes`, and `POST /api/provenance` must use write transactions.
+- bootstrap,
+- knowledge-node creation and parent connection,
+- knowledge-node update and history append,
+- connection promotion and demotion,
+- provenance creation.
 
-## 8. Concurrency
+Any failure rolls back the entire operation. Reads never return an intermediate
+state from a mutation.
 
-- Allow concurrent reads for memory explorer and context-loading endpoints.
-- Serialize writes that affect the same node's connection lists or history head.
-- Knowledge-node write conflicts must return `409` or retry internally with a bounded retry policy.
-- The backend must never expose partially updated connection lists.
+## 10. Implementation Requirements
 
-## 9. Observability
-
-The backend should log:
-
-- service startup configuration excluding secrets,
-- migrations applied,
-- provenance creation,
-- node creation/update calls,
-- connection updates,
-- validation failures,
-- database errors.
-
-Logs must not include full provenance data by default because conversations may contain private information.
+- Use parameterized SQL for every value.
+- Validate all referenced IDs before mutating.
+- Preserve connection ordering in every API response.
+- Do not log provenance data or full knowledge descriptions.
+- Do not follow symlinks or `..` components in static-file routes.
+- Keep migrations in source control and apply them in order.
+- Include unit tests for validation and graph promotion/demotion, plus
+  transaction tests for create and update history behavior.

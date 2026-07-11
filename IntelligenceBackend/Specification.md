@@ -2,361 +2,342 @@
 
 ## 1. Scope
 
-The intelligence backend is a separate Rust HTTP service that loads provider credentials and runtime settings from `config.yaml` and exposes a provider-agnostic API for sending prompts to remote LLM APIs.
+The intelligence backend is a generic Rust HTTP bridge between local browser
+applications and remote LLM providers. It accepts a complete normalized LLM
+request, sends an equivalent request to a configured provider, and normalizes
+the provider response.
 
-It is a generic LLM bridge. It does not know about application memory systems, domain-specific tools, frontend UI concepts, or product-specific agent names. The frontend supplies prompts, messages, tool definitions, and tool results.
+It is stateless between requests. It does not store conversations, execute
+tools, compose prompts, allocate short identifiers, or know anything about
+Kennedy or the kweb.
 
 ## 2. Responsibilities
 
-- Parse and validate `config.yaml`.
-- Manage LLM provider credentials without exposing secrets to the frontend.
-- List configured providers and models.
-- Create, continue, inspect, and delete LLM sessions.
-- Preserve provider-side or backend-side context across turns where supported.
-- Return provider tool-call requests to the frontend.
-- Accept frontend-supplied tool results and continue generation.
-- Provide provider/model metadata, usage, and errors in a stable API shape.
+- Load provider credentials and model defaults from `config.yaml`.
+- Keep credentials out of browser-visible responses.
+- Expose configured provider and model names.
+- Validate normalized messages and tool definitions.
+- Translate generation requests into provider-specific requests.
+- Normalize final text, tool calls, token usage, and provider failures.
+- Allow the configured Kweb frontend origin to call the API.
 
-## 3. Configuration File
+## 3. Configuration
 
-The service loads `config.yaml` from the working directory by default, or from `--config` / `INTELLIGENCE_CONFIG`.
-
-Example:
+The service loads `./config.yaml` by default. `--config PATH` selects another
+file.
 
 ```yaml
 server:
-  host: 127.0.0.1
-  port: 4322
+  bind: 127.0.0.1:4322
+  max_request_bytes: 10485760
+  allowed_origins:
+    - http://127.0.0.1:4321
+
+default_provider: primary
 
 providers:
-  default: openai
-  openai:
+  primary:
+    kind: openai
     api_key_env: OPENAI_API_KEY
     base_url: https://api.openai.com/v1
-    default_model: gpt-5.5
+    default_model: configured-model-name
+    models:
+      - configured-model-name
     timeout_seconds: 120
-
-sessions:
-  max_active_sessions: 32
-  idle_ttl_minutes: 120
-  preserve_remote_context: true
-  local_transcript_fallback: true
-
-logging:
-  level: info
-  redact_prompts: false
-  redact_api_keys: true
 ```
 
-### 3.1 Required Semantics
+Provider entry names such as `primary` are public API identifiers. `kind`
+selects the internal adapter. API keys are read from the named environment
+variable. Startup fails if the default provider, its default model, or its
+credential is missing.
 
-- API keys may be provided directly only for local development, but `api_key_env` is preferred.
-- Secrets must never be returned by any API.
-- Missing required provider configuration must fail service startup with a clear error.
-- Provider names are implementation-defined, but the public API must remain provider-agnostic.
+The service may initially implement one provider adapter. Adding another
+adapter must not change the public request and response shapes.
 
-## 4. Context Preservation Design
+## 4. Normalized Message Model
 
-The intelligence backend must support multi-turn LLM interactions without requiring the frontend to resend the entire prompt and transcript every turn when the selected provider supports remote context preservation.
+The request `messages` array is ordered and supports these shapes.
 
-The backend stores an `LlmSession`:
+### 4.1 Text Message
 
 ```json
 {
-  "session_id": "llm_01j00000000000000000000000",
-  "provider": "openai",
-  "model": "gpt-5.5",
-  "remote_context_id": "provider_response_or_thread_id",
-  "local_message_log": [],
-  "pending_tool_calls": [],
-  "created_at": "2026-07-11T00:00:00Z",
-  "last_used_at": "2026-07-11T00:00:00Z"
+  "role": "system",
+  "content": "Instructions or context."
 }
 ```
 
-The implementation should use provider-native previous-response, thread, cache, or conversation identifiers when available. If a provider lacks native remote context preservation, the backend must maintain a local compact transcript and resend the minimum required context.
+`role` is `system`, `user`, or `assistant`.
 
-Tool results returned to the intelligence backend become part of the preserved model context, allowing later turns to refer to prior tool outputs without the frontend resending those outputs unless the LLM session expires.
-
-## 5. Tool Call Contract
-
-The intelligence backend does not execute tools. It passes model-requested tool calls to the frontend and accepts tool results from the frontend.
-
-Tool definitions are supplied by the frontend when creating a session. Tool-call names, descriptions, schemas, arguments, and result payloads are opaque to the intelligence backend except for validation needed to correlate pending tool-call IDs.
-
-Tool-call shape:
+### 4.2 Assistant Tool-Call Message
 
 ```json
 {
-  "tool_call_id": "tool_01j00000000000000000000000",
-  "name": "ToolName",
-  "arguments": {
-    "key": "value"
+  "role": "assistant",
+  "content": null,
+  "tool_calls": [
+    {
+      "id": "call_opaque_id",
+      "name": "LoadNode",
+      "arguments": {
+        "identifier": 3
+      }
+    }
+  ]
+}
+```
+
+An assistant message may contain text, tool calls, or both.
+
+### 4.3 Tool-Result Message
+
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_opaque_id",
+  "name": "LoadNode",
+  "content": {
+    "ok": true,
+    "result": {}
   }
 }
 ```
 
-The backend must preserve pending tool calls until corresponding results arrive.
+`content` may be any JSON value. The adapter serializes it without changing its
+meaning. Every tool-result ID must match an earlier assistant tool call in the
+same request.
 
-## 6. API Reference
+## 5. Tool Definitions
 
-All endpoints are relative to the intelligence backend base URL.
+Tools use a provider-neutral JSON Schema subset:
+
+```json
+{
+  "name": "LoadNode",
+  "description": "Load a Kweb node into context.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "identifier": {"type": "integer"}
+    },
+    "required": ["identifier"],
+    "additionalProperties": false
+  }
+}
+```
+
+The intelligence backend validates the definition structure but does not
+interpret tool names or application semantics.
+
+The portable schema subset supports `type`, `properties`, `required`,
+`additionalProperties`, `items`, and the scalar types `string`, `integer`,
+`number`, and `boolean`, plus nested `object` and `array` schemas. The five
+Kennedy tools must be expressible using this subset.
+
+## 6. API
 
 ### 6.1 Health
 
 #### `GET /health`
 
-Response `200`:
-
 ```json
 {
-  "service": "intelligence-backend",
-  "status": "ok",
-  "provider_default": "openai",
-  "version": "0.1.0"
+  "service": "intelligence",
+  "status": "ok"
 }
 ```
 
-### 6.2 Providers and Models
+Health checks local configuration only; they do not make a paid provider
+request.
 
-#### `GET /api/intelligence/providers`
+### 6.2 Providers
 
-Returns configured providers and public model metadata. Secrets are never included.
-
-Response `200`:
+#### `GET /api/v1/providers`
 
 ```json
 {
-  "default_provider": "openai",
+  "default_provider": "primary",
   "providers": [
     {
-      "name": "openai",
-      "default_model": "gpt-5.5",
-      "models": ["gpt-5.5"]
+      "name": "primary",
+      "default_model": "configured-model-name",
+      "models": ["configured-model-name"]
     }
   ]
 }
 ```
 
-### 6.3 Create Session
+Credentials, environment-variable names, base URLs, and other private
+configuration are omitted.
 
-#### `POST /api/intelligence/sessions`
+### 6.3 Generate
 
-Creates a provider-backed LLM session.
+#### `POST /api/v1/generate`
 
 Request:
 
 ```json
 {
-  "provider": "openai",
-  "model": "gpt-5.5",
-  "instructions": "System prompt text...",
-  "initial_messages": [
+  "provider": "primary",
+  "model": "configured-model-name",
+  "messages": [
+    {
+      "role": "system",
+      "content": "System prompt."
+    },
     {
       "role": "user",
       "content": "Hello."
     }
   ],
-  "tool_definitions": [
-    {
-      "name": "ToolName",
-      "description": "Tool description.",
-      "json_schema": {
-        "type": "object",
-        "properties": {
-          "key": {"type": "string"}
-        },
-        "required": ["key"]
-      }
-    }
-  ]
+  "tools": []
 }
 ```
 
-Response `201`:
+`provider` and `model` may be omitted to use configured defaults. `messages`
+must be non-empty. `tools` may be omitted when no tools are available.
+
+Final-text response:
 
 ```json
 {
-  "session_id": "llm_01j00000000000000000000000",
-  "provider": "openai",
-  "model": "gpt-5.5",
-  "remote_context": {
-    "preserved": true,
-    "strategy": "provider_previous_response_id"
-  },
-  "created_at": "2026-07-11T00:00:00Z"
-}
-```
-
-### 6.4 Submit Turn
-
-#### `POST /api/intelligence/sessions/{session_id}/turns`
-
-Sends an input message to the LLM session.
-
-Request:
-
-```json
-{
-  "input": {
-    "role": "user",
-    "content": "Continue."
-  }
-}
-```
-
-Response `200` when the model returns final text:
-
-```json
-{
-  "status": "completed",
+  "status": "complete",
   "message": {
     "role": "assistant",
-    "content": "Response text."
+    "content": "Hello.",
+    "tool_calls": []
   },
-  "tool_calls": [],
   "usage": {
-    "input_tokens": 1000,
-    "output_tokens": 250,
-    "total_tokens": 1250
-  },
-  "remote_context": {
-    "preserved": true,
-    "context_id": "opaque_provider_context_id"
+    "input_tokens": 100,
+    "output_tokens": 20
   }
 }
 ```
 
-Response `200` when the model requests tools:
+Tool-call response:
 
 ```json
 {
-  "status": "requires_tool_results",
-  "message": null,
-  "tool_calls": [
-    {
-      "tool_call_id": "tool_01j00000000000000000000000",
-      "name": "ToolName",
-      "arguments": {
-        "key": "value"
+  "status": "tool_calls",
+  "message": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "call_opaque_id",
+        "name": "LoadNode",
+        "arguments": {
+          "identifier": 3
+        }
       }
-    }
-  ],
-  "usage": {
-    "input_tokens": 1000,
-    "output_tokens": 100,
-    "total_tokens": 1100
+    ]
   },
-  "remote_context": {
-    "preserved": true,
-    "context_id": "opaque_provider_context_id"
+  "usage": {
+    "input_tokens": 100,
+    "output_tokens": 20
   }
 }
 ```
 
-### 6.5 Submit Tool Results
+The backend returns the assistant message exactly once. The frontend appends
+that message and any tool results to its chatend, then sends another complete
+generation request. `usage` is null when the provider does not report it.
 
-#### `POST /api/intelligence/sessions/{session_id}/tool-results`
+## 7. Validation
 
-Continues generation after frontend-executed tools complete.
+Reject with `400` when:
 
-Request:
+- the provider or model is not configured,
+- messages are empty or use an unknown role,
+- required message fields are absent,
+- tool names are duplicated,
+- a tool definition is not a supported object JSON Schema,
+- assistant tool-call IDs are duplicated,
+- a tool-result message does not match an earlier tool call,
+- more than one result is supplied for the same tool call.
 
-```json
-{
-  "tool_results": [
-    {
-      "tool_call_id": "tool_01j00000000000000000000000",
-      "name": "ToolName",
-      "ok": true,
-      "result": {
-        "value": "result payload"
-      },
-      "error": null
-    }
-  ]
-}
+The backend does not validate application-specific tool arguments against the
+tool schema after the provider returns them; the frontend performs that check
+before execution. A provider response whose tool arguments cannot be normalized
+to a JSON object is a `502 provider_error`.
+
+## 8. Provider Adapter Contract
+
+Every adapter implements the same internal operation:
+
+```text
+generate(provider_config, model, messages, tools)
+    -> assistant message + optional usage
 ```
 
-Response is identical to `POST /turns`: either `completed` or `requires_tool_results`.
+An adapter must:
 
-Tool failure result example:
+- preserve message order and roles,
+- preserve assistant/tool-call/result correlations,
+- send all supplied system content with system-level priority supported by the
+  provider,
+- require tool arguments to decode as a JSON object,
+- generate opaque unique call IDs when the provider omits them,
+- preserve provider call IDs when available,
+- return all tool calls from one assistant response,
+- avoid using provider-side previous-response or conversation identifiers.
 
-```json
-{
-  "tool_call_id": "tool_01j00000000000000000000000",
-  "name": "ToolName",
-  "ok": false,
-  "result": null,
-  "error": {
-    "code": "tool_failed",
-    "message": "The frontend tool call failed."
-  }
-}
-```
+Provider-specific response IDs may be discarded. The complete request from the
+frontend is always authoritative.
 
-### 6.6 Get Session
+## 9. Errors
 
-#### `GET /api/intelligence/sessions/{session_id}`
+Errors use the shared envelope from `TechnicalDesign.md`.
 
-Response `200`:
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_request` | Normalized request validation failed |
+| `400` | `provider_not_configured` | Unknown provider or model |
+| `401` | `provider_auth_failed` | Remote provider rejected credentials |
+| `429` | `provider_rate_limited` | Remote provider rate limit |
+| `502` | `provider_error` | Remote provider returned an unusable response |
+| `503` | `provider_unavailable` | Provider could not be reached |
+| `504` | `provider_timeout` | Configured timeout elapsed |
+| `500` | `internal_error` | Unexpected local failure |
 
-```json
-{
-  "session_id": "llm_01j00000000000000000000000",
-  "provider": "openai",
-  "model": "gpt-5.5",
-  "created_at": "2026-07-11T00:00:00Z",
-  "last_used_at": "2026-07-11T00:00:00Z",
-  "pending_tool_call_count": 0,
-  "remote_context": {
-    "preserved": true,
-    "strategy": "provider_previous_response_id"
-  }
-}
-```
+Provider error bodies are not forwarded verbatim. The backend returns a stable
+message and logs provider diagnostics without credentials.
 
-### 6.7 Delete Session
+## 10. HTTP Requirements
 
-#### `DELETE /api/intelligence/sessions/{session_id}`
+- Bind to loopback by default.
+- Accept JSON request bodies only.
+- Set `Access-Control-Allow-Origin` only for an exact configured origin.
+- Handle CORS preflight for `POST /api/v1/generate`.
+- Enforce the configured request-body limit, which defaults to 10 MiB, and
+  reject larger requests with `413`.
+- Apply the configured provider timeout to every remote request.
+- Do not retry generation automatically; a retry could duplicate paid output
+  or produce a different tool decision.
 
-Deletes local session state and releases provider resources when supported.
+## 11. Logging
 
-Response `204` with no body.
+Log:
 
-## 7. Error Handling
-
-All errors use the common envelope from `TechnicalDesign.md`.
-
-Additional intelligence-specific error codes:
-
-| Code | Meaning |
-| --- | --- |
-| `provider_unavailable` | Provider request failed or timed out |
-| `provider_auth_failed` | API key rejected |
-| `session_expired` | LLM session no longer exists |
-| `tool_results_required` | New input submitted while tool calls are pending |
-| `unknown_tool_call_id` | Tool result does not match pending call |
-| `model_not_configured` | Requested model/provider is unavailable |
-
-## 8. Security
-
-- Never return API keys or provider secrets.
-- Redact secrets in logs.
-- Bind to localhost by default.
-- Do not accept arbitrary remote tool URLs.
-- Treat all provider output as untrusted; the frontend validates tool names and arguments.
-
-## 9. Observability
-
-Log per request:
-
-- request ID,
-- session ID when present,
-- provider/model,
-- status,
+- request identifier,
+- provider and model,
+- response status,
 - latency,
 - token usage when available,
-- error code when failed.
+- normalized error code.
 
-Prompt and tool-result logging is configurable because inputs may contain private data.
+Do not log API keys, complete prompts, tool-result contents, or provider
+authorization headers.
+
+## 12. Verification
+
+At minimum include:
+
+- request-shape validation tests,
+- tool-call and tool-result correlation tests,
+- provider-response normalization tests,
+- final-text and multiple-tool-call fixtures,
+- provider timeout and error mapping tests,
+- CORS tests for allowed and disallowed origins,
+- an adapter test proving that a complete second request does not depend on
+  state retained from the first.
