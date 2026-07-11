@@ -145,9 +145,9 @@ INSTRUCTIONS.md
 BackendKweb/Specification.md
 Frontend/Specification.md
 IntelligenceBackend/Specification.md
-SystemPromptAgentManuals/SystemPromptKmapAgentManual.txt
-SystemPromptAgentManuals/ConversationAgentManual.txt
-SystemPromptAgentManuals/HistoryIngressAgentManual.txt
+Frontend/SystemPrompts/SystemPromptKmapAgentManual.txt
+Frontend/SystemPrompts/ConversationAgentManual.txt
+Frontend/SystemPrompts/HistoryIngressAgentManual.txt
 ```
 
 Future implementation work should place code under component-appropriate directories while keeping these specification files current.
