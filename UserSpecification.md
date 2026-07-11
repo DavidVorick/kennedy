@@ -17,13 +17,25 @@ the kweb, using it to help the user solve problems.
 This specification contains a bunch of hard-coded numbers, because the spec was
 written by a human and hard-coded numbers are easier to reason about. Hoewver,
 in the actual code they should all be parameters that can easily be updated.
+The live parameters in the codebase may be materially different.
+
+## Vocabulary
+
+'Frontend' refers to the html/css/js application that is served. The frontend
+is fully stateless, and relies on APIs to various backend services to get
+persistence between sessions.
+
+'Chatend' refers to the actual context that is being passed to LLMs.
+
+'Backend' refers to any of the backend services that are providing APIs to the
+frontend.
 
 ## User Management
 
 For now, there is only one hardcoded user, and that user is David Vorick. A
 more complex user management system will be added later. We explicitly do not
 want to add access controls to the knowledge graph. This design is 'borg-like',
-all knowledge is shared between users.
+all knowledge is shared between users. More safety can be added later.
 
 ## The Data Store
 
@@ -89,12 +101,6 @@ however a data provenance node can appear in the history of many different
 knowledge nodes, if it contains lots of information that is relavant to many
 different knowledge nodes.
 
-## The Context Glue
-
-A layer exists between the database and the context window which simplifies the
-datatypes, but tracks exactly how the in-context data types map to the on-disk
-data types.
-
 ### In-Context Knowledge Node
 
 + Short Name (4-50 characters)
@@ -108,6 +114,14 @@ The backend will keep track of how short identifiers map to unique identifiers.
 The short identifiers are ephemeral, and get reset every time the context
 window is reset.
 
+## The Context Glue
+
+Because we don't want the chatend to have to deal with complex details like
+large randomized identifiers, the frontend provides an abstraction where it
+gives short identifiers to the chatend, and then maintains a mapping from short
+identifer to unique identifier. This mapping is fully ephemeral, and resets
+when the session or context resets.
+
 ## The Primary Functions
 
 Several tools are provided to Kennedy for building context and navigating the kweb:
@@ -117,6 +131,9 @@ Several tools are provided to Kennedy for building context and navigating the kw
 + UpdateNode
 + ResetContext
 + ConnectNodes
+
+Not every tool is available in every session, the session type determines which
+tools are available.
 
 ### LoadNode
 
@@ -131,15 +148,18 @@ the database.
 
 The call signature is simply LoadNode(shortIdentifier)
 
-A call to LoadNode will fail if there are already 7 nodes loaded in the context
-window. Kennedy will need to use ResetContext to unload some nodes if she wants
-to keep loading more nodes.
+A 'loaded node' is a node that has had 'LoadNode' called on it, which means
+that all of its active connections are also in the context. A call to LoadNode
+will fail if there are already 7 loaded nodes, including the user node. Kennedy
+will need to call ResetContext and reduce the number of loaded nodes if she
+wants to call LoadNode again after reaching the node limit.
 
 ### ResetContext
 
-ResetContext allows Kennedy to reset the context, unloading all nodes and then
-loading only the nodes provided as parameters. The user's root node is
-implicit, that will always be loaded even if not provided as a parameter.
+ResetContext allows Kennedy to reset the context. The conversation history with
+the user will remain, but the context will be blank. Then, LoadNode will be
+called on the user's node, and LoadNode will be called on every node that
+Kennedy passed in to the call to ResetContext.
 
 The call signature is ResetContext(shortIdentifier[])
 
@@ -201,7 +221,7 @@ Then, LoadNode is automatically called on the user's node, creating a rich
 context for Kennedy as she talks with the user.
 
 The user provides Kennedy with some prompt, and Kennedy will first determine
-whether she needs to make any calls to LoadNode, UpdateNode, or ResetContext
+whether she needs to make any calls to LoadNode, ConnectNodes, or ResetContext
 based on the prompt. Kennedy is allowed to call LoadNode up to 20 times per
 turn to find the context that's relevant to the user's prompt.
 
@@ -217,8 +237,8 @@ can be used in ConnectNodes.
 While the conversation session is ongoing, Kennedy may only call LoadNode,
 ConnectNodes, and ResetContext. When the conversation session ends, the full
 conversation (just the dialog between the user and Kennedy, not the other
-context) is turned into a history object, and then a History Ingress session is
-called on the conversation.
+context) is turned into a history provenance node, and then a History Ingress
+session is called on the conversation.
 
 Conversations are ended when the user deliberately ends the conversation, or
 otherwise starts a new conversation.
@@ -233,7 +253,9 @@ the context. Then the user's node is loaded. Kennedy can call LoadNode up to 50
 times during the session.
 
 Kennedy will update as many nodes as she feels is appropriate during the
-history ingress session.
+history ingress session. Zero updates is also valid. When Kennedy feels that
+the kmap has been updated appropriately, she will end the history ingress
+session.
 
 ### Self Action
 
@@ -263,7 +285,8 @@ node, see its contents, and then from there open up other nodes and explore the
 contents of the kweb.
 
 A conversation 'ends' when the user clicks an end conversation button, or when
-the UI is closed.
+the conversation UI is closed. If there is an abrupt closure, at least during
+the MPV, that conversation is lost.
 
 ## User Boostrap
 
