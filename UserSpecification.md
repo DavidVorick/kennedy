@@ -161,7 +161,7 @@ The call signature is ResetContext(shortIdentifier[])
 
 ### ConnectNodes
 
-Kennedy will call ConnectNodes when she identifies a subset of loaded nodes
+Kennedy will call ConnectNodes when she identifies a subset of in-context nodes
 that were helpful to responding to a particular prompt or query. The backend
 will update the nodes so that they all become active connections of each other.
 
