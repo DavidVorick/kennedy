@@ -38,18 +38,20 @@ default_provider: primary
 providers:
   primary:
     kind: openai
-    api_key_env: OPENAI_API_KEY
+    api_key: "replace-with-your-openai-api-key"
     base_url: https://api.openai.com/v1
     default_model: configured-model-name
     models:
       - configured-model-name
+    reasoning_effort: xhigh
     timeout_seconds: 120
 ```
 
 Provider entry names such as `primary` are public API identifiers. `kind`
-selects the internal adapter. API keys are read from the named environment
-variable. Startup fails if the default provider, its default model, or its
-credential is missing.
+selects the internal adapter. API keys are read directly from the YAML file and
+must never be exposed in browser-visible responses. `reasoning_effort` is sent
+to the provider with each generation request. Startup fails if the default
+provider, its default model, or its credential is missing.
 
 The service may initially implement one provider adapter. Adding another
 adapter must not change the public request and response shapes.

@@ -46,10 +46,11 @@ struct ServerConfig {
 #[derive(Clone, Deserialize)]
 struct ProviderConfig {
     kind: String,
-    api_key_env: String,
+    api_key: String,
     base_url: String,
     default_model: String,
     models: Vec<String>,
+    reasoning_effort: String,
     timeout_seconds: u64,
 }
 
@@ -218,14 +219,17 @@ fn initialize_providers(config: &Config) -> anyhow::Result<HashMap<String, Provi
         if !provider.models.contains(&provider.default_model) {
             anyhow::bail!("provider {name} default_model is not listed in models");
         }
-        let api_key = std::env::var(&provider.api_key_env).with_context(|| {
-            format!(
-                "environment variable {} is required for provider {name}",
-                provider.api_key_env
-            )
-        })?;
-        if api_key.trim().is_empty() {
-            anyhow::bail!("provider {name} credential is empty");
+        let api_key = provider.api_key.trim().to_owned();
+        if api_key.is_empty() || api_key == "replace-with-your-openai-api-key" {
+            anyhow::bail!("provider {name} credential is missing from config.yaml");
+        }
+        if !["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .contains(&provider.reasoning_effort.as_str())
+        {
+            anyhow::bail!(
+                "provider {name} has unsupported reasoning_effort '{}'",
+                provider.reasoning_effort
+            );
         }
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(provider.timeout_seconds))
@@ -409,6 +413,38 @@ fn provider_message(message: &Message) -> Value {
     }
 }
 
+fn provider_request_body(
+    request: &GenerateRequest,
+    model: &str,
+    reasoning_effort: &str,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": request.messages.iter().map(provider_message).collect::<Vec<_>>(),
+        "reasoning_effort": reasoning_effort,
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        }
+                    })
+                })
+                .collect(),
+        );
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
 async fn generate(
     State(state): State<AppState>,
     Json(request): Json<GenerateRequest>,
@@ -431,11 +467,7 @@ async fn generate(
             "Model is not configured for this provider.",
         ));
     }
-    let mut body = json!({"model":model,"messages":request.messages.iter().map(provider_message).collect::<Vec<_>>()});
-    if !request.tools.is_empty() {
-        body["tools"]=Value::Array(request.tools.iter().map(|t|json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.input_schema}})).collect());
-        body["tool_choice"] = json!("auto");
-    }
+    let body = provider_request_body(&request, model, &provider.config.reasoning_effort);
     let request_id = Uuid::new_v4();
     let started = Instant::now();
     let url = format!(
@@ -638,5 +670,21 @@ mod tests {
     #[test]
     fn text_message_is_valid() {
         assert!(validate_request(&request(vec![text("user", "hi")])).is_ok());
+    }
+    #[test]
+    fn provider_request_includes_reasoning_effort() {
+        let request = request(vec![text("user", "hi")]);
+        let body = provider_request_body(&request, "gpt-5.6-sol", "xhigh");
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+    #[test]
+    fn example_config_uses_direct_api_key_and_requested_model() {
+        let config: Config =
+            serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
+        let provider = config.providers.get("primary").unwrap();
+        assert_eq!(provider.api_key, "replace-with-your-openai-api-key");
+        assert_eq!(provider.default_model, "gpt-5.6-sol");
+        assert_eq!(provider.reasoning_effort, "xhigh");
     }
 }

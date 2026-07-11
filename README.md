@@ -16,8 +16,13 @@ configuration:
 
 ```sh
 cp IntelligenceBackend/config.example.yaml IntelligenceBackend/config.yaml
-export OPENAI_API_KEY="your-key"
 ```
+
+Open `IntelligenceBackend/config.yaml` and replace
+`replace-with-your-openai-api-key` with your API key. Keep the populated file
+private and do not commit or share it. Create a key from the
+[OpenAI API keys page](https://platform.openai.com/api-keys), then copy the new
+secret into the `api_key` field.
 
 Start the intelligence bridge in one terminal:
 
@@ -34,8 +39,9 @@ cargo run -p kennedy-kweb
 Open `http://127.0.0.1:4321`. The SQLite database is created as
 `kennedy.sqlite3` on first run. Both services bind to loopback only.
 
-The example configuration uses `gpt-5.5`. Change `default_model` and the
-`models` allowlist together if your account uses another tool-capable model.
+The example configuration uses `gpt-5.6-sol` with `xhigh` reasoning effort.
+Change `default_model` and the `models` allowlist together if your account uses
+another tool-capable model.
 
 ## Editing Kennedy
 
