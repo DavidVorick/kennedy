@@ -24,14 +24,14 @@ The eventual frontend implementation should use this shape:
 ```text
 Frontend/
   Specification.md
+  SystemPrompts/
+    SystemPromptKmapAgentManual.txt
+    ConversationAgentManual.txt
+    HistoryIngressAgentManual.txt
   public/
     index.html
     css/
       styles.css
-    prompts/
-      SystemPromptKmapAgentManual.txt
-      ConversationAgentManual.txt
-      HistoryIngressAgentManual.txt
     js/
       api.js
       app.js
