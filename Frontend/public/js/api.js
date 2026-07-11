@@ -1,0 +1,42 @@
+export class ApiError extends Error {
+  constructor(message, status = 0, code = "network_error") { super(message); this.name = "ApiError"; this.status = status; this.code = code; }
+}
+
+export async function requestJSON(base, path, options = {}) {
+  let response;
+  try {
+    response = await fetch(`${base}${path}`, {
+      ...options,
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    });
+  } catch (error) {
+    throw new ApiError(`Could not reach ${base}.`, 0, "network_error");
+  }
+  const isJSON = (response.headers.get("content-type") || "").includes("application/json");
+  const payload = isJSON ? await response.json().catch(() => null) : await response.text().catch(() => "");
+  if (!response.ok) {
+    const remote = payload?.error;
+    throw new ApiError(remote?.message || `Request failed (${response.status}).`, response.status, remote?.code || "request_failed");
+  }
+  return payload;
+}
+
+export const KwebAPI = (base) => ({
+  health: () => requestJSON(base, "/health"),
+  user: () => requestJSON(base, "/api/v1/user"),
+  node: (id) => requestJSON(base, `/api/v1/nodes/${id}`),
+  context: (id) => requestJSON(base, `/api/v1/nodes/${id}/context`),
+  history: (id) => requestJSON(base, `/api/v1/nodes/${id}/history`),
+  provenance: (id) => requestJSON(base, `/api/v1/provenance/${id}`),
+  createProvenance: (body) => requestJSON(base, "/api/v1/provenance", { method: "POST", body: JSON.stringify(body) }),
+  createNode: (body) => requestJSON(base, "/api/v1/nodes", { method: "POST", body: JSON.stringify(body) }),
+  updateNode: (id, body) => requestJSON(base, `/api/v1/nodes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  connect: (nodeIds) => requestJSON(base, "/api/v1/connections", { method: "POST", body: JSON.stringify({ node_ids: nodeIds }) }),
+});
+
+export const IntelligenceAPI = (base) => ({
+  health: () => requestJSON(base, "/health"),
+  providers: () => requestJSON(base, "/api/v1/providers"),
+  generate: (body) => requestJSON(base, "/api/v1/generate", { method: "POST", body: JSON.stringify(body) }),
+});
+

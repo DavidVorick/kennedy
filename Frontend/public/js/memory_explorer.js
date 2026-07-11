@@ -1,0 +1,62 @@
+import { element } from "./render.js";
+
+export class MemoryExplorer {
+  constructor({ api, rootNodeId, content, backButton, forwardButton }) {
+    this.api = api; this.rootNodeId = rootNodeId; this.content = content; this.backButton = backButton; this.forwardButton = forwardButton;
+    this.currentNodeId = null; this.back = []; this.forward = [];
+  }
+
+  async home() { return this.open(this.rootNodeId); }
+  async open(id, navigation = true) {
+    if (navigation && this.currentNodeId && this.currentNodeId !== id) { this.back.push(this.currentNodeId); this.forward = []; }
+    this.currentNodeId = id; this.updateButtons();
+    this.content.replaceChildren(element("p", "", "Loading memory…"));
+    try {
+      const [node, history] = await Promise.all([this.api.node(id), this.api.history(id)]);
+      this.renderNode(node, history.history);
+    } catch (error) { this.content.replaceChildren(element("p", "error-banner", error.message)); }
+  }
+
+  async goBack() { if (!this.back.length) return; this.forward.push(this.currentNodeId); const id = this.back.pop(); this.currentNodeId = null; await this.open(id, false); }
+  async goForward() { if (!this.forward.length) return; this.back.push(this.currentNodeId); const id = this.forward.pop(); this.currentNodeId = null; await this.open(id, false); }
+  updateButtons() { this.backButton.disabled = !this.back.length; this.forwardButton.disabled = !this.forward.length; }
+
+  renderNode(node, history) {
+    const root = document.createDocumentFragment();
+    root.append(element("h2", "", node.short_name), element("p", "node-description", node.short_description || "No short description."), element("div", "long-description", node.long_description || "No long description."));
+    const grid = element("div", "connection-grid");
+    grid.append(this.connectionList("Active connections", node.active_connections), this.connectionList("Fanout connections", node.fanout_connections));
+    root.append(grid);
+    const historySection = element("section", "history"); historySection.append(element("h3", "", "Source history"));
+    if (!history.length) historySection.append(element("p", "", "No history entries."));
+    history.forEach((entry, index) => {
+      const row = element("div", "history-entry");
+      row.append(element("span", "", `Revision ${history.length - index}`));
+      const button = element("button", "quiet", "View source"); button.type = "button";
+      button.addEventListener("click", () => this.showSource(entry.provenance_id, row)); row.append(button); historySection.append(row);
+    });
+    root.append(historySection); this.content.replaceChildren(root);
+  }
+
+  connectionList(title, connections) {
+    const section = element("section", "connection-list"); section.append(element("h3", "", title));
+    if (!connections.length) section.append(element("p", "", "None yet."));
+    for (const connection of connections) {
+      const button = element("button", "connection"); button.type = "button";
+      button.append(element("strong", "", connection.short_name), element("small", "", connection.short_description || "No description."));
+      button.addEventListener("click", () => this.open(connection.id)); section.append(button);
+    }
+    return section;
+  }
+
+  async showSource(provenanceId, row) {
+    const existing = row.nextElementSibling;
+    if (existing?.classList.contains("source-detail")) { existing.remove(); return; }
+    try {
+      const source = await this.api.provenance(provenanceId);
+      const detail = element("div", "source-detail", `${source.source} · ${source.source_created_at}\n\n${source.data}`);
+      row.insertAdjacentElement("afterend", detail);
+    } catch (error) { row.insertAdjacentElement("afterend", element("div", "source-detail", error.message)); }
+  }
+}
+

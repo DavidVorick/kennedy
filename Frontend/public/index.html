@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kennedy</title>
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <span class="eyebrow">LOCAL MEMORY ASSISTANT</span>
+      <h1>Kennedy</h1>
+    </div>
+    <div class="top-actions">
+      <span id="service-status" class="status" role="status">Starting…</span>
+      <button id="chat-tab" class="tab active" type="button">Conversation</button>
+      <button id="memory-tab" class="tab" type="button">Memory</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="chat-view" class="workspace">
+      <section class="panel conversation-panel" aria-label="Conversation">
+        <div id="transcript" class="transcript" aria-live="polite">
+          <div class="empty-state">
+            <p class="empty-title">What are we working on?</p>
+            <p>Kennedy can help directly and draw on your local memory when it matters.</p>
+          </div>
+        </div>
+        <div id="error-banner" class="error-banner hidden" role="alert"></div>
+        <form id="message-form" class="composer">
+          <label class="sr-only" for="message-input">Message Kennedy</label>
+          <textarea id="message-input" rows="3" placeholder="Message Kennedy…" required></textarea>
+          <div class="composer-actions">
+            <button id="end-button" class="secondary" type="button">End conversation</button>
+            <span id="activity" class="activity" aria-live="polite"></span>
+            <button id="send-button" class="primary" type="submit">Send</button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="panel inspector-panel" aria-label="Kennedy context inspector">
+        <div class="panel-heading">
+          <div><span class="eyebrow">LIVE DIAGNOSTICS</span><h2>Context inspector</h2></div>
+          <button id="copy-context" class="quiet" type="button">Copy JSON</button>
+        </div>
+        <div id="context-summary" class="context-summary"></div>
+        <pre id="context-inspector" tabindex="0"></pre>
+      </aside>
+    </section>
+
+    <section id="memory-view" class="memory-view hidden" aria-label="Memory explorer">
+      <div class="memory-toolbar">
+        <div>
+          <span class="eyebrow">DURABLE KMAP</span>
+          <h2>Memory explorer</h2>
+        </div>
+        <div>
+          <button id="memory-back" class="secondary" type="button" disabled>Back</button>
+          <button id="memory-forward" class="secondary" type="button" disabled>Forward</button>
+          <button id="memory-home" class="secondary" type="button">David’s root</button>
+        </div>
+      </div>
+      <div id="memory-content" class="memory-content"></div>
+    </section>
+  </main>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
+
