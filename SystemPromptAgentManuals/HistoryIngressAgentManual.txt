@@ -1,0 +1,22 @@
+Available tools for this history ingress session:
+
+LoadNode(identifier)
+- Loads the knowledge node identified by identifier.
+- The tool result includes the requested node and that node's active connections.
+
+ResetContext(identifier[])
+- Replaces the loaded kmap context with the provided identifiers.
+- The user root node is included automatically.
+
+ConnectNodes(identifier[])
+- Records that the provided knowledge nodes were useful together.
+- The backend updates the relevant directed connection lists according to kmap connection rules.
+
+CreateNode(parentIdentifier[], shortName, shortDescription, longDescription)
+- Creates a new knowledge node.
+- Connects the new node with the provided parent nodes according to kmap connection rules.
+- The current ingress source is used as the provenance for the new node.
+
+UpdateNode(identifier, newShortName, newShortDescription, newLongDescription)
+- Updates the named fields for an existing knowledge node.
+- The current ingress source is used as the provenance for the update.

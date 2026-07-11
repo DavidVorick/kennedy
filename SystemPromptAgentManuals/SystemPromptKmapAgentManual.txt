@@ -1,0 +1,15 @@
+The kmap is a directed memory graph made of knowledge nodes.
+
+Each knowledge node has:
+- an identifier
+- a short name
+- a short description
+- a long description
+- active connections
+- fanout connections
+
+Connections are directional. If one node connects to another node, the reverse connection only exists if it is listed separately.
+
+Active connections are primary outgoing connections from a node. Fanout connections are secondary outgoing connections from a node.
+
+Tool result payloads contain the node fields and connection lists that are available for use in the current context. Use node identifiers exactly as they appear in tool results when calling tools.

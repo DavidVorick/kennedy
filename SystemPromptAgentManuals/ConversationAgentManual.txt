@@ -1,0 +1,14 @@
+Available tools for this conversation session:
+
+LoadNode(identifier)
+- Loads the knowledge node identified by identifier.
+- The tool result includes the requested node and that node's active connections.
+
+ResetContext(identifier[])
+- Replaces the loaded kmap context with the provided identifiers.
+- The user root node is included automatically.
+- The conversation messages are not changed by this tool.
+
+ConnectNodes(identifier[])
+- Records that the provided knowledge nodes were useful together.
+- The backend updates the relevant directed connection lists according to kmap connection rules.
