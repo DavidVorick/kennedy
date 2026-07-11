@@ -22,7 +22,7 @@ The live parameters in the codebase may be materially different.
 ## Vocabulary
 
 'Frontend' refers to the html/css/js application that is served. The frontend
-is fully stateless, and relies on APIs to various backend services to get
+has no persistent state, and relies on APIs to various backend services to get
 persistence between sessions.
 
 'Chatend' refers to the actual context that is being passed to LLMs.
@@ -110,10 +110,6 @@ different knowledge nodes.
 + List of short names with short identifiers as 'active connections'
 + List of short names with short identifiers as 'fanout connections'
 
-The backend will keep track of how short identifiers map to unique identifiers.
-The short identifiers are ephemeral, and get reset every time the context
-window is reset.
-
 ## The Context Glue
 
 Because we don't want the chatend to have to deal with complex details like
@@ -157,8 +153,8 @@ wants to call LoadNode again after reaching the node limit.
 ### ResetContext
 
 ResetContext allows Kennedy to reset the context. The conversation history with
-the user will remain, but the context will be blank. Then, LoadNode will be
-called on the user's node, and LoadNode will be called on every node that
+the user will remain, but the kweb will be fully unloaded. Then, LoadNode will
+be called on the user's node, and LoadNode will be called on every node that
 Kennedy passed in to the call to ResetContext.
 
 The call signature is ResetContext(shortIdentifier[])
@@ -192,8 +188,8 @@ The new node is added to the database, and ConnectNodes is called on the node
 and all of its parents.
 
 Note: this can only be called during a history ingress session, so the relevant
-history object is implicit. That history object will be added as the head and
-tail of the history linked list.
+data provenance node is implicit. That provenance node will be added as the
+head and tail of the history linked list.
 
 ### UpdateNode
 
@@ -230,9 +226,9 @@ run out of calls to LoadNode, she will call ConnectNodes and then respond to
 the user. When calling ConnectNodes, Kennedy will only provide the nodes that
 are directly relevant to the user's prompt / query, which means that there may
 be many nodes which are loaded but are not provided to ConnectNodes. She may
-also provide nodes to ConnectNodes which are not active nodes - the active
-connections of active nodes provide their full long description, and therefore
-can be used in ConnectNodes.
+also provide nodes to ConnectNodes which are not loaded nodes - the active
+connections of loaded nodes provide their full long description and short
+identifier, and therefore can be used in ConnectNodes.
 
 While the conversation session is ongoing, Kennedy may only call LoadNode,
 ConnectNodes, and ResetContext. When the conversation session ends, the full
@@ -248,9 +244,9 @@ history with the user, and also the LoadNode counter.
 
 ### History Ingress
 
-In a history ingress session, a history object is created as the first part of
-the context. Then the user's node is loaded. Kennedy can call LoadNode up to 50
-times during the session.
+In a history ingress session, a history provenance node is created as the first
+part of the context. Then the user's node is loaded. Kennedy can call LoadNode
+up to 50 times during the session.
 
 Kennedy will update as many nodes as she feels is appropriate during the
 history ingress session. Zero updates is also valid. When Kennedy feels that
@@ -284,9 +280,9 @@ The UI also provides a memory explorer, where the user can open up their own
 node, see its contents, and then from there open up other nodes and explore the
 contents of the kweb.
 
-A conversation 'ends' when the user clicks an end conversation button, or when
-the conversation UI is closed. If there is an abrupt closure, at least during
-the MPV, that conversation is lost.
+A conversation 'ends' when the user clicks an end conversation button or starts
+a new conversation. Closing the UI abruptly may cause a conversation to be lost
+in the MVP.
 
 ## User Boostrap
 
