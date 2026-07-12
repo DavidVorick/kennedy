@@ -96,9 +96,11 @@ intelligence backend. It contains:
 - the current Kweb context,
 - tool calls and tool results that remain in context.
 
-The frontend submits the entire chatend on every generation request. The
-context inspector renders the same data structure, so it shows what Kennedy is
-actually sent rather than an approximation.
+The frontend submits the entire chatend on every generation request. The main
+body of the chatend inspector renders only that same message array, so it shows
+what Kennedy is actually sent rather than an approximation or a wrapper of
+diagnostic state. A compact summary may show the mode, provider, model, message
+count, and model-requested tool-call count.
 
 The clean transcript is maintained separately. It contains only user and final
 Kennedy messages and is the source used to create conversation provenance.
@@ -358,15 +360,12 @@ Tool calls and internal context never appear in the clean transcript.
 
 ### 11.2 Context Inspector
 
-The right panel renders:
-
-- composed instructions,
-- complete normalized chatend messages,
-- directly loaded nodes and their active expansions,
-- current short-ID mappings,
-- LoadNode usage and limit,
-- tool calls, results, duration, and failure state,
-- selected provider and model.
+The right panel's JSON body is the complete normalized chatend message array,
+including composed instructions, Kweb context, model-requested tool calls, and
+local tool results that remain in context. It does not wrap that array in
+diagnostic metadata. The summary identifies the current mode, provider, model,
+message count, and model-requested tool-call count. Copy Chatend copies exactly
+the JSON shown in the panel.
 
 ### 11.3 Memory Explorer
 

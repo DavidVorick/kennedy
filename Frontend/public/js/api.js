@@ -16,7 +16,8 @@ export async function requestJSON(base, path, options = {}) {
   const payload = isJSON ? await response.json().catch(() => null) : await response.text().catch(() => "");
   if (!response.ok) {
     const remote = payload?.error;
-    throw new ApiError(remote?.message || `Request failed (${response.status}).`, response.status, remote?.code || "request_failed");
+    const requestId = remote?.request_id ? ` (request ID: ${remote.request_id})` : "";
+    throw new ApiError(`${remote?.message || `Request failed (${response.status}).`}${requestId}`, response.status, remote?.code || "request_failed");
   }
   return payload;
 }
@@ -39,4 +40,3 @@ export const IntelligenceAPI = (base) => ({
   providers: () => requestJSON(base, "/api/v1/providers"),
   generate: (body) => requestJSON(base, "/api/v1/generate", { method: "POST", body: JSON.stringify(body) }),
 });
-

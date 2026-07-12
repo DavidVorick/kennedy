@@ -3,7 +3,7 @@ import { loadPromptManuals } from "./prompt_composer.js";
 import { ConversationSession } from "./conversation.js";
 import { runHistoryIngress } from "./history_ingress.js";
 import { MemoryExplorer } from "./memory_explorer.js";
-import { renderTranscript, renderInspector, showError, clearError } from "./render.js";
+import { renderTranscript, renderInspector, inspectorJSON, showError, clearError } from "./render.js";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -124,7 +124,6 @@ ui.memory_tab.addEventListener("click", () => showView(true));
 ui.memory_back.addEventListener("click", () => explorer?.goBack());
 ui.memory_forward.addEventListener("click", () => explorer?.goForward());
 ui.memory_home.addEventListener("click", () => explorer?.home());
-ui.copy_context.addEventListener("click", async () => { try { await navigator.clipboard.writeText(JSON.stringify(diagnostic(), null, 2)); ui.copy_context.textContent = "Copied"; setTimeout(() => { ui.copy_context.textContent = "Copy JSON"; }, 1200); } catch { showError(ui.error_banner, "Could not copy context to the clipboard."); } });
+ui.copy_context.addEventListener("click", async () => { try { await navigator.clipboard.writeText(inspectorJSON(diagnostic())); ui.copy_context.textContent = "Copied"; setTimeout(() => { ui.copy_context.textContent = "Copy chatend"; }, 1200); } catch { showError(ui.error_banner, "Could not copy the chatend to the clipboard."); } });
 
 initialize();
-

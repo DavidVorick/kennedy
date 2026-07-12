@@ -4,4 +4,4 @@
 *.sqlite3-wal
 IntelligenceBackend/config.yaml
 .env
-
+.tools/

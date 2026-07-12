@@ -50,7 +50,7 @@ providers:
 Provider entry names such as `primary` are public API identifiers. `kind`
 selects the internal adapter. API keys are read directly from the YAML file and
 must never be exposed in browser-visible responses. `reasoning_effort` is sent
-to the provider with each generation request. Startup fails if the default
+as `reasoning.effort` in each OpenAI Responses request. Startup fails if the default
 provider, its default model, or its credential is missing.
 
 The service may initially implement one provider adapter. Adding another
@@ -90,6 +90,13 @@ The request `messages` array is ordered and supports these shapes.
 ```
 
 An assistant message may contain text, tool calls, or both.
+
+An assistant message returned by an adapter may also contain `provider_items`,
+an opaque array of provider output items. The frontend appends and returns
+these items unchanged while that assistant message remains in the chatend.
+They preserve reasoning continuity during a stateless local tool loop; the
+frontend never interprets them and the adapter never treats them as a
+provider-side conversation identifier.
 
 ### 4.3 Tool-Result Message
 
@@ -232,6 +239,10 @@ Tool-call response:
           "identifier": 3
         }
       }
+    ],
+    "provider_items": [
+      {"type": "reasoning", "encrypted_content": "opaque-provider-data", "summary": []},
+      {"type": "function_call", "call_id": "call_opaque_id", "name": "LoadNode", "arguments": "{\"identifier\":3}"}
     ]
   },
   "usage": {
@@ -281,11 +292,17 @@ An adapter must:
 - require tool arguments to decode as a JSON object,
 - generate opaque unique call IDs when the provider omits them,
 - preserve provider call IDs when available,
+- preserve provider output items needed to continue a reasoning/tool turn,
 - return all tool calls from one assistant response,
 - avoid using provider-side previous-response or conversation identifiers.
 
-Provider-specific response IDs may be discarded. The complete request from the
-frontend is always authoritative.
+The OpenAI adapter uses `POST /v1/responses` with `store: false`, sends
+`reasoning.effort`, and requests encrypted reasoning content. Function tools
+are definitions for operations executed by the frontend; OpenAI does not
+execute Kennedy's Kweb tools. Responses `function_call` and
+`function_call_output` items are correlated by `call_id`. Provider-specific
+response IDs may be discarded. The complete request from the frontend is
+always authoritative.
 
 ## 9. Errors
 
@@ -302,8 +319,22 @@ Errors use the shared envelope from `TechnicalDesign.md`.
 | `504` | `provider_timeout` | Configured timeout elapsed |
 | `500` | `internal_error` | Unexpected local failure |
 
-Provider error bodies are not forwarded verbatim. The backend returns a stable
-message and logs provider diagnostics without credentials.
+Provider error bodies are not forwarded verbatim. For structured provider
+errors, the backend extracts and bounds the provider message so request-shape
+errors remain actionable. Credential failures remain generic except for a safe
+distinction between invalid credentials and insufficient model-request
+permission. Provider failures include a request ID in the error envelope so a
+visible error can be matched to logs:
+
+```json
+{
+  "error": {
+    "code": "provider_error",
+    "message": "Provider rejected the request: useful bounded detail",
+    "request_id": "9e6af478-9754-4e8b-bc79-9b9327079d6e"
+  }
+}
+```
 
 ## 10. HTTP Requirements
 
@@ -326,7 +357,8 @@ Log:
 - response status,
 - latency,
 - token usage when available,
-- normalized error code.
+- normalized error code,
+- structured provider error code, type, and parameter when available.
 
 Do not log API keys, complete prompts, tool-result contents, or provider
 authorization headers.

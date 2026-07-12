@@ -5,7 +5,7 @@ long-term memory. The MVP consists of two Rust services and a browser-native
 frontend:
 
 - `kennedy-kweb` owns SQLite, memory/history invariants, and serves the UI.
-- `kennedy-intelligence` is a stateless OpenAI-compatible generation bridge.
+- `kennedy-intelligence` is a stateless OpenAI Responses generation bridge.
 - `Frontend/public` owns live conversations, context, tool execution, and
   automatic history ingress when a conversation ends.
 

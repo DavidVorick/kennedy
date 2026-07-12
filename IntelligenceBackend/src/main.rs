@@ -72,6 +72,7 @@ struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    request_id: Option<Uuid>,
 }
 
 impl ApiError {
@@ -80,7 +81,12 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            request_id: None,
         }
+    }
+    fn with_request_id(mut self, request_id: Uuid) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
     fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
@@ -92,11 +98,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({"error":{"code":self.code,"message":self.message}})),
-        )
-            .into_response()
+        let mut error = json!({"code":self.code,"message":self.message});
+        if let Some(request_id) = self.request_id {
+            error["request_id"] = json!(request_id.to_string());
+        }
+        (self.status, Json(json!({"error":error}))).into_response()
     }
 }
 
@@ -111,6 +117,8 @@ struct Message {
     tool_call_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    provider_items: Vec<Value>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -342,6 +350,11 @@ fn validate_request(request: &GenerateRequest) -> Result<(), ApiError> {
                         "Only assistant messages may contain tool calls.",
                     ));
                 }
+                if !message.provider_items.is_empty() {
+                    return Err(ApiError::invalid(
+                        "Only assistant messages may contain provider items.",
+                    ));
+                }
             }
             "assistant" => {
                 if !matches!(
@@ -364,6 +377,11 @@ fn validate_request(request: &GenerateRequest) -> Result<(), ApiError> {
                 }
             }
             "tool" => {
+                if !message.provider_items.is_empty() {
+                    return Err(ApiError::invalid(
+                        "Tool results may not contain provider items.",
+                    ));
+                }
                 let id = message
                     .tool_call_id
                     .as_deref()
@@ -399,29 +417,52 @@ fn validate_request(request: &GenerateRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn provider_message(message: &Message) -> Value {
+fn provider_input_items(message: &Message) -> Vec<Value> {
+    if message.role == "assistant" && !message.provider_items.is_empty() {
+        return message.provider_items.clone();
+    }
     match message.role.as_str() {
-        "tool" => {
-            json!({"role":"tool","tool_call_id":message.tool_call_id,"content":serde_json::to_string(message.content.as_ref().unwrap_or(&Value::Null)).unwrap_or_else(|_|"null".into())})
+        "tool" => vec![json!({
+            "type": "function_call_output",
+            "call_id": message.tool_call_id,
+            "output": serde_json::to_string(message.content.as_ref().unwrap_or(&Value::Null))
+                .unwrap_or_else(|_| "null".into()),
+        })],
+        "assistant" => {
+            let mut items = Vec::new();
+            if let Some(Value::String(content)) = &message.content {
+                items.push(json!({"role":"assistant","content":content}));
+            }
+            items.extend(message.tool_calls.iter().map(|call| {
+                json!({
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.name,
+                    "arguments": serde_json::to_string(&call.arguments)
+                        .unwrap_or_else(|_| "{}".into()),
+                })
+            }));
+            items
         }
-        "assistant" if !message.tool_calls.is_empty() => {
-            json!({"role":"assistant","content":message.content,"tool_calls":message.tool_calls.iter().map(|c|json!({"id":c.id,"type":"function","function":{"name":c.name,"arguments":serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into())}})).collect::<Vec<_>>() })
-        }
-        _ => {
-            json!({"role":message.role,"content":message.content.as_ref().and_then(Value::as_str).unwrap_or("")})
-        }
+        _ => vec![json!({
+            "role": message.role,
+            "content": message.content.as_ref().and_then(Value::as_str).unwrap_or(""),
+        })],
     }
 }
 
-fn provider_request_body(
-    request: &GenerateRequest,
-    model: &str,
-    reasoning_effort: &str,
-) -> Value {
+fn provider_request_body(request: &GenerateRequest, model: &str, reasoning_effort: &str) -> Value {
+    let input = request
+        .messages
+        .iter()
+        .flat_map(provider_input_items)
+        .collect::<Vec<_>>();
     let mut body = json!({
         "model": model,
-        "messages": request.messages.iter().map(provider_message).collect::<Vec<_>>(),
-        "reasoning_effort": reasoning_effort,
+        "input": input,
+        "reasoning": {"effort": reasoning_effort},
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
     });
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
@@ -431,11 +472,10 @@ fn provider_request_body(
                 .map(|tool| {
                     json!({
                         "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.input_schema,
-                        }
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                        "strict": true,
                     })
                 })
                 .collect(),
@@ -471,7 +511,7 @@ async fn generate(
     let request_id = Uuid::new_v4();
     let started = Instant::now();
     let url = format!(
-        "{}/chat/completions",
+        "{}/responses",
         provider.config.base_url.trim_end_matches('/')
     );
     let response = provider
@@ -481,21 +521,23 @@ async fn generate(
         .json(&body)
         .send()
         .await
-        .map_err(map_transport_error)?;
+        .map_err(|error| map_transport_error(error).with_request_id(request_id))?;
     let status = response.status();
-    if !status.is_success() {
-        let mapped = map_provider_status(status);
-        tracing::warn!(%request_id,provider=%provider_name,%model,status=%status,code=%mapped.code,latency_ms=started.elapsed().as_millis(),"provider request failed");
-        return Err(mapped);
-    }
     let payload: Value = response.json().await.map_err(|_| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,
             "provider_error",
-            "Provider returned an unusable response.",
+            "Provider returned a response that was not valid JSON.",
         )
+        .with_request_id(request_id)
     })?;
-    let normalized = normalize_openai(payload)?;
+    if !status.is_success() {
+        let mapped = map_provider_status(status, &payload).with_request_id(request_id);
+        tracing::warn!(%request_id,provider=%provider_name,%model,status=%status,code=%mapped.code,provider_code=?provider_error_field(&payload, "code"),provider_type=?provider_error_field(&payload, "type"),provider_param=?provider_error_field(&payload, "param"),latency_ms=started.elapsed().as_millis(),"provider request failed");
+        return Err(mapped);
+    }
+    let normalized =
+        normalize_openai(payload).map_err(|error| error.with_request_id(request_id))?;
     tracing::info!(%request_id,provider=%provider_name,%model,status="ok",latency_ms=started.elapsed().as_millis(),input_tokens=?normalized.usage.as_ref().map(|u|u.input_tokens),output_tokens=?normalized.usage.as_ref().map(|u|u.output_tokens),"generation complete");
     Ok(Json(normalized))
 }
@@ -516,76 +558,115 @@ fn map_transport_error(error: reqwest::Error) -> ApiError {
     }
 }
 
-fn map_provider_status(status: reqwest::StatusCode) -> ApiError {
+fn provider_error_field<'a>(payload: &'a Value, field: &str) -> Option<&'a str> {
+    payload.get("error")?.get(field)?.as_str()
+}
+
+fn clean_provider_message(payload: &Value) -> Option<String> {
+    let message = provider_error_field(payload, "message")?;
+    let cleaned = message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(500)
+        .collect::<String>();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn map_provider_status(status: reqwest::StatusCode, payload: &Value) -> ApiError {
+    let detail = clean_provider_message(payload);
     match status.as_u16() {
-        401 | 403 => ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "provider_auth_failed",
-            "The provider rejected its configured credentials.",
-        ),
+        401 | 403 => {
+            let message = detail
+                .filter(|message| message.to_ascii_lowercase().contains("insufficient permission"))
+                .map(|_| "The provider credentials do not have permission to create model responses. Update the API key permissions to allow model requests.".to_string())
+                .unwrap_or_else(|| "The provider rejected its configured credentials. Check the API key and its project permissions.".to_string());
+            ApiError::new(StatusCode::UNAUTHORIZED, "provider_auth_failed", message)
+        }
         429 => ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "provider_rate_limited",
-            "The provider rate limit was reached.",
+            detail.unwrap_or_else(|| "The provider rate limit was reached.".into()),
         ),
-        _ => ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "provider_error",
-            "The provider returned an error.",
-        ),
+        _ => {
+            let message = detail
+                .map(|detail| format!("Provider rejected the request: {detail}"))
+                .unwrap_or_else(|| format!("Provider returned HTTP {status}."));
+            ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", message)
+        }
     }
 }
 
 fn normalize_openai(payload: Value) -> Result<NormalizedResponse, ApiError> {
-    let message = payload
-        .pointer("/choices/0/message")
-        .and_then(Value::as_object)
+    let output = payload
+        .get("output")
+        .and_then(Value::as_array)
         .ok_or_else(|| {
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "provider_error",
-                "Provider response did not contain a message.",
+                "Provider response did not contain an output array.",
             )
         })?;
-    let content = message.get("content").cloned().filter(|v| !v.is_null());
+    let mut text = Vec::new();
     let mut calls = Vec::new();
-    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-        for raw in tool_calls {
-            let id = raw
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4()));
-            let name = raw
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ApiError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "provider_error",
-                        "Provider tool call omitted its name.",
-                    )
-                })?
-                .to_string();
-            let args = raw
-                .pointer("/function/arguments")
-                .and_then(Value::as_str)
-                .and_then(|v| serde_json::from_str::<Value>(v).ok())
-                .and_then(|v| v.as_object().cloned())
-                .ok_or_else(|| {
-                    ApiError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "provider_error",
-                        "Provider tool arguments were not a JSON object.",
-                    )
-                })?;
-            calls.push(ToolCall {
-                id,
-                name,
-                arguments: args,
-            });
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    text.extend(parts.iter().filter_map(|part| {
+                        (part.get("type").and_then(Value::as_str) == Some("output_text"))
+                            .then(|| part.get("text").and_then(Value::as_str))
+                            .flatten()
+                            .map(str::to_string)
+                    }));
+                }
+            }
+            Some("function_call") => {
+                let id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4()));
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            StatusCode::BAD_GATEWAY,
+                            "provider_error",
+                            "Provider tool call omitted its name.",
+                        )
+                    })?
+                    .to_string();
+                let args = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                    .and_then(|v| v.as_object().cloned())
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            StatusCode::BAD_GATEWAY,
+                            "provider_error",
+                            "Provider tool arguments were not a JSON object.",
+                        )
+                    })?;
+                calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                });
+            }
+            _ => {}
         }
     }
+    let content = (!text.is_empty()).then(|| Value::String(text.join("")));
     if calls.is_empty() && !matches!(&content, Some(Value::String(_))) {
         return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
@@ -595,8 +676,8 @@ fn normalize_openai(payload: Value) -> Result<NormalizedResponse, ApiError> {
     }
     let usage = payload.get("usage").and_then(|u| {
         Some(Usage {
-            input_tokens: u.get("prompt_tokens")?.as_u64()?,
-            output_tokens: u.get("completion_tokens")?.as_u64()?,
+            input_tokens: u.get("input_tokens")?.as_u64()?,
+            output_tokens: u.get("output_tokens")?.as_u64()?,
         })
     });
     Ok(NormalizedResponse {
@@ -612,6 +693,7 @@ fn normalize_openai(payload: Value) -> Result<NormalizedResponse, ApiError> {
             tool_calls: calls,
             tool_call_id: None,
             name: None,
+            provider_items: output.clone(),
         },
         usage,
     })
@@ -635,6 +717,7 @@ mod tests {
             tool_calls: vec![],
             tool_call_id: None,
             name: None,
+            provider_items: vec![],
         }
     }
     #[test]
@@ -649,20 +732,29 @@ mod tests {
             tool_calls: vec![],
             tool_call_id: Some("x".into()),
             name: Some("LoadNode".into()),
+            provider_items: vec![],
         };
         assert!(validate_request(&request(vec![m])).is_err());
     }
     #[test]
     fn normalizes_multiple_calls() {
-        let payload = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"a","function":{"name":"One","arguments":"{}"}},{"id":"b","function":{"name":"Two","arguments":"{\"x\":1}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5}});
+        let payload = json!({
+            "output": [
+                {"type":"reasoning","encrypted_content":"opaque","summary":[]},
+                {"type":"function_call","call_id":"a","name":"One","arguments":"{}"},
+                {"type":"function_call","call_id":"b","name":"Two","arguments":"{\"x\":1}"}
+            ],
+            "usage":{"input_tokens":10,"output_tokens":5}
+        });
         let result = normalize_openai(payload).unwrap();
         assert_eq!(result.status, "tool_calls");
         assert_eq!(result.message.tool_calls.len(), 2);
+        assert_eq!(result.message.provider_items.len(), 3);
         assert_eq!(result.usage.unwrap().input_tokens, 10);
     }
     #[test]
     fn complete_text_normalizes() {
-        let payload = json!({"choices":[{"message":{"content":"hello"}}]});
+        let payload = json!({"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]}]});
         let result = normalize_openai(payload).unwrap();
         assert_eq!(result.status, "complete");
         assert_eq!(result.message.content, Some(json!("hello")));
@@ -672,16 +764,73 @@ mod tests {
         assert!(validate_request(&request(vec![text("user", "hi")])).is_ok());
     }
     #[test]
-    fn provider_request_includes_reasoning_effort() {
+    fn provider_request_uses_stateless_responses_shape() {
         let request = request(vec![text("user", "hi")]);
         let body = provider_request_body(&request, "gpt-5.6-sol", "xhigh");
         assert_eq!(body["model"], "gpt-5.6-sol");
-        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["input"][0], json!({"role":"user","content":"hi"}));
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+    #[test]
+    fn provider_request_replays_output_items_and_local_tool_result() {
+        let mut assistant = text("assistant", "ignored normalized copy");
+        assistant.provider_items = vec![
+            json!({"type":"reasoning","encrypted_content":"opaque","summary":[]}),
+            json!({"type":"function_call","call_id":"call_1","name":"LoadNode","arguments":"{\"identifier\":2}"}),
+        ];
+        assistant.tool_calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "LoadNode".into(),
+            arguments: Map::from_iter([("identifier".into(), json!(2))]),
+        }];
+        let result = Message {
+            role: "tool".into(),
+            content: Some(json!({"ok":true})),
+            tool_calls: vec![],
+            tool_call_id: Some("call_1".into()),
+            name: Some("LoadNode".into()),
+            provider_items: vec![],
+        };
+        let body = provider_request_body(
+            &request(vec![text("user", "hi"), assistant, result]),
+            "gpt-5.6-sol",
+            "xhigh",
+        );
+        assert_eq!(body["input"][1]["type"], "reasoning");
+        assert_eq!(body["input"][2]["call_id"], "call_1");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["input"][3]["output"], "{\"ok\":true}");
+    }
+    #[test]
+    fn provider_permission_error_is_actionable() {
+        let error = map_provider_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &json!({"error":{"message":"You have insufficient permissions for this operation."}}),
+        );
+        assert_eq!(error.code, "provider_auth_failed");
+        assert!(
+            error
+                .message
+                .contains("permission to create model responses")
+        );
+    }
+    #[test]
+    fn provider_validation_error_preserves_safe_detail() {
+        let error = map_provider_status(
+            reqwest::StatusCode::BAD_REQUEST,
+            &json!({"error":{"message":"Invalid value for reasoning.effort\n","param":"reasoning.effort"}}),
+        );
+        assert_eq!(error.code, "provider_error");
+        assert_eq!(
+            error.message,
+            "Provider rejected the request: Invalid value for reasoning.effort"
+        );
     }
     #[test]
     fn example_config_uses_direct_api_key_and_requested_model() {
-        let config: Config =
-            serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
+        let config: Config = serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
         let provider = config.providers.get("primary").unwrap();
         assert_eq!(provider.api_key, "replace-with-your-openai-api-key");
         assert_eq!(provider.default_model, "gpt-5.6-sol");

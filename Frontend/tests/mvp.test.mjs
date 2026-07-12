@@ -5,6 +5,7 @@ import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
 import { ToolExecutor } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
+import { inspectorJSON } from "../public/js/render.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -72,6 +73,12 @@ test("conversation provenance contains only clean dialog", () => {
   const session = new ConversationSession({});
   session.transcript = [{ role: "user", content: "Hi" }, { role: "kennedy", content: "Hello" }];
   assert.equal(session.serialize(), "David: Hi\n\nKennedy: Hello");
+});
+
+test("context inspector serializes only the authoritative chatend", () => {
+  const chatend = [{ role: "system", content: "instructions" }, { role: "user", content: "hi" }];
+  const rendered = JSON.parse(inspectorJSON({ chatend, context: { privateDiagnostic: true }, toolLog: [{ name: "LoadNode" }] }));
+  assert.deepEqual(rendered, chatend);
 });
 
 test("production frontend never uses HTML string insertion", async () => {

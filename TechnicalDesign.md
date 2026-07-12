@@ -28,6 +28,9 @@ System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
   tools.
 - The frontend sends the complete chatend on every generation request. It does
   not depend on opaque provider-side conversation state.
+- The OpenAI adapter uses stateless Responses API requests. Provider output
+  items required to continue a reasoning/tool turn are round-tripped inside
+  the frontend-owned chatend; `previous_response_id` is not used.
 - `ResetContext` rebuilds the chatend from retained session content and newly
   loaded kweb nodes, so unloaded node content is genuinely absent afterward.
 - Short identifiers never cross the Kweb backend API boundary. The frontend
@@ -80,6 +83,10 @@ The frontend owns:
 - agent tool definitions and tool loops,
 - prompt composition from system-prompt manuals,
 - the context inspector and memory explorer state.
+
+The context inspector's JSON body renders the chatend itself. Operational
+diagnostics may inform its compact summary but do not wrap or replace the
+displayed chatend.
 
 The frontend has no persistent state. A reload or abrupt close may discard an
 active conversation.
