@@ -1,61 +1,47 @@
 # Project Clarifications
 
-These user-provided clarifications supplement the repository specifications and
-technical design.
+These user-provided decisions supplement the repository specifications and
+technical design. They may be consolidated or removed once represented by the
+canonical documents; this file is not an append-only log.
 
-## Chatend Inspector
+## Chatend and Inspector
 
-- The chatend is the human-readable context Kennedy forms and sends to the LLM.
-- The main UI's right-hand inspector is a visualization of Kennedy's current
-  mental context, not an API-payload viewer or debugging tool.
-- The inspector shows readable system context, conversation text, memory
-  context, and the ordinary-text JSON envelopes Kennedy uses to request tools.
-  It hides provider response IDs, credentials, and non-context bookkeeping.
-- Text actually supplied to the model should share those readable qualities.
-  System instructions should be organized as prose sections, while loaded Kmap
-  nodes and local tool results should use a clear YAML-like text presentation
-  instead of JSON serialization.
-- Put exact context occupancy and remaining-window telemetry in the right side
-  of the Chatend header, where it remains visible while inspecting context.
-- Provide Full, System Prompts, and Memory Tree views. The memory view should
-  be expandable and visually distinguish directly loaded nodes, full nodes
-  pulled in by active connections, and summary-only fanout references.
-- Serve the local frontend without reusable browser caching and version its
-  entry assets so HTML and JavaScript revisions cannot be mixed. A startup
-  exception should produce a visible failure instead of leaving the UI frozen
-  at “Starting…”.
+- The chatend is the complete, human-readable logical context Kennedy forms for
+  the LLM. The main UI's right-hand inspector visualizes this mental context,
+  rather than provider payloads or transport diagnostics.
+- Show readable system and conversation text, memory context, Kennedy's
+  ordinary-text JSON tool requests, and readable tool results. Hide provider
+  response IDs, credentials, and non-context bookkeeping.
+- Organize system instructions as prose sections and loaded Kmap nodes and tool
+  results as clear YAML-like text rather than serialized JSON.
+- Provide Full, System Prompts, and expandable Memory Tree views. Distinguish
+  directly loaded nodes, full nodes included through active connections, and
+  summary-only fanout references.
+- Keep exact context occupancy and remaining-window telemetry visible in the
+  Chatend header. Also report provider cache reads, cache writes, and total
+  token usage where available.
 
-## OpenAI API and Local Tools
+## Tools and Provider Execution
 
-- The OpenAI adapter should use the Responses API rather than Chat
-  Completions.
-- Kennedy's Kweb tools are implemented and executed locally. Tool definitions
-  and the request envelope live in the readable agent manuals; provider-native
-  function and custom-tool APIs are not used.
-- Kennedy remains responsible for constructing and displaying its complete
-  logical context. Append-only rounds use provider response continuation and a
-  stable prompt-cache key; ResetContext starts a fresh provider chain.
-
-## Provider Errors
-
-- Provider failures should produce useful, actionable messages instead of
-  hiding the cause behind a generic gateway error.
-- Error reporting must still protect credentials and other sensitive provider
-  data; sanitized provider details and request IDs should be used where useful.
-
-## Transparent tools, caching, and usage
-
-- Kennedy requests local tools through an ordinary, human-visible text
-  protocol described completely in the system-prompt manuals. Do not send
-  provider-native function or custom-tool definitions.
-- A single Kennedy response may request multiple tools. Execute them
-  sequentially in the order written and return readable results to the model.
-- Continue append-only conversation and history-ingress rounds with provider
+- Use the OpenAI Responses API. Kennedy's Kweb tools are local operations
+  requested through the ordinary, human-visible text protocol defined in the
+  system-prompt manuals; do not use provider-native function or custom-tool
+  APIs.
+- A Kennedy response may request multiple tools. Execute them sequentially in
+  written order and return readable results to the model.
+- Continue append-only conversation and history-ingress rounds using provider
   response IDs and stable prompt-cache keys. `ResetContext` starts a fresh
-  provider chain because it removes prior Kmap context.
-- Enable prompt caching where it is economically sensible and report cache
-  reads, cache writes, total tokens, and estimated context-window use in the UI.
-- Do not implement automatic resets or compaction. Context resets remain under
-  user/Kennedy control.
-- Show live history-ingress tool requests and results in the conversation UI so
-  the user can follow memory updates.
+  provider chain with Kennedy's rebuilt logical context.
+- Use prompt caching where economically sensible. Do not automatically compact
+  or reset context; resets remain under user or Kennedy control.
+- Return actionable, sanitized provider errors, including request IDs when
+  useful, without exposing credentials or other sensitive provider data.
+
+## Frontend Behavior
+
+- Show live history-ingress tool requests and results in the conversation UI
+  so the user can follow memory updates.
+- Serve the local frontend without reusable browser caching and version its
+  entry assets so HTML and JavaScript revisions cannot be mixed.
+- Surface startup exceptions as visible failures instead of leaving the UI
+  frozen at “Starting…”.
