@@ -6,7 +6,7 @@ import { Chatend } from "../public/js/chatend.js";
 import { ToolExecutor } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { inspectorText } from "../public/js/render.js";
-import { composePrompt } from "../public/js/prompt_composer.js";
+import { composePrompt, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
 
 const id = n => n.toString(16).padStart(40, "0");
@@ -91,6 +91,25 @@ test("system prompt composition uses readable sections rather than markup wrappe
   const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation");
   assert.equal(prompt, "Kennedy's shared instructions\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.");
   assert.equal(prompt.includes("<kennedy_"), false);
+});
+
+test("system prompt loader requests the renamed Kmap manual", async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  globalThis.fetch = async path => {
+    requested.push(path);
+    return { ok: true, text: async () => path };
+  };
+  try {
+    await loadPromptManuals("/base");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requested.sort(), [
+    "/base/system-prompts/ConversationAgentManual.txt",
+    "/base/system-prompts/HistoryIngressAgentManual.txt",
+    "/base/system-prompts/KmapAgentManual.txt",
+  ]);
 });
 
 test("chatend inspector shows only readable text and hides structured calls", () => {

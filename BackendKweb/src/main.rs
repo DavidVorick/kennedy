@@ -22,7 +22,7 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 
 const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const PROMPT_FILES: [&str; 3] = [
-    "SystemPromptKmapAgentManual.txt",
+    "KmapAgentManual.txt",
     "ConversationAgentManual.txt",
     "HistoryIngressAgentManual.txt",
 ];

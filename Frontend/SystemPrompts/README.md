@@ -5,7 +5,7 @@ service serves them to the browser, and the browser fetches them at session
 startup. Edit a file and reload the page to test a change; no Rust or JavaScript
 rebuild is needed.
 
-- `SystemPromptKmapAgentManual.txt` defines Kennedy's identity, primary job,
+- `KmapAgentManual.txt` defines Kennedy's identity, primary job,
   safety boundaries, and shared memory model.
 - `ConversationAgentManual.txt` defines how she helps the user and navigates
   memory during a visible conversation.

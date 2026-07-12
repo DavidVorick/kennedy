@@ -48,7 +48,7 @@ another tool-capable model.
 Kennedy's live system prompts are deliberately plain-text files in
 [`Frontend/SystemPrompts`](Frontend/SystemPrompts/README.md):
 
-- `SystemPromptKmapAgentManual.txt` — identity, job, shared memory rules, and
+- `KmapAgentManual.txt` — identity, job, shared memory rules, and
   safety boundaries.
 - `ConversationAgentManual.txt` — user-facing problem solving and memory
   navigation.

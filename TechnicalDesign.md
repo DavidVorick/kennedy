@@ -203,7 +203,7 @@ BackendKweb/
 Frontend/
   Specification.md
   SystemPrompts/
-    SystemPromptKmapAgentManual.txt
+    KmapAgentManual.txt
     ConversationAgentManual.txt
     HistoryIngressAgentManual.txt
   public/

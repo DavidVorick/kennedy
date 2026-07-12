@@ -1,5 +1,5 @@
 const FILES = {
-  shared: "SystemPromptKmapAgentManual.txt",
+  shared: "KmapAgentManual.txt",
   conversation: "ConversationAgentManual.txt",
   ingress: "HistoryIngressAgentManual.txt",
 };

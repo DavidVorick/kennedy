@@ -17,7 +17,7 @@ rules.
 Frontend/
   Specification.md
   SystemPrompts/
-    SystemPromptKmapAgentManual.txt
+    KmapAgentManual.txt
     ConversationAgentManual.txt
     HistoryIngressAgentManual.txt
   public/
@@ -167,12 +167,12 @@ The frontend fetches manuals from `/system-prompts/{filename}`.
 
 Conversation instructions are composed, in order, from:
 
-1. `SystemPromptKmapAgentManual.txt`,
+1. `KmapAgentManual.txt`,
 2. `ConversationAgentManual.txt`.
 
 History-ingress instructions are composed from:
 
-1. `SystemPromptKmapAgentManual.txt`,
+1. `KmapAgentManual.txt`,
 2. `HistoryIngressAgentManual.txt`.
 
 Manual contents are inserted without rewriting. The prompt composer may add
