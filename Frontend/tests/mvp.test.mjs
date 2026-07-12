@@ -5,7 +5,9 @@ import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
 import { ToolExecutor } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
-import { inspectorJSON } from "../public/js/render.js";
+import { inspectorText } from "../public/js/render.js";
+import { composePrompt } from "../public/js/prompt_composer.js";
+import { formatKmapContext } from "../public/js/human_format.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -42,9 +44,9 @@ test("LoadNode attempts consume the tool budget, including failures", async () =
   const context = new KwebContext(api, id(1)); await context.initialize();
   const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 1 });
   const first = await executor.execute({ id: "a", name: "LoadNode", arguments: { identifier: 999 } });
-  assert.equal(first.message.content.ok, false);
+  assert.match(first.message.content, /Unknown memory identifier 999/);
   const second = await executor.execute({ id: "b", name: "LoadNode", arguments: { identifier: 2 } });
-  assert.equal(second.message.content.error.code, "load_budget_exhausted");
+  assert.match(second.message.content, /LoadNode budget of 1 is exhausted/);
   assert.equal(executor.loadCalls, 2);
 });
 
@@ -53,7 +55,7 @@ test("ConnectNodes translates short IDs to durable IDs", async () => {
   const context = new KwebContext(api, id(1)); await context.initialize();
   const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
   const result = await executor.execute({ id: "a", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
-  assert.equal(result.message.content.ok, true);
+  assert.match(result.message.content, /Memory connections updated/);
   assert.deepEqual(api.connected, [id(1), id(2)]);
 });
 
@@ -75,10 +77,38 @@ test("conversation provenance contains only clean dialog", () => {
   assert.equal(session.serialize(), "David: Hi\n\nKennedy: Hello");
 });
 
-test("context inspector serializes only the authoritative chatend", () => {
-  const chatend = [{ role: "system", content: "instructions" }, { role: "user", content: "hi" }];
-  const rendered = JSON.parse(inspectorJSON({ chatend, context: { privateDiagnostic: true }, toolLog: [{ name: "LoadNode" }] }));
-  assert.deepEqual(rendered, chatend);
+test("Kmap context is readable text rather than JSON", async () => {
+  const context = new KwebContext(new MockKweb([node(1, [2]), node(2)]), id(1));
+  await context.initialize();
+  const formatted = formatKmapContext(context.snapshot());
+  assert.match(formatted, /Current Kmap context/);
+  assert.match(formatted, /Node 1: Node 1/);
+  assert.match(formatted, /Active connections:\n  - 2: Node 2/);
+  assert.equal(formatted.includes('{'), false);
+});
+
+test("system prompt composition uses readable sections rather than markup wrappers", () => {
+  const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation");
+  assert.equal(prompt, "Kennedy's shared instructions\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.");
+  assert.equal(prompt.includes("<kennedy_"), false);
+});
+
+test("chatend inspector shows only readable text and hides structured calls", () => {
+  const chatend = [
+    { role: "system", content: "Readable instructions." },
+    { role: "user", content: "Hello." },
+    { role: "assistant", content: null, tool_calls: [{ id: "call_1", name: "LoadNode", arguments: { identifier: 2 } }], provider_items: [{ type: "reasoning", encrypted_content: "opaque" }] },
+    { role: "tool", content: "Memory load completed.\n\nNode 2: Project", tool_call_id: "call_1", name: "LoadNode" },
+    { role: "assistant", content: "Here is what I found." },
+  ];
+  const rendered = inspectorText({ chatend, context: { privateDiagnostic: true }, toolLog: [{ name: "LoadNode" }] });
+  assert.match(rendered, /System context\n\nReadable instructions/);
+  assert.match(rendered, /David\n\nHello/);
+  assert.match(rendered, /Memory context\n\nMemory load completed/);
+  assert.match(rendered, /Kennedy\n\nHere is what I found/);
+  assert.equal(rendered.includes("call_1"), false);
+  assert.equal(rendered.includes("provider_items"), false);
+  assert.equal(rendered.includes("privateDiagnostic"), false);
 });
 
 test("production frontend never uses HTML string insertion", async () => {

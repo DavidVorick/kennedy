@@ -15,9 +15,14 @@ export async function loadPromptManuals(base = "") {
 
 export function composePrompt(manuals, mode) {
   const session = mode === "conversation" ? manuals.conversation : manuals.ingress;
+  const sessionTitle = mode === "conversation" ? "Conversation session instructions" : "History-ingress session instructions";
   return [
-    "<kennedy_shared_manual>", manuals.shared, "</kennedy_shared_manual>",
-    "", `<kennedy_${mode}_manual>`, session, `</kennedy_${mode}_manual>`,
+    "Kennedy's shared instructions",
+    "",
+    manuals.shared,
+    "",
+    sessionTitle,
+    "",
+    session,
   ].join("\n");
 }
-

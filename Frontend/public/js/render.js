@@ -20,23 +20,16 @@ export function renderTranscript(container, transcript) {
   container.scrollTop = container.scrollHeight;
 }
 
-export function renderInspector(pre, summary, diagnostic) {
-  pre.textContent = inspectorJSON(diagnostic);
-  summary.replaceChildren();
-  const chatend = diagnostic.chatend || [];
-  const toolCalls = chatend.reduce((total, message) => total + (message.tool_calls?.length || 0), 0);
-  const metrics = [
-    `${diagnostic.mode || "conversation"}`,
-    `${chatend.length} messages`,
-    `${toolCalls} model tool calls`,
-    diagnostic.provider || "no provider",
-    diagnostic.model || "no model",
-  ];
-  for (const metric of metrics) summary.append(element("span", "metric", metric));
+export function renderInspector(pre, diagnostic) {
+  pre.textContent = inspectorText(diagnostic);
 }
 
-export function inspectorJSON(diagnostic) {
-  return JSON.stringify(diagnostic.chatend || [], null, 2);
+export function inspectorText(diagnostic) {
+  const labels = { system: "System context", user: "David", assistant: "Kennedy", tool: "Memory context" };
+  return (diagnostic.chatend || [])
+    .filter(message => typeof message.content === "string" && message.content.trim())
+    .map(message => `${labels[message.role] || "Context"}\n\n${message.content.trim()}`)
+    .join("\n\n────────────────────────\n\n");
 }
 
 export function showError(banner, message) { banner.textContent = message; banner.classList.remove("hidden"); }

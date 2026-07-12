@@ -3,7 +3,7 @@ import { loadPromptManuals } from "./prompt_composer.js";
 import { ConversationSession } from "./conversation.js";
 import { runHistoryIngress } from "./history_ingress.js";
 import { MemoryExplorer } from "./memory_explorer.js";
-import { renderTranscript, renderInspector, inspectorJSON, showError, clearError } from "./render.js";
+import { renderTranscript, renderInspector, inspectorText, showError, clearError } from "./render.js";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -11,7 +11,7 @@ const CONFIG = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "send-button", "end-button", "activity", "context-inspector", "context-summary", "copy-context", "memory-content", "memory-back", "memory-forward", "memory-home",
+  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "send-button", "end-button", "activity", "context-inspector", "copy-context", "memory-content", "memory-back", "memory-forward", "memory-home",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const kweb = KwebAPI(CONFIG.kwebBase);
@@ -45,7 +45,7 @@ function diagnostic() {
 
 function update() {
   renderTranscript(ui.transcript, session?.transcript || []);
-  renderInspector(ui.context_inspector, ui.context_summary, diagnostic());
+  renderInspector(ui.context_inspector, diagnostic());
   const busy = Boolean(session?.busy || ending);
   ui.message_input.disabled = busy || !session;
   ui.send_button.disabled = busy || !session;
@@ -124,6 +124,6 @@ ui.memory_tab.addEventListener("click", () => showView(true));
 ui.memory_back.addEventListener("click", () => explorer?.goBack());
 ui.memory_forward.addEventListener("click", () => explorer?.goForward());
 ui.memory_home.addEventListener("click", () => explorer?.home());
-ui.copy_context.addEventListener("click", async () => { try { await navigator.clipboard.writeText(inspectorJSON(diagnostic())); ui.copy_context.textContent = "Copied"; setTimeout(() => { ui.copy_context.textContent = "Copy chatend"; }, 1200); } catch { showError(ui.error_banner, "Could not copy the chatend to the clipboard."); } });
+ui.copy_context.addEventListener("click", async () => { try { await navigator.clipboard.writeText(inspectorText(diagnostic())); ui.copy_context.textContent = "Copied"; setTimeout(() => { ui.copy_context.textContent = "Copy context"; }, 1200); } catch { showError(ui.error_banner, "Could not copy Kennedy's context to the clipboard."); } });
 
 initialize();

@@ -8,26 +8,25 @@ Creating or updating zero nodes is correct when the conversation contains nothin
 
 Available tools:
 
-LoadNode({"identifier": integer})
-- Loads the selected knowledge node and its active connections.
-- Navigate enough to find likely existing subjects before creating duplicates.
+LoadNode loads a selected knowledge node and its active connections. Navigate
+enough to find likely existing subjects before creating duplicates.
 
-ResetContext({"identifiers": [integer, ...]})
-- Replaces the current kmap context with David's root plus the selected nodes.
-- The provenance remains available.
-- Do not include David's root identifier in the list.
+ResetContext replaces the current Kmap context with David's root plus selected
+nodes. The provenance remains available. Do not include David's root identifier
+in the selection.
 
-ConnectNodes({"identifiers": [integer, ...]})
-- Makes two or more full, genuinely related nodes active connections of one another.
-- Use meaningful relationships only; do not connect every touched node.
+ConnectNodes makes two or more fully loaded, genuinely related nodes active
+connections of one another. Use meaningful relationships only; do not connect
+every touched node.
 
-CreateNode({"parentIdentifiers": [integer, ...], "shortName": string, "shortDescription": string, "longDescription": string})
-- Creates a focused knowledge node using this provenance as its first history source.
-- Supply at least one full parent node. Usually choose David's root, a containing topic, or another clearly related node.
-- shortName must be 4-50 characters; shortDescription at most 200 characters; longDescription at most 1000 words.
+CreateNode creates a focused knowledge node using this provenance as its first
+history source. Supply at least one fully loaded parent node, usually David's
+root, a containing topic, or another clearly related node. The short name must
+contain 4–50 characters, the short description at most 200 characters, and the
+detailed description at most 1000 words.
 
-UpdateNode({"identifier": integer, "newShortName": string, "newShortDescription": string, "newLongDescription": string})
-- Replaces all descriptive fields of an existing full node and appends this provenance to its history.
-- Include the complete intended content, retaining still-valid prior knowledge.
+UpdateNode replaces all descriptive fields of an existing fully loaded node and
+appends this provenance to its history. Include the complete intended content
+and retain still-valid prior knowledge.
 
 Work methodically: inspect likely existing nodes, make the smallest set of justified mutations, connect only useful relationships, and finish. Do not include a user-facing answer or commentary about the original conversation in your final completion message.

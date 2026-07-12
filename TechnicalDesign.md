@@ -84,9 +84,11 @@ The frontend owns:
 - prompt composition from system-prompt manuals,
 - the context inspector and memory explorer state.
 
-The context inspector's JSON body renders the chatend itself. Operational
-diagnostics may inform its compact summary but do not wrap or replace the
-displayed chatend.
+The context inspector renders a human-readable text projection of the chatend.
+It shows system, conversation, and memory text while omitting structured tool
+calls, provider items, call IDs, and operational diagnostics. It is a view into
+Kennedy's current context, not a provider-payload debugger. LLM-visible Kmap
+context and local tool results use the same readable text formatting.
 
 The frontend has no persistent state. A reload or abrupt close may discard an
 active conversation.

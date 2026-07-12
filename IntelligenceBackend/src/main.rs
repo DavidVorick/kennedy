@@ -422,12 +422,17 @@ fn provider_input_items(message: &Message) -> Vec<Value> {
         return message.provider_items.clone();
     }
     match message.role.as_str() {
-        "tool" => vec![json!({
-            "type": "function_call_output",
-            "call_id": message.tool_call_id,
-            "output": serde_json::to_string(message.content.as_ref().unwrap_or(&Value::Null))
-                .unwrap_or_else(|_| "null".into()),
-        })],
+        "tool" => {
+            let output = match message.content.as_ref().unwrap_or(&Value::Null) {
+                Value::String(content) => content.clone(),
+                content => serde_json::to_string(content).unwrap_or_else(|_| "null".into()),
+            };
+            vec![json!({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id,
+                "output": output,
+            })]
+        }
         "assistant" => {
             let mut items = Vec::new();
             if let Some(Value::String(content)) = &message.content {
@@ -787,7 +792,7 @@ mod tests {
         }];
         let result = Message {
             role: "tool".into(),
-            content: Some(json!({"ok":true})),
+            content: Some(json!("Memory load completed.\n\nNode 2: Project")),
             tool_calls: vec![],
             tool_call_id: Some("call_1".into()),
             name: Some("LoadNode".into()),
@@ -801,7 +806,10 @@ mod tests {
         assert_eq!(body["input"][1]["type"], "reasoning");
         assert_eq!(body["input"][2]["call_id"], "call_1");
         assert_eq!(body["input"][3]["type"], "function_call_output");
-        assert_eq!(body["input"][3]["output"], "{\"ok\":true}");
+        assert_eq!(
+            body["input"][3]["output"],
+            "Memory load completed.\n\nNode 2: Project"
+        );
     }
     #[test]
     fn provider_permission_error_is_actionable() {

@@ -1,3 +1,5 @@
+import { formatToolResult } from "./human_format.js";
+
 const scalar = (type) => ({ type });
 const arrayOfIntegers = { type: "array", items: scalar("integer") };
 const objectSchema = (properties, required = Object.keys(properties)) => ({ type: "object", properties, required, additionalProperties: false });
@@ -38,7 +40,7 @@ export class ToolExecutor {
     return id;
   }
 
-  resultMessage(call, content) { return { role: "tool", tool_call_id: call.id, name: call.name, content }; }
+  resultMessage(call, content) { return { role: "tool", tool_call_id: call.id, name: call.name, content: formatToolResult(call.name, content) }; }
 
   failure(call, code, message) {
     const result = this.resultMessage(call, { ok: false, error: { code, message } });
@@ -113,4 +115,3 @@ export class ToolExecutor {
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
   }
 }
-

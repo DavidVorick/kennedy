@@ -96,11 +96,15 @@ intelligence backend. It contains:
 - the current Kweb context,
 - tool calls and tool results that remain in context.
 
-The frontend submits the entire chatend on every generation request. The main
-body of the chatend inspector renders only that same message array, so it shows
-what Kennedy is actually sent rather than an approximation or a wrapper of
-diagnostic state. A compact summary may show the mode, provider, model, message
-count, and model-requested tool-call count.
+The frontend submits the entire chatend on every generation request. All
+textual content in that chatend is composed for human readability: system
+instructions are prose sections, Kmap context is YAML-like text, and local tool
+results are readable memory updates rather than serialized JSON.
+
+The chatend also retains structured function-call and provider items required
+by the Responses protocol. Those items are transport bookkeeping, not part of
+the inspector's visualization. The inspector projects only the textual system,
+user, assistant, and memory context that the model reads.
 
 The clean transcript is maintained separately. It contains only user and final
 Kennedy messages and is the source used to create conversation provenance.
@@ -172,8 +176,9 @@ History-ingress instructions are composed from:
 2. `HistoryIngressAgentManual.txt`.
 
 Manual contents are inserted without rewriting. The prompt composer may add
-small machine-generated delimiters and the current context block, but must not
-duplicate behavioral instructions already present in the manuals.
+short human-readable section headings and the current context block, but must
+not add XML wrappers, JSON serialization, or duplicate behavioral instructions
+already present in the manuals.
 
 ## 8. Agent Tools
 
@@ -281,8 +286,8 @@ returns the updated node.
 
 Unknown tools are never executed. Invalid arguments, exhausted budgets, missing
 short IDs, and backend failures are returned to Kennedy as failed tool results
-with a short error code and message. They are also recorded in the diagnostic
-tool log.
+with a readable explanation. Machine-readable error codes remain in the
+internal diagnostic tool log but are not included in the chatend visualization.
 
 ## 9. Conversation Flow
 
@@ -360,12 +365,12 @@ Tool calls and internal context never appear in the clean transcript.
 
 ### 11.2 Context Inspector
 
-The right panel's JSON body is the complete normalized chatend message array,
-including composed instructions, Kweb context, model-requested tool calls, and
-local tool results that remain in context. It does not wrap that array in
-diagnostic metadata. The summary identifies the current mode, provider, model,
-message count, and model-requested tool-call count. Copy Chatend copies exactly
-the JSON shown in the panel.
+The right panel is a human-readable visualization of Kennedy's current
+chatend. It renders readable system context, user and Kennedy messages, and
+memory context. Structured function calls, JSON arguments, provider items,
+call IDs, and diagnostic metadata are omitted. Local tool results remain
+visible as readable memory context because their text is part of what the model
+receives. Copy Context copies exactly the displayed text.
 
 ### 11.3 Memory Explorer
 

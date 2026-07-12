@@ -112,9 +112,11 @@ provider-side conversation identifier.
 }
 ```
 
-`content` may be any JSON value. The adapter serializes it without changing its
-meaning. Every tool-result ID must match an earlier assistant tool call in the
-same request.
+`content` may be any JSON value. String content is passed directly as the
+Responses `function_call_output`; other values are serialized without changing
+their meaning. Kennedy uses readable text for local tool results so memory
+loaded during a tool loop remains human-readable model context. Every
+tool-result ID must match an earlier assistant tool call in the same request.
 
 ## 5. Tool Definitions
 

@@ -7,11 +7,19 @@ import { runAgentLoop } from "./intelligence.js";
 export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeId, provenanceId, provider, model, onUpdate }) {
   const provenance = await kweb.provenance(provenanceId);
   const context = new KwebContext(kweb, rootNodeId); await context.initialize();
-  const retained = [{ role: "user", content: `<conversation_provenance>\nSource: ${provenance.source}\nCreated: ${provenance.source_created_at}\n\n${provenance.data}\n</conversation_provenance>` }];
+  const retained = [{ role: "user", content: [
+    "Conversation provenance",
+    "",
+    `Source: ${provenance.source}`,
+    `Created: ${provenance.source_created_at}`,
+    "",
+    "Transcript",
+    "",
+    provenance.data,
+  ].join("\n") }];
   const chatend = new Chatend(composePrompt(manuals, "ingress"), context, retained);
   const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, provenanceId, loadLimit: 50, onUpdate: () => onUpdate({ chatend, context, executor }) });
   onUpdate({ chatend, context, executor });
   await runAgentLoop({ intelligence, provider, model, chatend, tools: toolDefinitions("ingress"), executor, onUpdate: () => onUpdate({ chatend, context, executor }) });
   return { chatend, context, executor };
 }
-
