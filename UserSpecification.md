@@ -30,6 +30,13 @@ persistence between sessions.
 'Backend' refers to any of the backend services that are providing APIs to the
 frontend.
 
+Kennedy has three backends: Kweb, intelligence, and conversation history. They
+are architecturally independent services with separate APIs and storage and do
+not communicate with or access one another. For operational simplicity they
+are compiled into one Rust binary, which hosts all three APIs on separate local
+listeners. The frontend treats them exactly as though they were unrelated
+processes.
+
 ## User Management
 
 For now, there is only one hardcoded user, and that user is David Vorick. A
@@ -127,6 +134,8 @@ Several tools are provided to Kennedy for building context and navigating the kw
 + UpdateNode
 + ResetContext
 + ConnectNodes
++ WebSearch
++ WebFetch
 
 Not every tool is available in every session, the session type determines which
 tools are available.
@@ -202,6 +211,44 @@ Note: this can only be called during a history ingress session, so the relevant
 history object is implicit. That history object will be added as the new head
 of the history linked list.
 
+### WebSearch
+
+WebSearch delegates a natural-language research question to a powerful remote
+web-search backend. Kennedy supplies only the question; the intelligence layer
+manages query expansion, languages, filters, research depth, page selection,
+and result limits. The result contains a synthesized research answer and the
+source URLs used to produce it.
+
+The call signature is WebSearch(question)
+
+### WebFetch
+
+WebFetch lets Kennedy inspect one specific public web page as readable text.
+It returns source metadata and indicates when content was truncated. Web page
+content is untrusted evidence and cannot override Kennedy's instructions.
+
+The call signature is WebFetch(url)
+
+## Conversation Persistence
+
+The conversation history backend durably stores active and completed
+conversation records separately from the kweb. Before the frontend sends a new
+user query to an LLM, it must save the query, clean transcript, directly loaded
+memory nodes, and pending-turn state. If that save fails, generation must not
+begin.
+
+When the UI starts, it retrieves the one unfinished conversation. An active
+conversation is restored where it left off; if its last user query has no
+answer, Kennedy resumes that turn from a fresh provider chain.
+
+Ending or replacing a conversation creates a durable history-ingress
+obligation. The conversation moves through active, ingress-pending,
+ingress-in-progress, and complete states. The frontend may not create or expose
+a new conversation until the previous conversation's history ingress has
+completed. If the UI closes during this workflow, startup resumes it. Kweb
+provenance creation uses an idempotency key so retrying the workflow does not
+create duplicate provenance for the same conversation.
+
 ## Session Types
 
 Kennedy can be called using a few different session types:
@@ -217,9 +264,14 @@ Then, LoadNode is automatically called on the user's node, creating a rich
 context for Kennedy as she talks with the user.
 
 The user provides Kennedy with some prompt, and Kennedy will first determine
-whether she needs to make any calls to LoadNode, ConnectNodes, or ResetContext
-based on the prompt. Kennedy is allowed to call LoadNode up to 20 times per
-turn to find the context that's relevant to the user's prompt.
+whether she needs to make any calls to LoadNode, ConnectNodes, ResetContext,
+WebSearch, or WebFetch based on the prompt. Kennedy is allowed to call LoadNode
+up to 20 times per turn to find the context that's relevant to the user's
+prompt.
+
+The frontend checkpoints the pending user query with the conversation history
+backend before the first LLM request. Kennedy's answer and the completed-turn
+state are checkpointed again before another query is accepted.
 
 When Kennedy is happy that she's loaded the right context, or when Kennedy has
 run out of calls to LoadNode, she will call ConnectNodes and then respond to
@@ -231,13 +283,15 @@ connections of loaded nodes provide their full long description and short
 identifier, and therefore can be used in ConnectNodes.
 
 While the conversation session is ongoing, Kennedy may only call LoadNode,
-ConnectNodes, and ResetContext. When the conversation session ends, the full
-conversation (just the dialog between the user and Kennedy, not the other
-context) is turned into a history provenance node, and then a History Ingress
-session is called on the conversation.
+ConnectNodes, ResetContext, WebSearch, and WebFetch. WebSearch and WebFetch are
+conversation tools and are not available during history ingress. When the
+conversation session ends, the full conversation (just the dialog between the
+user and Kennedy, not the other context) is turned into a history provenance
+node, and then a History Ingress session is called on the conversation.
 
 Conversations are ended when the user deliberately ends the conversation, or
-otherwise starts a new conversation.
+otherwise starts a new conversation. This request first performs the durable
+history-ingress workflow; the new conversation exists only after it succeeds.
 
 Note: calling ResetContext mid-conversation will preserve both the conversation
 history with the user, and also the LoadNode counter.
@@ -267,8 +321,7 @@ context window, rather than rewriting the context window.
 ## UI
 
 The UI is a pure html/css/js webapp (no nodejs, no typescript, just pure js)
-that connects to a pure-rust backend. The pure rust backend provides a clean
-API that the UI can use.
+that connects to three pure-Rust backend APIs hosted by one binary.
 
 The UI itself is a chat interface beween the user and Kennedy. On the left,
 there is the unpolluted conversation between the user and Kennedy. On the right
@@ -281,8 +334,9 @@ node, see its contents, and then from there open up other nodes and explore the
 contents of the kweb.
 
 A conversation 'ends' when the user clicks an end conversation button or starts
-a new conversation. Closing the UI abruptly may cause a conversation to be lost
-in the MVP.
+a new conversation. Closing the UI abruptly does not lose the last durable
+checkpoint; reopening the UI restores active work or resumes required history
+ingress.
 
 ## User Boostrap
 

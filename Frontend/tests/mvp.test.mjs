@@ -71,6 +71,35 @@ test("ConnectNodes translates short IDs to durable IDs", async () => {
   assert.deepEqual(api.connected, [id(1), id(2)]);
 });
 
+test("WebSearch and WebFetch expose only minimal model-facing arguments", async () => {
+  const calls = [];
+  const intelligence = {
+    webSearch: async body => { calls.push(["search", body]); return { answer: "Two candidates.", sources: [{ title: "Guide", url: "https://example.com/guide" }] }; },
+    webFetch: async body => { calls.push(["fetch", body]); return { url: body.url, title: "Guide", retrieved_at: "2026-07-12T00:00:00Z", content_type: "text/html", content: "Page evidence.", truncated: false }; },
+  };
+  const executor = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, provider: "primary", model: "model", loadLimit: 20 });
+  const search = await executor.execute({ id: "search", name: "WebSearch", arguments: { question: "best brunch in El Salvador" } });
+  const fetch = await executor.execute({ id: "fetch", name: "WebFetch", arguments: { url: "https://example.com/guide" } });
+  assert.deepEqual(calls, [
+    ["search", { provider: "primary", model: "model", question: "best brunch in El Salvador" }],
+    ["fetch", { url: "https://example.com/guide" }],
+  ]);
+  assert.equal(search.message.display_role, "Web tool result");
+  assert.match(search.message.content, /Web research completed/);
+  assert.match(search.message.content, /https:\/\/example.com\/guide/);
+  assert.match(fetch.message.content, /Readable page content:\n  Page evidence/);
+});
+
+test("web tools reject extra retrieval knobs and remain unavailable during ingress", async () => {
+  const intelligence = { webSearch: async () => { throw new Error("must not run"); } };
+  const conversation = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, loadLimit: 20 });
+  const extra = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", maxResults: 10 } });
+  assert.match(extra.message.content, /Expected exactly: question/);
+  const ingress = new ToolExecutor({ mode: "ingress", context: {}, api: {}, intelligence, provenanceId: "p", loadLimit: 50 });
+  const unavailable = await ingress.execute({ id: "search", name: "WebSearch", arguments: { question: "topic" } });
+  assert.match(unavailable.message.content, /only available during a live conversation/);
+});
+
 test("chatend reset retains clean session messages and drops old tool activity", async () => {
   const api = new MockKweb([node(1)]); const context = new KwebContext(api, id(1)); await context.initialize();
   const chatend = new Chatend("instructions", context, [{ role: "user", content: "hello" }]);
@@ -149,6 +178,72 @@ test("conversation provenance contains only clean dialog", () => {
   const session = new ConversationSession({});
   session.transcript = [{ role: "user", content: "Hi" }, { role: "kennedy", content: "Hello" }];
   assert.equal(session.serialize(), "David: Hi\n\nKennedy: Hello");
+});
+
+test("conversation checkpoints the pending query before any model request", async () => {
+  const events = [];
+  const kweb = new MockKweb([node(1)]);
+  const intelligence = { generate: async () => {
+    events.push("generate");
+    return { status: "complete", response_id: "response", message: { role: "assistant", content: "Saved answer." }, usage: null };
+  } };
+  const session = new ConversationSession({
+    kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    persist: async state => events.push(state.pendingTurn ? "checkpoint-pending" : "checkpoint-complete"), onUpdate: () => {},
+  });
+  await session.initialize();
+  await session.send("Saved question");
+  assert.deepEqual(events, ["checkpoint-pending", "generate", "checkpoint-complete"]);
+  assert.deepEqual(session.transcript.map(item => item.content), ["Saved question", "Saved answer."]);
+});
+
+test("restored pending conversation resumes from durable transcript and context", async () => {
+  const kweb = new MockKweb([node(1), node(2)]);
+  let generated = 0;
+  const session = new ConversationSession({
+    kweb,
+    intelligence: { generate: async () => { generated += 1; return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered answer." }, usage: null }; } },
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m", persist: async () => {}, onUpdate: () => {},
+  });
+  await session.initialize({ startedAt: "2026-07-12T00:00:00Z", transcript: [{ role: "user", content: "Interrupted query" }], loadedNodeIds: [id(1), id(2)], pendingTurn: true });
+  assert.deepEqual(session.context.loadedNodeIds, [id(1), id(2)]);
+  await session.resumePendingTurn();
+  assert.equal(generated, 1);
+  assert.equal(session.pendingTurn, false);
+  assert.equal(session.transcript.at(-1).content, "Recovered answer.");
+});
+
+test("an answer is not exposed as complete when its durable checkpoint fails", async () => {
+  const kweb = new MockKweb([node(1)]);
+  let checkpoints = 0;
+  const session = new ConversationSession({
+    kweb,
+    intelligence: { generate: async () => ({ status: "complete", response_id: "response", message: { role: "assistant", content: "Unsaved answer." }, usage: null }) },
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    persist: async () => { checkpoints += 1; if (checkpoints === 2) throw new Error("history unavailable"); }, onUpdate: () => {},
+  });
+  await session.initialize();
+  await assert.rejects(() => session.send("Question"), /history unavailable/);
+  assert.equal(session.pendingTurn, true);
+  assert.deepEqual(session.transcript.map(item => item.content), ["Question"]);
+  assert.equal(session.chatend.messages.some(message => message.content === "Unsaved answer."), false);
+});
+
+test("retry persists an initially failed pending checkpoint before generation", async () => {
+  const kweb = new MockKweb([node(1)]);
+  const events = [];
+  let fail = true;
+  const session = new ConversationSession({
+    kweb,
+    intelligence: { generate: async () => { events.push("generate"); return { status: "complete", response_id: "response", message: { role: "assistant", content: "Answer." }, usage: null }; } },
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    persist: async state => { events.push(state.pendingTurn ? "persist-pending" : "persist-complete"); if (fail) { fail = false; throw new Error("history unavailable"); } }, onUpdate: () => {},
+  });
+  await session.initialize();
+  await assert.rejects(() => session.send("Question"), /history unavailable/);
+  assert.deepEqual(events, ["persist-pending"]);
+  await session.resumePendingTurn();
+  assert.deepEqual(events, ["persist-pending", "persist-pending", "generate", "persist-complete"]);
 });
 
 test("Kmap context is readable text rather than JSON", async () => {

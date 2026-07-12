@@ -29,6 +29,11 @@ canonical documents; this file is not an append-only log.
   APIs.
 - A Kennedy response may request multiple tools. Execute them sequentially in
   written order and return readable results to the model.
+- Give live-conversation Kennedy `WebSearch(question)` for delegated hosted
+  research and `WebFetch(url)` for inspecting one public page. Search language,
+  geography, freshness, domains, result counts, and research depth are not tool
+  arguments; Kennedy states relevant constraints naturally and the intelligence
+  layer manages retrieval policy and budgets.
 - Continue append-only conversation and history-ingress rounds using provider
   response IDs and stable prompt-cache keys. `ResetContext` starts a fresh
   provider chain with Kennedy's rebuilt logical context.
@@ -39,6 +44,16 @@ canonical documents; this file is not an append-only log.
 
 ## Frontend Behavior
 
+- Persist the active conversation through a conversation-history backend.
+  Checkpoint each user query before any LLM request, restore unfinished work on
+  startup, and durably require history ingress to finish before a new
+  conversation may begin.
+- Kennedy has three logically separate backends: Kweb, intelligence, and
+  conversation history. They are independent services with separate APIs,
+  listeners, state, and databases and must not call or access one another. They
+  happen to be compiled into and hosted by one Rust binary for operational
+  convenience; the frontend and architecture otherwise treat them as if they
+  were unrelated processes.
 - Show live history-ingress tool requests and results in the conversation UI
   so the user can follow memory updates.
 - Serve the local frontend without reusable browser caching and version its

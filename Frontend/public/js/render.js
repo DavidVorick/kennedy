@@ -1,10 +1,31 @@
-import { formatKmapContext } from "./human_format.js?v=20260712.1";
+import { formatKmapContext } from "./human_format.js?v=20260712.3";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+function appendLinkedText(container, text) {
+  const pattern = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<]+)/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    container.append(document.createTextNode(text.slice(cursor, match.index)));
+    let label = match[1];
+    let url = match[2] || match[3];
+    let trailing = "";
+    if (!match[2]) {
+      const cleaned = url.replace(/[.,;:!?]+$/, "");
+      trailing = url.slice(cleaned.length);
+      url = cleaned; label = cleaned;
+    }
+    const link = element("a", "source-link", label);
+    link.href = url; link.target = "_blank"; link.rel = "noopener noreferrer";
+    container.append(link, document.createTextNode(trailing));
+    cursor = match.index + match[0].length;
+  }
+  container.append(document.createTextNode(text.slice(cursor)));
 }
 
 export function renderTranscript(container, transcript) {
@@ -16,7 +37,8 @@ export function renderTranscript(container, transcript) {
   }
   for (const item of transcript) {
     const message = element("article", `message ${item.role === "kennedy" ? "assistant" : "user"}`);
-    message.append(element("span", "role", item.role === "kennedy" ? "Kennedy" : "You"), element("div", "body", item.content));
+    const body = element("div", "body"); appendLinkedText(body, item.content);
+    message.append(element("span", "role", item.role === "kennedy" ? "Kennedy" : "You"), body);
     container.append(message);
   }
   container.scrollTop = container.scrollHeight;

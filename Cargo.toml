@@ -1,5 +1,5 @@
 [workspace]
-members = ["BackendKweb", "IntelligenceBackend"]
+members = ["BackendKweb", "ConversationHistory", "IntelligenceBackend", "KennedyServer"]
 resolver = "2"
 
 [workspace.package]
@@ -14,7 +14,8 @@ clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 http = "1"
 rand = "0.9"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "rustls-no-provider"] }
+html2text = "0.16"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

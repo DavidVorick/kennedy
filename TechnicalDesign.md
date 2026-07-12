@@ -7,16 +7,26 @@ Kennedy is a local-first memory application built around the kweb described in
 document defines the architecture used to implement that behavior, and the
 component specifications define the detailed contracts.
 
-The MVP has three runtime components:
+The MVP has four logical runtime components:
 
 1. **Frontend**: a browser-native HTML/CSS/JavaScript application. It owns the
-   user interface, ephemeral sessions, the chatend, short identifiers, prompt
+   user interface, the live chatend, short identifiers, prompt
    composition, and agent tool orchestration.
 2. **Kweb backend**: a Rust HTTP service. It owns SQLite, durable kweb data, and
    every graph and history invariant.
 3. **Intelligence backend**: a Rust HTTP service. It translates a complete LLM
-   request into a provider request and normalizes the provider response. It is
-   stateless between generation requests.
+   request into a provider request, performs bounded web research and public
+   page retrieval, and normalizes the results. It is stateless between
+   requests.
+4. **Conversation history backend**: a Rust HTTP service. It durably checkpoints
+   active browser conversations and owns the state machine requiring history
+   ingress to finish before the next conversation begins.
+
+The three backends are independent library crates compiled into one
+`kennedy-server` executable. The executable starts their listeners but shares
+no router, database, application state, or service handle among them. No
+backend crate depends on another backend crate; all coordination happens in the
+frontend through their public HTTP APIs.
 
 System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 
@@ -24,8 +34,12 @@ System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 
 - The frontend is the single authority for the current chatend.
 - The Kweb backend is the single authority for durable memory.
-- The intelligence backend never needs to understand Kennedy, the kweb, or its
-  tools.
+- The conversation history backend is the single authority for unfinished and
+  completed conversation records.
+- Logical backend isolation is preserved even though all three services share
+  one deployment binary.
+- The intelligence backend never needs to understand the kweb, short
+  identifiers, or Kennedy's text-tool protocol.
 - The frontend owns the complete human-readable chatend. It sends the full
   chatend when starting a provider chain and only newly appended text while
   continuing that chain with `previous_response_id`.
@@ -43,20 +57,13 @@ System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 ## 3. Runtime Topology
 
 ```text
-                         Remote LLM provider
-                                  ^
-                                  |
-                                  | HTTPS
-                                  |
-Browser frontend -------------- Intelligence backend
-       |
-       | HTTP on localhost
-       |
-       v
-Kweb backend ------------------ SQLite
-       |
-       +-- serves Frontend/public
-       +-- serves Frontend/SystemPrompts
+One kennedy-server process
+  ├─ Kweb API :4321 --------------------- kennedy.sqlite3
+  │    └─ serves frontend and manuals
+  ├─ Intelligence API :4322 ------------ remote LLM/search + public web
+  └─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
+
+Browser frontend calls all three APIs directly. No backend calls another.
 ```
 
 Default addresses:
@@ -65,9 +72,10 @@ Default addresses:
 | --- | --- |
 | Kweb backend | `http://127.0.0.1:4321` |
 | Intelligence backend | `http://127.0.0.1:4322` |
+| Conversation history backend | `http://127.0.0.1:4323` |
 
-The browser calls both services directly. The intelligence backend permits
-requests from the Kweb frontend origin. Both services bind to loopback by
+The browser calls all three services directly. Cross-origin backends permit
+requests from the Kweb frontend origin. Every listener binds to loopback by
 default.
 
 ## 4. Ownership Boundaries
@@ -83,7 +91,8 @@ The frontend owns:
 - conversation and history-ingress call budgets,
 - the transparent text tool protocol and tool loops,
 - prompt composition from system-prompt manuals,
-- the context inspector and memory explorer state.
+- the context inspector and memory explorer state,
+- checkpoint and recovery orchestration across backend APIs.
 
 The context inspector renders the human-readable chatend, including Kennedy's
 text tool requests and readable tool results. It provides full-context,
@@ -93,8 +102,9 @@ expansions, and summary-only fanout references remain visually distinct.
 Token, context-window, and cache telemetry is displayed in the Chatend header.
 Provider IDs and credentials remain hidden.
 
-The frontend has no persistent state. A reload or abrupt close may discard an
-active conversation.
+The frontend itself has no persistent state. It saves opaque recovery state to
+the conversation history API before generation and reconstructs the live
+session from that backend after a reload or abrupt close.
 
 ### 4.2 Kweb Backend
 
@@ -120,11 +130,29 @@ The intelligence backend owns:
 - translating normalized text messages and continuation/cache controls to the
   selected provider,
 - translating provider text, response IDs, errors, and detailed token usage
-  into one response shape.
+  into one response shape,
+- executing isolated provider-hosted WebSearch research runs,
+- safely fetching and extracting bounded text from public pages for WebFetch.
 
-It executes no tools and stores no local LLM session. The frontend continues a
-tool loop by appending readable tool requests and results to its chatend and
-submitting the new text against the previous provider response.
+It stores no local LLM session and never parses Kennedy's tool envelopes. The
+normal generation path has no provider tools. The frontend recognizes
+WebSearch and WebFetch text calls, invokes the corresponding intelligence API,
+then appends their readable results to the main conversation chain. Hosted
+search runs are fresh provider requests and cannot alter that chain.
+
+### 4.4 Conversation History Backend
+
+The conversation history backend owns its own SQLite database, opaque frontend
+checkpoints, optimistic record versions, and the conversation phase machine:
+
+```text
+active -> ingress_pending -> ingress_in_progress -> complete
+```
+
+It does not interpret chatends, call the Kweb or intelligence APIs, or validate
+their identifiers. It enforces that only one conversation is unfinished and
+that the next conversation cannot be created until the prior record is
+complete.
 
 ## 5. Session Model
 
@@ -132,9 +160,13 @@ submitting the new text against the previous provider response.
 
 At conversation start, the frontend creates a fresh transcript and chatend,
 loads the user root node, and assigns short identifiers to every in-context
-node. For each user turn it appends the user message, calls the intelligence
-backend, executes allowed tools, and continues until Kennedy returns final
-text. Only user and Kennedy text is added to the clean transcript.
+node. For each user turn it appends the user message, checkpoints the pending
+query, and only then calls the intelligence backend. It executes allowed tools
+and continues until Kennedy returns final text, then checkpoints the completed
+turn. During conversation Kennedy may delegate a natural-language research
+question through WebSearch or inspect one source through WebFetch; retrieval
+policy and limits remain in the intelligence layer. Only user and Kennedy text
+is added to the clean transcript.
 
 The Kweb portion of the chatend accumulates during the conversation. A
 `ResetContext` call resolves its arguments, removes all Kweb context, resets
@@ -142,8 +174,12 @@ short identifiers, reloads the root and requested nodes, and rebuilds the
 chatend while retaining the clean transcript and the current turn's LoadNode
 counter.
 
-Ending a conversation creates one data provenance node containing the clean
-transcript, then starts a history-ingress session using that provenance node.
+Ending a conversation first transitions its durable record to
+`ingress_pending`. The frontend creates one idempotent data provenance node
+containing the clean transcript, records its opaque ID while transitioning to
+`ingress_in_progress`, and starts history ingress. The record becomes
+`complete` only after ingress succeeds; only then may the frontend create the
+next conversation.
 
 ### 5.2 History Ingress
 
@@ -156,6 +192,11 @@ translates CreateNode and UpdateNode tool calls into Kweb API requests.
 The session ends when Kennedy returns final text. Live tool requests, results,
 and the completion are shown in the history-ingress activity panel. Completing
 with zero knowledge mutations is valid.
+
+At startup an `active` record restores its transcript, directly loaded nodes,
+and pending-turn flag. A pending user query is regenerated from a fresh
+provider chain. An `ingress_pending` or `ingress_in_progress` record resumes
+the ingress workflow before normal conversation input is enabled.
 
 ## 6. Kweb Data Model
 
@@ -176,8 +217,8 @@ active connections are demoted. Fanout overflow remains permitted in the MVP.
 
 ## 7. API Conventions
 
-Both services expose versioned JSON APIs under `/api/v1` and an unversioned
-`GET /health` endpoint.
+All three backends expose versioned JSON APIs under `/api/v1` and an
+unversioned `GET /health` endpoint.
 
 - Durable identifiers are lowercase hexadecimal encodings of 20 random bytes.
 - Timestamps are RFC 3339 UTC strings.
@@ -205,6 +246,8 @@ UserSpecification.md
 TechnicalDesign.md
 BackendKweb/
   Specification.md
+ConversationHistory/
+  Specification.md
 Frontend/
   Specification.md
   SystemPrompts/
@@ -214,6 +257,8 @@ Frontend/
   public/
 IntelligenceBackend/
   Specification.md
+KennedyServer/
+  src/main.rs
 ```
 
 Implementation code belongs under its owning component directory.
@@ -222,8 +267,7 @@ Implementation code belongs under its owning component directory.
 
 - Multiple users or access control.
 - Network deployment beyond the local machine.
-- Durable frontend conversation state.
-- Search, deletion, manual knowledge editing, or fanout pruning.
+- Manual knowledge editing, deletion, or fanout pruning.
 - Self-action sessions.
 - Streaming generation.
 - Provider-side conversation persistence.

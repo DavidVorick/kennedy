@@ -1,0 +1,16 @@
+[package]
+name = "kennedy-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+kennedy-conversation-history = { path = "../ConversationHistory" }
+kennedy-intelligence = { path = "../IntelligenceBackend" }
+kennedy-kweb = { path = "../BackendKweb" }
+rustls.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

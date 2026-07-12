@@ -1,13 +1,14 @@
-import { KwebAPI, IntelligenceAPI } from "./api.js?v=20260712.1";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260712.1";
-import { ConversationSession } from "./conversation.js?v=20260712.1";
-import { runHistoryIngress } from "./history_ingress.js?v=20260712.1";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260712.1";
-import { renderTranscript, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260712.1";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260712.3";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260712.3";
+import { ConversationSession } from "./conversation.js?v=20260712.3";
+import { runHistoryIngress } from "./history_ingress.js?v=20260712.3";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260712.3";
+import { renderTranscript, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260712.3";
 
 const CONFIG = {
   kwebBase: window.location.origin,
   intelligenceBase: "http://127.0.0.1:4322",
+  conversationHistoryBase: "http://127.0.0.1:4323",
 };
 
 const MODEL_LIMITS = {
@@ -21,7 +22,9 @@ const ui = Object.fromEntries([
 
 const kweb = KwebAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
+const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
 let session = null;
+let historyRecord = null;
 let manuals = null;
 let rootNodeId = null;
 let provider = null;
@@ -32,6 +35,7 @@ let explorer = null;
 let ingressDiagnostic = null;
 let ingressActivity = null;
 let ending = false;
+let ingressRequired = false;
 let inspectorMode = "full";
 
 function diagnostic() {
@@ -73,16 +77,35 @@ function update() {
     renderIngressActivity(ui.ingress_log, ingressActivity, Boolean(ingressDiagnostic));
   }
   const busy = Boolean(session?.busy || ending);
-  ui.message_input.disabled = busy || !session;
-  ui.send_button.disabled = busy || !session;
-  ui.end_button.disabled = busy || !session || !session.transcript.length;
-  ui.activity.textContent = ending ? "Saving conversation to memory…" : session?.busy ? "Kennedy is working…" : "";
+  const blocked = busy || ingressRequired || session?.pendingTurn;
+  ui.message_input.disabled = blocked || !session;
+  ui.send_button.disabled = blocked || !session;
+  ui.end_button.disabled = busy || !session || (!ingressRequired && !session.pendingTurn && !session.transcript.length);
+  ui.end_button.textContent = session?.pendingTurn ? "Retry saved query" : ingressRequired ? "Retry memory update" : "End conversation";
+  ui.activity.textContent = ending ? "Saving conversation to memory…" : session?.busy ? "Kennedy is working…" : session?.pendingTurn ? "Saved query needs a response" : ingressRequired ? "Memory ingestion must finish before a new conversation" : "";
 }
 
-async function startConversation() {
+async function persistSession(state) {
+  if (!historyRecord || historyRecord.phase !== "active") throw new Error("The conversation history backend is not ready to checkpoint this conversation.");
+  try {
+    historyRecord = await conversationHistory.checkpoint(historyRecord.id, { expected_version: historyRecord.version, state });
+  } catch (error) {
+    if (error.code !== "state_conflict") throw error;
+    const latest = await conversationHistory.get(historyRecord.id);
+    if (latest.phase !== "active" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
+    historyRecord = latest;
+  }
+}
+
+async function startConversation(restoredRecord = null) {
   ingressDiagnostic = null;
-  session = new ConversationSession({ kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens, maxInputTokens, onUpdate: update });
-  await session.initialize(); update(); ui.message_input.focus();
+  historyRecord = restoredRecord;
+  session = new ConversationSession({ kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens, maxInputTokens, persist: persistSession, onUpdate: update });
+  await session.initialize(restoredRecord?.state || null);
+  if (!restoredRecord) historyRecord = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
+  ingressRequired = historyRecord.phase !== "active";
+  update();
+  if (!ingressRequired && !session.pendingTurn) ui.message_input.focus();
 }
 
 async function submitMessage(event) {
@@ -94,21 +117,43 @@ async function submitMessage(event) {
   update();
 }
 
+async function resumeSavedQuery() {
+  if (!session?.pendingTurn || session.busy) return;
+  clearError(ui.error_banner);
+  try { await session.resumePendingTurn(); }
+  catch (error) { showError(ui.error_banner, `The saved query could not be resumed: ${error.message}`); }
+  update();
+}
+
 async function endConversation() {
-  if (!session?.transcript.length || ending) return;
-  ending = true; ingressDiagnostic = null; ingressActivity = null; clearError(ui.error_banner); update();
-  const ended = session;
+  if ((!session?.transcript.length && !ingressRequired) || ending) return;
+  ending = true; ingressRequired = true; ingressDiagnostic = null; ingressActivity = null; clearError(ui.error_banner); update();
   try {
-    const provenance = await kweb.createProvenance({ data: ended.serialize(), source: "conversation", source_created_at: ended.startedAt });
-    ingressActivity = await runHistoryIngress({ kweb, intelligence, manuals, rootNodeId, provenanceId: provenance.id, provider, model, contextWindowTokens, maxInputTokens, onUpdate: value => { ingressDiagnostic = value; ingressActivity = value; update(); } });
+    historyRecord = await conversationHistory.get(historyRecord.id);
+    if (historyRecord.phase === "complete") {
+      ingressRequired = false;
+      await startConversation();
+      return;
+    }
+    if (historyRecord.phase === "active") {
+      historyRecord = await conversationHistory.requestIngress(historyRecord.id, { expected_version: historyRecord.version, state: session.snapshot() });
+    }
+    if (historyRecord.phase === "ingress_pending") {
+      const provenance = await kweb.createProvenance({ data: session.serialize(), source: "conversation", source_created_at: session.startedAt, idempotency_key: `conversation:${historyRecord.id}` });
+      historyRecord = await conversationHistory.ingressStarted(historyRecord.id, { expected_version: historyRecord.version, provenance_id: provenance.id });
+    }
+    if (historyRecord.phase !== "ingress_in_progress" || !historyRecord.provenance_id) throw new Error("The saved conversation is not ready for history ingress.");
+    ingressActivity = await runHistoryIngress({ kweb, intelligence, manuals, rootNodeId, provenanceId: historyRecord.provenance_id, provider, model, contextWindowTokens, maxInputTokens, onUpdate: value => { ingressDiagnostic = value; ingressActivity = value; update(); } });
     ingressDiagnostic = null;
+    historyRecord = await conversationHistory.ingressCompleted(historyRecord.id, { expected_version: historyRecord.version });
+    ingressRequired = false;
     ui.service_status.textContent = "Conversation saved to memory";
+    await startConversation();
   } catch (error) {
-    showError(ui.error_banner, `The conversation ended, but memory ingestion failed: ${error.message}`);
+    showError(ui.error_banner, `A new conversation cannot start until memory ingestion succeeds: ${error.message}`);
     ui.service_status.textContent = "Memory ingestion needs attention";
   } finally {
     ending = false;
-    try { await startConversation(); } catch (error) { session = null; showError(ui.error_banner, error.message); }
     update();
   }
 }
@@ -130,7 +175,7 @@ async function initialize() {
     ui.service_status.textContent = "Kweb unavailable"; showError(ui.error_banner, error.message); update(); return;
   }
   try {
-    await intelligence.health();
+    await Promise.all([intelligence.health(), conversationHistory.health()]);
     const providers = await intelligence.providers();
     provider = providers.default_provider;
     const selected = providers.providers.find(item => item.name === provider);
@@ -138,8 +183,15 @@ async function initialize() {
     const fallbackLimits = MODEL_LIMITS[model] || {};
     contextWindowTokens = selected.context_window_tokens || fallbackLimits.contextWindowTokens || 0;
     maxInputTokens = selected.max_input_tokens || fallbackLimits.maxInputTokens || 0;
-    await startConversation();
-    ui.service_status.textContent = `Ready · ${model}`;
+    const current = (await conversationHistory.current()).conversation;
+    await startConversation(current);
+    if (historyRecord.phase !== "active") {
+      await endConversation();
+    } else if (session.pendingTurn) {
+      ui.service_status.textContent = `Restoring saved query · ${model}`; update();
+      await resumeSavedQuery();
+    }
+    if (!ingressRequired) ui.service_status.textContent = `Ready · ${model}`;
   } catch (error) {
     ui.service_status.textContent = "Chat offline · memory ready";
     showError(ui.error_banner, `The memory explorer is available, but chat is offline: ${error.message}`); update();
@@ -148,7 +200,7 @@ async function initialize() {
 
 ui.message_form.addEventListener("submit", submitMessage);
 ui.message_input.addEventListener("keydown", event => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); ui.message_form.requestSubmit(); } });
-ui.end_button.addEventListener("click", endConversation);
+ui.end_button.addEventListener("click", () => session?.pendingTurn ? resumeSavedQuery() : endConversation());
 ui.dismiss_ingress.addEventListener("click", () => { ingressActivity = null; update(); });
 for (const mode of ["full", "system", "memory"]) ui[`inspector_${mode}`].addEventListener("click", () => { inspectorMode = mode; update(); });
 ui.chat_tab.addEventListener("click", () => showView(false));

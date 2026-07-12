@@ -14,7 +14,6 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use clap::Parser;
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -22,26 +21,22 @@ use serde_json::json;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
 const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+const PROVENANCE_IDEMPOTENCY_MIGRATION: &str =
+    include_str!("../migrations/002_provenance_idempotency.sql");
 const PROMPT_FILES: [&str; 3] = [
     "KmapAgentManual.txt",
     "ConversationAgentManual.txt",
     "HistoryIngressAgentManual.txt",
 ];
 
-#[derive(Parser, Debug)]
-struct Args {
-    #[arg(long, default_value = "127.0.0.1:4321")]
-    bind: String,
-    #[arg(long, default_value = "./kennedy.sqlite3")]
-    database: PathBuf,
-    #[arg(long, default_value = "./Frontend/public")]
-    frontend_dir: PathBuf,
-    #[arg(long, default_value = "./Frontend/SystemPrompts")]
-    system_prompts_dir: PathBuf,
-    #[arg(long, default_value_t = 12)]
-    active_limit: usize,
-    #[arg(long, default_value_t = 60)]
-    _fanout_limit: usize,
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub bind: String,
+    pub database: PathBuf,
+    pub frontend_dir: PathBuf,
+    pub system_prompts_dir: PathBuf,
+    pub active_limit: usize,
+    pub fanout_limit: usize,
 }
 
 #[derive(Clone)]
@@ -131,6 +126,8 @@ struct ProvenanceInput {
     data: String,
     source: String,
     source_created_at: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -155,29 +152,24 @@ struct ConnectInput {
     node_ids: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "kennedy_kweb=info,tower_http=info".into()),
-        )
-        .init();
-    let args = Args::parse();
-    if args.active_limit == 0 {
-        anyhow::bail!("--active-limit must be positive");
+pub async fn serve(config: Config) -> anyhow::Result<()> {
+    if config.active_limit == 0 {
+        anyhow::bail!("active_limit must be positive");
     }
-    let mut connection = Connection::open(&args.database)
-        .with_context(|| format!("opening {}", args.database.display()))?;
+    let mut connection = Connection::open(&config.database)
+        .with_context(|| format!("opening {}", config.database.display()))?;
     configure_database(&connection)?;
     connection
         .execute_batch(MIGRATION)
         .context("applying schema migration")?;
+    connection
+        .execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION)
+        .context("applying provenance idempotency migration")?;
     bootstrap(&mut connection)?;
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
-        prompts_dir: args.system_prompts_dir,
-        active_limit: args.active_limit,
+        prompts_dir: config.system_prompts_dir,
+        active_limit: config.active_limit,
     };
 
     let app = Router::new()
@@ -191,13 +183,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/provenance/{provenance_id}", get(get_provenance))
         .route("/api/v1/connections", post(connect_nodes))
         .route("/system-prompts/{filename}", get(get_prompt))
-        .fallback_service(ServeDir::new(args.frontend_dir).append_index_html_on_directories(true))
+        .fallback_service(ServeDir::new(config.frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::map_response(prevent_stale_frontend_assets))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-    tracing::info!(address = %args.bind, "Kennedy Kweb listening");
+    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    tracing::info!(address = %config.bind, "Kennedy Kweb listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -395,14 +387,44 @@ async fn create_provenance(
     }
     DateTime::parse_from_rfc3339(&input.source_created_at)
         .map_err(|_| ApiError::bad("source_created_at must be an RFC 3339 timestamp."))?;
+    let idempotency_key = input.idempotency_key.map(|key| key.trim().to_owned());
+    if idempotency_key
+        .as_deref()
+        .is_some_and(|key| key.is_empty() || key.chars().count() > 200)
+    {
+        return Err(ApiError::bad(
+            "idempotency_key must contain 1 to 200 characters when supplied.",
+        ));
+    }
     let id = new_id();
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
+    if let Some(key) = idempotency_key.as_deref() {
+        let existing: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT provenance_id FROM provenance_idempotency WHERE idempotency_key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ApiError::internal)?;
+        if let Some(existing) = existing {
+            tx.commit().map_err(ApiError::internal)?;
+            return Ok((StatusCode::OK, Json(json!({"id":hex::encode(existing)}))));
+        }
+    }
     tx.execute(
         "INSERT INTO data_provenance_nodes(id,data,source,source_created_at) VALUES(?1,?2,?3,?4)",
         params![id, input.data, source, input.source_created_at],
     )
     .map_err(ApiError::internal)?;
+    if let Some(key) = idempotency_key {
+        tx.execute(
+            "INSERT INTO provenance_idempotency(idempotency_key,provenance_id) VALUES(?1,?2)",
+            params![key, id],
+        )
+        .map_err(ApiError::internal)?;
+    }
     tx.commit().map_err(ApiError::internal)?;
     Ok((StatusCode::CREATED, Json(json!({"id":hex::encode(id)}))))
 }
@@ -630,6 +652,7 @@ mod tests {
         let mut db = Connection::open_in_memory().unwrap();
         configure_database(&db).unwrap();
         db.execute_batch(MIGRATION).unwrap();
+        db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
         bootstrap(&mut db).unwrap();
         db
     }
@@ -670,5 +693,29 @@ mod tests {
         let db = db();
         let count:i64=db.query_row("SELECT COUNT(*) FROM knowledge_nodes n JOIN data_history_nodes h ON h.id=n.history_head_id JOIN data_provenance_nodes p ON p.id=h.provenance_id WHERE n.is_user_root=1",[],|r|r.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn provenance_creation_is_idempotent_when_keyed() {
+        let state = AppState {
+            db: Arc::new(Mutex::new(db())),
+            prompts_dir: PathBuf::new(),
+            active_limit: 12,
+        };
+        let input = || ProvenanceInput {
+            data: "David: hello".into(),
+            source: "conversation".into(),
+            source_created_at: "2026-07-12T00:00:00Z".into(),
+            idempotency_key: Some("conversation:test".into()),
+        };
+        let first = create_provenance(State(state.clone()), Json(input()))
+            .await
+            .unwrap();
+        let second = create_provenance(State(state), Json(input()))
+            .await
+            .unwrap();
+        assert_eq!(first.0, StatusCode::CREATED);
+        assert_eq!(second.0, StatusCode::OK);
+        assert_eq!(first.1.0["id"], second.1.0["id"]);
     }
 }

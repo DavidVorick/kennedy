@@ -6,10 +6,10 @@ The frontend is a browser-native HTML, CSS, and JavaScript application. It has
 no Node.js dependency, package manager, bundler, TypeScript, or compile step.
 The Kweb backend serves it on localhost.
 
-The frontend owns Kennedy's UI and all ephemeral orchestration: the clean
+The frontend owns Kennedy's UI and live orchestration: the clean
 transcript, the complete chatend, context glue, prompt composition, agent tool
-loops, and the memory explorer. It does not own durable data or Kweb mutation
-rules.
+loops, recovery coordination, and the memory explorer. It does not own durable
+data or backend mutation rules.
 
 ## 2. Source Layout
 
@@ -48,13 +48,14 @@ The frontend defaults to:
 
 - Kweb API and static origin: `http://127.0.0.1:4321`
 - Intelligence API: `http://127.0.0.1:4322`
+- Conversation history API: `http://127.0.0.1:4323`
 
 The values are defined once in `app.js` so alternate local ports do not require
 changes throughout the codebase.
 
 ## 4. Application State
 
-All application state is held in JavaScript memory:
+Live application state is held in JavaScript memory:
 
 ```js
 {
@@ -83,8 +84,11 @@ All application state is held in JavaScript memory:
 ```
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
-caches for persistence. Reloading or abruptly closing the page may lose the
-current conversation.
+caches for persistence. Instead it checkpoints an opaque recovery snapshot to
+the conversation history API. The snapshot contains the clean transcript,
+conversation start time, directly loaded durable node IDs, and a pending-turn
+flag. Provider response IDs, tool logs, usage telemetry, and transient chatend
+tool activity are not restored.
 
 ## 5. Chatend Model
 
@@ -310,11 +314,46 @@ The frontend resolves the node and calls `PUT /api/v1/nodes/{durable_id}` with
 the current provenance ID. It refreshes the in-context representation and
 returns the updated node.
 
-### 8.6 Tool Failures
+### 8.6 `WebSearch`
+
+Available only during live conversation.
+
+```json
+{
+  "question": "What are the strongest current brunch recommendations in El Salvador, and what evidence supports them?"
+}
+```
+
+The question is the tool's only model-controlled argument. Geographic,
+language, freshness, and source requirements belong in its natural language;
+provider filters, query expansion, research depth, and result limits remain
+intelligence-layer policy. The frontend calls `POST /api/v1/web/search` with
+the active provider/model and returns the normalized research answer and
+source URLs as a readable Web tool result. This research request is not part of
+the conversation's provider continuation chain.
+
+### 8.7 `WebFetch`
+
+Available only during live conversation.
+
+```json
+{
+  "url": "https://example.com/article"
+}
+```
+
+The frontend calls `POST /api/v1/web/fetch`. It returns final source metadata,
+a truncation indicator, and readable page text. Kennedy uses it to inspect a
+particular source page-by-page. Fetched content is untrusted evidence, cannot
+override system instructions, and may fail when a page is unsafe, binary,
+blocked, JavaScript-dependent, or otherwise unsupported.
+
+### 8.8 Tool Failures
 
 Unknown tools are never executed. Invalid arguments, exhausted budgets, missing
-short IDs, and backend failures are returned to Kennedy as failed tool results
-with a readable explanation. Machine-readable error codes remain in the
+short IDs, unsafe URLs, and backend failures are returned to Kennedy as failed
+tool results with a readable explanation. Memory and web operations have
+distinct readable result labels. Machine-readable error codes remain in the
 internal diagnostic tool log; readable requests and failures appear in the
 chatend visualization.
 
@@ -323,12 +362,16 @@ chatend visualization.
 ### 9.1 Start
 
 1. Fetch all system-prompt manuals.
-2. Check both backend health endpoints.
+2. Check all three backend health endpoints.
 3. Fetch `GET /api/v1/providers` from the intelligence backend.
 4. Fetch `GET /api/v1/user`.
-5. Create empty transcript and context state.
-6. Load the user root and build the initial chatend.
-7. Render an empty conversation ready for input.
+5. Fetch `GET /api/v1/conversations/current`.
+6. If there is no unfinished record, initialize an empty session and create
+   its durable `active` record.
+7. If the record is `active`, restore its transcript and directly loaded Kweb
+   nodes. A saved pending query is resumed from a fresh provider chain.
+8. If the record requires ingress, resume Section 10 before enabling input or
+   creating a new conversation.
 
 If the intelligence backend is unavailable, chat is disabled but the memory
 explorer remains usable.
@@ -337,15 +380,18 @@ explorer remains usable.
 
 1. Append the user message to the clean transcript and chatend.
 2. Set the per-turn LoadNode counter to zero.
-3. Submit newly appended messages, the previous response ID when available, a
+3. Checkpoint the pending query and recovery snapshot through the conversation
+   history API. If this fails, do not contact the LLM.
+4. Submit newly appended messages, the previous response ID when available, a
    stable session-type cache key, and the configured model to the intelligence
    backend. The first request sends the complete chatend.
-4. If Kennedy emits a tool envelope, append the visible assistant text, execute
+5. If Kennedy emits a tool envelope, append the visible assistant text, execute
    every call sequentially in array order, append readable result messages, and
    continue from the returned response ID. State changes from one call are
    visible to the next call in the same response.
-5. Continue until Kennedy returns final text.
-6. Append final text to the clean transcript and chatend.
+6. Continue until Kennedy returns final text.
+7. Append final text to the clean transcript and chatend and checkpoint the
+   completed turn before accepting another query.
 
 A conversation permits at most 20 model-requested LoadNode calls per user turn.
 The UI remains in a busy state for the entire tool loop.
@@ -355,12 +401,20 @@ The UI remains in a busy state for the entire tool loop.
 When the user ends the conversation or starts a new one:
 
 1. disable further input for the old conversation,
-2. serialize only the clean user/Kennedy transcript,
-3. create a provenance node with source `conversation` and the conversation's
-   start time as `source_created_at`,
-4. run history ingress using the returned provenance ID,
-5. show completion or failure,
-6. create a fresh conversation when requested.
+2. atomically checkpoint its final state and transition the conversation
+   history record from `active` to `ingress_pending`,
+3. serialize only the clean user/Kennedy transcript,
+4. create or retrieve a Kweb provenance node using source `conversation`, the
+   conversation start time, and idempotency key `conversation:{conversation_id}`,
+5. store the returned opaque provenance ID while transitioning the history
+   record to `ingress_in_progress`,
+6. run history ingress using that provenance ID,
+7. only after success transition the history record to `complete`,
+8. create and expose a fresh durable conversation.
+
+Any failure leaves the unfinished record retryable and keeps normal input
+disabled. Reloading the UI or pressing Retry Memory Update resumes from the
+durable phase.
 
 ## 10. History-Ingress Flow
 
@@ -375,7 +429,7 @@ conversation's Kweb tool history.
 6. generate with the ingress manual describing all five tools,
 7. execute tools until Kennedy returns final text,
 8. show live requests, results, and completion in the ingress activity panel,
-   then mark ingress complete.
+9. mark the conversation history record complete.
 
 At most 50 model-requested LoadNode calls are allowed across the whole ingress
 session. Zero CreateNode or UpdateNode calls is valid.
@@ -389,6 +443,7 @@ The left panel contains only:
 - user and Kennedy messages,
 - multiline input,
 - Send and End Conversation controls,
+- a Retry Memory Update state when durable ingress is unfinished,
 - busy and ingress status,
 - a live, dismissible history-ingress activity panel,
 - visible errors.
@@ -435,7 +490,8 @@ The explorer does not edit durable data.
 ## 12. Rendering and Error Requirements
 
 - Insert untrusted text with `textContent`, never `innerHTML`.
-- Keep user input disabled while a generation or tool loop is active.
+- Keep user input disabled while generation, a tool loop, a pending restored
+  query, or required history ingress is active.
 - Preserve the diagnostic record of failed calls.
 - Display backend error messages without exposing stack traces.
 - Use semantic controls and visible keyboard focus.
@@ -456,5 +512,7 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - short-to-durable translation for every tool,
 - chatend rebuilding after ResetContext,
 - clean-transcript serialization,
+- checkpoint-before-generation ordering and pending-query recovery,
+- durable ingress gating before new-conversation creation,
 - HTML escaping,
-- recovery from failed intelligence and Kweb requests.
+- recovery from failed intelligence, Kweb, and conversation-history requests.

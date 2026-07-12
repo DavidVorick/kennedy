@@ -51,6 +51,17 @@ function formatNodes(title, nodes) {
   return `${title}\n\n${nodes.map(formatContextNode).join("\n\n")}`;
 }
 
+function formatWebSources(sources) {
+  if (!sources?.length) return "Sources: none returned.";
+  return [
+    "Sources:",
+    ...sources.flatMap((source, index) => [
+      `  ${index + 1}. ${text(source.title, source.url)}`,
+      `     URL: ${text(source.url)}`,
+    ]),
+  ].join("\n");
+}
+
 export function formatToolResult(toolName, content) {
   if (!content?.ok) {
     return [
@@ -78,6 +89,28 @@ export function formatToolResult(toolName, content) {
       return ["Memory node created.", "", formatNodes("Created node", result.node ? [result.node] : [])].join("\n");
     case "UpdateNode":
       return ["Memory node updated.", "", formatNodes("Updated node", result.node ? [result.node] : [])].join("\n");
+    case "WebSearch":
+      return [
+        "Web research completed.",
+        "",
+        "Research answer:",
+        indented(result.answer),
+        "",
+        formatWebSources(result.sources),
+      ].join("\n");
+    case "WebFetch":
+      return [
+        "Web page fetched.",
+        "",
+        `URL: ${text(result.url)}`,
+        `Title: ${text(result.title)}`,
+        `Retrieved: ${text(result.retrieved_at)}`,
+        `Content type: ${text(result.content_type)}`,
+        `Truncated: ${result.truncated ? "yes" : "no"}`,
+        "",
+        "Readable page content:",
+        indented(result.content),
+      ].join("\n");
     default:
       return `${toolName} completed successfully.`;
   }

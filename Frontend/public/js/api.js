@@ -39,4 +39,18 @@ export const IntelligenceAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   providers: () => requestJSON(base, "/api/v1/providers"),
   generate: (body) => requestJSON(base, "/api/v1/generate", { method: "POST", body: JSON.stringify(body) }),
+  webSearch: (body) => requestJSON(base, "/api/v1/web/search", { method: "POST", body: JSON.stringify(body) }),
+  webFetch: (body) => requestJSON(base, "/api/v1/web/fetch", { method: "POST", body: JSON.stringify(body) }),
+});
+
+export const ConversationHistoryAPI = (base) => ({
+  health: () => requestJSON(base, "/health"),
+  list: () => requestJSON(base, "/api/v1/conversations"),
+  current: () => requestJSON(base, "/api/v1/conversations/current"),
+  get: (id) => requestJSON(base, `/api/v1/conversations/${id}`),
+  create: (body) => requestJSON(base, "/api/v1/conversations", { method: "POST", body: JSON.stringify(body) }),
+  checkpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
+  requestIngress: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/request-ingress`, { method: "POST", body: JSON.stringify(body) }),
+  ingressStarted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-started`, { method: "POST", body: JSON.stringify(body) }),
+  ingressCompleted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-completed`, { method: "POST", body: JSON.stringify(body) }),
 });

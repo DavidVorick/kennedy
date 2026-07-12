@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260712.1";
+import { formatToolResult } from "./human_format.js?v=20260712.3";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 
@@ -29,10 +29,11 @@ function validateObject(args, keys) {
 function integer(value, name) { if (!Number.isInteger(value) || value < 1) throw Object.assign(new Error(`${name} must be a positive integer.`), { code: "invalid_arguments" }); return value; }
 function integerArray(value, name, minimum = 0) { if (!Array.isArray(value) || value.length < minimum) throw Object.assign(new Error(`${name} must contain at least ${minimum} identifiers.`), { code: "invalid_arguments" }); value.forEach((v, i) => integer(v, `${name}[${i}]`)); if (new Set(value).size !== value.length) throw Object.assign(new Error(`${name} must not contain duplicates.`), { code: "invalid_arguments" }); return value; }
 function string(value, name) { if (typeof value !== "string") throw Object.assign(new Error(`${name} must be a string.`), { code: "invalid_arguments" }); return value; }
+function nonemptyString(value, name, maximum) { string(value, name); const trimmed = value.trim(); if (!trimmed || [...trimmed].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return trimmed; }
 
 export class ToolExecutor {
-  constructor({ mode, context, api, provenanceId = null, loadLimit, onUpdate = () => {} }) {
-    this.mode = mode; this.context = context; this.api = api; this.provenanceId = provenanceId;
+  constructor({ mode, context, api, intelligence = null, provider = null, model = null, provenanceId = null, loadLimit, onUpdate = () => {} }) {
+    this.mode = mode; this.context = context; this.api = api; this.intelligence = intelligence; this.provider = provider; this.model = model; this.provenanceId = provenanceId;
     this.loadLimit = loadLimit; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
   }
 
@@ -45,9 +46,10 @@ export class ToolExecutor {
   }
 
   resultMessage(call, content) {
+    const displayRole = call.name === "WebSearch" || call.name === "WebFetch" ? "Web tool result" : "Memory tool result";
     return {
       role: "user",
-      display_role: "Memory tool result",
+      display_role: displayRole,
       content: ["Kennedy tool result", `Tool: ${call.name}`, "", formatToolResult(call.name, content)].join("\n"),
     };
   }
@@ -69,6 +71,8 @@ export class ToolExecutor {
         case "ConnectNodes": outcome = await this.connectNodes(call.arguments); break;
         case "CreateNode": outcome = await this.createNode(call.arguments); break;
         case "UpdateNode": outcome = await this.updateNode(call.arguments); break;
+        case "WebSearch": outcome = await this.webSearch(call.arguments); break;
+        case "WebFetch": outcome = await this.webFetch(call.arguments); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
       }
       const message = this.resultMessage(call, { ok: true, result: outcome.result });
@@ -107,6 +111,19 @@ export class ToolExecutor {
   }
 
   assertIngress() { if (this.mode !== "ingress" || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" }); }
+  assertConversationWeb() { if (this.mode !== "conversation" || !this.intelligence) throw Object.assign(new Error("This web tool is only available during a live conversation."), { code: "tool_unavailable" }); }
+
+  async webSearch(args) {
+    this.assertConversationWeb(); validateObject(args, ["question"]);
+    const question = nonemptyString(args.question, "question", 4000);
+    return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question }) };
+  }
+
+  async webFetch(args) {
+    this.assertConversationWeb(); validateObject(args, ["url"]);
+    const url = nonemptyString(args.url, "url", 4096);
+    return { result: await this.intelligence.webFetch({ url }) };
+  }
 
   async createNode(args) {
     this.assertIngress(); validateObject(args, ["parentIdentifiers", "shortName", "shortDescription", "longDescription"]);

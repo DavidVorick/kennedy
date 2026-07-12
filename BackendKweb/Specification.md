@@ -7,6 +7,10 @@ It stores the kweb in SQLite, enforces graph and history invariants, exposes a
 JSON API to the frontend, and serves the frontend's static files and system
 prompt manuals.
 
+It is an independent library backend hosted by the `kennedy-server` binary.
+It has no dependency on and receives no state or handles from the intelligence
+or conversation history backends.
+
 It does not know about LLM providers, chatends, short identifiers, frontend
 sessions, or agent call budgets.
 
@@ -17,8 +21,8 @@ line flags.
 
 | Setting | Flag | Default |
 | --- | --- | --- |
-| Bind address | `--bind` | `127.0.0.1:4321` |
-| SQLite file | `--database` | `./kennedy.sqlite3` |
+| Bind address | `--kweb-bind` | `127.0.0.1:4321` |
+| SQLite file | `--kweb-database` | `./kennedy.sqlite3` |
 | Frontend directory | `--frontend-dir` | `./Frontend/public` |
 | System prompts directory | `--system-prompts-dir` | `./Frontend/SystemPrompts` |
 | Active connection limit | `--active-limit` | `12` |
@@ -240,9 +244,14 @@ Request:
 {
   "data": "User: ...\nKennedy: ...",
   "source": "conversation",
-  "source_created_at": "2026-07-11T00:00:00Z"
+  "source_created_at": "2026-07-11T00:00:00Z",
+  "idempotency_key": "conversation:550e8400-e29b-41d4-a716-446655440000"
 }
 ```
+
+`idempotency_key` is optional and contains 1–200 characters when supplied. The
+first request creates the provenance and returns `201`. Repeating the key
+returns the original ID with `200` without comparing or rewriting its data.
 
 Response `201`:
 
