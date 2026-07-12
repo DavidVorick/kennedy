@@ -8,7 +8,8 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -48,6 +49,14 @@ struct AppState {
     db: Arc<Mutex<Connection>>,
     prompts_dir: PathBuf,
     active_limit: usize,
+}
+
+async fn prevent_stale_frontend_assets(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    response
 }
 
 #[derive(Debug)]
@@ -185,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(ServeDir::new(args.frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::map_response(prevent_stale_frontend_assets))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     tracing::info!(address = %args.bind, "Kennedy Kweb listening");

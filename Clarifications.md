@@ -15,6 +15,15 @@ technical design.
   System instructions should be organized as prose sections, while loaded Kmap
   nodes and local tool results should use a clear YAML-like text presentation
   instead of JSON serialization.
+- Put exact context occupancy and remaining-window telemetry in the right side
+  of the Chatend header, where it remains visible while inspecting context.
+- Provide Full, System Prompts, and Memory Tree views. The memory view should
+  be expandable and visually distinguish directly loaded nodes, full nodes
+  pulled in by active connections, and summary-only fanout references.
+- Serve the local frontend without reusable browser caching and version its
+  entry assets so HTML and JavaScript revisions cannot be mixed. A startup
+  exception should produce a visible failure instead of leaving the UI frozen
+  at “Starting…”.
 
 ## OpenAI API and Local Tools
 

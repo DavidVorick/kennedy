@@ -1,4 +1,4 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260712.1";
 
 export function createCacheKey(mode) {
   return `kennedy-${mode}-prompt-v1`;

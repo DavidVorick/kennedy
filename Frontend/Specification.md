@@ -397,15 +397,26 @@ Tool calls and internal context never appear in the clean transcript.
 
 ### 11.2 Context Inspector
 
-The right panel visualizes Kennedy's current chatend, including system context,
-conversation, transparent JSON tool envelopes, and readable tool results.
-Provider response IDs and credentials are omitted. Copy Context copies exactly
-the displayed text.
+The right panel has three views of Kennedy's current chatend:
 
-Above the inspector, usage cards report current logical context occupancy and
-remaining context window, cumulative input/output/reasoning tokens, request
-count, cache-read tokens and percentage, and cache-write tokens. Values come
-from provider usage rather than client-side token estimates.
+- **Full view** shows system context, conversation, transparent JSON tool
+  envelopes, readable tool results, and loaded Kmap context.
+- **System prompts** shows only the agent manuals and other system
+  instructions.
+- **Memory tree** shows the Kmap material currently visible to Kennedy as an
+  expandable tree. It distinguishes directly loaded nodes, full nodes pulled
+  in through active connections, and fanout references whose summaries alone
+  are visible.
+
+Provider response IDs and credentials are omitted. Copy View copies exactly
+the text representation of the selected view.
+
+The right side of the Chatend header reports current logical context occupancy,
+the model context-window size, exact remaining tokens, and the percentage of
+input tokens served by prompt-cache reads. Hover details include cumulative
+input/output tokens, cache-read tokens, and cache-write tokens. Values come
+from provider usage rather than client-side token estimates; before the first
+provider response the configured model limit supplies the empty-window size.
 
 ### 11.3 Memory Explorer
 

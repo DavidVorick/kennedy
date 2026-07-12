@@ -86,8 +86,12 @@ The frontend owns:
 - the context inspector and memory explorer state.
 
 The context inspector renders the human-readable chatend, including Kennedy's
-text tool requests and readable tool results. Token, context-window, and cache
-telemetry is displayed separately. Provider IDs and credentials remain hidden.
+text tool requests and readable tool results. It provides full-context,
+system-prompt-only, and expandable Kmap-memory views. The memory view derives
+node provenance from the Kweb context snapshot so direct loads, active-edge
+expansions, and summary-only fanout references remain visually distinct.
+Token, context-window, and cache telemetry is displayed in the Chatend header.
+Provider IDs and credentials remain hidden.
 
 The frontend has no persistent state. A reload or abrupt close may discard an
 active conversation.

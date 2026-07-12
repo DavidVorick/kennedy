@@ -1,8 +1,8 @@
-import { Chatend } from "./chatend.js";
-import { KwebContext } from "./kweb_context.js";
-import { composePrompt } from "./prompt_composer.js";
-import { ToolExecutor } from "./tools.js";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js";
+import { Chatend } from "./chatend.js?v=20260712.1";
+import { KwebContext } from "./kweb_context.js?v=20260712.1";
+import { composePrompt } from "./prompt_composer.js?v=20260712.1";
+import { ToolExecutor } from "./tools.js?v=20260712.1";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260712.1";
 
 export class ConversationSession {
   constructor({ kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, onUpdate }) {

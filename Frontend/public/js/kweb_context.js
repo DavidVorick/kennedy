@@ -4,6 +4,7 @@ export class KwebContext {
   clear() {
     this.loadedNodeIds = [];
     this.fullNodeIds = new Set();
+    this.nodeOrigins = new Map();
     this.nodesById = new Map();
     this.shortToDurable = new Map();
     this.durableToShort = new Map();
@@ -24,10 +25,14 @@ export class KwebContext {
     return this.shortToDurable.get(identifier);
   }
 
-  ingestNode(node, full = true) {
+  ingestNode(node, full = true, origin = "context") {
     this.shortId(node.id);
     for (const connection of [...(node.active_connections || []), ...(node.fanout_connections || [])]) this.shortId(connection.id);
-    if (full) { this.nodesById.set(node.id, node); this.fullNodeIds.add(node.id); }
+    if (full) {
+      this.nodesById.set(node.id, node); this.fullNodeIds.add(node.id);
+      if (!this.nodeOrigins.has(node.id)) this.nodeOrigins.set(node.id, new Set());
+      this.nodeOrigins.get(node.id).add(origin);
+    }
     else if (!this.nodesById.has(node.id)) this.nodesById.set(node.id, node);
   }
 
@@ -35,8 +40,8 @@ export class KwebContext {
     if (!internal && this.loadedNodeIds.length >= 7) throw Object.assign(new Error("Seven nodes are already directly loaded. Reset the context to continue."), { code: "loaded_node_limit" });
     if (this.loadedNodeIds.includes(durableId)) throw Object.assign(new Error("That node is already directly loaded."), { code: "already_loaded" });
     const payload = await this.api.context(durableId);
-    this.ingestNode(payload.requested_node, true);
-    for (const node of payload.active_connection_nodes) this.ingestNode(node, true);
+    this.ingestNode(payload.requested_node, true, "direct");
+    for (const node of payload.active_connection_nodes) this.ingestNode(node, true, "active");
     this.loadedNodeIds.push(durableId);
     return { requestedNode: this.toContextNode(payload.requested_node), activeConnectionNodes: payload.active_connection_nodes.map(node => this.toContextNode(node)) };
   }
@@ -53,7 +58,7 @@ export class KwebContext {
     return { loads, context: this.snapshot() };
   }
 
-  refresh(nodes) { for (const node of nodes) this.ingestNode(node, true); }
+  refresh(nodes) { for (const node of nodes) this.ingestNode(node, true, "operation"); }
 
   summary(connection) { return { identifier: this.shortId(connection.id), shortName: connection.short_name, shortDescription: connection.short_description }; }
 
@@ -71,7 +76,7 @@ export class KwebContext {
   snapshot() {
     return {
       directlyLoadedIdentifiers: this.loadedNodeIds.map(id => this.shortId(id)),
-      nodes: [...this.fullNodeIds].map(id => this.toContextNode(this.nodesById.get(id))),
+      nodes: [...this.fullNodeIds].map(id => ({ ...this.toContextNode(this.nodesById.get(id)), contextSources: [...(this.nodeOrigins.get(id) || [])] })),
     };
   }
 
@@ -79,9 +84,9 @@ export class KwebContext {
     return {
       loadedNodeIds: [...this.loadedNodeIds],
       fullNodeIds: [...this.fullNodeIds],
+      nodeOrigins: Object.fromEntries([...this.nodeOrigins].map(([id, origins]) => [id, [...origins]])),
       shortToDurable: Object.fromEntries(this.shortToDurable),
       nextShortId: this.nextShortId,
     };
   }
 }
-

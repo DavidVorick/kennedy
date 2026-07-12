@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kennedy</title>
-  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="stylesheet" href="/css/styles.css?v=20260712.1">
 </head>
 <body>
   <header class="topbar">
@@ -50,10 +50,17 @@
       <aside class="panel inspector-panel" aria-label="Kennedy context inspector">
         <div class="panel-heading">
           <div><span class="eyebrow">KENNEDY'S CURRENT CONTEXT</span><h2>Chatend</h2></div>
-          <button id="copy-context" class="quiet" type="button">Copy context</button>
+          <div class="inspector-heading-actions">
+            <div id="usage-metrics" class="context-usage" aria-label="Token and cache usage"></div>
+            <button id="copy-context" class="quiet" type="button">Copy view</button>
+          </div>
         </div>
-        <div id="usage-metrics" class="usage-grid" aria-label="Token and cache usage"></div>
-        <pre id="context-inspector" tabindex="0"></pre>
+        <nav class="inspector-tabs" aria-label="Chatend views">
+          <button id="inspector-full" class="inspector-tab active" type="button" aria-pressed="true">Full view</button>
+          <button id="inspector-system" class="inspector-tab" type="button" aria-pressed="false">System prompts</button>
+          <button id="inspector-memory" class="inspector-tab" type="button" aria-pressed="false">Memory tree</button>
+        </nav>
+        <div id="context-inspector" class="inspector-content" tabindex="0"></div>
       </aside>
     </section>
 
@@ -73,6 +80,6 @@
     </section>
   </main>
 
-  <script type="module" src="/js/app.js"></script>
+  <script type="module" src="/js/app.js?v=20260712.1"></script>
 </body>
 </html>

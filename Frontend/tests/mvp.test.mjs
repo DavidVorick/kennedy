@@ -32,6 +32,17 @@ test("short IDs are stable within a context and reset from one", async () => {
   assert.equal(context.resolve(context.shortId(id(3))), id(3));
 });
 
+test("Kmap snapshot distinguishes direct loads from active expansions", async () => {
+  const context = new KwebContext(new MockKweb([node(1, [2]), node(2)]), id(1));
+  await context.initialize();
+  let snapshot = context.snapshot();
+  assert.deepEqual(snapshot.nodes.find(item => item.identifier === 1).contextSources, ["direct"]);
+  assert.deepEqual(snapshot.nodes.find(item => item.identifier === 2).contextSources, ["active"]);
+  await context.loadDurable(id(2));
+  snapshot = context.snapshot();
+  assert.deepEqual(snapshot.nodes.find(item => item.identifier === 2).contextSources, ["active", "direct"]);
+});
+
 test("seven direct loads are enforced", async () => {
   const nodes = Array.from({ length: 8 }, (_, index) => node(index + 1));
   const context = new KwebContext(new MockKweb(nodes), id(1));
@@ -100,6 +111,7 @@ test("agent loop executes multiple text tool calls before the next generation", 
   };
   const continuation = new ContinuationState("kennedy-test");
   const usage = new UsageTracker({ contextWindowTokens: 1000, maxInputTokens: 900 });
+  assert.equal(usage.snapshot().contextRemaining, 1000);
   const answer = await runAgentLoop({ intelligence, provider: "p", model: "m", chatend, executor, continuation, usage });
   assert.equal(answer, "Finished.");
   assert.deepEqual(executed, ["First", "Second"]);
@@ -108,6 +120,9 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.deepEqual(requests[1].messages.map(message => message.content), ["First completed.", "Second completed."]);
   assert.equal("tools" in requests[0], false);
   assert.equal(usage.snapshot().totalCachedTokens, 180);
+  assert.equal(usage.snapshot().contextTokens, 135);
+  assert.equal(usage.snapshot().contextRemaining, 865);
+  assert.equal(usage.snapshot().cacheReadPercent, (100 * 180) / 230);
 });
 
 test("ResetContext abandons continuation and resends the rebuilt full chatend", async () => {
@@ -150,6 +165,16 @@ test("system prompt composition uses readable sections rather than markup wrappe
   const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation");
   assert.equal(prompt, "Kennedy's shared instructions\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.");
   assert.equal(prompt.includes("<kennedy_"), false);
+});
+
+test("chatend inspector system view excludes conversation and Kmap context", async () => {
+  const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
+  const chatend = new Chatend("Agent manual text.", context, [{ role: "user", content: "Conversation provenance." }]);
+  const diagnostic = { chatend: chatend.messages, memory: context.snapshot() };
+  assert.match(inspectorText(diagnostic, "system"), /Agent manual text/);
+  assert.equal(inspectorText(diagnostic, "system").includes("Conversation provenance"), false);
+  assert.equal(inspectorText(diagnostic, "system").includes("Current Kmap context"), false);
+  assert.match(inspectorText(diagnostic, "memory"), /Current Kmap context/);
 });
 
 test("system prompt loader requests the renamed Kmap manual", async () => {
@@ -195,4 +220,11 @@ test("production frontend never uses HTML string insertion", async () => {
     const source = await readFile(new URL(`../public/js/${file}`, import.meta.url), "utf8");
     assert.equal(source.includes("innerHTML"), false, `${file} uses innerHTML`);
   }
+});
+
+test("frontend exposes full, system, and memory inspector controls", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-memory"]) assert.match(html, new RegExp(`id="${id}"`));
+  assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
+  assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
 });

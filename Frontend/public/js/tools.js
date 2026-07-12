@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js";
+import { formatToolResult } from "./human_format.js?v=20260712.1";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 

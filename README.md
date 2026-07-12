@@ -60,7 +60,9 @@ Kennedy's live system prompts are deliberately plain-text files in
 Kennedy's local tools use a text protocol documented in the session manuals,
 so tool requests and results are visible in the chatend. The UI also reports
 provider token usage, context-window headroom, and prompt-cache reads and
-writes, and shows history ingress as it runs.
+writes in the Chatend header, and shows history ingress as it runs. The
+Chatend inspector can display the complete context, just the system prompts,
+or an expandable tree of loaded Kmap memory.
 
 The browser fetches these files at session startup. Edit them and reload the
 page; no compilation is required.
