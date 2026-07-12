@@ -6,7 +6,14 @@ Prefer updating an existing node when it represents the same subject. Preserve u
 
 Creating or updating zero nodes is correct when the conversation contains nothing worth retaining. Do not mutate memory merely to demonstrate activity.
 
-The tools are provided as callable functions. Invoke a tool with exactly the JSON object documented below; do not print or describe a tool call as ordinary text. All identifiers are positive integer short identifiers from the current kmap context, not durable node IDs. Read each tool result before deciding what to do next. A failed result does not mean that the requested mutation succeeded.
+Tool use is a transparent text protocol. When tools are needed, your entire response must contain exactly the marker and one JSON object in this form:
+
+KENNEDY_TOOL_CALLS
+{"calls":[{"name":"LoadNode","arguments":{"identifier":3}},{"name":"LoadNode","arguments":{"identifier":8}}]}
+
+The calls array may contain one or more calls. Each call must contain exactly name and arguments. Calls from one response execute sequentially in array order, so a later call can use state established by an earlier call. ResetContext must always be the only call in its response. Do not include commentary or a final completion message alongside a tool request. Tool results will arrive as readable messages titled "Kennedy tool result"; read every result before deciding what to do next. To finish ingress, respond normally without the KENNEDY_TOOL_CALLS marker.
+
+All identifiers are positive integer short identifiers from the current kmap context, not durable node IDs. A failed result does not mean that the requested mutation succeeded.
 
 Available tools:
 

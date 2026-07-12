@@ -3,7 +3,7 @@ import { loadPromptManuals } from "./prompt_composer.js";
 import { ConversationSession } from "./conversation.js";
 import { runHistoryIngress } from "./history_ingress.js";
 import { MemoryExplorer } from "./memory_explorer.js";
-import { renderTranscript, renderInspector, inspectorText, showError, clearError } from "./render.js";
+import { renderTranscript, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -11,7 +11,7 @@ const CONFIG = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "send-button", "end-button", "activity", "context-inspector", "copy-context", "memory-content", "memory-back", "memory-forward", "memory-home",
+  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "send-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "ingress-panel", "ingress-title", "ingress-log", "dismiss-ingress", "memory-content", "memory-back", "memory-forward", "memory-home",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const kweb = KwebAPI(CONFIG.kwebBase);
@@ -21,8 +21,11 @@ let manuals = null;
 let rootNodeId = null;
 let provider = null;
 let model = null;
+let contextWindowTokens = 0;
+let maxInputTokens = 0;
 let explorer = null;
 let ingressDiagnostic = null;
+let ingressActivity = null;
 let ending = false;
 
 function diagnostic() {
@@ -32,20 +35,29 @@ function diagnostic() {
     context: ingressDiagnostic.context.diagnostics(),
     loadCalls: ingressDiagnostic.executor.loadCalls, loadLimit: ingressDiagnostic.executor.loadLimit,
     toolLog: ingressDiagnostic.executor.toolLog,
+    usage: ingressDiagnostic.usage.snapshot(),
   };
-  if (!session) return { mode: "offline", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 0, toolLog: [] };
+  if (!session) return { mode: "offline", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 0, toolLog: [], usage: null };
   return {
     mode: "conversation", provider, model,
     chatend: session.chatend?.messages || [],
     context: session.context?.diagnostics() || {},
     loadCalls: session.executor?.loadCalls || 0, loadLimit: session.executor?.loadLimit || 20,
     toolLog: session.executor?.toolLog || [],
+    usage: session.usage?.snapshot() || null,
   };
 }
 
 function update() {
   renderTranscript(ui.transcript, session?.transcript || []);
-  renderInspector(ui.context_inspector, diagnostic());
+  const currentDiagnostic = diagnostic();
+  renderInspector(ui.context_inspector, currentDiagnostic);
+  renderUsage(ui.usage_metrics, currentDiagnostic);
+  ui.ingress_panel.classList.toggle("hidden", !ingressActivity);
+  if (ingressActivity) {
+    ui.ingress_title.textContent = ingressDiagnostic ? "History ingress · live" : "History ingress · complete";
+    renderIngressActivity(ui.ingress_log, ingressActivity, Boolean(ingressDiagnostic));
+  }
   const busy = Boolean(session?.busy || ending);
   ui.message_input.disabled = busy || !session;
   ui.send_button.disabled = busy || !session;
@@ -55,7 +67,7 @@ function update() {
 
 async function startConversation() {
   ingressDiagnostic = null;
-  session = new ConversationSession({ kweb, intelligence, manuals, rootNodeId, provider, model, onUpdate: update });
+  session = new ConversationSession({ kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens, maxInputTokens, onUpdate: update });
   await session.initialize(); update(); ui.message_input.focus();
 }
 
@@ -70,11 +82,12 @@ async function submitMessage(event) {
 
 async function endConversation() {
   if (!session?.transcript.length || ending) return;
-  ending = true; clearError(ui.error_banner); update();
+  ending = true; ingressDiagnostic = null; ingressActivity = null; clearError(ui.error_banner); update();
   const ended = session;
   try {
     const provenance = await kweb.createProvenance({ data: ended.serialize(), source: "conversation", source_created_at: ended.startedAt });
-    await runHistoryIngress({ kweb, intelligence, manuals, rootNodeId, provenanceId: provenance.id, provider, model, onUpdate: value => { ingressDiagnostic = value; update(); } });
+    ingressActivity = await runHistoryIngress({ kweb, intelligence, manuals, rootNodeId, provenanceId: provenance.id, provider, model, contextWindowTokens, maxInputTokens, onUpdate: value => { ingressDiagnostic = value; ingressActivity = value; update(); } });
+    ingressDiagnostic = null;
     ui.service_status.textContent = "Conversation saved to memory";
   } catch (error) {
     showError(ui.error_banner, `The conversation ended, but memory ingestion failed: ${error.message}`);
@@ -108,6 +121,8 @@ async function initialize() {
     provider = providers.default_provider;
     const selected = providers.providers.find(item => item.name === provider);
     model = selected.default_model;
+    contextWindowTokens = selected.context_window_tokens || 0;
+    maxInputTokens = selected.max_input_tokens || 0;
     await startConversation();
     ui.service_status.textContent = `Ready · ${model}`;
   } catch (error) {
@@ -119,6 +134,7 @@ async function initialize() {
 ui.message_form.addEventListener("submit", submitMessage);
 ui.message_input.addEventListener("keydown", event => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); ui.message_form.requestSubmit(); } });
 ui.end_button.addEventListener("click", endConversation);
+ui.dismiss_ingress.addEventListener("click", () => { ingressActivity = null; update(); });
 ui.chat_tab.addEventListener("click", () => showView(false));
 ui.memory_tab.addEventListener("click", () => showView(true));
 ui.memory_back.addEventListener("click", () => explorer?.goBack());

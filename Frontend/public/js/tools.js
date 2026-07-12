@@ -1,21 +1,25 @@
 import { formatToolResult } from "./human_format.js";
 
-const scalar = (type) => ({ type });
-const arrayOfIntegers = { type: "array", items: scalar("integer") };
-const objectSchema = (properties, required = Object.keys(properties)) => ({ type: "object", properties, required, additionalProperties: false });
+export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 
-const BASE_TOOLS = [
-  { name: "LoadNode", description: "Load one known kmap node and its active connections into context.", input_schema: objectSchema({ identifier: scalar("integer") }) },
-  { name: "ResetContext", description: "Replace kmap context with the user root and selected known nodes.", input_schema: objectSchema({ identifiers: arrayOfIntegers }) },
-  { name: "ConnectNodes", description: "Record that two or more full in-context nodes are useful together.", input_schema: objectSchema({ identifiers: arrayOfIntegers }) },
-];
-
-const INGRESS_TOOLS = [
-  { name: "CreateNode", description: "Create a durable knowledge node from the current provenance and connect it to parents.", input_schema: objectSchema({ parentIdentifiers: arrayOfIntegers, shortName: scalar("string"), shortDescription: scalar("string"), longDescription: scalar("string") }) },
-  { name: "UpdateNode", description: "Replace a knowledge node's descriptive fields using the current provenance.", input_schema: objectSchema({ identifier: scalar("integer"), newShortName: scalar("string"), newShortDescription: scalar("string"), newLongDescription: scalar("string") }) },
-];
-
-export function toolDefinitions(mode) { return mode === "ingress" ? [...BASE_TOOLS, ...INGRESS_TOOLS] : BASE_TOOLS; }
+export function parseToolCalls(content) {
+  if (typeof content !== "string") throw Object.assign(new Error("Kennedy returned no text."), { code: "invalid_tool_protocol" });
+  const trimmed = content.trim();
+  if (!trimmed.startsWith(TOOL_CALL_PREFIX)) return null;
+  if (!trimmed.startsWith(`${TOOL_CALL_PREFIX}\n`)) throw Object.assign(new Error(`Tool requests must put JSON on the line after ${TOOL_CALL_PREFIX}.`), { code: "invalid_tool_protocol" });
+  let envelope;
+  try { envelope = JSON.parse(trimmed.slice(TOOL_CALL_PREFIX.length).trim()); }
+  catch { throw Object.assign(new Error("The tool request after KENNEDY_TOOL_CALLS was not valid JSON."), { code: "invalid_tool_protocol" }); }
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope) || Object.keys(envelope).length !== 1 || !Array.isArray(envelope.calls) || envelope.calls.length === 0) {
+    throw Object.assign(new Error('The tool request must be exactly {"calls":[...]} with at least one call.'), { code: "invalid_tool_protocol" });
+  }
+  return envelope.calls.map((call, index) => {
+    if (!call || typeof call !== "object" || Array.isArray(call) || Object.keys(call).length !== 2 || typeof call.name !== "string" || !call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+      throw Object.assign(new Error(`Tool call ${index + 1} must contain exactly a string name and an object arguments field.`), { code: "invalid_tool_protocol" });
+    }
+    return { id: `text_call_${index + 1}`, name: call.name, arguments: call.arguments };
+  });
+}
 
 function validateObject(args, keys) {
   if (!args || typeof args !== "object" || Array.isArray(args)) throw Object.assign(new Error("Arguments must be a JSON object."), { code: "invalid_arguments" });
@@ -40,7 +44,13 @@ export class ToolExecutor {
     return id;
   }
 
-  resultMessage(call, content) { return { role: "tool", tool_call_id: call.id, name: call.name, content: formatToolResult(call.name, content) }; }
+  resultMessage(call, content) {
+    return {
+      role: "user",
+      display_role: "Memory tool result",
+      content: ["Kennedy tool result", `Tool: ${call.name}`, "", formatToolResult(call.name, content)].join("\n"),
+    };
+  }
 
   failure(call, code, message) {
     const result = this.resultMessage(call, { ok: false, error: { code, message } });

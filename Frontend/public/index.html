@@ -28,6 +28,13 @@
             <p>Kennedy can help directly and draw on your local memory when it matters.</p>
           </div>
         </div>
+        <section id="ingress-panel" class="ingress-panel hidden" aria-label="History ingress activity">
+          <div class="ingress-heading">
+            <div><span class="eyebrow">MEMORY UPDATE</span><strong id="ingress-title">History ingress</strong></div>
+            <button id="dismiss-ingress" class="quiet" type="button">Dismiss</button>
+          </div>
+          <div id="ingress-log" class="ingress-log" aria-live="polite"></div>
+        </section>
         <div id="error-banner" class="error-banner hidden" role="alert"></div>
         <form id="message-form" class="composer">
           <label class="sr-only" for="message-input">Message Kennedy</label>
@@ -45,6 +52,7 @@
           <div><span class="eyebrow">KENNEDY'S CURRENT CONTEXT</span><h2>Chatend</h2></div>
           <button id="copy-context" class="quiet" type="button">Copy context</button>
         </div>
+        <div id="usage-metrics" class="usage-grid" aria-label="Token and cache usage"></div>
         <pre id="context-inspector" tabindex="0"></pre>
       </aside>
     </section>

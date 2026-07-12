@@ -13,6 +13,7 @@ rebuild is needed.
   conservatively turned into durable memory.
 
 The shared manual is composed first, followed by the session-specific manual.
-Keep tool names and JSON argument names synchronized with
-`Frontend/public/js/tools.js`. The prompts should describe judgment and policy;
-hard limits and validation are enforced in code.
+The session manuals are the LLM-visible source of truth for the transparent
+tool-request protocol, tool names, argument names, judgment, and policy. Keep
+them synchronized with validation and execution in `Frontend/public/js/tools.js`;
+hard limits remain enforced in code.

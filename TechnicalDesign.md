@@ -26,11 +26,12 @@ System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 - The Kweb backend is the single authority for durable memory.
 - The intelligence backend never needs to understand Kennedy, the kweb, or its
   tools.
-- The frontend sends the complete chatend on every generation request. It does
-  not depend on opaque provider-side conversation state.
-- The OpenAI adapter uses stateless Responses API requests. Provider output
-  items required to continue a reasoning/tool turn are round-tripped inside
-  the frontend-owned chatend; `previous_response_id` is not used.
+- The frontend owns the complete human-readable chatend. It sends the full
+  chatend when starting a provider chain and only newly appended text while
+  continuing that chain with `previous_response_id`.
+- The OpenAI adapter enables stored Responses continuation and prompt caching.
+  A `ResetContext` call deliberately abandons the old response chain and sends
+  the rebuilt chatend as a fresh request.
 - `ResetContext` rebuilds the chatend from retained session content and newly
   loaded kweb nodes, so unloaded node content is genuinely absent afterward.
 - Short identifiers never cross the Kweb backend API boundary. The frontend
@@ -80,15 +81,13 @@ The frontend owns:
 - directly loaded nodes and their expanded active connections,
 - durable-ID to short-ID mappings,
 - conversation and history-ingress call budgets,
-- agent tool definitions and tool loops,
+- the transparent text tool protocol and tool loops,
 - prompt composition from system-prompt manuals,
 - the context inspector and memory explorer state.
 
-The context inspector renders a human-readable text projection of the chatend.
-It shows system, conversation, and memory text while omitting structured tool
-calls, provider items, call IDs, and operational diagnostics. It is a view into
-Kennedy's current context, not a provider-payload debugger. LLM-visible Kmap
-context and local tool results use the same readable text formatting.
+The context inspector renders the human-readable chatend, including Kennedy's
+text tool requests and readable tool results. Token, context-window, and cache
+telemetry is displayed separately. Provider IDs and credentials remain hidden.
 
 The frontend has no persistent state. A reload or abrupt close may discard an
 active conversation.
@@ -114,13 +113,14 @@ The intelligence backend owns:
 
 - loading provider credentials and model configuration,
 - validating the normalized generation request,
-- translating normalized messages and tools to the selected provider,
-- translating provider text, tool calls, errors, and usage into one response
-  shape.
+- translating normalized text messages and continuation/cache controls to the
+  selected provider,
+- translating provider text, response IDs, errors, and detailed token usage
+  into one response shape.
 
-It executes no tools and stores no LLM session. The frontend continues a tool
-loop by appending tool calls and results to its chatend and submitting another
-complete generation request.
+It executes no tools and stores no local LLM session. The frontend continues a
+tool loop by appending readable tool requests and results to its chatend and
+submitting the new text against the previous provider response.
 
 ## 5. Session Model
 
@@ -149,8 +149,9 @@ Kennedy may navigate the kweb and create or update knowledge nodes. The current
 provenance identifier is held by the frontend and supplied implicitly when it
 translates CreateNode and UpdateNode tool calls into Kweb API requests.
 
-The session ends when Kennedy returns final text. The text is not shown as a
-chat message. Completing with zero knowledge mutations is valid.
+The session ends when Kennedy returns final text. Live tool requests, results,
+and the completion are shown in the history-ingress activity panel. Completing
+with zero knowledge mutations is valid.
 
 ## 6. Kweb Data Model
 

@@ -88,23 +88,21 @@ current conversation.
 
 ## 5. Chatend Model
 
-The chatend is the exact normalized message sequence submitted to the
-intelligence backend. It contains:
+The chatend is the complete human-readable logical context Kennedy has formed.
+It contains:
 
 - the composed system prompt,
 - the clean conversation transcript,
 - the current Kweb context,
-- tool calls and tool results that remain in context.
+- transparent text tool requests and readable tool results that remain in
+  context.
 
-The frontend submits the entire chatend on every generation request. All
-textual content in that chatend is composed for human readability: system
-instructions are prose sections, Kmap context is YAML-like text, and local tool
-results are readable memory updates rather than serialized JSON.
-
-The chatend also retains structured function-call and provider items required
-by the Responses protocol. Those items are transport bookkeeping, not part of
-the inspector's visualization. The inspector projects only the textual system,
-user, assistant, and memory context that the model reads.
+The frontend submits the entire chatend when starting a provider response
+chain. Later requests use `previous_response_id` and submit only text appended
+after the referenced response. The frontend still retains and displays the
+whole logical chatend. System instructions are prose sections, Kmap context is
+YAML-like text, tool requests are ordinary assistant text, and local tool
+results are readable memory updates.
 
 The clean transcript is maintained separately. It contains only user and final
 Kennedy messages and is the source used to create conversation provenance.
@@ -123,8 +121,24 @@ It then clears loaded Kweb data and short-ID mappings, reloads the user root and
 the supplied nodes, and rebuilds the chatend. Previous Kweb context and tool
 activity are omitted. The clean transcript or provenance input remains.
 During an active tool loop, the rebuilt chatend ends with the assistant's
-ResetContext call and a correlated tool result containing the newly loaded
-context, allowing generation to continue normally.
+visible ResetContext request and a readable result containing the newly loaded
+context. Reset abandons the old `previous_response_id` chain and submits the
+rebuilt chatend as a fresh cached request.
+
+### 5.2 Continuation, caching, and context growth
+
+Conversation and ingress use separate deterministic prompt-cache keys, reused
+across sessions of the same type so unchanged manual prefixes can be shared.
+Append-only generations continue with the latest provider response ID. The
+intelligence backend enables GPT-5.6 implicit prompt caching, so the newest
+message becomes a cache breakpoint and unchanged prefixes remain eligible for
+cache reads.
+
+The frontend aggregates provider-reported input, output, reasoning, cache-read,
+and cache-write tokens. Current context occupancy is the latest request's input
+plus output tokens; remaining capacity is computed from provider model metadata.
+These figures are informative and never trigger compaction, truncation, or an
+automatic reset. Only an explicit ResetContext tool request rebuilds context.
 
 ## 6. Context Glue
 
@@ -182,13 +196,27 @@ already present in the manuals.
 
 ## 8. Agent Tools
 
-The intelligence backend only transports tool calls. The frontend validates
-the tool name and argument shape, resolves short IDs, calls the Kweb API, and
-returns an LLM-visible result.
+All tool names, argument shapes, usage policy, and the request protocol are
+written in the session's system-prompt manual. No provider-native function or
+custom-tool definitions are sent.
+
+Kennedy requests tools using an ordinary assistant response:
+
+```text
+KENNEDY_TOOL_CALLS
+{"calls":[{"name":"LoadNode","arguments":{"identifier":3}}]}
+```
+
+The response must contain only the marker and an object with one non-empty
+`calls` array. Each call has exactly `name` and object-valued `arguments`.
+Multiple calls are allowed and execute sequentially in array order before the
+next generation request. `ResetContext` must be the only call in its response.
+The frontend rejects malformed envelopes and returns a readable protocol error
+so Kennedy can retry.
 
 ### 8.1 `LoadNode`
 
-LLM schema:
+Text-protocol arguments:
 
 ```json
 {
@@ -214,7 +242,7 @@ or resetting a context do not consume that budget.
 
 ### 8.2 `ResetContext`
 
-LLM schema:
+Text-protocol arguments:
 
 ```json
 {
@@ -287,7 +315,8 @@ returns the updated node.
 Unknown tools are never executed. Invalid arguments, exhausted budgets, missing
 short IDs, and backend failures are returned to Kennedy as failed tool results
 with a readable explanation. Machine-readable error codes remain in the
-internal diagnostic tool log but are not included in the chatend visualization.
+internal diagnostic tool log; readable requests and failures appear in the
+chatend visualization.
 
 ## 9. Conversation Flow
 
@@ -308,12 +337,13 @@ explorer remains usable.
 
 1. Append the user message to the clean transcript and chatend.
 2. Set the per-turn LoadNode counter to zero.
-3. Submit the complete chatend, conversation tools, and configured model to
-   `POST /api/v1/generate` on the intelligence backend.
-4. If Kennedy requests tools, append the assistant tool-call message, execute
-   every call sequentially in response order, append correlated tool-result
-   messages, and generate again. State changes from one call are visible to the
-   next call in the same response.
+3. Submit newly appended messages, the previous response ID when available, a
+   stable session-type cache key, and the configured model to the intelligence
+   backend. The first request sends the complete chatend.
+4. If Kennedy emits a tool envelope, append the visible assistant text, execute
+   every call sequentially in array order, append readable result messages, and
+   continue from the returned response ID. State changes from one call are
+   visible to the next call in the same response.
 5. Continue until Kennedy returns final text.
 6. Append final text to the clean transcript and chatend.
 
@@ -342,9 +372,10 @@ conversation's Kweb tool history.
 3. place the provenance data into the retained session content,
 4. load the user root,
 5. set the session LoadNode counter to zero,
-6. generate with all five history-ingress tools,
+6. generate with the ingress manual describing all five tools,
 7. execute tools until Kennedy returns final text,
-8. discard the final text and mark ingress complete.
+8. show live requests, results, and completion in the ingress activity panel,
+   then mark ingress complete.
 
 At most 50 model-requested LoadNode calls are allowed across the whole ingress
 session. Zero CreateNode or UpdateNode calls is valid.
@@ -359,18 +390,22 @@ The left panel contains only:
 - multiline input,
 - Send and End Conversation controls,
 - busy and ingress status,
+- a live, dismissible history-ingress activity panel,
 - visible errors.
 
 Tool calls and internal context never appear in the clean transcript.
 
 ### 11.2 Context Inspector
 
-The right panel is a human-readable visualization of Kennedy's current
-chatend. It renders readable system context, user and Kennedy messages, and
-memory context. Structured function calls, JSON arguments, provider items,
-call IDs, and diagnostic metadata are omitted. Local tool results remain
-visible as readable memory context because their text is part of what the model
-receives. Copy Context copies exactly the displayed text.
+The right panel visualizes Kennedy's current chatend, including system context,
+conversation, transparent JSON tool envelopes, and readable tool results.
+Provider response IDs and credentials are omitted. Copy Context copies exactly
+the displayed text.
+
+Above the inspector, usage cards report current logical context occupancy and
+remaining context window, cumulative input/output/reasoning tokens, request
+count, cache-read tokens and percentage, and cache-write tokens. Values come
+from provider usage rather than client-side token estimates.
 
 ### 11.3 Memory Explorer
 
@@ -404,6 +439,9 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - stable short-ID assignment and reset,
 - seven-direct-load enforcement,
 - conversation and ingress LoadNode budgets,
+- parsing and sequential execution of multiple text tool calls from one round,
+- continuation requests sending only newly appended messages,
+- cache read/write and context-window telemetry aggregation,
 - short-to-durable translation for every tool,
 - chatend rebuilding after ResetContext,
 - clean-transcript serialization,

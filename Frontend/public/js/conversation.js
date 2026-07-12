@@ -1,14 +1,16 @@
 import { Chatend } from "./chatend.js";
 import { KwebContext } from "./kweb_context.js";
 import { composePrompt } from "./prompt_composer.js";
-import { ToolExecutor, toolDefinitions } from "./tools.js";
-import { runAgentLoop } from "./intelligence.js";
+import { ToolExecutor } from "./tools.js";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js";
 
 export class ConversationSession {
-  constructor({ kweb, intelligence, manuals, rootNodeId, provider, model, onUpdate }) {
+  constructor({ kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, onUpdate }) {
     this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals; this.rootNodeId = rootNodeId;
     this.provider = provider; this.model = model; this.onUpdate = onUpdate;
     this.transcript = []; this.startedAt = new Date().toISOString(); this.busy = false;
+    this.continuation = new ContinuationState(createCacheKey("conversation"));
+    this.usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
   }
 
   async initialize() {
@@ -28,7 +30,7 @@ export class ConversationSession {
     this.chatend.append({ role: "user", content });
     this.executor.resetLoadCalls(); this.onUpdate();
     try {
-      const answer = await runAgentLoop({ intelligence: this.intelligence, provider: this.provider, model: this.model, chatend: this.chatend, tools: toolDefinitions("conversation"), executor: this.executor, onUpdate: this.onUpdate });
+      const answer = await runAgentLoop({ intelligence: this.intelligence, provider: this.provider, model: this.model, chatend: this.chatend, executor: this.executor, continuation: this.continuation, usage: this.usage, onUpdate: this.onUpdate });
       this.transcript.push({ role: "kennedy", content: answer });
       this.chatend.retained = this.retainedTranscript();
       return answer;
@@ -37,4 +39,3 @@ export class ConversationSession {
 
   serialize() { return this.transcript.map(item => `${item.role === "kennedy" ? "Kennedy" : "David"}: ${item.content}`).join("\n\n"); }
 }
-
