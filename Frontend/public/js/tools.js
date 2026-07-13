@@ -139,7 +139,7 @@ export class ToolExecutor {
   }
 
   async connectNodes(args) {
-    validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers", 2);
+    this.assertIngress(); validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers", 2);
     const durable = args.identifiers.map(id => this.fullDurable(id));
     const payload = await this.api.connect(durable);
     this.context.refresh(payload.nodes);
@@ -147,7 +147,7 @@ export class ToolExecutor {
   }
 
   async consolidateFanout(args) {
-    validateObject(args, ["parentIdentifier", "aggregatorIdentifier", "fanoutIdentifiers"]);
+    this.assertIngress(); validateObject(args, ["parentIdentifier", "aggregatorIdentifier", "fanoutIdentifiers"]);
     integer(args.parentIdentifier, "parentIdentifier"); integer(args.aggregatorIdentifier, "aggregatorIdentifier");
     integerArray(args.fanoutIdentifiers, "fanoutIdentifiers", 1);
     const parentId = this.fullDurable(args.parentIdentifier);
@@ -159,7 +159,7 @@ export class ToolExecutor {
   }
 
   async assignTask(args) {
-    validateObject(args, ["parentIdentifier", "childIdentifier", "priority"]);
+    this.assertIngress(); validateObject(args, ["parentIdentifier", "childIdentifier", "priority"]);
     integer(args.parentIdentifier, "parentIdentifier");
     if (args.childIdentifier !== "blank") integer(args.childIdentifier, "childIdentifier");
     if (!["high", "medium", "low"].includes(args.priority)) throw Object.assign(new Error("priority must be high, medium, or low."), { code: "invalid_arguments" });

@@ -19,8 +19,7 @@ The MVP has four logical runtime components:
    page retrieval, and normalizes the results. It is stateless between
    requests.
 4. **Conversation history backend**: a Rust HTTP service. It durably checkpoints
-   active browser conversations and owns the state machine requiring history
-   ingress to finish before the next conversation begins.
+   active browser conversations and owns the sequential history-ingress queue.
 
 The three backends are independent library crates compiled into one
 `kennedy-server` executable. The executable starts their listeners but shares
@@ -32,7 +31,8 @@ System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 
 ## 2. Design Principles
 
-- The frontend is the single authority for the current chatend.
+- The frontend is the single authority for each live session's chatend and
+  in-memory draft.
 - The Kweb backend is the single authority for durable memory.
 - The conversation history backend is the single authority for unfinished and
   completed conversation records.
@@ -41,11 +41,11 @@ System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 - The intelligence backend never needs to understand the kweb, short
   identifiers, or Kennedy's text-tool protocol.
 - The frontend owns the complete human-readable chatend. It sends the full
-  chatend when starting a provider chain and only newly appended text while
-  continuing that chain with `previous_response_id`.
-- The OpenAI adapter enables stored Responses continuation and prompt caching.
-  A `ResetContext` call deliberately abandons the old response chain and sends
-  the rebuilt chatend as a fresh request.
+  chatend when starting a Codex thread and only newly appended text while
+  continuing that thread with `previous_response_id`.
+- The Codex adapter uses the machine's ChatGPT-authenticated CLI and resumes
+  persisted Codex threads. A `ResetContext` call deliberately abandons the old
+  thread and sends the rebuilt chatend as a fresh request.
 - `ResetContext` rebuilds the chatend from retained session content and newly
   loaded kweb nodes, so unloaded node content is genuinely absent afterward.
 - Short identifiers never cross the Kweb backend API boundary. The frontend
@@ -60,7 +60,7 @@ System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 One kennedy-server process
   ├─ Kweb API :4321 --------------------- kennedy.sqlite3
   │    └─ serves frontend and manuals
-  ├─ Intelligence API :4322 ------------ remote LLM/search + public web
+  ├─ Intelligence API :4322 ------------ Podman Codex launcher + public web
   └─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
 
 Browser frontend calls all three APIs directly. No backend calls another.
@@ -127,20 +127,20 @@ budgets, or provider APIs.
 
 The intelligence backend owns:
 
-- loading provider credentials and model configuration,
+- validating ChatGPT Codex login and loading model/CLI configuration,
 - validating the normalized generation request,
-- translating normalized text messages and continuation/cache controls to the
-  selected provider,
-- translating provider text, response IDs, errors, and detailed token usage
+- translating normalized text messages and continuation controls into bounded,
+  read-only non-interactive Codex turns,
+- translating Codex text, thread IDs, errors, and detailed token usage
   into one response shape,
-- executing isolated provider-hosted WebSearch research runs,
+- executing isolated Codex WebSearch research runs,
 - safely fetching and extracting bounded text from public pages for WebFetch.
 
 It stores no local LLM session and never parses Kennedy's tool envelopes. The
 normal generation path has no provider tools. The frontend recognizes
 WebSearch and WebFetch text calls, invokes the corresponding intelligence API,
 then appends their readable results to the main conversation chain. Hosted
-search runs are fresh provider requests and cannot alter that chain.
+search runs are fresh ephemeral Codex threads and cannot alter that chain.
 
 ### 4.4 Conversation History Backend
 
@@ -151,30 +151,31 @@ checkpoints, optimistic record versions, and the conversation phase machine:
 active -> ingress_pending -> ingress_in_progress -> complete
 ```
 
-It does not interpret chatends, call the Kweb or intelligence APIs, or validate
-their identifiers. It enforces that only one conversation is unfinished and
-that the next conversation cannot be created until the prior record is
-complete.
+It does not call the Kweb or intelligence APIs or validate their identifiers.
+It permits multiple `active` and `ingress_pending` records while enforcing one
+`ingress_in_progress` record. A user-activity checkpoint also closes other
+active conversations idle for more than 24 hours, unless Kennedy still owes a
+response in that record.
 
 ## 5. Session Model
 
 ### 5.1 Conversation
 
-At conversation start, the frontend creates a fresh transcript and chatend,
-loads the user root node, and assigns short identifiers to every in-context
-node. For each user turn it appends the user message, checkpoints the pending
-query, and only then calls the intelligence backend. It executes allowed tools
-and continues until Kennedy returns final text, then checkpoints the completed
-turn. During conversation Kennedy may delegate a natural-language research
-question through WebSearch or inspect one source through WebFetch; retrieval
-policy and limits remain in the intelligence layer. Only user and Kennedy text
-is added to the clean transcript.
+Each active conversation has its own transcript, chatend, loaded Kmap snapshot,
+Codex thread, and composer draft. The frontend can keep several sessions live
+and switch or create sessions while Kennedy is working in another. For each
+user turn it appends the user message, checkpoints the pending query, and only
+then calls the intelligence backend. Conversation tools are read-only with
+respect to Kmap: `LoadNode`, `ResetContext`, `WebSearch`, and `WebFetch`.
+Only user and Kennedy text is added to the clean transcript.
 
-Ordinary model generations use stored background Responses and poll by
-response ID, so slow reasoning does not depend on one long-lived provider
-connection. If generation or a tool-round checkpoint fails, the frontend
-restores the last durable Chatend and local execution state and retries the
-pending turn from a fresh provider chain.
+Ordinary model generations invoke `codex-safe`, which runs
+`codex exec --json` inside a persistent Podman sandbox with `gpt-5.6-sol` and
+`xhigh`, resuming by Codex thread ID. The child process is bounded by a total
+deadline, uses the ChatGPT login, and cannot use shell/file/internet tools. If
+generation or a tool-round checkpoint fails, the frontend restores the last
+durable Chatend and local execution state and retries the pending turn from a
+fresh Codex thread.
 
 The Kweb portion of the chatend accumulates during the conversation. A
 `ResetContext` call resolves its arguments, removes all Kweb context, resets
@@ -182,36 +183,38 @@ short identifiers, reloads the root and requested nodes, and rebuilds the
 chatend while retaining the clean transcript and the current turn's LoadNode
 counter.
 
-Ending a conversation first transitions its durable record to
-`ingress_pending`. The frontend creates one idempotent data provenance node
-containing the complete conversation Chatend archive, records its opaque ID while transitioning to
-`ingress_in_progress`, and starts history ingress. The record becomes
-`complete` only after ingress succeeds. In parallel, the frontend prepares and
-shows an empty in-memory next session so the user can type. Sending remains
-disabled and the next durable record is created only after ingress completes.
-Completed records and their opaque conversation and history-ingress Chatend
-archives remain queryable for the conversation-history sidebar.
+Explicitly ending a conversation transitions its durable record to
+`ingress_pending`; starting a new conversation does not end existing live ones.
+A successful user-message checkpoint in another conversation also queues active
+records idle for more than 24 hours, except pending Kennedy turns. The frontend
+worker processes queued records oldest-activity-first, creates idempotent data
+provenance from each complete Chatend archive, transitions exactly one record
+to `ingress_in_progress`, and completes it before claiming the next. Live
+conversations remain usable throughout. Completed records and both archives
+remain queryable from the sidebar.
 
 ### 5.2 History Ingress
 
 History ingress uses a separate chatend composed from the Kmap and
 HistoryIngress manuals, the provenance data, and the loaded user root node.
-Kennedy may navigate the kweb, reorganize fanout, manage task slots, and create
-or update knowledge nodes. The current provenance identifier is held by the
+Kennedy may navigate the kweb, connect nodes, reorganize fanout, manage task
+slots, and create or update knowledge nodes. WebSearch and WebFetch are not
+available; ingress must interpret only the archived conversation and Kmap
+material in front of it. The current provenance identifier is held by the
 frontend and supplied implicitly when it translates CreateNode and UpdateNode
 tool calls into Kweb API requests.
 
 The session ends when Kennedy returns final text. Its whole Chatend is
 checkpointed on the owning conversation record after each tool round and at
 completion. Live tool requests, results, and the completion are shown only
-when that record is selected; completed records reconstruct the panel from the
-saved archive. Completing with zero knowledge mutations is valid.
+when that record is selected, appended after its clean transcript in the same
+scrolling flow; completed records reconstruct that continuation from the saved
+archive. Completing with zero knowledge mutations is valid.
 
-At startup an `active` record restores its transcript, directly loaded nodes,
-and pending-turn flag. A pending user query is regenerated from a fresh
-provider chain. An `ingress_pending` or `ingress_in_progress` record resumes
-the ingress workflow while a fresh composer is prepared; input is editable but
-submission remains disabled until the workflow succeeds.
+At startup every `active` record restores its transcript, directly loaded nodes,
+and pending-turn flag. Pending user queries resume from fresh Codex threads.
+Queued ingress resumes independently and sequentially without disabling any
+live composer.
 
 ## 6. Kweb Data Model
 

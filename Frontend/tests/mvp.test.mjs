@@ -87,7 +87,7 @@ test("LoadNode attempts consume the tool budget, including failures", async () =
 test("ConnectNodes translates short IDs to durable IDs", async () => {
   const api = new MockKweb([node(1, [2]), node(2)]);
   const context = new KwebContext(api, id(1)); await context.initialize();
-  const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
+  const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", loadLimit: 20 });
   const result = await executor.execute({ id: "a", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
   assert.match(result.message.content, /Memory connections updated/);
   assert.deepEqual(api.connected, [id(1), id(2)]);
@@ -105,7 +105,7 @@ test("ConsolidateFanout and AssignTask translate short IDs and refresh task conn
     api.assigned = body;
     return { node: body.child_node_id ? node(1, [], [3, 4], [[2, body.priority]]) : node(1, [], [3, 4]), replaced_task: null };
   };
-  const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
+  const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", loadLimit: 20 });
   const consolidated = await executor.execute({ id: "a", name: "ConsolidateFanout", arguments: { parentIdentifier: 1, aggregatorIdentifier: 2, fanoutIdentifiers: [3, 4] } });
   assert.match(consolidated.message.content, /Fanout connections consolidated/);
   assert.deepEqual(api.consolidated, { parent_node_id: id(1), aggregator_node_id: id(2), fanout_node_ids: [id(3), id(4)] });
@@ -137,6 +137,22 @@ test("WebSearch and WebFetch expose only minimal model-facing arguments", async 
   assert.match(search.message.content, /Web research completed/);
   assert.match(search.message.content, /https:\/\/example.com\/guide/);
   assert.match(fetch.message.content, /Readable page content:\n  Page evidence/);
+});
+
+test("live conversations cannot mutate the Kmap", async () => {
+  const api = new MockKweb([node(1, [2]), node(2)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
+  for (const call of [
+    { name: "ConnectNodes", arguments: { identifiers: [1, 2] } },
+    { name: "ConsolidateFanout", arguments: { parentIdentifier: 1, aggregatorIdentifier: 2, fanoutIdentifiers: [2] } },
+    { name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: 2, priority: "high" } },
+    { name: "CreateNode", arguments: { parentIdentifiers: [1], shortName: "Task", shortDescription: "Task.", longDescription: "Task." } },
+    { name: "UpdateNode", arguments: { identifier: 1, newShortName: "Root", newShortDescription: "Root.", newLongDescription: "Root." } },
+  ]) {
+    const result = await executor.execute({ id: call.name, ...call });
+    assert.match(result.message.content, /only available during history ingress/);
+  }
 });
 
 test("web tools reject extra retrieval knobs and remain unavailable during ingress", async () => {
@@ -342,7 +358,14 @@ test("conversation history titles use the first durable user message", () => {
   assert.equal(conversationTitle({ state: { transcript: [] } }), "New conversation");
 });
 
-test("next request stays editable but cannot send during background ingress", () => {
+test("conversation sidebar distinguishes continuable and closed records", async () => {
+  const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
+  assert.match(render, /active: "Live · Continue"/);
+  assert.match(render, /ingress_pending: "Closed · Memory queued"/);
+  assert.match(render, /complete: "Saved · Read only"/);
+});
+
+test("composer stays editable but cannot send during a conversation transition", () => {
   const controls = conversationControlState({
     hasSession: true, sessionBusy: false, transitionBusy: true,
     ingressRequired: true, pendingTurn: false, viewingHistory: false, transcriptLength: 0,
@@ -350,7 +373,7 @@ test("next request stays editable but cannot send during background ingress", ()
   assert.equal(controls.inputDisabled, false);
   assert.equal(controls.sendDisabled, true);
   assert.equal(controls.endDisabled, true);
-  assert.equal(controls.newDisabled, false);
+  assert.equal(controls.newDisabled, true);
 });
 
 test("next message stays editable but cannot send while Kennedy is working", () => {
@@ -361,7 +384,7 @@ test("next message stays editable but cannot send while Kennedy is working", () 
   assert.equal(controls.inputDisabled, false);
   assert.equal(controls.sendDisabled, true);
   assert.equal(controls.endDisabled, true);
-  assert.equal(controls.newDisabled, true);
+  assert.equal(controls.newDisabled, false);
 });
 
 test("history ingress activity belongs only to its selected conversation", () => {
@@ -410,6 +433,7 @@ test("history ingress summary counts only successful memory mutations", () => {
 
 test("conversation checkpoints the pending query before any model request", async () => {
   const events = [];
+  const metadata = [];
   const kweb = new MockKweb([node(1)]);
   const intelligence = { generate: async () => {
     events.push("generate");
@@ -417,11 +441,12 @@ test("conversation checkpoints the pending query before any model request", asyn
   } };
   const session = new ConversationSession({
     kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
-    persist: async state => events.push(state.pendingTurn ? "checkpoint-pending" : "checkpoint-complete"), onUpdate: () => {},
+    persist: async (state, details) => { events.push(state.pendingTurn ? "checkpoint-pending" : "checkpoint-complete"); metadata.push(details); }, onUpdate: () => {},
   });
   await session.initialize();
   await session.send("Saved question");
   assert.deepEqual(events, ["checkpoint-pending", "generate", "checkpoint-complete"]);
+  assert.deepEqual(metadata, [{ userActivity: true }, {}]);
   assert.deepEqual(session.transcript.map(item => item.content), ["Saved question", "Saved answer."]);
 });
 
@@ -593,23 +618,38 @@ test("session manuals enforce exclusive tool-request responses", async () => {
   }
 });
 
-test("Kennedy's manuals expose fanout consolidation and narrowly scoped task assignment", async () => {
+test("only history ingress exposes Kmap mutations and narrowly scoped task assignment", async () => {
   const shared = await readFile(new URL("../SystemPrompts/KmapAgentManual.txt", import.meta.url), "utf8");
   assert.match(shared, /Task connections are reserved for concrete, outstanding work/);
   assert.match(shared, /only when there is a clear need for that task to be completed/);
-  for (const file of ["ConversationAgentManual.txt", "HistoryIngressAgentManual.txt"]) {
-    const manual = await readFile(new URL(`../SystemPrompts/${file}`, import.meta.url), "utf8");
-    assert.match(manual, /ConsolidateFanout\n  Call:/);
-    assert.match(manual, /AssignTask\n  Call:/);
-    assert.match(manual, /only when there is a clear need for concrete work/);
-    assert.match(manual, /Pass the string "blank" as childIdentifier/);
-  }
+  const conversation = await readFile(new URL("../SystemPrompts/ConversationAgentManual.txt", import.meta.url), "utf8");
+  assert.doesNotMatch(conversation, /ConnectNodes\n  Call:/);
+  assert.doesNotMatch(conversation, /ConsolidateFanout\n  Call:/);
+  assert.doesNotMatch(conversation, /AssignTask\n  Call:/);
+  assert.match(conversation, /cannot mutate it/);
+  const ingress = await readFile(new URL("../SystemPrompts/HistoryIngressAgentManual.txt", import.meta.url), "utf8");
+  assert.match(ingress, /ConsolidateFanout\n  Call:/);
+  assert.match(ingress, /AssignTask\n  Call:/);
+  assert.match(ingress, /only when there is a clear need for concrete work/);
+  assert.match(ingress, /Pass the string "blank" as childIdentifier/);
 });
 
-test("history ingress starts at the top without a sticky usage row", async () => {
+test("transcript rerenders follow only readers already at the bottom", async () => {
+  const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
+  assert.match(render, /wasAtBottom = container\.scrollHeight - container\.clientHeight - container\.scrollTop <= 1/);
+  assert.match(render, /container\.scrollTop = wasAtBottom \? container\.scrollHeight : previousTop/);
+});
+
+test("history ingress is an inline continuation with no independent scroller", async () => {
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/css/styles.css", import.meta.url), "utf8");
-  assert.match(render, /renderIngressActivity[\s\S]*?container\.scrollTop = 0/);
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(render, /renderTranscript\(container, transcript, ingressActivity = null\)/);
+  assert.match(render, /renderIngressActivity\(container, ingressActivity\.diagnostic, ingressActivity\.active\)[\s\S]*?container\.scrollTop = wasAtBottom \? container\.scrollHeight : previousTop/);
+  assert.match(styles, /\.ingress-continuation\s*\{/);
+  assert.equal(styles.includes(".ingress-panel"), false);
+  assert.equal(styles.includes(".ingress-log"), false);
+  assert.equal(html.includes('id="ingress-panel"'), false);
   assert.equal(/\.ingress-usage\s*\{[^}]*position:\s*sticky/s.test(styles), false);
 });
 

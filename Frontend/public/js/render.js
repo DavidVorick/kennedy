@@ -28,12 +28,16 @@ function appendLinkedText(container, text) {
   container.append(document.createTextNode(text.slice(cursor)));
 }
 
-export function renderTranscript(container, transcript) {
+export function renderTranscript(container, transcript, ingressActivity = null) {
+  const previousTop = container.scrollTop;
+  const wasAtBottom = container.scrollHeight - container.clientHeight - container.scrollTop <= 1;
   container.replaceChildren();
-  if (!transcript.length) {
+  if (!transcript.length && !ingressActivity?.diagnostic) {
     const empty = element("div", "empty-state");
     empty.append(element("p", "empty-title", "What are we working on?"), element("p", "", "Kennedy can help directly and draw on your local memory when it matters."));
-    container.append(empty); return;
+    container.append(empty);
+    container.scrollTop = wasAtBottom ? container.scrollHeight : previousTop;
+    return;
   }
   for (const item of transcript) {
     const message = element("article", `message ${item.role === "kennedy" ? "assistant" : "user"}`);
@@ -41,7 +45,10 @@ export function renderTranscript(container, transcript) {
     message.append(element("span", "role", item.role === "kennedy" ? "Kennedy" : "You"), body);
     container.append(message);
   }
-  container.scrollTop = container.scrollHeight;
+  if (ingressActivity?.diagnostic) {
+    renderIngressActivity(container, ingressActivity.diagnostic, ingressActivity.active);
+  }
+  container.scrollTop = wasAtBottom ? container.scrollHeight : previousTop;
 }
 
 export function conversationTitle(record, limit = 54) {
@@ -68,21 +75,28 @@ export function renderConversationHistory(container, records, { selectedId = nul
     button.type = "button";
     button.setAttribute("aria-pressed", String(record.id === selectedId));
     const meta = element("span", "history-item-meta");
-    const phase = record.phase === "complete" ? "Saved" : record.phase.replaceAll("_", " ");
-    meta.append(element("span", "history-phase", phase), element("time", "", historyDate(record.started_at)));
+    const phases = {
+      active: "Live · Continue",
+      ingress_pending: "Closed · Memory queued",
+      ingress_in_progress: "Closed · Updating memory",
+      complete: "Saved · Read only",
+    };
+    const phase = phases[record.phase] || record.phase.replaceAll("_", " ");
+    const status = element("span", `history-phase ${record.phase === "active" ? "live" : "closed"}`, phase);
+    status.setAttribute("aria-label", phase);
+    meta.append(status, element("time", "", historyDate(record.started_at)));
     button.append(element("span", "history-item-title", conversationTitle(record)), meta);
     button.addEventListener("click", () => onSelect(record.id));
     container.append(button);
   }
 }
 
-export function conversationControlState({ hasSession, sessionBusy, transitionBusy, ingressRequired, pendingTurn, viewingHistory, transcriptLength }) {
-  const busy = sessionBusy || transitionBusy;
+export function conversationControlState({ hasSession, sessionBusy, transitionBusy, pendingTurn, viewingHistory, transcriptLength }) {
   return {
     inputDisabled: viewingHistory || !hasSession,
-    sendDisabled: busy || ingressRequired || pendingTurn || viewingHistory || !hasSession,
-    endDisabled: busy || viewingHistory || !hasSession || (!ingressRequired && !pendingTurn && !transcriptLength),
-    newDisabled: sessionBusy || pendingTurn,
+    sendDisabled: sessionBusy || transitionBusy || pendingTurn || viewingHistory || !hasSession,
+    endDisabled: sessionBusy || transitionBusy || viewingHistory || !hasSession || (!pendingTurn && !transcriptLength),
+    newDisabled: transitionBusy,
   };
 }
 
@@ -283,8 +297,16 @@ function renderMemoryTree(container, snapshot) {
 }
 
 export function renderIngressActivity(container, diagnostic, active) {
-  container.replaceChildren();
-  container.scrollTop = 0;
+  const continuation = element("section", "ingress-continuation");
+  continuation.setAttribute("aria-label", active ? "History ingress in progress" : "Completed history ingress");
+  const heading = element("div", "ingress-heading");
+  const headingText = element("div");
+  headingText.append(
+    element("span", "eyebrow", "MEMORY UPDATE"),
+    element("strong", "", active ? "History ingress · live" : "History ingress · complete"),
+  );
+  heading.append(headingText);
+  continuation.append(heading);
   const summary = ingressMutationSummary(diagnostic);
   const review = element("section", "ingress-summary");
   review.setAttribute("aria-label", "History ingress memory changes");
@@ -300,10 +322,10 @@ export function renderIngressActivity(container, diagnostic, active) {
     counts.append(item);
   }
   review.append(counts);
-  container.append(review);
+  continuation.append(review);
   const usage = diagnostic?.usage?.snapshot?.();
   if (usage?.requests) {
-    container.append(element(
+    continuation.append(element(
       "p",
       "ingress-usage",
       `${usage.requests} request${usage.requests === 1 ? "" : "s"} · ${tokenCount(usage.totalInputTokens)} input · ${tokenCount(usage.totalCachedTokens)} cache reads · ${tokenCount(usage.totalCacheWriteTokens)} cache writes`,
@@ -313,14 +335,16 @@ export function renderIngressActivity(container, diagnostic, active) {
     message.role === "assistant" || message.display_role === "Memory tool result" || message.display_role === "Tool protocol error"
   );
   if (!visible.length) {
-    container.append(element("p", "ingress-empty", active ? "Kennedy is preparing the history-ingress context…" : "No ingress activity was recorded."));
+    continuation.append(element("p", "ingress-empty", active ? "Kennedy is preparing the history-ingress context…" : "No ingress activity was recorded."));
+    container.append(continuation);
     return;
   }
   for (const message of visible) {
     const item = element("article", "ingress-entry");
     item.append(element("span", "role", message.display_role || "Kennedy"), element("pre", "ingress-body", message.content));
-    container.append(item);
+    continuation.append(item);
   }
+  container.append(continuation);
 }
 
 export function showError(banner, message) { banner.textContent = message; banner.classList.remove("hidden"); }

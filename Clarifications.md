@@ -25,10 +25,14 @@ canonical documents; this file is not an append-only log.
 
 ## Tools and Provider Execution
 
-- Use the OpenAI Responses API. Kennedy's Kweb tools are local operations
-  requested through the ordinary, human-visible text protocol defined in the
-  system-prompt manuals; do not use provider-native function or custom-tool
-  APIs.
+- Use the ChatGPT-authenticated Codex CLI, so Kennedy consumes Codex
+  subscription limits rather than a billed
+  OpenAI API key. On this deployment, invoke it only through the host's
+  `codex-safe` launcher in `/home/user/podman`; that launcher keeps Codex in the
+  same persistent Podman sandbox rather than installing or invoking Codex on
+  the host. Keep `gpt-5.6-sol` with `xhigh` reasoning. Kennedy's Kweb
+  tools remain ordinary, human-visible text protocol rather than provider-native
+  function or custom-tool APIs.
 - A Kennedy response may request multiple tools. Execute them sequentially in
   written order and return readable results to the model.
 - Treat tool-request output as an exclusive response mode: the marker must be
@@ -40,29 +44,30 @@ canonical documents; this file is not an append-only log.
   geography, freshness, domains, result counts, and research depth are not tool
   arguments; Kennedy states relevant constraints naturally and the intelligence
   layer manages retrieval policy and budgets.
-- Continue append-only conversation and history-ingress rounds using provider
-  response IDs and stable prompt-cache keys. `ResetContext` starts a fresh
-  provider chain with Kennedy's rebuilt logical context.
-- Run ordinary Kennedy generations in stored Responses API background mode and
-  poll them to a terminal state, so slow first-turn or cold-start reasoning is
-  not lost to a long-lived provider HTTP connection or one transient retrieval
-  failure.
-- Use prompt caching where economically sensible. Do not automatically compact
-  or reset context; resets remain under user or Kennedy control.
+- Continue append-only conversation and history-ingress rounds using Codex
+  thread IDs. `ResetContext` starts a fresh Codex thread with Kennedy's rebuilt
+  logical context.
+- Run ordinary Kennedy generations through `codex-safe` and non-interactive
+  `codex exec` under a bounded deadline, read-only sandbox, no approval prompts,
+  and no shell/file tools. Give only the dedicated WebSearch run internet access.
+- Reuse Codex threads and report cache reads where Codex exposes them. Do not
+  automatically compact or reset context; resets remain under user or Kennedy
+  control.
 - Return actionable, sanitized provider errors, including request IDs when
   useful, without exposing credentials or other sensitive provider data.
 
 ## Frontend Behavior
 
-- History-ingress activity starts scrolled to its summary at the top, and its
-  usage row scrolls normally instead of remaining sticky.
+- History-ingress activity is appended after its conversation transcript in
+  the same scroll container, as a natural continuation rather than an overlay
+  or independently scrolling panel. Its header and usage row are ordinary
+  content that can be scrolled past.
 - Keep the message composer editable while Kennedy is generating or running
   tools so the user can draft the next message, but keep Send disabled until
   Kennedy completes the current turn.
-- Persist the active conversation through a conversation-history backend.
-  Checkpoint each user query before any LLM request, restore unfinished work on
-  startup, and durably require history ingress to finish before a new
-  conversation may begin.
+- Persist every active conversation through a conversation-history backend.
+  Checkpoint each user query before any LLM request and restore unfinished work
+  on startup.
 - Persist the entire structured Chatend, not only clean dialog: system prompts,
   retained messages, loaded memory, tool requests/results, counters, usage, and
   future serializable media blocks or attachment references. Use a versioned
@@ -74,20 +79,19 @@ canonical documents; this file is not an append-only log.
   happen to be compiled into and hosted by one Rust binary for operational
   convenience; the frontend and architecture otherwise treat them as if they
   were unrelated processes.
-- Show live history-ingress tool requests and results in the conversation UI
-  so the user can follow memory updates.
+- Show live history-ingress tool requests and results inline after the owning
+  conversation so the user can follow memory updates in one continuous scroll.
 - Store the complete history-ingress Chatend on its owning conversation record.
-  Show live or archived ingress activity only when that conversation is
-  selected; never carry the completed-ingress panel into the prepared new chat.
+  Show live or archived ingress activity only when that closed conversation is
+  selected; never carry it into another live chat.
 - At the top of each live or archived history-ingress review, summarize the
   number of successfully added nodes, successfully updated nodes, and
   successful `ConnectNodes` calls. Do not count failed tool attempts.
 - Show durable conversation history in a sidebar and allow completed
   transcripts to be reopened read-only.
-- When a conversation ends, switch immediately to an editable empty composer
-  and run required history ingress in the background. Keep Send disabled and
-  defer creation of the next durable conversation until ingress succeeds, then
-  preserve and unlock whatever next request the user has already drafted.
+- When a conversation ends, select another live conversation or create one,
+  and run required history ingress sequentially in the background without
+  disabling live chat.
 - Serve the local frontend without reusable browser caching and version its
   entry assets so HTML and JavaScript revisions cannot be mixed.
 - Surface startup exceptions as visible failures instead of leaving the UI
@@ -98,7 +102,41 @@ canonical documents; this file is not an append-only log.
 - Existing Kweb databases require no schema migration or task backfill. Nodes
   without explicitly assigned task connections behave as though their task
   list is empty.
-- Teach Kennedy `ConsolidateFanout` and `AssignTask` in both session manuals.
+- Teach Kennedy `ConsolidateFanout` and `AssignTask` in history ingress only.
   A task connection is justified only by a clear need for concrete work to be
   completed; ordinary relationships, vague possibilities, and completed work
   do not belong in task slots.
+
+## Concurrent Conversations and Serialized Memory
+
+- Superseding the earlier single-unfinished-conversation behavior, allow any
+  number of durable live conversations. The user can switch among them and
+  create a new one even while Kennedy is responding in another; preserve one
+  unsent in-memory draft per live conversation.
+- Conversation sessions are read-only with respect to the Kmap. Their complete
+  tool set is `LoadNode`, `ResetContext`, `WebSearch`, and `WebFetch`.
+  `ConnectNodes`, `ConsolidateFanout`, `AssignTask`, `CreateNode`, and
+  `UpdateNode` are history-ingress-only. This supersedes the earlier decision
+  to teach the mutation tools in both manuals.
+- History ingress cannot use `WebSearch` or `WebFetch`; it must process the
+  archived conversation and Kmap context already in front of it.
+- Explicit End closes a conversation immediately. Also close a conversation
+  after more than 24 hours without a user message only when the user
+  successfully sends in another conversation. Do not treat viewing, switching,
+  or typing as activity, and never time out a turn Kennedy has not answered.
+- Queue closed conversations oldest-user-activity-first and run history ingress
+  sequentially, with at most one Kmap-mutating ingress session at a time. Live
+  conversation reads remain available during Kmap updates.
+- Mark sidebar records clearly as live/continuable or closed/read-only.
+- On startup, idempotently remove the obsolete singleton-conversation index
+  even from databases already marked migration v2; an early v2 build could
+  recreate that index after the version advanced.
+- On transcript rerenders, follow new content only if the reader was already at
+  the bottom. Otherwise preserve the exact scroll offset so status/tool updates
+  do not interrupt reading.
+
+## Web Search Recovery
+
+- Treat a completed hosted-search answer as successful even when the provider
+  returns only a URL-less live-data feed (such as time, weather, finance, or
+  sports). Preserve and display HTTP(S) citations whenever they are present.

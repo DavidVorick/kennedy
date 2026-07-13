@@ -59,29 +59,26 @@ Live application state is held in JavaScript memory:
 
 ```js
 {
-  mode: "conversation", // conversation | ingesting | explorer
-  transcript: [],       // user and Kennedy text only
-  chatend: [],           // complete normalized LLM messages
-  context: {
-    loadedNodeIds: [],   // directly loaded durable IDs; root included
-    fullNodeIds: new Set(),
-    nodesById: new Map(),
-    shortToDurable: new Map(),
-    durableToShort: new Map(),
-    nextShortId: 1
+  selectedConversationId: null,
+  historyRecords: [],
+  liveSessions: new Map(), // durable ID -> independent ConversationSession
+  drafts: new Map(),       // durable ID -> unsent composer text
+  ingressWorker: {
+    running: false,
+    activeRecord: null,
+    diagnostic: null
   },
-  loadCalls: 0,
-  conversationStartedAt: null,
-  currentProvenanceId: null,
-  toolLog: [],
   explorer: {
     currentNodeId: null,
     back: [],
     forward: []
-  },
-  busy: false
+  }
 }
 ```
+
+Each `ConversationSession` owns its clean transcript, complete Chatend, Kweb
+context and short-ID maps, LoadNode counter, tool log, usage, continuation,
+start time, pending-turn flag, and busy state.
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. Instead it checkpoints an opaque recovery snapshot to
@@ -95,15 +92,15 @@ response IDs and credentials are transport details and are not archived.
 The archive never projects message `content` to text. Arrays and objects are
 preserved recursively, so future multimodal content blocks survive storage
 even before every inspector has a renderer for that media type. Active records
-restore the exact archived Chatend on a fresh provider chain. Legacy
+restore the exact archived Chatend on a fresh Codex thread. Legacy
 transcript-only snapshots remain readable and recover through the old rebuild
 path.
 
-It also loads all durable records for the conversation-history sidebar. A
-selected completed record is a read-only transcript view. While required
-history ingress runs, an empty next-session object may exist only in memory;
-its composer is editable, but it cannot be checkpointed or submitted until the
-backend permits creation of the next active record.
+It loads all durable records for the conversation-history sidebar and keeps a
+`ConversationSession` plus an independent in-memory composer draft for every
+active record. The user may switch freely among active sessions or create a
+new one while Kennedy is working elsewhere. Closed records are read-only.
+Draft text is not durable until submitted.
 
 ## 5. Chatend Model
 
@@ -116,9 +113,9 @@ It contains:
 - transparent text tool requests and readable tool results that remain in
   context.
 
-The frontend submits the entire chatend when starting a provider response
-chain. Later requests use `previous_response_id` and submit only text appended
-after the referenced response. The frontend still retains and displays the
+The frontend submits the entire chatend when starting a Codex thread. Later
+requests use `previous_response_id` as the Codex thread ID and submit only text
+appended after the referenced response. The frontend still retains and displays the
 whole logical chatend. System instructions are prose sections, Kmap context is
 YAML-like text, tool requests are ordinary assistant text, and local tool
 results are readable memory updates.
@@ -142,17 +139,16 @@ the supplied nodes, and rebuilds the chatend. Previous Kweb context and tool
 activity are omitted. The clean transcript or provenance input remains.
 During an active tool loop, the rebuilt chatend ends with the assistant's
 visible ResetContext request and a readable result containing the newly loaded
-context. Reset abandons the old `previous_response_id` chain and submits the
-rebuilt chatend as a fresh cached request.
+context. Reset abandons the old `previous_response_id` thread and submits the
+rebuilt chatend as a fresh request.
 
 ### 5.2 Continuation, caching, and context growth
 
-Conversation and ingress use separate deterministic prompt-cache keys, reused
-across sessions of the same type so unchanged manual prefixes can be shared.
-Append-only generations continue with the latest provider response ID. The
-intelligence backend enables GPT-5.6 implicit prompt caching, so the newest
-message becomes a cache breakpoint and unchanged prefixes remain eligible for
-cache reads.
+Conversation and ingress retain separate deterministic cache-key fields in the
+frontend/backend contract, but the Codex runtime manages caching through its
+threads and does not consume those keys. Append-only generations continue with
+the latest Codex thread ID, keeping unchanged prefixes eligible for Codex cache
+reads.
 
 The frontend aggregates provider-reported input, output, reasoning, cache-read,
 and cache-write tokens. Current context occupancy is the latest request's input
@@ -287,6 +283,9 @@ complete newly loaded Kweb context.
 
 ### 8.3 `ConnectNodes`
 
+Available only during history ingress. Live conversation execution rejects it
+even if an older prompt or malformed model response requests it.
+
 LLM schema:
 
 ```json
@@ -304,6 +303,8 @@ records. The tool result reports the updated in-context node shapes.
 
 ### 8.4 `ConsolidateFanout`
 
+Available only during history ingress.
+
 ```json
 {
   "parentIdentifier": 2,
@@ -318,6 +319,8 @@ known fanout summaries. The frontend resolves them and calls
 nodes refresh the context.
 
 ### 8.5 `AssignTask`
+
+Available only during history ingress.
 
 ```json
 {
@@ -419,15 +422,14 @@ chatend visualization.
 2. Check all three backend health endpoints.
 3. Fetch `GET /api/v1/providers` from the intelligence backend.
 4. Fetch `GET /api/v1/user`.
-5. Fetch `GET /api/v1/conversations` for the sidebar and
-   `GET /api/v1/conversations/current` for recovery.
-6. If there is no unfinished record, initialize an empty session and create
-   its durable `active` record.
-7. If the record is `active`, restore its transcript and directly loaded Kweb
-   nodes. A saved pending query is resumed from a fresh provider chain.
-8. If the record requires ingress, prepare an editable in-memory next composer
-   and resume Section 10; keep Send disabled until the next durable record can
-   be created.
+5. Fetch `GET /api/v1/conversations` for the sidebar.
+6. Restore every `active` record as an independently continuable session. Resume
+   each saved pending query from a fresh Codex thread, including in the
+   background when another conversation is selected.
+7. Select the most recently updated active record, or create a new durable
+   active record if none exists.
+8. Start the sequential history-ingress worker for the queue without blocking
+   any active conversation.
 
 If the intelligence backend is unavailable, chat is disabled but the memory
 explorer remains usable.
@@ -437,7 +439,8 @@ explorer remains usable.
 1. Append the user message to the clean transcript and chatend.
 2. Set the per-turn LoadNode counter to zero.
 3. Checkpoint the pending query and recovery snapshot through the conversation
-   history API. If this fails, do not contact the LLM.
+   history API with `user_activity: true`. If this fails, do not contact the
+   LLM. The backend may atomically time out other eligible idle conversations.
 4. Submit newly appended messages, the previous response ID when available, a
    stable session-type cache key, and the configured model to the intelligence
    backend. The first request sends the complete chatend.
@@ -463,29 +466,34 @@ The UI remains in a busy state for the entire tool loop.
 
 ### 9.3 End
 
-When the user ends the conversation or starts a new one:
+Starting a new conversation simply creates another durable active record and
+selects it; it does not end or block any existing live conversation. When the
+user explicitly ends the selected conversation:
 
-1. stop accepting input for the old conversation and immediately expose an
-   empty next-conversation composer,
-2. allow drafting in that composer while keeping Send disabled,
-3. atomically checkpoint the old conversation's final state and transition the
+1. atomically checkpoint its final state and transition the
    history record from `active` to `ingress_pending`,
-4. serialize the complete versioned Chatend archive, including structured
+2. remove it from the set of continuable sessions and select another live
+   conversation, or create one if none remains,
+3. serialize the complete versioned Chatend archive, including structured
    system, memory, tool, and media-capable message content,
-5. create or retrieve a Kweb provenance node using source `conversation`, the
+4. let the serialized ingress worker create or retrieve Kweb provenance using
+   source `conversation`, the
    conversation start time, and idempotency key `conversation:{conversation_id}`,
-6. store the returned opaque provenance ID while transitioning the history
+5. store the returned opaque provenance ID while transitioning the history
    record to `ingress_in_progress`,
-7. run history ingress using that provenance ID in the background and
+6. run history ingress using that provenance ID in the background and
    checkpoint its complete Chatend after every tool round,
-8. only after success transition the history record to `complete`,
-9. create the already-visible fresh conversation's durable record and enable
-   Send without clearing text the user drafted during ingress.
+7. only after success transition the history record to `complete`, then claim
+   the next queued record.
 
-Any failure leaves the unfinished record retryable and keeps submission
-disabled while preserving the editable next-request draft. Reloading the UI or
-pressing Retry Memory Update resumes from the durable phase; an unsubmitted
-in-memory draft is not durable across a reload.
+Any failure leaves the queued record retryable and does not disable live
+conversation submission. A same-origin browser lock and the backend's unique
+in-progress invariant prevent concurrent tabs from running two ingress workers.
+
+An active conversation also moves to `ingress_pending` when it has been idle
+for more than 24 hours and the user successfully sends a message in a different
+conversation. Merely viewing or typing does not trigger expiry, and Kennedy's
+pending response is never timed out.
 
 ## 10. History-Ingress Flow
 
@@ -497,9 +505,11 @@ conversation's Kweb tool history.
 3. place the provenance data into the retained session content,
 4. load the user root,
 5. set the session LoadNode counter to zero,
-6. generate with the ingress manual describing all seven available tools,
+6. generate with the ingress manual describing the memory navigation and
+   mutation tools; WebSearch and WebFetch are unavailable,
 7. execute tools until Kennedy returns final text,
-8. show live requests, results, and completion in the ingress activity panel,
+8. append live requests, results, and completion after the clean transcript in
+   the same scroll container,
 9. mark the conversation history record complete.
 
 At most 50 model-requested LoadNode calls are allowed across the whole ingress
@@ -514,28 +524,27 @@ The left panel contains only:
 - user and Kennedy messages,
 - multiline input,
 - Send and End Conversation controls,
-- a Retry Memory Update state when durable ingress is unfinished,
-- busy and ingress status,
-- a live, dismissible history-ingress activity panel,
+- a Retry Saved Query state when a durable user turn needs to resume,
+- per-conversation busy status,
+- inline history-ingress activity after a closed conversation,
 - visible errors.
 
 Tool calls and internal context never appear in the clean transcript.
 
 A separate left sidebar lists all durable conversations. Each entry derives a
-short title from its first user message, shows its phase and date, and opens the
-saved clean transcript read-only. A New control returns to or prepares the live
-conversation.
+short title from its first user message, shows its phase/date and a clear live
+or closed indicator. Selecting a live entry restores its draft and continuable
+session; selecting a closed entry opens its clean transcript read-only. New
+always creates and selects another durable live conversation.
 
-The history-ingress activity panel belongs to the conversation record that
-created it. It is hidden while the prepared next conversation is selected.
-Selecting an in-progress record shows its live ingress; selecting any completed
-record reconstructs that record's saved ingress panel from its archived
-history-ingress Chatend. The top of the panel summarizes successful memory
-mutations with counts for nodes added (`CreateNode`), nodes updated
-(`UpdateNode`), and `ConnectNodes` calls. Failed tool attempts do not increment
-these totals. Whenever the panel is rendered it starts scrolled to that summary
-at the top. Its usage row scrolls with the rest of the activity rather than
-sticking to the viewport edge.
+History-ingress activity belongs to the conversation record that created it
+and is hidden while a live conversation is selected. Selecting an in-progress
+or completed record reconstructs its live or archived ingress after the clean
+transcript. There is no overlay, second scrollbar, sticky row, or dismissible
+panel: the memory-update heading, mutation summary, usage, and activity are
+ordinary continuation content in the transcript's scrolling flow. The summary
+counts successful `CreateNode`, `UpdateNode`, and `ConnectNodes` calls; failed
+attempts do not increment the totals.
 
 ### 11.2 Context Inspector
 
@@ -582,9 +591,11 @@ The explorer does not edit durable data.
 - Insert untrusted text with `textContent`, never `innerHTML`.
 - Keep the composer editable while generation, a tool loop, or a pending
   restored query is active so the user can draft their next message. Keep Send
-  disabled until Kennedy has responded and the current turn is complete. During
-  required history ingress, likewise keep the next composer editable but
-  disable submission until the next durable record exists.
+  disabled until Kennedy has responded and the current turn is complete.
+- Preserve transcript scroll position across rerenders unless the reader was
+  already at the bottom; only bottom-following readers track new content.
+- Keep a per-live-conversation draft while switching sessions, and show a clear
+  `Live · Continue` versus closed/read-only status in the sidebar.
 - Preserve the diagnostic record of failed calls.
 - Display backend error messages without exposing stack traces.
 - Use semantic controls and visible keyboard focus.
@@ -608,8 +619,8 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - checkpoint-before-generation ordering and pending-query recovery,
 - lossless full-Chatend persistence, including structured media content,
 - response-sized tool-round checkpoints and exact Chatend recovery,
-- durable ingress gating before new-conversation creation,
-- editable next-request drafting during background ingress,
+- unrestricted new-conversation creation while other sessions remain live,
+- editable next-request drafting during Kennedy work and background ingress,
 - conversation-history titles and read-only transcript selection,
 - per-conversation live and archived history-ingress activity,
 - HTML escaping,

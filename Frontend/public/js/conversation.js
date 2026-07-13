@@ -1,7 +1,7 @@
 import { Chatend } from "./chatend.js?v=20260713.6";
 import { KwebContext } from "./kweb_context.js?v=20260713.6";
 import { composePrompt } from "./prompt_composer.js?v=20260713.6";
-import { ToolExecutor } from "./tools.js?v=20260713.6";
+import { ToolExecutor } from "./tools.js?v=20260713.7";
 import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260713.6";
 
 function jsonCopy(value) {
@@ -92,8 +92,8 @@ export class ConversationSession {
     };
   }
 
-  async persistSnapshot(state = this.snapshot()) {
-    await this.persist(state);
+  async persistSnapshot(state = this.snapshot(), metadata = {}) {
+    await this.persist(state, metadata);
     this.durableState = jsonCopy(state);
   }
 
@@ -152,7 +152,7 @@ export class ConversationSession {
     this.chatend.append({ role: "user", content });
     this.executor.resetLoadCalls(); this.onUpdate();
     try {
-      await this.persistSnapshot();
+      await this.persistSnapshot(this.snapshot(), { userActivity: true });
       this.pendingCheckpointed = true;
       return await this.runPendingTurn();
     } finally { this.busy = false; this.onUpdate(); }
@@ -163,7 +163,7 @@ export class ConversationSession {
     this.busy = true; this.onUpdate();
     try {
       if (!this.pendingCheckpointed) {
-        await this.persistSnapshot();
+        await this.persistSnapshot(this.snapshot(), { userActivity: true });
         this.pendingCheckpointed = true;
       }
       return await this.runPendingTurn();

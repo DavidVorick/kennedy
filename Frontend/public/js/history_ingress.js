@@ -1,7 +1,7 @@
 import { Chatend } from "./chatend.js?v=20260713.6";
 import { KwebContext } from "./kweb_context.js?v=20260713.6";
 import { composePrompt } from "./prompt_composer.js?v=20260713.6";
-import { ToolExecutor } from "./tools.js?v=20260713.6";
+import { ToolExecutor } from "./tools.js?v=20260713.7";
 import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260713.6";
 
 function jsonCopy(value) {

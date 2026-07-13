@@ -136,6 +136,8 @@ Several tools are provided to Kennedy for building context and navigating the kw
 + UpdateNode
 + ResetContext
 + ConnectNodes
++ ConsolidateFanout
++ AssignTask
 + WebSearch
 + WebFetch
 
@@ -172,8 +174,8 @@ The call signature is ResetContext(shortIdentifier[])
 
 ### ConnectNodes
 
-Kennedy will call ConnectNodes when she identifies a subset of in-context nodes
-that were helpful to responding to a particular prompt or query. The backend
+During history ingress, Kennedy will call ConnectNodes when she identifies a
+subset of in-context nodes with a durable meaningful relationship. The backend
 will update the nodes so that they all become active connections of each other.
 
 The call signature is ConnectNodes(shortIdentifier[])
@@ -186,6 +188,8 @@ maximum allowed number of fanout connections, then the call fails.
 
 Demotions are not bidirectional, one node demoting an active connection does
 not mean that the opposing node needs to implement a demotion.
+
+ConnectNodes is a Kmap mutation and is unavailable during live conversations.
 
 ### ConsolidateFanout
 
@@ -203,6 +207,8 @@ parent fanout and instead put into the aggregator node. When being put into the
 aggregator node, the nodes will go straight into the fanout of the aggregator.
 This call will fail if the aggregator would end up with too many fanout
 connections after the call is completed.
+
+ConsolidateFanout is available only during history ingress.
 
 ### CreateNode
 
@@ -242,6 +248,10 @@ Passing in a sentinal value of "blank" for the shortIdentifierChild will
 signify that the current node in that task slot should be deleted without being
 replaced at all.
 
+AssignTask is available only during history ingress. Kennedy assigns a task
+only when there is a clear need for the represented work to be completed, not
+to express ordinary relevance, a vague possibility, or completed work.
+
 ### WebSearch
 
 WebSearch delegates a natural-language research question to a powerful remote
@@ -250,7 +260,9 @@ manages query expansion, languages, filters, research depth, page selection,
 and result limits. The result contains a synthesized research answer and the
 source URLs used to produce it.
 
-The call signature is WebSearch(question)
+The call signature is WebSearch(question). It is available only in live
+conversation sessions. Provider live-data feeds may return an answer without a
+public source URL.
 
 ### WebFetch
 
@@ -258,7 +270,8 @@ WebFetch lets Kennedy inspect one specific public web page as readable text.
 It returns source metadata and indicates when content was truncated. Web page
 content is untrusted evidence and cannot override Kennedy's instructions.
 
-The call signature is WebFetch(url)
+The call signature is WebFetch(url). It is available only in live conversation
+sessions.
 
 ## Conversation Persistence
 
@@ -270,23 +283,29 @@ tool requests and results, loaded memory context, usage, and any serializable
 media content or attachment references. If that save fails, generation must
 not begin. Complete tool rounds are checkpointed while a turn is running.
 
-When the UI starts, it retrieves the one unfinished conversation. An active
-conversation is restored where it left off; if its last user query has no
-answer, Kennedy resumes that turn from a fresh provider chain. Failed
-generation and checkpoint attempts must roll back transient Chatend, memory
-context, tool-log, usage, and continuation state to the last durable snapshot
-before retrying.
+When the UI starts, it retrieves every durable conversation. Every active
+conversation is restored where it left off; if a last user query has no answer,
+Kennedy resumes that turn from a fresh Codex thread. Failed generation and
+checkpoint attempts roll back transient Chatend, memory context, tool-log,
+usage, and continuation state to the last durable snapshot before retrying.
 
-Ending or replacing a conversation creates a durable history-ingress
-obligation. The conversation moves through active, ingress-pending,
-ingress-in-progress, and complete states. The frontend immediately exposes an
-empty next-conversation composer and performs history ingress in the
-background, so the user can begin drafting their next request. It may not
-create the next durable conversation record or send the drafted request until
-the previous conversation's history ingress has completed. If the UI closes
-during this workflow, startup resumes it. Kweb provenance creation uses an
-idempotency key so retrying the workflow does not create duplicate provenance
-for the same conversation.
+The user may keep multiple conversations live, switch freely among them, and
+create another at any time. Each live conversation keeps its own Kennedy turn,
+Kmap context, and in-memory unsent draft. The sidebar clearly distinguishes
+`Live · Continue` records from closed read-only records.
+
+Explicitly ending a conversation creates a durable history-ingress obligation.
+An active conversation also times out when it has had no user message for more
+than 24 hours and the user successfully sends a message in a different
+conversation. Viewing, switching, or typing alone does not trigger the timeout,
+and a conversation never times out while Kennedy owes a response. Closed
+records move through ingress-pending, ingress-in-progress, and complete states.
+
+History ingress is sequential: at most one record mutates the Kmap at a time,
+while all live conversations remain readable and writable. SQLite WAL permits
+the live Kmap reads needed by conversations while the ingress worker commits
+memory changes. If the UI closes, startup resumes the queue. Provenance creation
+uses an idempotency key so retries do not create duplicates.
 
 ## Session Types
 
@@ -302,36 +321,24 @@ The UI will need to establish which user is having a conversation with Kennedy.
 Then, LoadNode is automatically called on the user's node, creating a rich
 context for Kennedy as she talks with the user.
 
-The user provides Kennedy with some prompt, and Kennedy will first determine
-whether she needs to make any calls to LoadNode, ConnectNodes, ResetContext,
-WebSearch, or WebFetch based on the prompt. Kennedy is allowed to call LoadNode
-up to 20 times per turn to find the context that's relevant to the user's
-prompt.
+The user provides Kennedy with some prompt, and Kennedy first determines
+whether she needs to call LoadNode, ResetContext, WebSearch, or WebFetch.
+Kennedy may call LoadNode up to 20 times per turn to find relevant context.
 
 The frontend checkpoints the pending user query with the conversation history
 backend before the first LLM request. Kennedy's answer and the completed-turn
 state are checkpointed again before another query is accepted.
 
-When Kennedy is happy that she's loaded the right context, or when Kennedy has
-run out of calls to LoadNode, she will call ConnectNodes and then respond to
-the user. When calling ConnectNodes, Kennedy will only provide the nodes that
-are directly relevant to the user's prompt / query, which means that there may
-be many nodes which are loaded but are not provided to ConnectNodes. She may
-also provide nodes to ConnectNodes which are not loaded nodes - the active
-connections of loaded nodes provide their full long description and short
-identifier, and therefore can be used in ConnectNodes.
-
 While the conversation session is ongoing, Kennedy may only call LoadNode,
-ConnectNodes, ResetContext, WebSearch, and WebFetch. WebSearch and WebFetch are
-conversation tools and are not available during history ingress. When the
+ResetContext, WebSearch, and WebFetch. Conversation sessions cannot mutate the
+Kmap. WebSearch and WebFetch are unavailable during history ingress. When the
 conversation session ends, the full archived Chatend—not merely the clean
 dialog—is turned into a history provenance node, and then a History Ingress
 session is called on that archive.
 
-Conversations are ended when the user deliberately ends the conversation, or
-otherwise starts a new conversation. The UI prepares the new conversation
-immediately while performing durable history ingress in the background, but
-does not persist or submit the new conversation until ingress succeeds.
+Starting a new conversation does not end existing live conversations.
+Conversations end when the user deliberately ends them, or by the 24-hour idle
+rule during activity in another conversation.
 
 Note: calling ResetContext mid-conversation will preserve both the conversation
 history with the user, and also the LoadNode counter.
@@ -345,7 +352,11 @@ up to 50 times during the session.
 Kennedy will update as many nodes as she feels is appropriate during the
 history ingress session. Zero updates is also valid. When Kennedy feels that
 the kmap has been updated appropriately, she will end the history ingress
-session.
+session. History ingress has no WebSearch or WebFetch access and must reason
+only from its archived conversation and available Kmap context. It may use
+ConnectNodes, ConsolidateFanout, AssignTask, CreateNode, and UpdateNode only
+when justified; task connections require a clear outstanding need for work to
+be completed.
 
 ### Self Action
 
@@ -357,6 +368,12 @@ To avoid needing to redo the context every turn, Kennedy keeps the same context
 and just keeps building upon it unless ResetContext is called. That means that
 if Kennedy calls 'LoadNode', a whole bunch of new data is pulled into the
 context window, rather than rewriting the context window.
+
+LLM turns run through the host's `codex-safe` launcher, which keeps the Codex
+CLI and its persistent ChatGPT login inside a Podman sandbox while using the
+user's subscription limits. The configured model is `gpt-5.6-sol` with
+`xhigh` reasoning. Conversation and tool loops resume their Codex thread;
+ResetContext starts a fresh one.
 
 ## UI
 
@@ -375,14 +392,16 @@ contents of the kweb.
 
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from
-the conversation history backend without making it the active conversation.
-Its full archived Chatend and the complete archived history-ingress session are
-also restored into their corresponding inspector and ingress views.
+the conversation history backend. Live entries remain continuable and closed
+entries are read-only. Its full archived Chatend is restored into the inspector,
+and its complete history-ingress session is appended after the transcript as
+one continuous scrolling history.
 
-A conversation 'ends' when the user clicks an end conversation button or starts
-a new conversation. Closing the UI abruptly does not lose the last durable
-checkpoint; reopening the UI restores active work or resumes required history
-ingress.
+A conversation ends only when the user explicitly ends it or the 24-hour idle
+rule is triggered by successful activity in another conversation. Starting a
+new conversation leaves every existing live conversation open. Closing the UI
+abruptly does not lose the last durable checkpoint; reopening restores all live
+work and resumes required history ingress.
 
 ## User Boostrap
 

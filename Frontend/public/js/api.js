@@ -49,6 +49,7 @@ export const ConversationHistoryAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   list: () => requestJSON(base, "/api/v1/conversations"),
   current: () => requestJSON(base, "/api/v1/conversations/current"),
+  nextIngress: () => requestJSON(base, "/api/v1/conversations/ingress/next"),
   get: (id) => requestJSON(base, `/api/v1/conversations/${id}`),
   create: (body) => requestJSON(base, "/api/v1/conversations", { method: "POST", body: JSON.stringify(body) }),
   checkpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
