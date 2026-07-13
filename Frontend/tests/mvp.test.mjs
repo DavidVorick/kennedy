@@ -5,7 +5,8 @@ import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
 import { ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
-import { conversationControlState, conversationTitle, inspectorText } from "../public/js/render.js";
+import { runHistoryIngress } from "../public/js/history_ingress.js";
+import { conversationControlState, conversationIngressActivity, conversationTitle, inspectorText } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
@@ -41,6 +42,19 @@ test("Kmap snapshot distinguishes direct loads from active expansions", async ()
   await context.loadDurable(id(2));
   snapshot = context.snapshot();
   assert.deepEqual(snapshot.nodes.find(item => item.identifier === 2).contextSources, ["active", "direct"]);
+});
+
+test("Kmap archives restore raw nodes and short identifiers exactly", async () => {
+  const api = new MockKweb([node(1, [2]), node(2), node(3)]);
+  const context = new KwebContext(api, id(1));
+  await context.initialize();
+  await context.loadDurable(id(3));
+  const archived = context.archive();
+  const restored = new KwebContext(api, id(1));
+  restored.restore(archived);
+  assert.deepEqual(restored.archive(), archived);
+  assert.equal(restored.resolve(context.shortId(id(2))), id(2));
+  assert.deepEqual(restored.snapshot(), context.snapshot());
 });
 
 test("seven direct loads are enforced", async () => {
@@ -140,8 +154,12 @@ test("agent loop executes multiple text tool calls before the next generation", 
   };
   const continuation = new ContinuationState("kennedy-test");
   const usage = new UsageTracker({ contextWindowTokens: 1000, maxInputTokens: 900 });
+  const checkpoints = [];
   assert.equal(usage.snapshot().contextRemaining, 1000);
-  const answer = await runAgentLoop({ intelligence, provider: "p", model: "m", chatend, executor, continuation, usage });
+  const answer = await runAgentLoop({
+    intelligence, provider: "p", model: "m", chatend, executor, continuation, usage,
+    checkpoint: async () => checkpoints.push(chatend.messages.map(message => message.content)),
+  });
   assert.equal(answer, "Finished.");
   assert.deepEqual(executed, ["First", "Second"]);
   assert.equal(requests.length, 2);
@@ -152,6 +170,9 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.equal(usage.snapshot().contextTokens, 135);
   assert.equal(usage.snapshot().contextRemaining, 865);
   assert.equal(usage.snapshot().cacheReadPercent, (100 * 180) / 230);
+  assert.equal(checkpoints.length, 1);
+  assert.equal(checkpoints[0].includes("First completed."), true);
+  assert.equal(checkpoints[0].includes("Second completed."), true);
 });
 
 test("ResetContext abandons continuation and resends the rebuilt full chatend", async () => {
@@ -174,10 +195,90 @@ test("ResetContext abandons continuation and resends the rebuilt full chatend", 
   assert.equal(requests[1].messages.some(message => message.content === "Memory context reset completed."), true);
 });
 
-test("conversation provenance contains only clean dialog", () => {
-  const session = new ConversationSession({});
+test("conversation provenance preserves the complete structured Chatend", async () => {
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1)]), intelligence: {},
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1),
+    provider: "p", model: "m", onUpdate: () => {},
+  });
+  await session.initialize();
   session.transcript = [{ role: "user", content: "Hi" }, { role: "kennedy", content: "Hello" }];
-  assert.equal(session.serialize(), "David: Hi\n\nKennedy: Hello");
+  session.chatend.append({ role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":1}}]}' });
+  session.chatend.append({ role: "user", display_role: "Memory tool result", content: "Kennedy tool result\nTool: LoadNode\n\nLoaded." });
+  session.chatend.append({
+    role: "user",
+    content: [{ type: "input_text", text: "Look at this" }, { type: "input_image", image_url: "data:image/png;base64,AAAA" }],
+  });
+  const archive = JSON.parse(session.serialize());
+  assert.equal(archive.format, "kennedy-chatend");
+  assert.equal(archive.version, 1);
+  assert.match(archive.systemPrompt, /Shared/);
+  assert.equal(archive.context.snapshot.nodes[0].longDescription, "Details 1");
+  assert.match(archive.messages.find(message => typeof message.content === "string" && message.content.includes("KENNEDY_TOOL_CALLS")).content, /LoadNode/);
+  assert.match(archive.messages.find(message => message.display_role === "Memory tool result").content, /Loaded/);
+  assert.equal(archive.messages.at(-1).content[1].image_url, "data:image/png;base64,AAAA");
+});
+
+test("a structured Chatend archive is restored exactly while legacy snapshots remain supported", async () => {
+  const kweb = new MockKweb([node(1), node(2)]);
+  const source = new ConversationSession({
+    kweb, intelligence: {}, manuals: { shared: "Shared", conversation: "Conversation" },
+    rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
+  });
+  await source.initialize();
+  await source.context.loadDurable(id(2));
+  source.chatend.append({ role: "assistant", content: "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":2}}]}" });
+  source.chatend.append({ role: "user", display_role: "Memory tool result", content: "Kennedy tool result\nTool: LoadNode\n\nLoaded." });
+  source.executor.loadCalls = 3;
+  source.executor.toolLog.push({ name: "LoadNode", ok: true });
+  source.usage.record({ input_tokens: 12, output_tokens: 3, cached_tokens: 4, cache_write_tokens: 0, reasoning_tokens: 1 });
+  const saved = source.snapshot();
+
+  const restored = new ConversationSession({
+    kweb, intelligence: {}, manuals: { shared: "Changed", conversation: "Changed" },
+    rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
+  });
+  await restored.initialize(saved);
+  assert.deepEqual(restored.chatend.messages, saved.archive.messages);
+  assert.deepEqual(restored.context.loadedNodeIds, [id(1), id(2)]);
+  assert.equal(restored.executor.loadCalls, 3);
+  assert.deepEqual(restored.executor.toolLog, [{ name: "LoadNode", ok: true }]);
+  assert.equal(restored.usage.snapshot().totalInputTokens, 12);
+});
+
+test("history ingress checkpoints its whole Chatend and completed archives resume without regeneration", async () => {
+  const kweb = new MockKweb([node(1)]);
+  kweb.provenance = async () => ({ source: "conversation", source_created_at: "2026-07-13T00:00:00Z", data: '{"format":"kennedy-chatend"}' });
+  let generations = 0;
+  const intelligence = { generate: async () => {
+    generations += 1;
+    return { status: "complete", response_id: "ingress-response", message: { role: "assistant", content: "Memory review complete." }, usage: null };
+  } };
+  const checkpoints = [];
+  await runHistoryIngress({
+    kweb, intelligence, manuals: { shared: "Shared", ingress: "Ingress" },
+    rootNodeId: id(1), provenanceId: "provenance", provider: "p", model: "m",
+    checkpoint: async archive => checkpoints.push(structuredClone(archive)), onUpdate: () => {},
+  });
+  assert.equal(generations, 1);
+  assert.equal(checkpoints[0].completed, false);
+  assert.equal(checkpoints.at(-1).completed, true);
+  assert.match(checkpoints.at(-1).systemPrompt, /Ingress/);
+  assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend \(JSON\)/);
+  assert.equal(checkpoints.at(-1).messages.at(-1).content, "Memory review complete.");
+  assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
+
+  const resumed = [];
+  await runHistoryIngress({
+    kweb,
+    intelligence: { generate: async () => { throw new Error("completed ingress must not regenerate"); } },
+    manuals: { shared: "Changed", ingress: "Changed" }, rootNodeId: id(1),
+    provenanceId: "provenance", provider: "p", model: "m",
+    restoredArchive: checkpoints.at(-1), checkpoint: async archive => resumed.push(archive), onUpdate: () => {},
+  });
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].completed, true);
+  assert.equal(resumed[0].messages.at(-1).content, "Memory review complete.");
 });
 
 test("conversation history titles use the first durable user message", () => {
@@ -197,7 +298,24 @@ test("next request stays editable but cannot send during background ingress", ()
   assert.equal(controls.inputDisabled, false);
   assert.equal(controls.sendDisabled, true);
   assert.equal(controls.endDisabled, true);
-  assert.equal(controls.newDisabled, true);
+  assert.equal(controls.newDisabled, false);
+});
+
+test("history ingress activity belongs only to its selected conversation", () => {
+  const archive = {
+    format: "kennedy-chatend", sessionType: "history-ingress",
+    messages: [{ role: "assistant", content: "Archived ingress." }], usage: { requests: 1 },
+  };
+  const record = { id: "old", phase: "complete", state: { historyIngress: archive } };
+  assert.equal(conversationIngressActivity({ record: null, liveRecordId: "old", liveDiagnostic: {} }), null);
+  const saved = conversationIngressActivity({ record });
+  assert.equal(saved.active, false);
+  assert.equal(saved.diagnostic.chatend.messages[0].content, "Archived ingress.");
+  const liveDiagnostic = { chatend: { messages: [{ role: "assistant", content: "Live ingress." }] } };
+  const live = conversationIngressActivity({ record: { ...record, phase: "ingress_in_progress" }, liveRecordId: "old", liveDiagnostic });
+  assert.equal(live.active, true);
+  assert.equal(live.diagnostic, liveDiagnostic);
+  assert.equal(conversationIngressActivity({ record, dismissedId: "old" }), null);
 });
 
 test("conversation checkpoints the pending query before any model request", async () => {

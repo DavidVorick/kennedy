@@ -23,9 +23,10 @@ Each conversation record contains:
 SQLite permits at most one record whose phase is not `complete`. Completed
 records remain available as conversation history.
 
-The frontend state currently contains the clean transcript, start timestamp,
-directly loaded durable Kweb IDs, and whether a user query still needs a model
-response. The backend does not interpret those fields.
+The frontend state contains recovery metadata and versioned, opaque JSON
+archives for both the complete conversation Chatend and its history-ingress
+Chatend. Archives preserve structured messages and future serializable media
+content without the backend interpreting their fields.
 
 ## 3. State Machine
 
@@ -59,16 +60,18 @@ been reached.
 - `PUT /api/v1/conversations/{id}/checkpoint`
 - `POST /api/v1/conversations/{id}/request-ingress`
 - `POST /api/v1/conversations/{id}/ingress-started`
+- `PUT /api/v1/conversations/{id}/ingress-checkpoint`
 - `POST /api/v1/conversations/{id}/ingress-completed`
 
 `current` returns `{ "conversation": null }` when no unfinished record exists.
 The list endpoint returns every durable record, including its opaque state, so
 the frontend can render conversation history; the record endpoint retrieves one
-complete record and its full saved transcript state.
+complete record and its full saved conversation and ingress Chatend state.
 Create accepts `started_at` plus opaque `state`. Checkpoint and
 `request-ingress` accept `expected_version` plus `state`. `ingress-started`
 accepts `expected_version` plus `provenance_id`; `ingress-completed` accepts
-`expected_version`.
+`expected_version`. `ingress-checkpoint` accepts `expected_version` plus the
+complete updated opaque state and is valid only during `ingress_in_progress`.
 
 All successful mutations return the complete updated record.
 
@@ -76,6 +79,8 @@ All successful mutations return the complete updated record.
 
 The default listener is `127.0.0.1:4323` and the default database is
 `kennedy-conversations.sqlite3`. Only the frontend origin is allowed by CORS.
+The server accepts request bodies up to 128 MiB for structured Chatend archives
+and future inline media payloads.
 The single `kennedy-server` executable starts this service alongside the other
 backend libraries, but the top-level binary passes no backend state or handles
 between them.
@@ -83,5 +88,8 @@ between them.
 ## 6. Verification
 
 Tests cover the phase transition, optimistic-version conflicts, and the
-one-unfinished-conversation database invariant. Frontend tests verify that a
-pending query is checkpointed before generation and can resume after restore.
+one-unfinished-conversation database invariant, structured conversation
+archives, and phase-restricted ingress archives. Frontend tests verify that a
+pending query is checkpointed before generation, complete tool rounds are
+saved, and both conversation and history-ingress Chatends resume from their
+archives.

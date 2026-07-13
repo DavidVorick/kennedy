@@ -238,11 +238,15 @@ All objects use the knowledge-node shape. The requested node appears only in
 
 #### `POST /api/v1/provenance`
 
+The loopback service accepts provenance request bodies up to 128 MiB so a
+complete structured Chatend archive, including future inline media payloads,
+can be retained without truncation.
+
 Request:
 
 ```json
 {
-  "data": "User: ...\nKennedy: ...",
+  "data": "{\"format\":\"kennedy-chatend\",\"version\":1,\"messages\":[...]}",
   "source": "conversation",
   "source_created_at": "2026-07-11T00:00:00Z",
   "idempotency_key": "conversation:550e8400-e29b-41d4-a716-446655440000"

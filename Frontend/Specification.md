@@ -85,10 +85,19 @@ Live application state is held in JavaScript memory:
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. Instead it checkpoints an opaque recovery snapshot to
-the conversation history API. The snapshot contains the clean transcript,
-conversation start time, directly loaded durable node IDs, and a pending-turn
-flag. Provider response IDs, tool logs, usage telemetry, and transient chatend
-tool activity are not restored.
+the conversation history API. The versioned snapshot contains recovery fields
+plus a lossless JSON Chatend archive: composed system prompt, retained content,
+structured messages, structured Kmap snapshot and durable-ID diagnostics, tool
+log and counters, usage telemetry, and a media collection reserved for future
+serializable image/audio/video payloads or attachment references. Provider
+response IDs and credentials are transport details and are not archived.
+
+The archive never projects message `content` to text. Arrays and objects are
+preserved recursively, so future multimodal content blocks survive storage
+even before every inspector has a renderer for that media type. Active records
+restore the exact archived Chatend on a fresh provider chain. Legacy
+transcript-only snapshots remain readable and recover through the old rebuild
+path.
 
 It also loads all durable records for the conversation-history sidebar. A
 selected completed record is a read-only transcript view. While required
@@ -114,8 +123,9 @@ whole logical chatend. System instructions are prose sections, Kmap context is
 YAML-like text, tool requests are ordinary assistant text, and local tool
 results are readable memory updates.
 
-The clean transcript is maintained separately. It contains only user and final
-Kennedy messages and is the source used to create conversation provenance.
+The clean transcript is maintained separately for the uncluttered conversation
+panel. Conversation provenance is created from the complete versioned Chatend
+archive rather than from that transcript.
 
 ### 5.1 Context Rebuild
 
@@ -397,6 +407,8 @@ explorer remains usable.
    every call sequentially in array order, append readable result messages, and
    continue from the returned response ID. State changes from one call are
    visible to the next call in the same response.
+   After every complete response-sized tool round, checkpoint the updated full
+   Chatend archive before requesting another model response.
 6. Continue until Kennedy returns final text.
 7. Append final text to the clean transcript and chatend and checkpoint the
    completed turn before accepting another query.
@@ -413,12 +425,14 @@ When the user ends the conversation or starts a new one:
 2. allow drafting in that composer while keeping Send disabled,
 3. atomically checkpoint the old conversation's final state and transition the
    history record from `active` to `ingress_pending`,
-4. serialize only the clean user/Kennedy transcript,
+4. serialize the complete versioned Chatend archive, including structured
+   system, memory, tool, and media-capable message content,
 5. create or retrieve a Kweb provenance node using source `conversation`, the
    conversation start time, and idempotency key `conversation:{conversation_id}`,
 6. store the returned opaque provenance ID while transitioning the history
    record to `ingress_in_progress`,
-7. run history ingress using that provenance ID in the background,
+7. run history ingress using that provenance ID in the background and
+   checkpoint its complete Chatend after every tool round,
 8. only after success transition the history record to `complete`,
 9. create the already-visible fresh conversation's durable record and enable
    Send without clearing text the user drafted during ingress.
@@ -466,6 +480,12 @@ A separate left sidebar lists all durable conversations. Each entry derives a
 short title from its first user message, shows its phase and date, and opens the
 saved clean transcript read-only. A New control returns to or prepares the live
 conversation.
+
+The history-ingress activity panel belongs to the conversation record that
+created it. It is hidden while the prepared next conversation is selected.
+Selecting an in-progress record shows its live ingress; selecting any completed
+record reconstructs that record's saved ingress panel from its archived
+history-ingress Chatend.
 
 ### 11.2 Context Inspector
 
@@ -534,8 +554,11 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - chatend rebuilding after ResetContext,
 - clean-transcript serialization,
 - checkpoint-before-generation ordering and pending-query recovery,
+- lossless full-Chatend persistence, including structured media content,
+- response-sized tool-round checkpoints and exact Chatend recovery,
 - durable ingress gating before new-conversation creation,
 - editable next-request drafting during background ingress,
 - conversation-history titles and read-only transcript selection,
+- per-conversation live and archived history-ingress activity,
 - HTML escaping,
 - recovery from failed intelligence, Kweb, and conversation-history requests.

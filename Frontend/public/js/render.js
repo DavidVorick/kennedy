@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260713.1";
+import { formatKmapContext } from "./human_format.js?v=20260713.2";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -82,7 +82,21 @@ export function conversationControlState({ hasSession, sessionBusy, transitionBu
     inputDisabled: sessionBusy || viewingHistory || !hasSession,
     sendDisabled: busy || ingressRequired || pendingTurn || viewingHistory || !hasSession,
     endDisabled: busy || viewingHistory || !hasSession || (!ingressRequired && !pendingTurn && !transcriptLength),
-    newDisabled: busy || pendingTurn,
+    newDisabled: sessionBusy || pendingTurn,
+  };
+}
+
+export function conversationIngressActivity({ record, liveRecordId = null, liveDiagnostic = null, dismissedId = null }) {
+  if (!record || record.id === dismissedId) return null;
+  const archive = record.state?.historyIngress;
+  const saved = archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
+    ? { chatend: { messages: archive.messages || [] }, usage: { snapshot: () => archive.usage || null } }
+    : null;
+  const diagnostic = record.id === liveRecordId && liveDiagnostic ? liveDiagnostic : saved;
+  if (!diagnostic) return null;
+  return {
+    diagnostic,
+    active: record.phase === "ingress_pending" || record.phase === "ingress_in_progress",
   };
 }
 

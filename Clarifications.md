@@ -50,6 +50,11 @@ canonical documents; this file is not an append-only log.
   Checkpoint each user query before any LLM request, restore unfinished work on
   startup, and durably require history ingress to finish before a new
   conversation may begin.
+- Persist the entire structured Chatend, not only clean dialog: system prompts,
+  retained messages, loaded memory, tool requests/results, counters, usage, and
+  future serializable media blocks or attachment references. Use a versioned
+  lossless JSON archive, restore it exactly, and store that complete archive as
+  conversation provenance for history ingress.
 - Kennedy has three logically separate backends: Kweb, intelligence, and
   conversation history. They are independent services with separate APIs,
   listeners, state, and databases and must not call or access one another. They
@@ -58,6 +63,9 @@ canonical documents; this file is not an append-only log.
   were unrelated processes.
 - Show live history-ingress tool requests and results in the conversation UI
   so the user can follow memory updates.
+- Store the complete history-ingress Chatend on its owning conversation record.
+  Show live or archived ingress activity only when that conversation is
+  selected; never carry the completed-ingress panel into the prepared new chat.
 - Show durable conversation history in a sidebar and allow completed
   transcripts to be reopened read-only.
 - When a conversation ends, switch immediately to an editable empty composer

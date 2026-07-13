@@ -80,6 +80,30 @@ export class KwebContext {
     };
   }
 
+  archive() {
+    return {
+      loadedNodeIds: [...this.loadedNodeIds],
+      fullNodeIds: [...this.fullNodeIds],
+      nodesById: [...this.nodesById].map(([id, node]) => [id, JSON.parse(JSON.stringify(node))]),
+      nodeOrigins: [...this.nodeOrigins].map(([id, origins]) => [id, [...origins]]),
+      shortToDurable: [...this.shortToDurable],
+      nextShortId: this.nextShortId,
+    };
+  }
+
+  restore(archive) {
+    if (!archive || !Array.isArray(archive.loadedNodeIds) || !Array.isArray(archive.nodesById) || !Array.isArray(archive.shortToDurable)) {
+      throw new Error("The saved Kmap context archive is invalid.");
+    }
+    this.loadedNodeIds = [...archive.loadedNodeIds];
+    this.fullNodeIds = new Set(archive.fullNodeIds || []);
+    this.nodesById = new Map(archive.nodesById.map(([id, node]) => [id, JSON.parse(JSON.stringify(node))]));
+    this.nodeOrigins = new Map((archive.nodeOrigins || []).map(([id, origins]) => [id, new Set(origins)]));
+    this.shortToDurable = new Map(archive.shortToDurable);
+    this.durableToShort = new Map([...this.shortToDurable].map(([short, durable]) => [durable, short]));
+    this.nextShortId = Number.isInteger(archive.nextShortId) ? archive.nextShortId : this.shortToDurable.size + 1;
+  }
+
   diagnostics() {
     return {
       loadedNodeIds: [...this.loadedNodeIds],

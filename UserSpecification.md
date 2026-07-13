@@ -233,9 +233,11 @@ The call signature is WebFetch(url)
 
 The conversation history backend durably stores active and completed
 conversation records separately from the kweb. Before the frontend sends a new
-user query to an LLM, it must save the query, clean transcript, directly loaded
-memory nodes, and pending-turn state. If that save fails, generation must not
-begin.
+user query to an LLM, it must save the query, pending-turn state, and a lossless
+versioned archive of the whole Chatend: system prompts, structured messages,
+tool requests and results, loaded memory context, usage, and any serializable
+media content or attachment references. If that save fails, generation must
+not begin. Complete tool rounds are checkpointed while a turn is running.
 
 When the UI starts, it retrieves the one unfinished conversation. An active
 conversation is restored where it left off; if its last user query has no
@@ -288,9 +290,9 @@ identifier, and therefore can be used in ConnectNodes.
 While the conversation session is ongoing, Kennedy may only call LoadNode,
 ConnectNodes, ResetContext, WebSearch, and WebFetch. WebSearch and WebFetch are
 conversation tools and are not available during history ingress. When the
-conversation session ends, the full conversation (just the dialog between the
-user and Kennedy, not the other context) is turned into a history provenance
-node, and then a History Ingress session is called on the conversation.
+conversation session ends, the full archived Chatend—not merely the clean
+dialog—is turned into a history provenance node, and then a History Ingress
+session is called on that archive.
 
 Conversations are ended when the user deliberately ends the conversation, or
 otherwise starts a new conversation. The UI prepares the new conversation
@@ -340,6 +342,8 @@ contents of the kweb.
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from
 the conversation history backend without making it the active conversation.
+Its full archived Chatend and the complete archived history-ingress session are
+also restored into their corresponding inspector and ingress views.
 
 A conversation 'ends' when the user clicks an end conversation button or starts
 a new conversation. Closing the UI abruptly does not lose the last durable

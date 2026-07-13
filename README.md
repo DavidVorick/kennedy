@@ -9,7 +9,8 @@ browser-native frontend:
   continuation, prompt-cache telemetry, hosted web research, and safe public
   page extraction.
 - `kennedy-conversation-history` checkpoints active conversations and durably
-  gates new conversations on successful history ingress.
+  stores complete conversation and history-ingress Chatend archives and
+  durably gates new conversations on successful history ingress.
 - `Frontend/public` owns live conversations, context, tool execution, durable
   recovery orchestration, conversation-history browsing, and automatic
   background history ingress.

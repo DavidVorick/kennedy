@@ -51,6 +51,17 @@ export class UsageTracker {
     this.last = normalized;
   }
 
+  restore(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return;
+    this.requests = Number(snapshot.requests) || 0;
+    this.totalInputTokens = Number(snapshot.totalInputTokens) || 0;
+    this.totalOutputTokens = Number(snapshot.totalOutputTokens) || 0;
+    this.totalCachedTokens = Number(snapshot.totalCachedTokens) || 0;
+    this.totalCacheWriteTokens = Number(snapshot.totalCacheWriteTokens) || 0;
+    this.totalReasoningTokens = Number(snapshot.totalReasoningTokens) || 0;
+    this.last = snapshot.last && typeof snapshot.last === "object" ? { ...snapshot.last } : null;
+  }
+
   snapshot() {
     const contextTokens = this.last ? this.last.inputTokens + this.last.outputTokens : 0;
     const contextRemaining = this.contextWindowTokens ? Math.max(0, this.contextWindowTokens - contextTokens) : null;
@@ -84,7 +95,7 @@ function protocolFailureMessage(error) {
   };
 }
 
-export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, onUpdate = () => {} }) {
+export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, onUpdate = () => {}, checkpoint = async () => {} }) {
   for (let round = 0; round < 100; round++) {
     const messages = continuation.requestMessages(chatend);
     if (messages.length === 0) throw new Error("Kennedy has no new context to continue from.");
@@ -107,6 +118,7 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     catch (error) {
       chatend.append(protocolFailureMessage(error));
       onUpdate();
+      await checkpoint();
       continue;
     }
     if (!calls) return content;
@@ -125,6 +137,7 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       }
       onUpdate();
     }
+    await checkpoint();
   }
   throw new Error("Kennedy exceeded the 100-round tool-loop safety limit.");
 }

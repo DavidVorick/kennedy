@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260713.1";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260713.1";
-import { ConversationSession } from "./conversation.js?v=20260713.1";
-import { runHistoryIngress } from "./history_ingress.js?v=20260713.1";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260713.1";
-import { renderTranscript, renderConversationHistory, conversationControlState, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260713.1";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260713.2";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260713.2";
+import { ConversationSession } from "./conversation.js?v=20260713.2";
+import { runHistoryIngress } from "./history_ingress.js?v=20260713.2";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260713.2";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260713.2";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -35,7 +35,7 @@ let contextWindowTokens = 0;
 let maxInputTokens = 0;
 let explorer = null;
 let ingressDiagnostic = null;
-let ingressActivity = null;
+let dismissedIngressId = null;
 let ending = false;
 let ingressRequired = false;
 let ingressSourceSession = null;
@@ -47,22 +47,18 @@ let inspectorMode = "full";
 function diagnostic() {
   if (viewedRecord) {
     const transcript = Array.isArray(viewedRecord.state?.transcript) ? viewedRecord.state.transcript : [];
+    const archive = viewedRecord.state?.archive?.format === "kennedy-chatend" ? viewedRecord.state.archive : null;
     return {
       mode: "saved conversation", provider, model,
-      chatend: transcript.map(item => ({ role: item.role === "kennedy" ? "assistant" : "user", content: item.content })),
-      context: {}, loadCalls: 0, loadLimit: 0, toolLog: [], usage: null,
-      memory: { directlyLoadedIdentifiers: [], nodes: [] },
+      chatend: archive?.messages || transcript.map(item => ({ role: item.role === "kennedy" ? "assistant" : "user", content: item.content })),
+      context: archive?.context?.diagnostics || {},
+      loadCalls: archive?.tools?.loadCalls || 0,
+      loadLimit: archive?.tools?.loadLimit || 0,
+      toolLog: archive?.tools?.log || [],
+      usage: archive?.usage || null,
+      memory: archive?.context?.snapshot || { directlyLoadedIdentifiers: [], nodes: [] },
     };
   }
-  if (ingressDiagnostic) return {
-    mode: "history ingress", provider, model,
-    chatend: ingressDiagnostic.chatend.messages,
-    context: ingressDiagnostic.context.diagnostics(),
-    loadCalls: ingressDiagnostic.executor.loadCalls, loadLimit: ingressDiagnostic.executor.loadLimit,
-    toolLog: ingressDiagnostic.executor.toolLog,
-    usage: ingressDiagnostic.usage.snapshot(),
-    memory: ingressDiagnostic.context.snapshot(),
-  };
   if (!session) return { mode: "offline", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 0, toolLog: [], usage: null, memory: { directlyLoadedIdentifiers: [], nodes: [] } };
   return {
     mode: "conversation", provider, model,
@@ -73,6 +69,15 @@ function diagnostic() {
     usage: session.usage?.snapshot() || null,
     memory: session.context?.snapshot() || { directlyLoadedIdentifiers: [], nodes: [] },
   };
+}
+
+function visibleIngressActivity() {
+  return conversationIngressActivity({
+    record: viewedRecord,
+    liveRecordId: ingressRecord?.id,
+    liveDiagnostic: ingressDiagnostic,
+    dismissedId: dismissedIngressId,
+  });
 }
 
 function update() {
@@ -89,10 +94,11 @@ function update() {
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   }
-  ui.ingress_panel.classList.toggle("hidden", !ingressActivity);
-  if (ingressActivity) {
-    ui.ingress_title.textContent = ingressDiagnostic ? "History ingress · live" : "History ingress · complete";
-    renderIngressActivity(ui.ingress_log, ingressActivity, Boolean(ingressDiagnostic));
+  const ingressActivity = visibleIngressActivity();
+  ui.ingress_panel.classList.toggle("hidden", !ingressActivity?.diagnostic);
+  if (ingressActivity?.diagnostic) {
+    ui.ingress_title.textContent = ingressActivity.active ? "History ingress · live" : "History ingress · complete";
+    renderIngressActivity(ui.ingress_log, ingressActivity.diagnostic, ingressActivity.active);
   }
   const viewingHistory = Boolean(viewedRecord);
   const controls = conversationControlState({
@@ -112,10 +118,12 @@ function upsertHistory(record) {
   if (!record) return;
   historyRecords = [record, ...historyRecords.filter(item => item.id !== record.id)]
     .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  if (viewedRecord?.id === record.id) viewedRecord = record;
 }
 
 async function selectConversation(id) {
   clearError(ui.error_banner);
+  dismissedIngressId = null;
   if (!ingressRequired && id === historyRecord?.id) {
     viewedRecord = null;
   } else {
@@ -182,13 +190,14 @@ async function resumeSavedQuery() {
 }
 
 async function beginNewConversation() {
-  if (ending || session?.busy || session?.pendingTurn) return;
+  if (session?.busy || session?.pendingTurn) return;
   if (ingressRequired) {
     viewedRecord = null;
     update();
     ui.message_input.focus();
     return;
   }
+  if (ending) return;
   if (!session?.transcript.length) {
     viewedRecord = null;
     update();
@@ -198,7 +207,7 @@ async function beginNewConversation() {
   ingressSourceSession = session;
   ingressRecord = historyRecord;
   ingressDiagnostic = null;
-  ingressActivity = null;
+  dismissedIngressId = null;
   clearError(ui.error_banner);
   ui.message_input.value = "";
   await prepareNextConversation();
@@ -224,7 +233,25 @@ async function finishHistoryIngress() {
     }
     if (record.phase === "ingress_in_progress") {
       if (!record.provenance_id) throw new Error("The saved conversation is missing its history provenance.");
-      ingressActivity = await runHistoryIngress({ kweb, intelligence, manuals, rootNodeId, provenanceId: record.provenance_id, provider, model, contextWindowTokens, maxInputTokens, onUpdate: value => { ingressDiagnostic = value; ingressActivity = value; update(); } });
+      const persistIngress = async archive => {
+        const state = { ...record.state, historyIngress: archive };
+        try {
+          record = await conversationHistory.ingressCheckpoint(record.id, { expected_version: record.version, state });
+        } catch (error) {
+          if (error.code !== "state_conflict") throw error;
+          const latest = await conversationHistory.get(record.id);
+          if (latest.phase !== "ingress_in_progress" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
+          record = latest;
+        }
+        ingressRecord = record; historyRecord = record; upsertHistory(record); update();
+      };
+      await runHistoryIngress({
+        kweb, intelligence, manuals, rootNodeId, provenanceId: record.provenance_id,
+        provider, model, contextWindowTokens, maxInputTokens,
+        restoredArchive: record.state?.historyIngress,
+        checkpoint: persistIngress,
+        onUpdate: value => { ingressDiagnostic = value; update(); },
+      });
       ingressDiagnostic = null;
       record = await conversationHistory.ingressCompleted(record.id, { expected_version: record.version });
     }
@@ -294,7 +321,7 @@ ui.message_form.addEventListener("submit", submitMessage);
 ui.message_input.addEventListener("keydown", event => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); ui.message_form.requestSubmit(); } });
 ui.end_button.addEventListener("click", () => session?.pendingTurn ? resumeSavedQuery() : ingressRequired ? finishHistoryIngress() : beginNewConversation().catch(error => showError(ui.error_banner, error.message)));
 ui.new_conversation.addEventListener("click", () => beginNewConversation().catch(error => showError(ui.error_banner, error.message)));
-ui.dismiss_ingress.addEventListener("click", () => { ingressActivity = null; update(); });
+ui.dismiss_ingress.addEventListener("click", () => { dismissedIngressId = viewedRecord?.id || null; update(); });
 for (const mode of INSPECTOR_MODES) ui[`inspector_${mode}`].addEventListener("click", () => { inspectorMode = mode; update(); });
 ui.chat_tab.addEventListener("click", () => showView(false));
 ui.memory_tab.addEventListener("click", () => showView(true));

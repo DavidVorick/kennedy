@@ -165,6 +165,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(ingress_started),
         )
         .route(
+            "/api/v1/conversations/{conversation_id}/ingress-checkpoint",
+            put(checkpoint_ingress),
+        )
+        .route(
             "/api/v1/conversations/{conversation_id}/ingress-completed",
             post(ingress_completed),
         )
@@ -352,6 +356,40 @@ async fn ingress_started(
     Ok(Json(fetch_record(&db, &id)?))
 }
 
+async fn checkpoint_ingress(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<CheckpointConversation>,
+) -> Result<Json<ConversationRecord>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    Ok(Json(update_ingress(
+        &db,
+        &id,
+        input.expected_version,
+        &input.state,
+    )?))
+}
+
+fn update_ingress(
+    db: &Connection,
+    id: &str,
+    expected_version: i64,
+    state: &Value,
+) -> Result<ConversationRecord, ApiError> {
+    validate_version(expected_version)?;
+    let state_json = serde_json::to_string(state).map_err(ApiError::internal)?;
+    let changed = db.execute(
+        "UPDATE conversations SET state_json=?1,updated_at=?2,version=version+1 WHERE id=?3 AND phase='ingress_in_progress' AND version=?4",
+        params![state_json,Utc::now().to_rfc3339(),id,expected_version],
+    ).map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "Conversation ingress changed in another session or is no longer in progress.",
+        ));
+    }
+    fetch_record(db, id)
+}
+
 async fn ingress_completed(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -386,11 +424,21 @@ mod tests {
     fn state_machine_requires_ingress_before_completion() {
         let db = database();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('c','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).unwrap();
-        let record =
-            update_active(&db, "c", 1, &json!({"transcript":[]}), "ingress_pending").unwrap();
+        let state = json!({
+            "transcript":[],
+            "archive":{
+                "format":"kennedy-chatend",
+                "messages":[{"role":"user","content":[
+                    {"type":"input_text","text":"Look"},
+                    {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+                ]}]
+            }
+        });
+        let record = update_active(&db, "c", 1, &state, "ingress_pending").unwrap();
         assert_eq!(record.phase, "ingress_pending");
         assert_eq!(record.version, 2);
         assert_eq!(record.state["transcript"], json!([]));
+        assert_eq!(record.state, state);
     }
 
     #[test]
@@ -410,5 +458,24 @@ mod tests {
         let db = database();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('a','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).unwrap();
         assert!(db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('b','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).is_err());
+    }
+
+    #[test]
+    fn ingress_checkpoints_preserve_the_complete_ingress_chatend() {
+        let db = database();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('c','ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',4)", []).unwrap();
+        let state = json!({"archive":{"format":"kennedy-chatend"},"historyIngress":{
+            "format":"kennedy-chatend",
+            "sessionType":"history-ingress",
+            "messages":[{"role":"assistant","content":"Memory updated."}]
+        }});
+        let record = update_ingress(&db, "c", 4, &state).unwrap();
+        assert_eq!(record.phase, "ingress_in_progress");
+        assert_eq!(record.version, 5);
+        assert_eq!(record.state, state);
+        assert_eq!(
+            update_ingress(&db, "c", 4, &json!({})).unwrap_err().code,
+            "state_conflict"
+        );
     }
 }

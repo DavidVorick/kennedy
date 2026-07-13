@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         bind: args.conversation_history_bind,
         database: args.conversation_history_database,
         allowed_origins: vec![args.frontend_origin],
-        max_request_bytes: 10 * 1024 * 1024,
+        max_request_bytes: 128 * 1024 * 1024,
     };
     let intelligence_config = args.intelligence_config;
     tokio::try_join!(

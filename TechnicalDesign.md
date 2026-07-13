@@ -102,9 +102,11 @@ expansions, and summary-only fanout references remain visually distinct.
 Token, context-window, and cache telemetry is displayed in the Chatend header.
 Provider IDs and credentials remain hidden.
 
-The frontend itself has no persistent state. It saves opaque recovery state to
-the conversation history API before generation and reconstructs the live
-session from that backend after a reload or abrupt close.
+The frontend itself has no persistent state. It saves versioned, opaque,
+lossless Chatend archives to the conversation history API before generation,
+after complete tool rounds, and after final output. Structured content is
+preserved for future media support. It reconstructs the exact live session
+from that backend after a reload or abrupt close.
 
 ### 4.2 Kweb Backend
 
@@ -176,13 +178,13 @@ counter.
 
 Ending a conversation first transitions its durable record to
 `ingress_pending`. The frontend creates one idempotent data provenance node
-containing the clean transcript, records its opaque ID while transitioning to
+containing the complete conversation Chatend archive, records its opaque ID while transitioning to
 `ingress_in_progress`, and starts history ingress. The record becomes
 `complete` only after ingress succeeds. In parallel, the frontend prepares and
 shows an empty in-memory next session so the user can type. Sending remains
 disabled and the next durable record is created only after ingress completes.
-Completed records and their opaque transcript state remain queryable for the
-conversation-history sidebar.
+Completed records and their opaque conversation and history-ingress Chatend
+archives remain queryable for the conversation-history sidebar.
 
 ### 5.2 History Ingress
 
@@ -192,9 +194,11 @@ Kennedy may navigate the kweb and create or update knowledge nodes. The current
 provenance identifier is held by the frontend and supplied implicitly when it
 translates CreateNode and UpdateNode tool calls into Kweb API requests.
 
-The session ends when Kennedy returns final text. Live tool requests, results,
-and the completion are shown in the history-ingress activity panel. Completing
-with zero knowledge mutations is valid.
+The session ends when Kennedy returns final text. Its whole Chatend is
+checkpointed on the owning conversation record after each tool round and at
+completion. Live tool requests, results, and the completion are shown only
+when that record is selected; completed records reconstruct the panel from the
+saved archive. Completing with zero knowledge mutations is valid.
 
 At startup an `active` record restores its transcript, directly loaded nodes,
 and pending-turn flag. A pending user query is regenerated from a fresh

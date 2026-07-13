@@ -23,6 +23,7 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const PROVENANCE_IDEMPOTENCY_MIGRATION: &str =
     include_str!("../migrations/002_provenance_idempotency.sql");
+const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const PROMPT_FILES: [&str; 3] = [
     "KmapAgentManual.txt",
     "ConversationAgentManual.txt",
@@ -184,7 +185,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/v1/connections", post(connect_nodes))
         .route("/system-prompts/{filename}", get(get_prompt))
         .fallback_service(ServeDir::new(config.frontend_dir).append_index_html_on_directories(true))
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::map_response(prevent_stale_frontend_assets))
         .with_state(state);
