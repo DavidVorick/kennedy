@@ -54,6 +54,8 @@ canonical documents; this file is not an append-only log.
 
 ## Frontend Behavior
 
+- History-ingress activity starts scrolled to its summary at the top, and its
+  usage row scrolls normally instead of remaining sticky.
 - Keep the message composer editable while Kennedy is generating or running
   tools so the user can draft the next message, but keep Send disabled until
   Kennedy completes the current turn.
@@ -90,3 +92,13 @@ canonical documents; this file is not an append-only log.
   entry assets so HTML and JavaScript revisions cannot be mixed.
 - Surface startup exceptions as visible failures instead of leaving the UI
   frozen at “Starting…”.
+
+## Task Connections
+
+- Existing Kweb databases require no schema migration or task backfill. Nodes
+  without explicitly assigned task connections behave as though their task
+  list is empty.
+- Teach Kennedy `ConsolidateFanout` and `AssignTask` in both session manuals.
+  A task connection is justified only by a clear need for concrete work to be
+  completed; ordinary relationships, vague possibilities, and completed work
+  do not belong in task slots.

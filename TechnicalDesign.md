@@ -86,7 +86,7 @@ The frontend owns:
 
 - the clean user/Kennedy transcript,
 - the current chatend sent to the LLM,
-- directly loaded nodes and their expanded active connections,
+- directly loaded nodes and their task, active, and fanout connections,
 - durable-ID to short-ID mappings,
 - conversation and history-ingress call budgets,
 - the transparent text tool protocol and tool loops,
@@ -97,8 +97,8 @@ The frontend owns:
 The context inspector renders the human-readable chatend, including Kennedy's
 text tool requests and readable tool results. It provides full-context,
 system-prompt-only, and expandable Kmap-memory views. The memory view derives
-node provenance from the Kweb context snapshot so direct loads, active-edge
-expansions, and summary-only fanout references remain visually distinct.
+node provenance from the Kweb context snapshot so direct loads, task edges,
+active-edge expansions, and summary-only fanout references remain visually distinct.
 Token, context-window, and cache telemetry is displayed in the Chatend header.
 Provider IDs and credentials remain hidden.
 
@@ -196,9 +196,10 @@ archives remain queryable for the conversation-history sidebar.
 
 History ingress uses a separate chatend composed from the Kmap and
 HistoryIngress manuals, the provenance data, and the loaded user root node.
-Kennedy may navigate the kweb and create or update knowledge nodes. The current
-provenance identifier is held by the frontend and supplied implicitly when it
-translates CreateNode and UpdateNode tool calls into Kweb API requests.
+Kennedy may navigate the kweb, reorganize fanout, manage task slots, and create
+or update knowledge nodes. The current provenance identifier is held by the
+frontend and supplied implicitly when it translates CreateNode and UpdateNode
+tool calls into Kweb API requests.
 
 The session ends when Kennedy returns final text. Its whole Chatend is
 checkpointed on the owning conversation record after each tool round and at
@@ -224,10 +225,15 @@ SQLite stores exactly the three durable node types from the user specification:
   provenance node and the previous history node.
 
 Connections are represented in a relational table as an implementation detail
-of knowledge nodes. Each directed connection has an `active` or `fanout` tier
-and a deterministic recency order. `ConnectNodes` promotes every ordered pair
-in the supplied set. If a source exceeds the active limit, its least recently
-active connections are demoted. Fanout overflow remains permitted in the MVP.
+of knowledge nodes. Each directed connection has an active, fanout, or task
+role and a deterministic order. Task priority slots use reserved negative order
+values in the existing connection schema, so legacy databases need no migration
+and nodes without assigned tasks expose an empty task list. `ConnectNodes`
+promotes every ordered pair in the supplied set. If a source exceeds the active
+limit, its least recently active connections are demoted unless that would
+exceed the fanout limit. `ConsolidateFanout` moves selected fanout references
+under an existing aggregator. `AssignTask` replaces or clears one directional
+high, medium, or low task slot.
 
 ## 7. API Conventions
 

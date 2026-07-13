@@ -26,10 +26,7 @@ line flags.
 | Frontend directory | `--frontend-dir` | `./Frontend/public` |
 | System prompts directory | `--system-prompts-dir` | `./Frontend/SystemPrompts` |
 | Active connection limit | `--active-limit` | `12` |
-| Fanout connection target | `--fanout-limit` | `60` |
-
-The fanout value is exposed as configuration even though overflow is not
-enforced in the MVP.
+| Fanout connection limit | `--fanout-limit` | `60` |
 
 ## 3. SQLite Model
 
@@ -84,19 +81,24 @@ its newest entry; following `previous_history_id` reaches older entries.
 
 ### 3.4 Directed Connections
 
-`knowledge_connections` is a normalized implementation of the active and
-fanout lists on knowledge nodes. It contains:
+`knowledge_connections` is a normalized implementation of the task, active,
+and fanout lists on knowledge nodes. It contains:
 
 | Column | Meaning |
 | --- | --- |
 | `source_node_id` | Node containing the outgoing connection |
 | `target_node_id` | Destination node |
 | `tier` | `active` or `fanout` |
-| `activation_order` | Monotonically increasing integer used for recency |
+| `activation_order` | Nonnegative recency value, or a reserved task-slot value |
 
 The primary key is `(source_node_id, target_node_id)`. Self-connections are
-forbidden. A connection exists in only one tier. Connection rows are supporting
-structure, not an additional durable node type.
+forbidden. A connection exists in only one role. Ordinary active and fanout
+connections use nonnegative activation orders. To remain compatible with the
+existing schema, task slots use `tier = fanout` with reserved activation orders
+`-1`, `-2`, and `-3` for high, medium, and low priority. Ordinary fanout reads
+exclude those reserved rows. This requires no schema migration or backfill;
+legacy databases simply return an empty task list until tasks are assigned.
+Connection rows are supporting structure, not an additional durable node type.
 
 Schema constraints enforce 20-byte IDs, valid connection tiers, non-self
 connections, required foreign keys, and a single user root. Foreign-key delete
@@ -127,10 +129,20 @@ every ordered pair `(a, b)` where `a != b`, the backend:
 After promoting the pairs, each affected source node is processed separately.
 If it has more active connections than the configured limit, its oldest active
 connections are demoted to fanout until it is within the limit. A demotion from
-`a` to `b` does not change the connection from `b` to `a`.
+`a` to `b` does not change the connection from `b` to `a`. The whole operation
+fails atomically if those demotions would exceed the configured fanout limit.
 
-Fanout connections are not pruned in the MVP, even when they exceed the
-configured target.
+`ConsolidateFanout` keeps one existing aggregator in a parent's fanout, removes
+selected ordinary fanout connections from that parent, and adds them as
+ordinary fanout connections of the aggregator. The parent, aggregator, and
+selected nodes are distinct. The aggregator and selected nodes must already be
+in the parent's fanout, and the operation fails atomically if the aggregator
+would exceed the fanout limit.
+
+`AssignTask` replaces one directional high, medium, or low task slot. Supplying
+no child clears that slot. A child cannot be the parent itself. Assigning a
+connection to a task slot removes its prior active, fanout, or other task role
+for that parent because a directed pair has one connection role.
 
 ## 6. HTTP and Static Files
 
@@ -164,13 +176,22 @@ not permit arbitrary filesystem paths.
   "short_name": "Example Node",
   "short_description": "Short description.",
   "long_description": "Long description.",
+  "task_connections": [
+    {
+      "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "short_name": "Outstanding Task",
+      "short_description": "Task summary.",
+      "priority": "high"
+    }
+  ],
   "active_connections": [],
   "fanout_connections": [],
   "history_head_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
 ```
 
-Connection arrays contain connection summaries in descending activation order.
+Task connections are ordered high, medium, then low. Active and fanout arrays
+contain connection summaries in descending activation order.
 
 ### 7.3 Error
 
@@ -359,7 +380,38 @@ Response:
 
 `nodes` contains the affected knowledge nodes after promotion and demotion.
 
-### 8.10 Read Knowledge History
+### 8.10 Consolidate Fanout Connections
+
+#### `POST /api/v1/connections/consolidate-fanout`
+
+```json
+{
+  "parent_node_id": "0123456789abcdef0123456789abcdef01234567",
+  "aggregator_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "fanout_node_ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+}
+```
+
+The fanout list is non-empty and distinct. The response contains the refreshed
+parent and aggregator nodes in a `nodes` array.
+
+### 8.11 Assign or Clear a Task Connection
+
+#### `POST /api/v1/tasks`
+
+```json
+{
+  "parent_node_id": "0123456789abcdef0123456789abcdef01234567",
+  "child_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "priority": "high"
+}
+```
+
+`priority` is `high`, `medium`, or `low`. `child_node_id` may be null to clear
+the selected slot. The response contains the refreshed parent as `node` and
+the displaced task summary as `replaced_task`, or null when none was displaced.
+
+### 8.12 Read Knowledge History
 
 #### `GET /api/v1/nodes/{node_id}/history`
 
@@ -386,6 +438,8 @@ The following are single SQLite write transactions:
 - knowledge-node creation and parent connection,
 - knowledge-node update and history append,
 - connection promotion and demotion,
+- fanout consolidation,
+- task assignment or clearing,
 - provenance creation.
 
 Any failure rolls back the entire operation. Reads never return an intermediate

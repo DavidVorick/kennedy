@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260712.3";
+import { formatToolResult } from "./human_format.js?v=20260713.6";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 
@@ -103,6 +103,8 @@ export class ToolExecutor {
         case "LoadNode": outcome = await this.loadNode(call.arguments); break;
         case "ResetContext": outcome = await this.resetContext(call.arguments); break;
         case "ConnectNodes": outcome = await this.connectNodes(call.arguments); break;
+        case "ConsolidateFanout": outcome = await this.consolidateFanout(call.arguments); break;
+        case "AssignTask": outcome = await this.assignTask(call.arguments); break;
         case "CreateNode": outcome = await this.createNode(call.arguments); break;
         case "UpdateNode": outcome = await this.updateNode(call.arguments); break;
         case "WebSearch": outcome = await this.webSearch(call.arguments); break;
@@ -142,6 +144,31 @@ export class ToolExecutor {
     const payload = await this.api.connect(durable);
     this.context.refresh(payload.nodes);
     return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
+  }
+
+  async consolidateFanout(args) {
+    validateObject(args, ["parentIdentifier", "aggregatorIdentifier", "fanoutIdentifiers"]);
+    integer(args.parentIdentifier, "parentIdentifier"); integer(args.aggregatorIdentifier, "aggregatorIdentifier");
+    integerArray(args.fanoutIdentifiers, "fanoutIdentifiers", 1);
+    const parentId = this.fullDurable(args.parentIdentifier);
+    const aggregatorId = this.fullDurable(args.aggregatorIdentifier);
+    const fanoutIds = args.fanoutIdentifiers.map(id => this.context.resolve(id));
+    const payload = await this.api.consolidateFanout({ parent_node_id: parentId, aggregator_node_id: aggregatorId, fanout_node_ids: fanoutIds });
+    this.context.refresh(payload.nodes);
+    return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
+  }
+
+  async assignTask(args) {
+    validateObject(args, ["parentIdentifier", "childIdentifier", "priority"]);
+    integer(args.parentIdentifier, "parentIdentifier");
+    if (args.childIdentifier !== "blank") integer(args.childIdentifier, "childIdentifier");
+    if (!["high", "medium", "low"].includes(args.priority)) throw Object.assign(new Error("priority must be high, medium, or low."), { code: "invalid_arguments" });
+    const parentId = this.fullDurable(args.parentIdentifier);
+    const childId = args.childIdentifier === "blank" ? null : this.fullDurable(args.childIdentifier);
+    const payload = await this.api.assignTask({ parent_node_id: parentId, child_node_id: childId, priority: args.priority });
+    this.context.refresh([payload.node]);
+    const replacedTask = payload.replaced_task ? { ...this.context.summary(payload.replaced_task), priority: payload.replaced_task.priority } : null;
+    return { result: { node: this.context.toContextNode(payload.node), replacedTask, cleared: childId === null } };
   }
 
   assertIngress() { if (this.mode !== "ingress" || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" }); }

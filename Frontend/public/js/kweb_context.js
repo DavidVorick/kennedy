@@ -27,7 +27,7 @@ export class KwebContext {
 
   ingestNode(node, full = true, origin = "context") {
     this.shortId(node.id);
-    for (const connection of [...(node.active_connections || []), ...(node.fanout_connections || [])]) this.shortId(connection.id);
+    for (const connection of [...(node.task_connections || []), ...(node.active_connections || []), ...(node.fanout_connections || [])]) this.shortId(connection.id);
     if (full) {
       this.nodesById.set(node.id, node); this.fullNodeIds.add(node.id);
       if (!this.nodeOrigins.has(node.id)) this.nodeOrigins.set(node.id, new Set());
@@ -68,6 +68,7 @@ export class KwebContext {
       shortName: node.short_name,
       shortDescription: node.short_description,
       longDescription: node.long_description,
+      taskConnections: (node.task_connections || []).map(c => ({ ...this.summary(c), priority: c.priority })),
       activeConnections: (node.active_connections || []).map(c => this.summary(c)),
       fanoutConnections: (node.fanout_connections || []).map(c => this.summary(c)),
     };

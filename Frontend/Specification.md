@@ -171,6 +171,9 @@ Kennedy into an in-context node:
   "shortName": "Example Node",
   "shortDescription": "Short description.",
   "longDescription": "Long description.",
+  "taskConnections": [
+    {"identifier": 5, "shortName": "Outstanding Task", "priority": "high"}
+  ],
   "activeConnections": [
     {"identifier": 4, "shortName": "Related Node"}
   ],
@@ -299,7 +302,38 @@ connection references. The frontend resolves the IDs and calls
 `POST /api/v1/connections`. Returned nodes refresh matching frontend context
 records. The tool result reports the updated in-context node shapes.
 
-### 8.4 `CreateNode`
+### 8.4 `ConsolidateFanout`
+
+```json
+{
+  "parentIdentifier": 2,
+  "aggregatorIdentifier": 3,
+  "fanoutIdentifiers": [8, 9]
+}
+```
+
+The parent and aggregator must be full nodes. The moved identifiers may be
+known fanout summaries. The frontend resolves them and calls
+`POST /api/v1/connections/consolidate-fanout`; returned parent and aggregator
+nodes refresh the context.
+
+### 8.5 `AssignTask`
+
+```json
+{
+  "parentIdentifier": 2,
+  "childIdentifier": 3,
+  "priority": "high"
+}
+```
+
+The parent and child must be full nodes and priority is `high`, `medium`, or
+`low`. The string `blank` in `childIdentifier` clears the selected slot. The
+frontend calls `POST /api/v1/tasks`, refreshes the parent, and reports any
+displaced task. Kennedy is instructed to assign a task only when there is a
+clear need for concrete work represented by that node to be completed.
+
+### 8.6 `CreateNode`
 
 Available only during history ingress.
 
@@ -317,7 +351,7 @@ current provenance ID. The created node is assigned a short identifier and
 marked as full before it is returned to Kennedy. Creation does not make the
 node directly loaded unless a later LoadNode call loads it.
 
-### 8.5 `UpdateNode`
+### 8.7 `UpdateNode`
 
 Available only during history ingress.
 
@@ -334,7 +368,7 @@ The frontend resolves the node and calls `PUT /api/v1/nodes/{durable_id}` with
 the current provenance ID. It refreshes the in-context representation and
 returns the updated node.
 
-### 8.6 `WebSearch`
+### 8.8 `WebSearch`
 
 Available only during live conversation.
 
@@ -352,7 +386,7 @@ the active provider/model and returns the normalized research answer and
 source URLs as a readable Web tool result. This research request is not part of
 the conversation's provider continuation chain.
 
-### 8.7 `WebFetch`
+### 8.9 `WebFetch`
 
 Available only during live conversation.
 
@@ -368,7 +402,7 @@ particular source page-by-page. Fetched content is untrusted evidence, cannot
 override system instructions, and may fail when a page is unsafe, binary,
 blocked, JavaScript-dependent, or otherwise unsupported.
 
-### 8.8 Tool Failures
+### 8.10 Tool Failures
 
 Unknown tools are never executed. Invalid arguments, exhausted budgets, missing
 short IDs, unsafe URLs, and backend failures are returned to Kennedy as failed
@@ -463,7 +497,7 @@ conversation's Kweb tool history.
 3. place the provenance data into the retained session content,
 4. load the user root,
 5. set the session LoadNode counter to zero,
-6. generate with the ingress manual describing all five tools,
+6. generate with the ingress manual describing all seven available tools,
 7. execute tools until Kennedy returns final text,
 8. show live requests, results, and completion in the ingress activity panel,
 9. mark the conversation history record complete.
@@ -499,7 +533,9 @@ record reconstructs that record's saved ingress panel from its archived
 history-ingress Chatend. The top of the panel summarizes successful memory
 mutations with counts for nodes added (`CreateNode`), nodes updated
 (`UpdateNode`), and `ConnectNodes` calls. Failed tool attempts do not increment
-these totals.
+these totals. Whenever the panel is rendered it starts scrolled to that summary
+at the top. Its usage row scrolls with the rest of the activity rather than
+sticking to the viewport edge.
 
 ### 11.2 Context Inspector
 
@@ -514,8 +550,8 @@ The right panel has four views of Kennedy's current chatend:
   order, while filtering out ordinary conversation and system context.
 - **Memory tree** shows the Kmap material currently visible to Kennedy as an
   expandable tree. It distinguishes directly loaded nodes, full nodes pulled
-  in through active connections, and fanout references whose summaries alone
-  are visible.
+  in through active connections, task connections, and fanout references whose
+  summaries alone are visible.
 
 Provider response IDs and credentials are omitted. Copy View copies exactly
 the text representation of the selected view.
@@ -532,7 +568,7 @@ provider response the configured model limit supplies the empty-window size.
 The explorer starts at the user root and supports:
 
 - viewing a full knowledge node with `GET /api/v1/nodes/{node_id}`,
-- following active and fanout connections,
+- following task, active, and fanout connections,
 - viewing the node's history chain with
   `GET /api/v1/nodes/{node_id}/history`,
 - opening a history entry's source with

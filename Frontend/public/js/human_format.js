@@ -19,12 +19,24 @@ function connectionLines(title, connections) {
   ];
 }
 
+function taskConnectionLines(connections) {
+  if (!connections?.length) return ["Task connections: none"];
+  return [
+    "Task connections:",
+    ...connections.flatMap(connection => [
+      `  - ${connection.priority}: ${connection.identifier}: ${text(connection.shortName)}`,
+      `    Summary: ${text(connection.shortDescription)}`,
+    ]),
+  ];
+}
+
 export function formatContextNode(node) {
   return [
     `Node ${node.identifier}: ${text(node.shortName)}`,
     `Summary: ${text(node.shortDescription)}`,
     "Details:",
     indented(node.longDescription),
+    ...taskConnectionLines(node.taskConnections),
     ...connectionLines("Active connections", node.activeConnections),
     ...connectionLines("Fanout connections", node.fanoutConnections),
   ].join("\n");
@@ -85,6 +97,15 @@ export function formatToolResult(toolName, content) {
       return ["Memory context reset completed.", "", formatKmapContext(result.context || {})].join("\n");
     case "ConnectNodes":
       return ["Memory connections updated.", "", formatNodes("Affected nodes", result.nodes)].join("\n");
+    case "ConsolidateFanout":
+      return ["Fanout connections consolidated.", "", formatNodes("Affected nodes", result.nodes)].join("\n");
+    case "AssignTask":
+      return [
+        result.cleared ? "Task slot cleared." : "Task connection assigned.",
+        "",
+        formatNodes("Updated parent node", result.node ? [result.node] : []),
+        ...(result.replacedTask ? ["", `Replaced task: ${result.replacedTask.priority} · ${result.replacedTask.identifier}: ${text(result.replacedTask.shortName)}`] : []),
+      ].join("\n");
     case "CreateNode":
       return ["Memory node created.", "", formatNodes("Created node", result.node ? [result.node] : [])].join("\n");
     case "UpdateNode":

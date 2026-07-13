@@ -13,7 +13,7 @@ import { formatKmapContext } from "../public/js/human_format.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
-const node = (n, active = [], fanout = []) => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}`, long_description: `Details ${n}`, active_connections: active.map(summary), fanout_connections: fanout.map(summary), history_head_id: id(100 + n) });
+const node = (n, active = [], fanout = [], tasks = []) => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}`, long_description: `Details ${n}`, task_connections: tasks.map(([task, priority]) => ({ ...summary(task), priority })), active_connections: active.map(summary), fanout_connections: fanout.map(summary), history_head_id: id(100 + n) });
 
 class MockKweb {
   constructor(nodes) { this.nodes = new Map(nodes.map(n => [n.id, n])); this.connected = null; }
@@ -42,6 +42,14 @@ test("Kmap snapshot distinguishes direct loads from active expansions", async ()
   await context.loadDurable(id(2));
   snapshot = context.snapshot();
   assert.deepEqual(snapshot.nodes.find(item => item.identifier === 2).contextSources, ["active", "direct"]);
+});
+
+test("legacy nodes without explicit task connections behave as though they have none", async () => {
+  const legacy = node(1);
+  delete legacy.task_connections;
+  const context = new KwebContext(new MockKweb([legacy]), id(1));
+  await context.initialize();
+  assert.deepEqual(context.snapshot().nodes[0].taskConnections, []);
 });
 
 test("Kmap archives restore raw nodes and short identifiers exactly", async () => {
@@ -83,6 +91,33 @@ test("ConnectNodes translates short IDs to durable IDs", async () => {
   const result = await executor.execute({ id: "a", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
   assert.match(result.message.content, /Memory connections updated/);
   assert.deepEqual(api.connected, [id(1), id(2)]);
+});
+
+test("ConsolidateFanout and AssignTask translate short IDs and refresh task connections", async () => {
+  const api = new MockKweb([node(1, [], [2, 3, 4]), node(2), node(3), node(4)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  await context.loadDurable(id(2));
+  api.consolidateFanout = async body => {
+    api.consolidated = body;
+    return { nodes: [node(1, [], [2]), node(2, [], [3, 4])] };
+  };
+  api.assignTask = async body => {
+    api.assigned = body;
+    return { node: body.child_node_id ? node(1, [], [3, 4], [[2, body.priority]]) : node(1, [], [3, 4]), replaced_task: null };
+  };
+  const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
+  const consolidated = await executor.execute({ id: "a", name: "ConsolidateFanout", arguments: { parentIdentifier: 1, aggregatorIdentifier: 2, fanoutIdentifiers: [3, 4] } });
+  assert.match(consolidated.message.content, /Fanout connections consolidated/);
+  assert.deepEqual(api.consolidated, { parent_node_id: id(1), aggregator_node_id: id(2), fanout_node_ids: [id(3), id(4)] });
+
+  const assigned = await executor.execute({ id: "b", name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: 2, priority: "high" } });
+  assert.match(assigned.message.content, /Task connection assigned/);
+  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: id(2), priority: "high" });
+  assert.equal(context.snapshot().nodes.find(item => item.identifier === 1).taskConnections[0].priority, "high");
+
+  const cleared = await executor.execute({ id: "c", name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: "blank", priority: "high" } });
+  assert.match(cleared.message.content, /Task slot cleared/);
+  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: null, priority: "high" });
 });
 
 test("WebSearch and WebFetch expose only minimal model-facing arguments", async () => {
@@ -503,11 +538,12 @@ test("retry persists an initially failed pending checkpoint before generation", 
 });
 
 test("Kmap context is readable text rather than JSON", async () => {
-  const context = new KwebContext(new MockKweb([node(1, [2]), node(2)]), id(1));
+  const context = new KwebContext(new MockKweb([node(1, [2], [], [[2, "high"]]), node(2)]), id(1));
   await context.initialize();
   const formatted = formatKmapContext(context.snapshot());
   assert.match(formatted, /Current Kmap context/);
   assert.match(formatted, /Node 1: Node 1/);
+  assert.match(formatted, /Task connections:\n  - high: 2: Node 2/);
   assert.match(formatted, /Active connections:\n  - 2: Node 2/);
   assert.equal(formatted.includes('{'), false);
 });
@@ -555,6 +591,26 @@ test("session manuals enforce exclusive tool-request responses", async () => {
     assert.match(manual, /Do not put explanations, status updates/);
     assert.match(manual, /no text after the final brace/);
   }
+});
+
+test("Kennedy's manuals expose fanout consolidation and narrowly scoped task assignment", async () => {
+  const shared = await readFile(new URL("../SystemPrompts/KmapAgentManual.txt", import.meta.url), "utf8");
+  assert.match(shared, /Task connections are reserved for concrete, outstanding work/);
+  assert.match(shared, /only when there is a clear need for that task to be completed/);
+  for (const file of ["ConversationAgentManual.txt", "HistoryIngressAgentManual.txt"]) {
+    const manual = await readFile(new URL(`../SystemPrompts/${file}`, import.meta.url), "utf8");
+    assert.match(manual, /ConsolidateFanout\n  Call:/);
+    assert.match(manual, /AssignTask\n  Call:/);
+    assert.match(manual, /only when there is a clear need for concrete work/);
+    assert.match(manual, /Pass the string "blank" as childIdentifier/);
+  }
+});
+
+test("history ingress starts at the top without a sticky usage row", async () => {
+  const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/css/styles.css", import.meta.url), "utf8");
+  assert.match(render, /renderIngressActivity[\s\S]*?container\.scrollTop = 0/);
+  assert.equal(/\.ingress-usage\s*\{[^}]*position:\s*sticky/s.test(styles), false);
 });
 
 test("chatend inspector exposes text tool requests and readable results", () => {

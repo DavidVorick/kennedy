@@ -24,6 +24,9 @@ const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const PROVENANCE_IDEMPOTENCY_MIGRATION: &str =
     include_str!("../migrations/002_provenance_idempotency.sql");
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+const TASK_HIGH_ORDER: i64 = -1;
+const TASK_MEDIUM_ORDER: i64 = -2;
+const TASK_LOW_ORDER: i64 = -3;
 const PROMPT_FILES: [&str; 3] = [
     "KmapAgentManual.txt",
     "ConversationAgentManual.txt",
@@ -45,6 +48,7 @@ struct AppState {
     db: Arc<Mutex<Connection>>,
     prompts_dir: PathBuf,
     active_limit: usize,
+    fanout_limit: usize,
 }
 
 async fn prevent_stale_frontend_assets(mut response: Response) -> Response {
@@ -112,11 +116,20 @@ struct ConnectionSummary {
 }
 
 #[derive(Clone, Serialize)]
+struct TaskConnectionSummary {
+    id: String,
+    short_name: String,
+    short_description: String,
+    priority: String,
+}
+
+#[derive(Clone, Serialize)]
 struct KnowledgeNode {
     id: String,
     short_name: String,
     short_description: String,
     long_description: String,
+    task_connections: Vec<TaskConnectionSummary>,
     active_connections: Vec<ConnectionSummary>,
     fanout_connections: Vec<ConnectionSummary>,
     history_head_id: Option<String>,
@@ -153,9 +166,26 @@ struct ConnectInput {
     node_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct ConsolidateFanoutInput {
+    parent_node_id: String,
+    aggregator_node_id: String,
+    fanout_node_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct AssignTaskInput {
+    parent_node_id: String,
+    child_node_id: Option<String>,
+    priority: String,
+}
+
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     if config.active_limit == 0 {
         anyhow::bail!("active_limit must be positive");
+    }
+    if config.fanout_limit == 0 {
+        anyhow::bail!("fanout_limit must be positive");
     }
     let mut connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
@@ -171,6 +201,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         db: Arc::new(Mutex::new(connection)),
         prompts_dir: config.system_prompts_dir,
         active_limit: config.active_limit,
+        fanout_limit: config.fanout_limit,
     };
 
     let app = Router::new()
@@ -182,7 +213,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/v1/nodes", post(create_node))
         .route("/api/v1/provenance", post(create_provenance))
         .route("/api/v1/provenance/{provenance_id}", get(get_provenance))
+        .route(
+            "/api/v1/connections/consolidate-fanout",
+            post(consolidate_fanout),
+        )
         .route("/api/v1/connections", post(connect_nodes))
+        .route("/api/v1/tasks", post(assign_task))
         .route("/system-prompts/{filename}", get(get_prompt))
         .fallback_service(ServeDir::new(config.frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -319,12 +355,52 @@ fn fetch_summaries(
     source: &[u8],
     tier: &str,
 ) -> rusqlite::Result<Vec<ConnectionSummary>> {
-    let mut stmt = db.prepare("SELECT n.id,n.short_name,n.short_description FROM knowledge_connections c JOIN knowledge_nodes n ON n.id=c.target_node_id WHERE c.source_node_id=?1 AND c.tier=?2 ORDER BY c.activation_order DESC")?;
+    let sql = if tier == "fanout" {
+        "SELECT n.id,n.short_name,n.short_description FROM knowledge_connections c JOIN knowledge_nodes n ON n.id=c.target_node_id WHERE c.source_node_id=?1 AND c.tier=?2 AND c.activation_order>=0 ORDER BY c.activation_order DESC"
+    } else {
+        "SELECT n.id,n.short_name,n.short_description FROM knowledge_connections c JOIN knowledge_nodes n ON n.id=c.target_node_id WHERE c.source_node_id=?1 AND c.tier=?2 ORDER BY c.activation_order DESC"
+    };
+    let mut stmt = db.prepare(sql)?;
     stmt.query_map(params![source, tier], |row| {
         Ok(ConnectionSummary {
             id: hex::encode(row.get::<_, Vec<u8>>(0)?),
             short_name: row.get(1)?,
             short_description: row.get(2)?,
+        })
+    })?
+    .collect()
+}
+
+fn task_priority(order: i64) -> Option<&'static str> {
+    match order {
+        TASK_HIGH_ORDER => Some("high"),
+        TASK_MEDIUM_ORDER => Some("medium"),
+        TASK_LOW_ORDER => Some("low"),
+        _ => None,
+    }
+}
+
+fn task_order(priority: &str) -> Result<i64, ApiError> {
+    match priority {
+        "high" => Ok(TASK_HIGH_ORDER),
+        "medium" => Ok(TASK_MEDIUM_ORDER),
+        "low" => Ok(TASK_LOW_ORDER),
+        _ => Err(ApiError::bad("Task priority must be high, medium, or low.")),
+    }
+}
+
+fn fetch_task_summaries(
+    db: &Connection,
+    source: &[u8],
+) -> rusqlite::Result<Vec<TaskConnectionSummary>> {
+    let mut stmt = db.prepare("SELECT n.id,n.short_name,n.short_description,c.activation_order FROM knowledge_connections c JOIN knowledge_nodes n ON n.id=c.target_node_id WHERE c.source_node_id=?1 AND c.tier='fanout' AND c.activation_order BETWEEN ?2 AND ?3 ORDER BY c.activation_order DESC")?;
+    stmt.query_map(params![source, TASK_LOW_ORDER, TASK_HIGH_ORDER], |row| {
+        let order = row.get::<_, i64>(3)?;
+        Ok(TaskConnectionSummary {
+            id: hex::encode(row.get::<_, Vec<u8>>(0)?),
+            short_name: row.get(1)?,
+            short_description: row.get(2)?,
+            priority: task_priority(order).unwrap_or("unknown").to_string(),
         })
     })?
     .collect()
@@ -340,6 +416,7 @@ fn fetch_node(db: &Connection, id: &[u8]) -> Result<KnowledgeNode, ApiError> {
         short_name,
         short_description,
         long_description,
+        task_connections: fetch_task_summaries(db, id).map_err(ApiError::internal)?,
         active_connections: fetch_summaries(db, id, "active").map_err(ApiError::internal)?,
         fanout_connections: fetch_summaries(db, id, "fanout").map_err(ApiError::internal)?,
         history_head_id: history.map(hex::encode),
@@ -501,13 +578,14 @@ fn connect_in_tx(
     tx: &Transaction<'_>,
     ids: &[Vec<u8>],
     active_limit: usize,
+    fanout_limit: usize,
 ) -> Result<(), ApiError> {
     for id in ids {
         require_exists(tx, "knowledge_nodes", id, "Knowledge node")?;
     }
     let mut order: i64 = tx
         .query_row(
-            "SELECT COALESCE(MAX(activation_order),0) FROM knowledge_connections",
+            "SELECT COALESCE(MAX(activation_order),0) FROM knowledge_connections WHERE activation_order>=0",
             [],
             |r| r.get(0),
         )
@@ -525,6 +603,12 @@ fn connect_in_tx(
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='active'", [source], |r| r.get(0)).map_err(ApiError::internal)?;
         let count = count as usize;
         if count > active_limit {
+            let fanout_count: i64 = tx.query_row("SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='fanout' AND activation_order>=0", [source], |r| r.get(0)).map_err(ApiError::internal)?;
+            if fanout_count as usize + (count - active_limit) > fanout_limit {
+                return Err(ApiError::conflict(format!(
+                    "ConnectNodes would exceed the fanout connection limit of {fanout_limit}."
+                )));
+            }
             tx.execute("UPDATE knowledge_connections SET tier='fanout' WHERE source_node_id=?1 AND target_node_id IN (SELECT target_node_id FROM knowledge_connections WHERE source_node_id=?1 AND tier='active' ORDER BY activation_order ASC LIMIT ?2)", params![source,(count-active_limit) as i64]).map_err(ApiError::internal)?;
         }
     }
@@ -538,13 +622,165 @@ async fn connect_nodes(
     let ids = validate_distinct_ids(&input.node_ids, 2, "ConnectNodes")?;
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
-    connect_in_tx(&tx, &ids, state.active_limit)?;
+    connect_in_tx(&tx, &ids, state.active_limit, state.fanout_limit)?;
     tx.commit().map_err(ApiError::internal)?;
     let nodes = ids
         .iter()
         .map(|id| fetch_node(&db, id))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({"nodes":nodes})))
+}
+
+fn ordinary_fanout_exists(
+    tx: &Transaction<'_>,
+    source: &[u8],
+    target: &[u8],
+) -> Result<bool, ApiError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM knowledge_connections WHERE source_node_id=?1 AND target_node_id=?2 AND tier='fanout' AND activation_order>=0)",
+        params![source, target],
+        |row| row.get(0),
+    )
+    .map_err(ApiError::internal)
+}
+
+fn consolidate_fanout_in_tx(
+    tx: &Transaction<'_>,
+    parent: &[u8],
+    aggregator: &[u8],
+    fanout_ids: &[Vec<u8>],
+    fanout_limit: usize,
+) -> Result<(), ApiError> {
+    require_exists(tx, "knowledge_nodes", parent, "Parent knowledge node")?;
+    require_exists(
+        tx,
+        "knowledge_nodes",
+        aggregator,
+        "Aggregator knowledge node",
+    )?;
+    if parent == aggregator || fanout_ids.iter().any(|id| id == parent || id == aggregator) {
+        return Err(ApiError::bad(
+            "The parent, aggregator, and fanout identifiers must all be distinct.",
+        ));
+    }
+    for id in fanout_ids {
+        require_exists(tx, "knowledge_nodes", id, "Fanout knowledge node")?;
+    }
+    if !ordinary_fanout_exists(tx, parent, aggregator)? {
+        return Err(ApiError::conflict(
+            "The aggregator must already be a fanout connection of the parent.",
+        ));
+    }
+    for id in fanout_ids {
+        if !ordinary_fanout_exists(tx, parent, id)? {
+            return Err(ApiError::conflict(
+                "Every consolidated node must currently be a fanout connection of the parent.",
+            ));
+        }
+    }
+
+    let existing_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='fanout' AND activation_order>=0",
+            [aggregator],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    let mut added = 0_usize;
+    for id in fanout_ids {
+        if !ordinary_fanout_exists(tx, aggregator, id)? {
+            added += 1;
+        }
+    }
+    if existing_count as usize + added > fanout_limit {
+        return Err(ApiError::conflict(format!(
+            "ConsolidateFanout would exceed the fanout connection limit of {fanout_limit}."
+        )));
+    }
+
+    let mut order: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(activation_order),0) FROM knowledge_connections WHERE activation_order>=0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    for id in fanout_ids {
+        tx.execute(
+            "DELETE FROM knowledge_connections WHERE source_node_id=?1 AND target_node_id=?2",
+            params![parent, id],
+        )
+        .map_err(ApiError::internal)?;
+        order += 1;
+        tx.execute(
+            "INSERT INTO knowledge_connections(source_node_id,target_node_id,tier,activation_order) VALUES(?1,?2,'fanout',?3) ON CONFLICT(source_node_id,target_node_id) DO UPDATE SET tier='fanout',activation_order=excluded.activation_order",
+            params![aggregator, id, order],
+        )
+        .map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
+
+async fn consolidate_fanout(
+    State(state): State<AppState>,
+    Json(input): Json<ConsolidateFanoutInput>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let parent = decode_id(&input.parent_node_id)?;
+    let aggregator = decode_id(&input.aggregator_node_id)?;
+    let fanout_ids =
+        validate_distinct_ids(&input.fanout_node_ids, 1, "ConsolidateFanout fanout list")?;
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    consolidate_fanout_in_tx(&tx, &parent, &aggregator, &fanout_ids, state.fanout_limit)?;
+    tx.commit().map_err(ApiError::internal)?;
+    let nodes = [parent, aggregator]
+        .iter()
+        .map(|id| fetch_node(&db, id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(json!({"nodes":nodes})))
+}
+
+async fn assign_task(
+    State(state): State<AppState>,
+    Json(input): Json<AssignTaskInput>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let parent = decode_id(&input.parent_node_id)?;
+    let child = input.child_node_id.as_deref().map(decode_id).transpose()?;
+    let priority_order = task_order(&input.priority)?;
+    if child.as_deref() == Some(parent.as_slice()) {
+        return Err(ApiError::bad("A node cannot be its own task connection."));
+    }
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    require_exists(&tx, "knowledge_nodes", &parent, "Parent knowledge node")?;
+    if let Some(child) = child.as_deref() {
+        require_exists(&tx, "knowledge_nodes", child, "Task knowledge node")?;
+    }
+    let mut replaced = fetch_task_summaries(&tx, &parent)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|task| task.priority == input.priority);
+    if replaced
+        .as_ref()
+        .is_some_and(|task| child.as_ref().is_some_and(|id| task.id == hex::encode(id)))
+    {
+        replaced = None;
+    }
+    tx.execute(
+        "DELETE FROM knowledge_connections WHERE source_node_id=?1 AND tier='fanout' AND activation_order=?2",
+        params![parent, priority_order],
+    )
+    .map_err(ApiError::internal)?;
+    if let Some(child) = child {
+        tx.execute(
+            "INSERT INTO knowledge_connections(source_node_id,target_node_id,tier,activation_order) VALUES(?1,?2,'fanout',?3) ON CONFLICT(source_node_id,target_node_id) DO UPDATE SET tier='fanout',activation_order=excluded.activation_order",
+            params![parent, child, priority_order],
+        )
+        .map_err(ApiError::internal)?;
+    }
+    tx.commit().map_err(ApiError::internal)?;
+    let node = fetch_node(&db, &parent)?;
+    Ok(Json(json!({"node":node,"replaced_task":replaced})))
 }
 
 async fn create_node(
@@ -575,7 +811,7 @@ async fn create_node(
     .map_err(ApiError::internal)?;
     let mut connected = vec![node_id.clone()];
     connected.extend(parents);
-    connect_in_tx(&tx, &connected, state.active_limit)?;
+    connect_in_tx(&tx, &connected, state.active_limit, state.fanout_limit)?;
     tx.commit().map_err(ApiError::internal)?;
     let node = fetch_node(&db, &node_id)?;
     Ok((
@@ -658,6 +894,25 @@ mod tests {
         db
     }
 
+    fn state(db: Connection) -> AppState {
+        AppState {
+            db: Arc::new(Mutex::new(db)),
+            prompts_dir: PathBuf::new(),
+            active_limit: 12,
+            fanout_limit: 60,
+        }
+    }
+
+    fn insert_node(db: &Connection, name: &str) -> Vec<u8> {
+        let id = new_id();
+        db.execute(
+            "INSERT INTO knowledge_nodes(id,short_name,short_description,long_description) VALUES(?1,?2,'','')",
+            params![id, name],
+        )
+        .unwrap();
+        id
+    }
+
     #[test]
     fn text_validation_enforces_contract() {
         assert!(validate_node_text("abc", "", "ok").is_err());
@@ -680,7 +935,7 @@ mod tests {
             tx.execute("INSERT INTO knowledge_nodes(id,short_name,short_description,long_description) VALUES(?1,?2,'','')",params![id,format!("Node {i}")]).unwrap();
             ids.push(id);
         }
-        connect_in_tx(&tx, &ids, 2).unwrap();
+        connect_in_tx(&tx, &ids, 2, 60).unwrap();
         for id in &ids {
             let count:i64=tx.query_row("SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='active'",[id],|r|r.get(0)).unwrap();
             assert_eq!(count, 2);
@@ -690,19 +945,163 @@ mod tests {
     }
 
     #[test]
+    fn connection_overflow_fails_before_exceeding_the_fanout_limit() {
+        let mut db = db();
+        let tx = db.transaction().unwrap();
+        let ids = [
+            insert_node(&tx, "Source Node"),
+            insert_node(&tx, "Second Node"),
+            insert_node(&tx, "Third Node"),
+        ];
+        let existing_fanout = insert_node(&tx, "Existing Fanout");
+        tx.execute(
+            "INSERT INTO knowledge_connections(source_node_id,target_node_id,tier,activation_order) VALUES(?1,?2,'fanout',1)",
+            params![ids[0], existing_fanout],
+        )
+        .unwrap();
+        let error = connect_in_tx(&tx, &ids, 1, 1).unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
     fn bootstrap_has_valid_history() {
         let db = db();
         let count:i64=db.query_row("SELECT COUNT(*) FROM knowledge_nodes n JOIN data_history_nodes h ON h.id=n.history_head_id JOIN data_provenance_nodes p ON p.id=h.provenance_id WHERE n.is_user_root=1",[],|r|r.get(0)).unwrap();
         assert_eq!(count, 1);
     }
 
+    #[test]
+    fn legacy_nodes_have_no_task_connections_without_a_schema_upgrade() {
+        let db = db();
+        let root: Vec<u8> = db
+            .query_row(
+                "SELECT id FROM knowledge_nodes WHERE is_user_root=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let node = fetch_node(&db, &root).unwrap();
+        assert!(node.task_connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_slots_can_be_assigned_replaced_and_cleared() {
+        let db = db();
+        let parent: Vec<u8> = db
+            .query_row(
+                "SELECT id FROM knowledge_nodes WHERE is_user_root=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let first = insert_node(&db, "First Task");
+        let second = insert_node(&db, "Second Task");
+        let state = state(db);
+
+        let assigned = assign_task(
+            State(state.clone()),
+            Json(AssignTaskInput {
+                parent_node_id: hex::encode(&parent),
+                child_node_id: Some(hex::encode(&first)),
+                priority: "high".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            assigned.0["node"]["task_connections"][0]["id"],
+            hex::encode(&first)
+        );
+        assert_eq!(
+            assigned.0["node"]["task_connections"][0]["priority"],
+            "high"
+        );
+        assert_eq!(assigned.0["node"]["fanout_connections"], json!([]));
+
+        let replaced = assign_task(
+            State(state.clone()),
+            Json(AssignTaskInput {
+                parent_node_id: hex::encode(&parent),
+                child_node_id: Some(hex::encode(&second)),
+                priority: "high".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced.0["replaced_task"]["id"], hex::encode(&first));
+        assert_eq!(
+            replaced.0["node"]["task_connections"][0]["id"],
+            hex::encode(&second)
+        );
+
+        let cleared = assign_task(
+            State(state),
+            Json(AssignTaskInput {
+                parent_node_id: hex::encode(parent),
+                child_node_id: None,
+                priority: "high".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.0["replaced_task"]["id"], hex::encode(second));
+        assert_eq!(cleared.0["node"]["task_connections"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn fanout_consolidation_moves_children_under_the_aggregator() {
+        let db = db();
+        let parent: Vec<u8> = db
+            .query_row(
+                "SELECT id FROM knowledge_nodes WHERE is_user_root=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let aggregator = insert_node(&db, "Task Group");
+        let first = insert_node(&db, "Fanout One");
+        let second = insert_node(&db, "Fanout Two");
+        for (order, target) in [&aggregator, &first, &second].into_iter().enumerate() {
+            db.execute(
+                "INSERT INTO knowledge_connections(source_node_id,target_node_id,tier,activation_order) VALUES(?1,?2,'fanout',?3)",
+                params![parent, target, order as i64 + 1],
+            )
+            .unwrap();
+        }
+        let state = state(db);
+        let result = consolidate_fanout(
+            State(state),
+            Json(ConsolidateFanoutInput {
+                parent_node_id: hex::encode(&parent),
+                aggregator_node_id: hex::encode(&aggregator),
+                fanout_node_ids: vec![hex::encode(&first), hex::encode(&second)],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.0["nodes"][0]["fanout_connections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            result.0["nodes"][0]["fanout_connections"][0]["id"],
+            hex::encode(&aggregator)
+        );
+        assert_eq!(
+            result.0["nodes"][1]["fanout_connections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn provenance_creation_is_idempotent_when_keyed() {
-        let state = AppState {
-            db: Arc::new(Mutex::new(db())),
-            prompts_dir: PathBuf::new(),
-            active_limit: 12,
-        };
+        let state = state(db());
         let input = || ProvenanceInput {
             data: "David: hello".into(),
             source: "conversation".into(),

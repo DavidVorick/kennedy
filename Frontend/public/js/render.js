@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260713.5";
+import { formatKmapContext } from "./human_format.js?v=20260713.6";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -199,6 +199,7 @@ function connectionLeaf(connection, kind, nodeByIdentifier, directlyLoaded) {
     element("span", "memory-connection-name", connection.shortName),
     badge(kind === "fanout" ? "summary only" : target ? "full context" : "summary only", kind === "fanout" || !target ? "summary" : "expanded"),
   );
+  if (kind === "task") row.append(badge(`${connection.priority} priority`, "task"));
   if (directlyLoaded.has(connection.identifier)) row.append(badge("also directly loaded", "direct"));
   if (connection.shortDescription) row.append(element("span", "memory-connection-description", connection.shortDescription));
   return row;
@@ -243,6 +244,7 @@ function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, dept
   if (node.shortDescription) body.append(element("p", "memory-node-short", node.shortDescription));
   body.append(element("p", "memory-node-long", node.longDescription || "No detailed description."));
   body.append(
+    connectionGroup("Task connections", node.taskConnections || [], "task", nodeByIdentifier, directlyLoaded, path, depth),
     connectionGroup("Active connections", node.activeConnections || [], "active", nodeByIdentifier, directlyLoaded, path, depth),
     connectionGroup("Fanout references", node.fanoutConnections || [], "fanout", nodeByIdentifier, directlyLoaded, path, depth),
   );
@@ -282,6 +284,7 @@ function renderMemoryTree(container, snapshot) {
 
 export function renderIngressActivity(container, diagnostic, active) {
   container.replaceChildren();
+  container.scrollTop = 0;
   const summary = ingressMutationSummary(diagnostic);
   const review = element("section", "ingress-summary");
   review.setAttribute("aria-label", "History ingress memory changes");
@@ -318,7 +321,6 @@ export function renderIngressActivity(container, diagnostic, active) {
     item.append(element("span", "role", message.display_role || "Kennedy"), element("pre", "ingress-body", message.content));
     container.append(item);
   }
-  container.scrollTop = container.scrollHeight;
 }
 
 export function showError(banner, message) { banner.textContent = message; banner.classList.remove("hidden"); }

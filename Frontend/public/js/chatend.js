@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260712.3";
+import { formatKmapContext } from "./human_format.js?v=20260713.6";
 
 export class Chatend {
   constructor(systemPrompt, context, retained = []) { this.systemPrompt = systemPrompt; this.context = context; this.retained = retained; this.messages = []; this.rebuild(); }

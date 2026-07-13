@@ -1,4 +1,4 @@
-import { element } from "./render.js?v=20260712.3";
+import { element } from "./render.js?v=20260713.6";
 
 export class MemoryExplorer {
   constructor({ api, rootNodeId, content, backButton, forwardButton }) {
@@ -25,7 +25,7 @@ export class MemoryExplorer {
     const root = document.createDocumentFragment();
     root.append(element("h2", "", node.short_name), element("p", "node-description", node.short_description || "No short description."), element("div", "long-description", node.long_description || "No long description."));
     const grid = element("div", "connection-grid");
-    grid.append(this.connectionList("Active connections", node.active_connections), this.connectionList("Fanout connections", node.fanout_connections));
+    grid.append(this.connectionList("Task connections", node.task_connections || [], true), this.connectionList("Active connections", node.active_connections), this.connectionList("Fanout connections", node.fanout_connections));
     root.append(grid);
     const historySection = element("section", "history"); historySection.append(element("h3", "", "Source history"));
     if (!history.length) historySection.append(element("p", "", "No history entries."));
@@ -38,12 +38,12 @@ export class MemoryExplorer {
     root.append(historySection); this.content.replaceChildren(root);
   }
 
-  connectionList(title, connections) {
+  connectionList(title, connections, showPriority = false) {
     const section = element("section", "connection-list"); section.append(element("h3", "", title));
     if (!connections.length) section.append(element("p", "", "None yet."));
     for (const connection of connections) {
       const button = element("button", "connection"); button.type = "button";
-      button.append(element("strong", "", connection.short_name), element("small", "", connection.short_description || "No description."));
+      button.append(element("strong", "", showPriority ? `${connection.priority} · ${connection.short_name}` : connection.short_name), element("small", "", connection.short_description || "No description."));
       button.addEventListener("click", () => this.open(connection.id)); section.append(button);
     }
     return section;
@@ -59,4 +59,3 @@ export class MemoryExplorer {
     } catch (error) { row.insertAdjacentElement("afterend", element("div", "source-detail", error.message)); }
   }
 }
-

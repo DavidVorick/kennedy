@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260713.5";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260713.5";
-import { ConversationSession } from "./conversation.js?v=20260713.5";
-import { runHistoryIngress } from "./history_ingress.js?v=20260713.5";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260713.5";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260713.5";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260713.6";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260713.6";
+import { ConversationSession } from "./conversation.js?v=20260713.6";
+import { runHistoryIngress } from "./history_ingress.js?v=20260713.6";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260713.6";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260713.6";
 
 const CONFIG = {
   kwebBase: window.location.origin,
