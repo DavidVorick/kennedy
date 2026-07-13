@@ -544,9 +544,11 @@ The explorer does not edit durable data.
 ## 12. Rendering and Error Requirements
 
 - Insert untrusted text with `textContent`, never `innerHTML`.
-- Keep user input disabled while generation, a tool loop, or a pending restored
-  query is active. During required history ingress, keep the next composer
-  editable but disable submission until the next durable record exists.
+- Keep the composer editable while generation, a tool loop, or a pending
+  restored query is active so the user can draft their next message. Keep Send
+  disabled until Kennedy has responded and the current turn is complete. During
+  required history ingress, likewise keep the next composer editable but
+  disable submission until the next durable record exists.
 - Preserve the diagnostic record of failed calls.
 - Display backend error messages without exposing stack traces.
 - Use semantic controls and visible keyboard focus.

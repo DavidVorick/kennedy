@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260713.4";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260713.4";
-import { ConversationSession } from "./conversation.js?v=20260713.4";
-import { runHistoryIngress } from "./history_ingress.js?v=20260713.4";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260713.4";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260713.4";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260713.5";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260713.5";
+import { ConversationSession } from "./conversation.js?v=20260713.5";
+import { runHistoryIngress } from "./history_ingress.js?v=20260713.5";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260713.5";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, renderIngressActivity, inspectorText, showError, clearError } from "./render.js?v=20260713.5";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -111,7 +111,7 @@ function update() {
   ui.end_button.disabled = controls.endDisabled;
   ui.new_conversation.disabled = controls.newDisabled;
   ui.end_button.textContent = session?.pendingTurn ? "Retry saved query" : ingressRequired ? "Retry memory update" : "End conversation";
-  ui.activity.textContent = viewingHistory ? "Viewing a saved conversation" : ending && ingressRequired ? "Updating memory in the background — you can write your next message" : session?.busy ? "Kennedy is working…" : session?.pendingTurn ? "Saved query needs a response" : ingressRequired ? "Write your next message; Send unlocks after the memory update" : "";
+  ui.activity.textContent = viewingHistory ? "Viewing a saved conversation" : ending && ingressRequired ? "Updating memory in the background — you can write your next message" : session?.busy ? "Kennedy is working — you can draft your next message" : session?.pendingTurn ? "Saved query needs a response" : ingressRequired ? "Write your next message; Send unlocks after the memory update" : "";
 }
 
 function upsertHistory(record) {
@@ -173,7 +173,7 @@ async function prepareNextConversation() {
 }
 
 async function submitMessage(event) {
-  event.preventDefault(); if (!session || session.busy || ingressRequired || viewedRecord) return;
+  event.preventDefault(); if (!session || session.busy || session.pendingTurn || ending || ingressRequired || viewedRecord) return;
   const text = ui.message_input.value; if (!text.trim()) return;
   ui.message_input.value = ""; clearError(ui.error_banner);
   try { await session.send(text); }

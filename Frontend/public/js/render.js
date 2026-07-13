@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260713.4";
+import { formatKmapContext } from "./human_format.js?v=20260713.5";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -79,7 +79,7 @@ export function renderConversationHistory(container, records, { selectedId = nul
 export function conversationControlState({ hasSession, sessionBusy, transitionBusy, ingressRequired, pendingTurn, viewingHistory, transcriptLength }) {
   const busy = sessionBusy || transitionBusy;
   return {
-    inputDisabled: sessionBusy || viewingHistory || !hasSession,
+    inputDisabled: viewingHistory || !hasSession,
     sendDisabled: busy || ingressRequired || pendingTurn || viewingHistory || !hasSession,
     endDisabled: busy || viewingHistory || !hasSession || (!ingressRequired && !pendingTurn && !transcriptLength),
     newDisabled: sessionBusy || pendingTurn,

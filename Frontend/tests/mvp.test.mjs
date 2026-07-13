@@ -318,6 +318,17 @@ test("next request stays editable but cannot send during background ingress", ()
   assert.equal(controls.newDisabled, false);
 });
 
+test("next message stays editable but cannot send while Kennedy is working", () => {
+  const controls = conversationControlState({
+    hasSession: true, sessionBusy: true, transitionBusy: false,
+    ingressRequired: false, pendingTurn: false, viewingHistory: false, transcriptLength: 1,
+  });
+  assert.equal(controls.inputDisabled, false);
+  assert.equal(controls.sendDisabled, true);
+  assert.equal(controls.endDisabled, true);
+  assert.equal(controls.newDisabled, true);
+});
+
 test("history ingress activity belongs only to its selected conversation", () => {
   const archive = {
     format: "kennedy-chatend", sessionType: "history-ingress",

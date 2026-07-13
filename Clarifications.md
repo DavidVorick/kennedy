@@ -54,6 +54,9 @@ canonical documents; this file is not an append-only log.
 
 ## Frontend Behavior
 
+- Keep the message composer editable while Kennedy is generating or running
+  tools so the user can draft the next message, but keep Send disabled until
+  Kennedy completes the current turn.
 - Persist the active conversation through a conversation-history backend.
   Checkpoint each user query before any LLM request, restore unfinished work on
   startup, and durably require history ingress to finish before a new
