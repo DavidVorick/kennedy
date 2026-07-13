@@ -170,6 +170,12 @@ question through WebSearch or inspect one source through WebFetch; retrieval
 policy and limits remain in the intelligence layer. Only user and Kennedy text
 is added to the clean transcript.
 
+Ordinary model generations use stored background Responses and poll by
+response ID, so slow reasoning does not depend on one long-lived provider
+connection. If generation or a tool-round checkpoint fails, the frontend
+restores the last durable Chatend and local execution state and retries the
+pending turn from a fresh provider chain.
+
 The Kweb portion of the chatend accumulates during the conversation. A
 `ResetContext` call resolves its arguments, removes all Kweb context, resets
 short identifiers, reloads the root and requested nodes, and rebuilds the

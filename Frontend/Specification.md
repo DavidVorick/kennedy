@@ -417,6 +417,13 @@ explorer remains usable.
 7. Append final text to the clean transcript and chatend and checkpoint the
    completed turn before accepting another query.
 
+If generation or a response-sized checkpoint fails, restore the last durable
+Chatend, Kmap context, tool log, counters, and usage before allowing a retry,
+and abandon the in-memory provider continuation. This prevents a same-process
+retry from continuing from tool results or assistant output that the
+conversation backend never saved. A cold-start retry follows the same fresh
+provider-chain path and sends the pending user query exactly once.
+
 A conversation permits at most 20 model-requested LoadNode calls per user turn.
 The UI remains in a busy state for the entire tool loop.
 
@@ -489,7 +496,10 @@ The history-ingress activity panel belongs to the conversation record that
 created it. It is hidden while the prepared next conversation is selected.
 Selecting an in-progress record shows its live ingress; selecting any completed
 record reconstructs that record's saved ingress panel from its archived
-history-ingress Chatend.
+history-ingress Chatend. The top of the panel summarizes successful memory
+mutations with counts for nodes added (`CreateNode`), nodes updated
+(`UpdateNode`), and `ConnectNodes` calls. Failed tool attempts do not increment
+these totals.
 
 ### 11.2 Context Inspector
 

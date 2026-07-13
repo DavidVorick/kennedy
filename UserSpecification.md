@@ -241,7 +241,10 @@ not begin. Complete tool rounds are checkpointed while a turn is running.
 
 When the UI starts, it retrieves the one unfinished conversation. An active
 conversation is restored where it left off; if its last user query has no
-answer, Kennedy resumes that turn from a fresh provider chain.
+answer, Kennedy resumes that turn from a fresh provider chain. Failed
+generation and checkpoint attempts must roll back transient Chatend, memory
+context, tool-log, usage, and continuation state to the last durable snapshot
+before retrying.
 
 Ending or replacing a conversation creates a durable history-ingress
 obligation. The conversation moves through active, ingress-pending,

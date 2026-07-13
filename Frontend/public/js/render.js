@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260713.2";
+import { formatKmapContext } from "./human_format.js?v=20260713.4";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -90,7 +90,7 @@ export function conversationIngressActivity({ record, liveRecordId = null, liveD
   if (!record || record.id === dismissedId) return null;
   const archive = record.state?.historyIngress;
   const saved = archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
-    ? { chatend: { messages: archive.messages || [] }, usage: { snapshot: () => archive.usage || null } }
+    ? { chatend: { messages: archive.messages || [] }, usage: { snapshot: () => archive.usage || null }, toolLog: archive.tools?.log || [] }
     : null;
   const diagnostic = record.id === liveRecordId && liveDiagnostic ? liveDiagnostic : saved;
   if (!diagnostic) return null;
@@ -98,6 +98,17 @@ export function conversationIngressActivity({ record, liveRecordId = null, liveD
     diagnostic,
     active: record.phase === "ingress_pending" || record.phase === "ingress_in_progress",
   };
+}
+
+export function ingressMutationSummary(diagnostic) {
+  const toolLog = diagnostic?.executor?.toolLog || diagnostic?.toolLog || [];
+  return toolLog.reduce((summary, entry) => {
+    if (entry?.ok !== true) return summary;
+    if (entry.name === "CreateNode") summary.nodesAdded += 1;
+    else if (entry.name === "UpdateNode") summary.nodesUpdated += 1;
+    else if (entry.name === "ConnectNodes") summary.connectCalls += 1;
+    return summary;
+  }, { nodesAdded: 0, nodesUpdated: 0, connectCalls: 0 });
 }
 
 export function renderInspector(container, diagnostic, view = "full") {
@@ -271,6 +282,22 @@ function renderMemoryTree(container, snapshot) {
 
 export function renderIngressActivity(container, diagnostic, active) {
   container.replaceChildren();
+  const summary = ingressMutationSummary(diagnostic);
+  const review = element("section", "ingress-summary");
+  review.setAttribute("aria-label", "History ingress memory changes");
+  review.append(element("span", "eyebrow", "MEMORY CHANGES"));
+  const counts = element("div", "ingress-summary-counts");
+  for (const [value, label] of [
+    [summary.nodesAdded, "Nodes added"],
+    [summary.nodesUpdated, "Nodes updated"],
+    [summary.connectCalls, "ConnectNodes calls"],
+  ]) {
+    const item = element("div", "ingress-summary-item");
+    item.append(element("strong", "", String(value)), element("span", "", label));
+    counts.append(item);
+  }
+  review.append(counts);
+  container.append(review);
   const usage = diagnostic?.usage?.snapshot?.();
   if (usage?.requests) {
     container.append(element(

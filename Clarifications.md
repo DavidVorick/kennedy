@@ -43,6 +43,10 @@ canonical documents; this file is not an append-only log.
 - Continue append-only conversation and history-ingress rounds using provider
   response IDs and stable prompt-cache keys. `ResetContext` starts a fresh
   provider chain with Kennedy's rebuilt logical context.
+- Run ordinary Kennedy generations in stored Responses API background mode and
+  poll them to a terminal state, so slow first-turn or cold-start reasoning is
+  not lost to a long-lived provider HTTP connection or one transient retrieval
+  failure.
 - Use prompt caching where economically sensible. Do not automatically compact
   or reset context; resets remain under user or Kennedy control.
 - Return actionable, sanitized provider errors, including request IDs when
@@ -70,6 +74,9 @@ canonical documents; this file is not an append-only log.
 - Store the complete history-ingress Chatend on its owning conversation record.
   Show live or archived ingress activity only when that conversation is
   selected; never carry the completed-ingress panel into the prepared new chat.
+- At the top of each live or archived history-ingress review, summarize the
+  number of successfully added nodes, successfully updated nodes, and
+  successful `ConnectNodes` calls. Do not count failed tool attempts.
 - Show durable conversation history in a sidebar and allow completed
   transcripts to be reopened read-only.
 - When a conversation ends, switch immediately to an editable empty composer

@@ -6,7 +6,7 @@ import { Chatend } from "../public/js/chatend.js";
 import { ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
-import { conversationControlState, conversationIngressActivity, conversationTitle, inspectorText } from "../public/js/render.js";
+import { conversationControlState, conversationIngressActivity, conversationTitle, ingressMutationSummary, inspectorText } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
@@ -335,6 +335,33 @@ test("history ingress activity belongs only to its selected conversation", () =>
   assert.equal(conversationIngressActivity({ record, dismissedId: "old" }), null);
 });
 
+test("history ingress summary counts only successful memory mutations", () => {
+  const toolLog = [
+    { name: "CreateNode", ok: true },
+    { name: "CreateNode", ok: false },
+    { name: "UpdateNode", ok: true },
+    { name: "UpdateNode", ok: true },
+    { name: "ConnectNodes", ok: true },
+    { name: "LoadNode", ok: true },
+  ];
+  assert.deepEqual(ingressMutationSummary({ executor: { toolLog } }), {
+    nodesAdded: 1,
+    nodesUpdated: 2,
+    connectCalls: 1,
+  });
+  const record = {
+    id: "old", phase: "complete", state: { historyIngress: {
+      format: "kennedy-chatend", sessionType: "history-ingress", messages: [], tools: { log: toolLog },
+    } },
+  };
+  const archived = conversationIngressActivity({ record });
+  assert.deepEqual(ingressMutationSummary(archived.diagnostic), {
+    nodesAdded: 1,
+    nodesUpdated: 2,
+    connectCalls: 1,
+  });
+});
+
 test("conversation checkpoints the pending query before any model request", async () => {
   const events = [];
   const kweb = new MockKweb([node(1)]);
@@ -366,6 +393,69 @@ test("restored pending conversation resumes from durable transcript and context"
   assert.equal(generated, 1);
   assert.equal(session.pendingTurn, false);
   assert.equal(session.transcript.at(-1).content, "Recovered answer.");
+});
+
+test("a structured pending Chatend resumes from cold start without duplicating its user query", async () => {
+  const kweb = new MockKweb([node(1)]);
+  let saved;
+  const interrupted = new ConversationSession({
+    kweb,
+    intelligence: { generate: async () => { throw new Error("connection lost"); } },
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    persist: async state => { saved = structuredClone(state); }, onUpdate: () => {},
+  });
+  await interrupted.initialize();
+  await assert.rejects(() => interrupted.send("Cold-start query"), /connection lost/);
+  assert.equal(saved.pendingTurn, true);
+  assert.equal(saved.archive.messages.filter(message => message.content === "Cold-start query").length, 1);
+
+  const requests = [];
+  const restored = new ConversationSession({
+    kweb,
+    intelligence: { generate: async request => {
+      requests.push(request);
+      return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered once." }, usage: null };
+    } },
+    manuals: { shared: "Changed", conversation: "Changed" }, rootNodeId: id(1), provider: "p", model: "m",
+    persist: async () => {}, onUpdate: () => {},
+  });
+  await restored.initialize(saved);
+  await restored.resumePendingTurn();
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].previous_response_id, null);
+  assert.equal(requests[0].messages.filter(message => message.content === "Cold-start query").length, 1);
+  assert.deepEqual(restored.transcript.map(item => item.content), ["Cold-start query", "Recovered once."]);
+});
+
+test("a failed mid-loop checkpoint rolls back transient tool state before retry", async () => {
+  const kweb = new MockKweb([node(1, [2]), node(2)]);
+  let generations = 0;
+  let checkpoints = 0;
+  const session = new ConversationSession({
+    kweb,
+    intelligence: { generate: async () => {
+      generations += 1;
+      if (generations === 1) return {
+        status: "complete", response_id: "tool-response",
+        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' }, usage: { input_tokens: 10, output_tokens: 2 },
+      };
+      return { status: "complete", response_id: "retry-response", message: { role: "assistant", content: "Recovered cleanly." }, usage: null };
+    } },
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    persist: async () => { checkpoints += 1; if (checkpoints === 2) throw new Error("checkpoint interrupted"); }, onUpdate: () => {},
+  });
+  await session.initialize();
+  await assert.rejects(() => session.send("Load more context"), /checkpoint interrupted/);
+  assert.deepEqual(session.context.loadedNodeIds, [id(1)]);
+  assert.deepEqual(session.executor.toolLog, []);
+  assert.equal(session.usage.snapshot().requests, 0);
+  assert.equal(session.chatend.messages.some(message => message.content?.includes?.("LoadNode")), false);
+  assert.equal(session.continuation.previousResponseId, null);
+
+  await session.resumePendingTurn();
+  assert.equal(generations, 2);
+  assert.equal(session.pendingTurn, false);
+  assert.equal(session.transcript.at(-1).content, "Recovered cleanly.");
 });
 
 test("an answer is not exposed as complete when its durable checkpoint fails", async () => {

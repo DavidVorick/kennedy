@@ -79,10 +79,22 @@ struct ProviderConfig {
     models: Vec<String>,
     reasoning_effort: String,
     timeout_seconds: u64,
+    #[serde(default = "default_response_timeout_seconds")]
+    response_timeout_seconds: u64,
+    #[serde(default = "default_response_poll_interval_milliseconds")]
+    response_poll_interval_milliseconds: u64,
     #[serde(default)]
     context_window_tokens: Option<u64>,
     #[serde(default)]
     max_input_tokens: Option<u64>,
+}
+
+fn default_response_timeout_seconds() -> u64 {
+    600
+}
+
+fn default_response_poll_interval_milliseconds() -> u64 {
+    1_000
 }
 
 #[derive(Clone)]
@@ -209,6 +221,7 @@ struct Usage {
 }
 
 pub async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
+    ensure_crypto_provider()?;
     let raw = tokio::fs::read_to_string(&config_path)
         .await
         .with_context(|| {
@@ -253,6 +266,16 @@ pub async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn ensure_crypto_provider() -> anyhow::Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        anyhow::bail!("installing TLS crypto provider");
+    }
+    Ok(())
+}
+
 fn initialize_providers(config: &Config) -> anyhow::Result<HashMap<String, ProviderRuntime>> {
     if !["low", "medium", "high"].contains(&config.web.search_context_size.as_str()) {
         anyhow::bail!("web.search_context_size must be low, medium, or high");
@@ -293,6 +316,12 @@ fn initialize_providers(config: &Config) -> anyhow::Result<HashMap<String, Provi
                 "provider {name} has unsupported reasoning_effort '{}'",
                 provider.reasoning_effort
             );
+        }
+        if provider.timeout_seconds == 0
+            || provider.response_timeout_seconds == 0
+            || provider.response_poll_interval_milliseconds == 0
+        {
+            anyhow::bail!("provider {name} timeouts and poll interval must be greater than zero");
         }
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(provider.timeout_seconds))
@@ -387,6 +416,7 @@ fn provider_request_body(request: &GenerateRequest, model: &str, reasoning_effor
         "model": model,
         "input": input,
         "reasoning": {"effort": reasoning_effort, "context": "all_turns"},
+        "background": true,
         "store": true,
     });
     if let Some(previous_response_id) = &request.previous_response_id {
@@ -465,32 +495,18 @@ async fn generate(
     let body = provider_request_body(&request, model, &provider.config.reasoning_effort);
     let request_id = Uuid::new_v4();
     let started = Instant::now();
-    let url = format!(
-        "{}/responses",
-        provider.config.base_url.trim_end_matches('/')
-    );
-    let response = provider
-        .client
-        .post(url)
-        .bearer_auth(&provider.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| map_transport_error(error).with_request_id(request_id))?;
-    let status = response.status();
-    let payload: Value = response.json().await.map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "provider_error",
-            "Provider returned a response that was not valid JSON.",
-        )
-        .with_request_id(request_id)
+    let payload = run_background_response(
+        provider,
+        &body,
+        provider.config.response_timeout_seconds,
+        provider.config.response_poll_interval_milliseconds,
+        BackgroundResponseKind::Generation,
+        request_id,
+    )
+    .await
+    .inspect_err(|error| {
+        tracing::warn!(%request_id,provider=%provider_name,%model,code=%error.code,latency_ms=started.elapsed().as_millis(),"provider generation failed");
     })?;
-    if !status.is_success() {
-        let mapped = map_provider_status(status, &payload).with_request_id(request_id);
-        tracing::warn!(%request_id,provider=%provider_name,%model,status=%status,code=%mapped.code,provider_code=?provider_error_field(&payload, "code"),provider_type=?provider_error_field(&payload, "type"),provider_param=?provider_error_field(&payload, "param"),latency_ms=started.elapsed().as_millis(),"provider request failed");
-        return Err(mapped);
-    }
     let normalized =
         normalize_openai(payload).map_err(|error| error.with_request_id(request_id))?;
     tracing::info!(
@@ -526,7 +542,15 @@ async fn web_search(
     let body = web_search_request_body(question, model, &state.config.web);
     let request_id = Uuid::new_v4();
     let started = Instant::now();
-    let payload = run_background_search(provider, &body, &state.config.web, request_id).await?;
+    let payload = run_background_response(
+        provider,
+        &body,
+        state.config.web.search_timeout_seconds,
+        state.config.web.search_poll_interval_milliseconds,
+        BackgroundResponseKind::WebSearch,
+        request_id,
+    )
+    .await?;
     let (answer, sources, usage) =
         normalize_openai_web_search(payload, state.config.web.max_search_sources)
             .map_err(|error| error.with_request_id(request_id))?;
@@ -540,13 +564,35 @@ async fn web_search(
     }))
 }
 
-async fn run_background_search(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackgroundResponseKind {
+    Generation,
+    WebSearch,
+}
+
+impl BackgroundResponseKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Generation => "Model response",
+            Self::WebSearch => "Web research",
+        }
+    }
+
+    fn includes_search_sources(self) -> bool {
+        self == Self::WebSearch
+    }
+}
+
+async fn run_background_response(
     provider: &ProviderRuntime,
     body: &Value,
-    web: &WebConfig,
+    timeout_seconds: u64,
+    poll_interval_milliseconds: u64,
+    kind: BackgroundResponseKind,
     request_id: Uuid,
 ) -> Result<Value, ApiError> {
     let base_url = provider.config.base_url.trim_end_matches('/');
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let response = provider
         .client
         .post(format!("{base_url}/responses"))
@@ -555,20 +601,23 @@ async fn run_background_search(
         .send()
         .await
         .map_err(|error| map_transport_error(error).with_request_id(request_id))?;
-    let mut payload = read_search_provider_response(response, request_id).await?;
+    let mut payload = read_provider_response(response, request_id).await?;
     let response_id = payload
         .get("id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let deadline = Instant::now() + Duration::from_secs(web.search_timeout_seconds);
+    let mut consecutive_retrieval_failures = 0_u8;
 
     while matches!(response_status(&payload), Some("queued" | "in_progress")) {
         let response_id = response_id.as_deref().ok_or_else(|| {
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "provider_error",
-                "Search provider did not return an ID for its background response.",
+                format!(
+                    "{} provider did not return an ID for its background response.",
+                    kind.description()
+                ),
             )
             .with_request_id(request_id)
         })?;
@@ -576,48 +625,109 @@ async fn run_background_search(
             return Err(ApiError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "provider_timeout",
-                "Web research did not finish before the configured search deadline.",
+                format!(
+                    "{} did not finish before its configured background deadline.",
+                    kind.description()
+                ),
             )
             .with_request_id(request_id));
         }
-        tokio::time::sleep(Duration::from_millis(web.search_poll_interval_milliseconds)).await;
-        let retrieve_url = background_response_url(base_url, response_id)
-            .map_err(|error| error.with_request_id(request_id))?;
+        tokio::time::sleep(Duration::from_millis(poll_interval_milliseconds)).await;
+        let retrieve_url =
+            background_response_url(base_url, response_id, kind.includes_search_sources())
+                .map_err(|error| error.with_request_id(request_id))?;
         let response = provider
             .client
             .get(retrieve_url)
             .bearer_auth(&provider.api_key)
             .send()
-            .await
-            .map_err(|error| map_transport_error(error).with_request_id(request_id))?;
-        payload = read_search_provider_response(response, request_id).await?;
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if consecutive_retrieval_failures < 3 => {
+                consecutive_retrieval_failures += 1;
+                tracing::warn!(
+                    %request_id,
+                    %response_id,
+                    attempt=consecutive_retrieval_failures,
+                    timeout=error.is_timeout(),
+                    "background response retrieval failed transiently; retrying"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(map_transport_error(error).with_request_id(request_id));
+            }
+        };
+        let status = response.status();
+        if retryable_provider_status(status) && consecutive_retrieval_failures < 3 {
+            consecutive_retrieval_failures += 1;
+            tracing::warn!(
+                %request_id,
+                %response_id,
+                %status,
+                attempt=consecutive_retrieval_failures,
+                "background response retrieval returned a transient status; retrying"
+            );
+            continue;
+        }
+        payload = read_provider_response(response, request_id).await?;
+        consecutive_retrieval_failures = 0;
     }
 
     match response_status(&payload) {
-        None | Some("completed") => Ok(payload),
-        Some("failed") => Err(background_search_failure(&payload).with_request_id(request_id)),
+        Some("completed") => Ok(payload),
+        None => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "provider_error",
+            format!(
+                "{} provider returned a background response without a status.",
+                kind.description()
+            ),
+        )
+        .with_request_id(request_id)),
+        Some("failed") => {
+            Err(background_response_failure(&payload, kind).with_request_id(request_id))
+        }
         Some("cancelled") => Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "provider_error",
-            "Search provider cancelled the background response.",
+            format!(
+                "{} provider cancelled the background response.",
+                kind.description()
+            ),
         )
         .with_request_id(request_id)),
         Some("incomplete") => Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "provider_error",
-            "Search provider could not complete the background response.",
+            format!(
+                "{} provider could not complete the background response.",
+                kind.description()
+            ),
         )
         .with_request_id(request_id)),
         Some(status) => Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "provider_error",
-            format!("Search provider returned unexpected response status {status}."),
+            format!(
+                "{} provider returned unexpected response status {status}.",
+                kind.description()
+            ),
         )
         .with_request_id(request_id)),
     }
 }
 
-fn background_response_url(base_url: &str, response_id: &str) -> Result<Url, ApiError> {
+fn retryable_provider_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn background_response_url(
+    base_url: &str,
+    response_id: &str,
+    include_search_sources: bool,
+) -> Result<Url, ApiError> {
     let mut url = Url::parse(&format!("{base_url}/responses/")).map_err(|_| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -635,12 +745,14 @@ fn background_response_url(base_url: &str, response_id: &str) -> Result<Url, Api
         })?
         .pop_if_empty()
         .push(response_id);
-    url.query_pairs_mut()
-        .append_pair("include[]", "web_search_call.action.sources");
+    if include_search_sources {
+        url.query_pairs_mut()
+            .append_pair("include[]", "web_search_call.action.sources");
+    }
     Ok(url)
 }
 
-async fn read_search_provider_response(
+async fn read_provider_response(
     response: reqwest::Response,
     request_id: Uuid,
 ) -> Result<Value, ApiError> {
@@ -649,7 +761,7 @@ async fn read_search_provider_response(
         ApiError::new(
             StatusCode::BAD_GATEWAY,
             "provider_error",
-            "Search provider returned a response that was not valid JSON.",
+            "Provider returned a response that was not valid JSON.",
         )
         .with_request_id(request_id)
     })?;
@@ -664,10 +776,15 @@ fn response_status(payload: &Value) -> Option<&str> {
     payload.get("status").and_then(Value::as_str)
 }
 
-fn background_search_failure(payload: &Value) -> ApiError {
+fn background_response_failure(payload: &Value, kind: BackgroundResponseKind) -> ApiError {
     let message = clean_provider_message(payload)
-        .map(|detail| format!("Search provider failed: {detail}"))
-        .unwrap_or_else(|| "Search provider failed its background response.".into());
+        .map(|detail| format!("{} provider failed: {detail}", kind.description()))
+        .unwrap_or_else(|| {
+            format!(
+                "{} provider failed its background response.",
+                kind.description()
+            )
+        });
     ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", message)
 }
 
@@ -1225,6 +1342,9 @@ fn push_web_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State as AxumState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     fn request(messages: Vec<Message>) -> GenerateRequest {
         GenerateRequest {
             provider: None,
@@ -1238,6 +1358,30 @@ mod tests {
         Message {
             role: role.into(),
             content: content.into(),
+        }
+    }
+
+    fn test_provider(base_url: String) -> ProviderRuntime {
+        ensure_crypto_provider().unwrap();
+        ProviderRuntime {
+            config: ProviderConfig {
+                kind: "openai".into(),
+                api_key: "test-key".into(),
+                base_url,
+                default_model: "test-model".into(),
+                models: vec!["test-model".into()],
+                reasoning_effort: "high".into(),
+                timeout_seconds: 2,
+                response_timeout_seconds: 2,
+                response_poll_interval_milliseconds: 1,
+                context_window_tokens: None,
+                max_input_tokens: None,
+            },
+            api_key: "test-key".into(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
         }
     }
     #[test]
@@ -1286,6 +1430,7 @@ mod tests {
             body["input"][0]["content"],
             "Memory tool results\nLoaded node 3"
         );
+        assert_eq!(body["background"], true);
         assert_eq!(body["store"], true);
         assert_eq!(body["previous_response_id"], "resp_previous");
         assert_eq!(body["prompt_cache_key"], "kennedy-session-1");
@@ -1310,26 +1455,94 @@ mod tests {
         assert!(body.get("previous_response_id").is_none());
     }
     #[test]
-    fn background_search_statuses_are_classified() {
+    fn background_response_statuses_and_urls_are_classified() {
         assert_eq!(response_status(&json!({"status":"queued"})), Some("queued"));
         assert_eq!(
             response_status(&json!({"status":"completed"})),
             Some("completed")
         );
         assert_eq!(response_status(&json!({})), None);
-        let error = background_search_failure(&json!({
-            "error":{"message":"Remote search worker failed.\n"}
-        }));
+        assert!(retryable_provider_status(
+            reqwest::StatusCode::GATEWAY_TIMEOUT
+        ));
+        assert!(retryable_provider_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!retryable_provider_status(reqwest::StatusCode::BAD_REQUEST));
+        let error = background_response_failure(
+            &json!({"error":{"message":"Remote generation worker failed.\n"}}),
+            BackgroundResponseKind::Generation,
+        );
         assert_eq!(error.code, "provider_error");
         assert_eq!(
             error.message,
-            "Search provider failed: Remote search worker failed."
+            "Model response provider failed: Remote generation worker failed."
         );
-        let retrieve = background_response_url("https://api.openai.com/v1", "resp_123").unwrap();
+        let retrieve =
+            background_response_url("https://api.openai.com/v1", "resp_123", false).unwrap();
         assert_eq!(
             retrieve.as_str(),
+            "https://api.openai.com/v1/responses/resp_123"
+        );
+        let search_retrieve =
+            background_response_url("https://api.openai.com/v1", "resp_123", true).unwrap();
+        assert_eq!(
+            search_retrieve.as_str(),
             "https://api.openai.com/v1/responses/resp_123?include%5B%5D=web_search_call.action.sources"
         );
+    }
+    #[tokio::test]
+    async fn background_generation_polls_through_a_transient_gateway_timeout() {
+        async fn create_response(Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["background"], true);
+            Json(json!({"id":"resp_background","status":"in_progress"}))
+        }
+        async fn retrieve_response(AxumState(attempts): AxumState<Arc<AtomicUsize>>) -> Response {
+            match attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({"error":{"message":"temporary gateway timeout"}})),
+                )
+                    .into_response(),
+                1 => Json(json!({"id":"resp_background","status":"in_progress"}))
+                    .into_response(),
+                _ => Json(json!({
+                    "id":"resp_background",
+                    "status":"completed",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"Recovered."}]}]
+                }))
+                .into_response(),
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/responses", post(create_response))
+            .route("/responses/{response_id}", get(retrieve_response))
+            .with_state(attempts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = test_provider(format!("http://{address}"));
+        let body = json!({"background":true});
+        let payload = run_background_response(
+            &provider,
+            &body,
+            2,
+            1,
+            BackgroundResponseKind::Generation,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(
+            normalize_openai(payload).unwrap().message.content,
+            "Recovered."
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
     #[test]
     fn web_search_normalizes_and_deduplicates_sources() {
@@ -1411,6 +1624,25 @@ mod tests {
         assert_eq!(provider.api_key, "replace-with-your-openai-api-key");
         assert_eq!(provider.default_model, "gpt-5.6-sol");
         assert_eq!(provider.reasoning_effort, "xhigh");
+        assert_eq!(provider.response_timeout_seconds, 600);
+        assert_eq!(provider.response_poll_interval_milliseconds, 1_000);
         assert_eq!(model_limits(provider, "gpt-5.6-sol"), (1_050_000, 922_000));
+    }
+    #[test]
+    fn existing_provider_configs_receive_background_polling_defaults() {
+        let provider: ProviderConfig = serde_yaml::from_str(
+            r#"
+kind: openai
+api_key: test-key
+base_url: https://api.openai.com/v1
+default_model: test-model
+models: [test-model]
+reasoning_effort: high
+timeout_seconds: 120
+"#,
+        )
+        .unwrap();
+        assert_eq!(provider.response_timeout_seconds, 600);
+        assert_eq!(provider.response_poll_interval_milliseconds, 1_000);
     }
 }

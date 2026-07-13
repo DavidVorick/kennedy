@@ -69,6 +69,8 @@ providers:
     context_window_tokens: 1050000
     max_input_tokens: 922000
     timeout_seconds: 120
+    response_timeout_seconds: 600
+    response_poll_interval_milliseconds: 1000
 ```
 
 `context_window_tokens` and `max_input_tokens` are optional overrides. The
@@ -187,6 +189,8 @@ authenticated browser.
 
 The adapter uses `POST /v1/responses` with:
 
+- `background: true`, so long-running reasoning is not tied to one provider
+  HTTP connection;
 - `store: true`, so `previous_response_id` can continue the chain;
 - `reasoning.effort` from configuration;
 - `reasoning.context: all_turns`;
@@ -201,16 +205,23 @@ append-only conversation and tool loops: a later request can read the previous
 prefix and write the newly extended prefix. Cache writes and reads are both
 reported so the UI can show the actual behavior.
 
+After background creation, the adapter polls `GET /v1/responses/{id}` while
+the response is `queued` or `in_progress`. Polling is bounded by
+`response_timeout_seconds` and paced by
+`response_poll_interval_milliseconds`. A transient transport failure or HTTP
+408, 409, 429, 500, 502, 503, or 504 during retrieval is retried up to three
+consecutive times because the stored provider job remains addressable. Failed,
+cancelled, incomplete, and unknown terminal states become actionable errors;
+only a completed response is normalized into Kennedy's Chatend.
+
 `ResetContext` is implemented by the frontend. It stops supplying the old
 `previous_response_id` and sends the rebuilt full chatend, which guarantees
 removed Kmap content is absent from the new provider chain. No automatic reset
 or compaction is performed.
 
-The web-search endpoint also uses `POST /v1/responses`, but with background
-execution and `store: true` so long-running hosted searches are not tied to one
-provider HTTP connection. It polls `GET /v1/responses/{id}` until the response
-leaves `queued` or `in_progress`, bounded by `search_timeout_seconds`. Search
-requests have no continuation or cache key and use a required hosted
+The web-search endpoint uses the same background-response runner, bounded by
+`search_timeout_seconds`. Search requests have no continuation or cache key
+and use a required hosted
 `web_search` tool, live access, and the configured search context and reasoning
 effort. Web search output is normalized before it is returned to Kennedy's
 visible text-tool loop.

@@ -28,4 +28,7 @@ providers:
     reasoning_effort: xhigh
     context_window_tokens: 1050000
     max_input_tokens: 922000
+    # Per-HTTP-operation deadline. Background jobs have their own total deadline below.
     timeout_seconds: 120
+    response_timeout_seconds: 600
+    response_poll_interval_milliseconds: 1000

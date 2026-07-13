@@ -48,7 +48,7 @@ export class ConversationSession {
       this.executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
     }
     this.usage.restore(archive?.usage);
-    this.durableChatend = jsonCopy(this.chatend.messages);
+    this.durableState = this.snapshot();
     this.onUpdate();
   }
 
@@ -94,25 +94,46 @@ export class ConversationSession {
 
   async persistSnapshot(state = this.snapshot()) {
     await this.persist(state);
-    this.durableChatend = jsonCopy(this.chatend.messages);
+    this.durableState = jsonCopy(state);
+  }
+
+  restoreDurableState() {
+    const state = this.durableState;
+    const archive = state?.archive;
+    if (!archive || !Array.isArray(archive.messages) || !archive.context?.state) return;
+    this.transcript = jsonCopy(state.transcript || archive.transcript || []);
+    this.pendingTurn = Boolean(state.pendingTurn);
+    this.pendingCheckpointed = this.pendingTurn;
+    this.chatend.messages = jsonCopy(archive.messages);
+    this.chatend.systemPrompt = archive.systemPrompt || this.chatend.systemPrompt;
+    this.chatend.retained = jsonCopy(archive.retained || this.retainedTranscript());
+    this.context.restore(archive.context.state);
+    this.executor.loadCalls = Number.isInteger(archive.tools?.loadCalls) ? archive.tools.loadCalls : 0;
+    this.executor.toolLog = jsonCopy(archive.tools?.log || []);
+    this.usage.restore(archive.usage);
   }
 
   async runPendingTurn() {
     if (!this.pendingTurn) return null;
-    const answer = await runAgentLoop({
-      intelligence: this.intelligence, provider: this.provider, model: this.model,
-      chatend: this.chatend, executor: this.executor, continuation: this.continuation,
-      usage: this.usage, onUpdate: this.onUpdate,
-      checkpoint: () => this.persistSnapshot(),
-    });
+    let answer;
+    try {
+      answer = await runAgentLoop({
+        intelligence: this.intelligence, provider: this.provider, model: this.model,
+        chatend: this.chatend, executor: this.executor, continuation: this.continuation,
+        usage: this.usage, onUpdate: this.onUpdate,
+        checkpoint: () => this.persistSnapshot(),
+      });
+    } catch (error) {
+      this.restoreDurableState();
+      this.continuation.reset();
+      throw error;
+    }
     this.transcript.push({ role: "kennedy", content: answer });
     this.chatend.retained = this.retainedTranscript();
     try {
       await this.persistSnapshot({ ...this.snapshot(), pendingTurn: false });
     } catch (error) {
-      this.transcript.pop();
-      this.chatend.messages = jsonCopy(this.durableChatend);
-      this.chatend.retained = this.retainedTranscript();
+      this.restoreDurableState();
       this.continuation.reset();
       throw error;
     }
