@@ -31,6 +31,10 @@ canonical documents; this file is not an append-only log.
   APIs.
 - A Kennedy response may request multiple tools. Execute them sequentially in
   written order and return readable results to the model.
+- Treat tool-request output as an exclusive response mode: the marker must be
+  first, exactly one JSON envelope follows, and its closing brace is the last
+  non-whitespace character. Never mix narration or status text with a tool
+  request; return specific protocol feedback for leading or trailing prose.
 - Give live-conversation Kennedy `WebSearch(question)` for delegated hosted
   research and `WebFetch(url)` for inspecting one public page. Search language,
   geography, freshness, domains, result counts, and research depth are not tool

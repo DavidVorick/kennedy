@@ -134,6 +134,23 @@ test("transparent tool protocol parses multiple calls from one model response", 
   assert.equal(parseToolCalls("A normal answer."), null);
 });
 
+test("tool protocol rejects narration before or after an otherwise valid envelope", () => {
+  const envelope = 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"Compare {official} sources and escape \\\"quoted\\\" names."}}]}';
+  assert.equal(parseToolCalls(`${envelope}\n  `)[0].name, "WebSearch");
+  assert.throws(
+    () => parseToolCalls(`${envelope}\nI’m looking this up now.`),
+    /cannot contain commentary or any other text after the JSON object's final brace/,
+  );
+  assert.throws(
+    () => parseToolCalls(`I’m looking this up now.\n${envelope}`),
+    /must be the first text in a tool-request response/,
+  );
+  assert.throws(
+    () => parseToolCalls(`\`\`\`json\n${envelope}\n\`\`\``),
+    /must be the first text in a tool-request response/,
+  );
+});
+
 test("agent loop executes multiple text tool calls before the next generation", async () => {
   const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
   const chatend = new Chatend("instructions", context, [{ role: "user", content: "work" }]);
@@ -427,6 +444,16 @@ test("system prompt loader requests the renamed Kmap manual", async () => {
     "/base/system-prompts/HistoryIngressAgentManual.txt",
     "/base/system-prompts/KmapAgentManual.txt",
   ]);
+});
+
+test("session manuals enforce exclusive tool-request responses", async () => {
+  for (const file of ["ConversationAgentManual.txt", "HistoryIngressAgentManual.txt"]) {
+    const manual = await readFile(new URL(`../SystemPrompts/${file}`, import.meta.url), "utf8");
+    assert.match(manual, /closing brace must be the final non-whitespace character/);
+    assert.match(manual, /Do not use a Markdown code fence/);
+    assert.match(manual, /Do not put explanations, status updates/);
+    assert.match(manual, /no text after the final brace/);
+  }
 });
 
 test("chatend inspector exposes text tool requests and readable results", () => {

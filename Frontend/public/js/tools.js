@@ -2,14 +2,48 @@ import { formatToolResult } from "./human_format.js?v=20260712.3";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 
+function splitToolEnvelope(value) {
+  if (!value.startsWith("{")) throw Object.assign(new Error("The tool request must contain one JSON object immediately after the marker."), { code: "invalid_tool_protocol" });
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const trailing = value.slice(index + 1).trim();
+        if (trailing) throw Object.assign(new Error("A tool request cannot contain commentary or any other text after the JSON object's final brace."), { code: "invalid_tool_protocol" });
+        return value.slice(0, index + 1);
+      }
+      if (depth < 0) break;
+    }
+  }
+  return value;
+}
+
 export function parseToolCalls(content) {
   if (typeof content !== "string") throw Object.assign(new Error("Kennedy returned no text."), { code: "invalid_tool_protocol" });
   const trimmed = content.trim();
-  if (!trimmed.startsWith(TOOL_CALL_PREFIX)) return null;
+  if (!trimmed.startsWith(TOOL_CALL_PREFIX)) {
+    if (trimmed.includes(TOOL_CALL_PREFIX)) throw Object.assign(new Error(`${TOOL_CALL_PREFIX} must be the first text in a tool-request response, with no commentary before it.`), { code: "invalid_tool_protocol" });
+    return null;
+  }
   if (!trimmed.startsWith(`${TOOL_CALL_PREFIX}\n`)) throw Object.assign(new Error(`Tool requests must put JSON on the line after ${TOOL_CALL_PREFIX}.`), { code: "invalid_tool_protocol" });
   let envelope;
-  try { envelope = JSON.parse(trimmed.slice(TOOL_CALL_PREFIX.length).trim()); }
-  catch { throw Object.assign(new Error("The tool request after KENNEDY_TOOL_CALLS was not valid JSON."), { code: "invalid_tool_protocol" }); }
+  try { envelope = JSON.parse(splitToolEnvelope(trimmed.slice(TOOL_CALL_PREFIX.length).trim())); }
+  catch (error) {
+    if (error?.code === "invalid_tool_protocol") throw error;
+    throw Object.assign(new Error("The tool request after KENNEDY_TOOL_CALLS was not valid JSON."), { code: "invalid_tool_protocol" });
+  }
   if (!envelope || typeof envelope !== "object" || Array.isArray(envelope) || Object.keys(envelope).length !== 1 || !Array.isArray(envelope.calls) || envelope.calls.length === 0) {
     throw Object.assign(new Error('The tool request must be exactly {"calls":[...]} with at least one call.'), { code: "invalid_tool_protocol" });
   }

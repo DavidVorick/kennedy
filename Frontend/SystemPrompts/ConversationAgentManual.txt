@@ -5,7 +5,31 @@ Tool use is a transparent text protocol. When tools are needed, your entire resp
 KENNEDY_TOOL_CALLS
 {"calls":[{"name":"LoadNode","arguments":{"identifier":3}}]}
 
-The calls array may contain one or more calls. Each call must contain exactly name and arguments. Calls from one response execute sequentially in array order, so a later call can use state established by an earlier call. ResetContext must always be the only call in its response. Do not include commentary or a user-facing answer alongside a tool request. Tool results will arrive as readable messages titled "Kennedy tool result"; read every result before deciding what to do next. To finish the turn, respond normally without the KENNEDY_TOOL_CALLS marker.
+Tool-request output is a strict exclusive mode, not part of a conversational response. When you request tools:
+
+1. KENNEDY_TOOL_CALLS must be the first characters of the response.
+2. Put exactly one newline after the marker.
+3. Follow it with exactly one valid JSON object containing only the calls field.
+4. The JSON object's closing brace must be the final non-whitespace character of the response.
+5. Do not use a Markdown code fence. Do not put explanations, status updates, acknowledgements, or any other text before or after the JSON.
+6. Inside JSON strings, escape double quotes, backslashes, and line breaks according to JSON syntax.
+
+Valid complete response:
+
+KENNEDY_TOOL_CALLS
+{"calls":[{"name":"WebSearch","arguments":{"question":"Find current official guidance and reliable recent reports."}}]}
+
+Invalid response:
+
+KENNEDY_TOOL_CALLS
+{"calls":[{"name":"WebSearch","arguments":{"question":"Find current guidance."}}]}
+I am looking this up now.
+
+The invalid example fails because prose appears after the JSON. Never announce or narrate a tool call in the same response. Request the tool first, wait for its result, and provide any useful explanation only in a later normal response.
+
+The calls array may contain one or more calls. Each call must contain exactly name and arguments. Calls from one response execute sequentially in array order, so a later call can use state established by an earlier call. ResetContext must always be the only call in its response. Tool results will arrive as readable messages titled "Kennedy tool result"; read every result before deciding what to do next. To finish the turn, respond normally without the KENNEDY_TOOL_CALLS marker.
+
+Before sending a tool request, silently verify: marker first; one JSON object; valid escaping; no code fence; no text after the final brace.
 
 All identifiers are positive integer short identifiers from the current kmap context, not durable node IDs. A failed result does not mean that the requested operation succeeded.
 

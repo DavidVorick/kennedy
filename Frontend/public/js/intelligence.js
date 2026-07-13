@@ -90,7 +90,7 @@ function protocolFailureMessage(error) {
       "Kennedy tool protocol error",
       "",
       error.message,
-      `Return either a normal final answer or ${TOOL_CALL_PREFIX} followed by one valid JSON envelope.`,
+      `Return either a normal final answer with no ${TOOL_CALL_PREFIX} marker, or a tool request containing only ${TOOL_CALL_PREFIX}, one newline, and one valid JSON envelope whose closing brace is the final non-whitespace character.`,
     ].join("\n"),
   };
 }

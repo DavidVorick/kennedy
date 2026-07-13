@@ -231,8 +231,12 @@ The response must contain only the marker and an object with one non-empty
 `calls` array. Each call has exactly `name` and object-valued `arguments`.
 Multiple calls are allowed and execute sequentially in array order before the
 next generation request. `ResetContext` must be the only call in its response.
-The frontend rejects malformed envelopes and returns a readable protocol error
-so Kennedy can retry.
+The marker must be the first response text and the JSON closing brace must be
+the final non-whitespace character. Markdown fences, commentary, status
+updates, and final-answer text are forbidden before or after the envelope. The
+frontend rejects malformed envelopes and distinguishes invalid JSON, text
+before the marker, and trailing text after valid JSON in its readable protocol
+feedback so Kennedy can retry correctly.
 
 ### 8.1 `LoadNode`
 
