@@ -8,6 +8,8 @@ web:
   search_context_size: high
   search_reasoning_effort: high
   max_search_sources: 12
+  search_timeout_seconds: 600
+  search_poll_interval_milliseconds: 1000
   fetch_timeout_seconds: 30
   max_fetch_bytes: 2000000
   max_fetch_characters: 50000

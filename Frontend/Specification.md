@@ -90,6 +90,12 @@ conversation start time, directly loaded durable node IDs, and a pending-turn
 flag. Provider response IDs, tool logs, usage telemetry, and transient chatend
 tool activity are not restored.
 
+It also loads all durable records for the conversation-history sidebar. A
+selected completed record is a read-only transcript view. While required
+history ingress runs, an empty next-session object may exist only in memory;
+its composer is editable, but it cannot be checkpointed or submitted until the
+backend permits creation of the next active record.
+
 ## 5. Chatend Model
 
 The chatend is the complete human-readable logical context Kennedy has formed.
@@ -365,13 +371,15 @@ chatend visualization.
 2. Check all three backend health endpoints.
 3. Fetch `GET /api/v1/providers` from the intelligence backend.
 4. Fetch `GET /api/v1/user`.
-5. Fetch `GET /api/v1/conversations/current`.
+5. Fetch `GET /api/v1/conversations` for the sidebar and
+   `GET /api/v1/conversations/current` for recovery.
 6. If there is no unfinished record, initialize an empty session and create
    its durable `active` record.
 7. If the record is `active`, restore its transcript and directly loaded Kweb
    nodes. A saved pending query is resumed from a fresh provider chain.
-8. If the record requires ingress, resume Section 10 before enabling input or
-   creating a new conversation.
+8. If the record requires ingress, prepare an editable in-memory next composer
+   and resume Section 10; keep Send disabled until the next durable record can
+   be created.
 
 If the intelligence backend is unavailable, chat is disabled but the memory
 explorer remains usable.
@@ -400,21 +408,25 @@ The UI remains in a busy state for the entire tool loop.
 
 When the user ends the conversation or starts a new one:
 
-1. disable further input for the old conversation,
-2. atomically checkpoint its final state and transition the conversation
+1. stop accepting input for the old conversation and immediately expose an
+   empty next-conversation composer,
+2. allow drafting in that composer while keeping Send disabled,
+3. atomically checkpoint the old conversation's final state and transition the
    history record from `active` to `ingress_pending`,
-3. serialize only the clean user/Kennedy transcript,
-4. create or retrieve a Kweb provenance node using source `conversation`, the
+4. serialize only the clean user/Kennedy transcript,
+5. create or retrieve a Kweb provenance node using source `conversation`, the
    conversation start time, and idempotency key `conversation:{conversation_id}`,
-5. store the returned opaque provenance ID while transitioning the history
+6. store the returned opaque provenance ID while transitioning the history
    record to `ingress_in_progress`,
-6. run history ingress using that provenance ID,
-7. only after success transition the history record to `complete`,
-8. create and expose a fresh durable conversation.
+7. run history ingress using that provenance ID in the background,
+8. only after success transition the history record to `complete`,
+9. create the already-visible fresh conversation's durable record and enable
+   Send without clearing text the user drafted during ingress.
 
-Any failure leaves the unfinished record retryable and keeps normal input
-disabled. Reloading the UI or pressing Retry Memory Update resumes from the
-durable phase.
+Any failure leaves the unfinished record retryable and keeps submission
+disabled while preserving the editable next-request draft. Reloading the UI or
+pressing Retry Memory Update resumes from the durable phase; an unsubmitted
+in-memory draft is not durable across a reload.
 
 ## 10. History-Ingress Flow
 
@@ -450,14 +462,22 @@ The left panel contains only:
 
 Tool calls and internal context never appear in the clean transcript.
 
+A separate left sidebar lists all durable conversations. Each entry derives a
+short title from its first user message, shows its phase and date, and opens the
+saved clean transcript read-only. A New control returns to or prepares the live
+conversation.
+
 ### 11.2 Context Inspector
 
-The right panel has three views of Kennedy's current chatend:
+The right panel has four views of Kennedy's current chatend:
 
 - **Full view** shows system context, conversation, transparent JSON tool
   envelopes, readable tool results, and loaded Kmap context.
 - **System prompts** shows only the agent manuals and other system
   instructions.
+- **Tool calls** shows every transparent tool-request envelope and its readable
+  memory or web result currently present in the Chatend, in chronological
+  order, while filtering out ordinary conversation and system context.
 - **Memory tree** shows the Kmap material currently visible to Kennedy as an
   expandable tree. It distinguishes directly loaded nodes, full nodes pulled
   in through active connections, and fanout references whose summaries alone
@@ -490,8 +510,9 @@ The explorer does not edit durable data.
 ## 12. Rendering and Error Requirements
 
 - Insert untrusted text with `textContent`, never `innerHTML`.
-- Keep user input disabled while generation, a tool loop, a pending restored
-  query, or required history ingress is active.
+- Keep user input disabled while generation, a tool loop, or a pending restored
+  query is active. During required history ingress, keep the next composer
+  editable but disable submission until the next durable record exists.
 - Preserve the diagnostic record of failed calls.
 - Display backend error messages without exposing stack traces.
 - Use semantic controls and visible keyboard focus.
@@ -514,5 +535,7 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - clean-transcript serialization,
 - checkpoint-before-generation ordering and pending-query recovery,
 - durable ingress gating before new-conversation creation,
+- editable next-request drafting during background ingress,
+- conversation-history titles and read-only transcript selection,
 - HTML escaping,
 - recovery from failed intelligence, Kweb, and conversation-history requests.

@@ -48,6 +48,8 @@ web:
   search_context_size: high
   search_reasoning_effort: high
   max_search_sources: 12
+  search_timeout_seconds: 600
+  search_poll_interval_milliseconds: 1000
   fetch_timeout_seconds: 30
   max_fetch_bytes: 2000000
   max_fetch_characters: 50000
@@ -204,10 +206,14 @@ reported so the UI can show the actual behavior.
 removed Kmap content is absent from the new provider chain. No automatic reset
 or compaction is performed.
 
-The web-search endpoint also uses `POST /v1/responses`, but with `store: false`,
-no continuation or cache key, a required hosted `web_search` tool, live access,
-and the configured search context and reasoning effort. Web search output is
-normalized before it is returned to Kennedy's visible text-tool loop.
+The web-search endpoint also uses `POST /v1/responses`, but with background
+execution and `store: true` so long-running hosted searches are not tied to one
+provider HTTP connection. It polls `GET /v1/responses/{id}` until the response
+leaves `queued` or `in_progress`, bounded by `search_timeout_seconds`. Search
+requests have no continuation or cache key and use a required hosted
+`web_search` tool, live access, and the configured search context and reasoning
+effort. Web search output is normalized before it is returned to Kennedy's
+visible text-tool loop.
 
 ## 7. Validation
 

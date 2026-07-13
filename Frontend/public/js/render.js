@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260712.3";
+import { formatKmapContext } from "./human_format.js?v=20260713.1";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -44,6 +44,48 @@ export function renderTranscript(container, transcript) {
   container.scrollTop = container.scrollHeight;
 }
 
+export function conversationTitle(record, limit = 54) {
+  const transcript = Array.isArray(record?.state?.transcript) ? record.state.transcript : [];
+  const firstUserMessage = transcript.find(item => item?.role === "user" && typeof item.content === "string")?.content;
+  const normalized = (firstUserMessage || "New conversation").replace(/\s+/g, " ").trim() || "New conversation";
+  return normalized.length > limit ? `${normalized.slice(0, limit - 1).trimEnd()}…` : normalized;
+}
+
+function historyDate(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) return "Saved";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(parsed);
+}
+
+export function renderConversationHistory(container, records, { selectedId = null, onSelect = () => {} } = {}) {
+  container.replaceChildren();
+  if (!records.length) {
+    container.append(element("p", "history-empty", "Past conversations will appear here after you begin chatting."));
+    return;
+  }
+  for (const record of records) {
+    const button = element("button", `history-item${record.id === selectedId ? " selected" : ""}`);
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(record.id === selectedId));
+    const meta = element("span", "history-item-meta");
+    const phase = record.phase === "complete" ? "Saved" : record.phase.replaceAll("_", " ");
+    meta.append(element("span", "history-phase", phase), element("time", "", historyDate(record.started_at)));
+    button.append(element("span", "history-item-title", conversationTitle(record)), meta);
+    button.addEventListener("click", () => onSelect(record.id));
+    container.append(button);
+  }
+}
+
+export function conversationControlState({ hasSession, sessionBusy, transitionBusy, ingressRequired, pendingTurn, viewingHistory, transcriptLength }) {
+  const busy = sessionBusy || transitionBusy;
+  return {
+    inputDisabled: sessionBusy || viewingHistory || !hasSession,
+    sendDisabled: busy || ingressRequired || pendingTurn || viewingHistory || !hasSession,
+    endDisabled: busy || viewingHistory || !hasSession || (!ingressRequired && !pendingTurn && !transcriptLength),
+    newDisabled: busy || pendingTurn,
+  };
+}
+
 export function renderInspector(container, diagnostic, view = "full") {
   container.replaceChildren();
   if (view === "memory") {
@@ -60,6 +102,19 @@ export function inspectorText(diagnostic, view = "full") {
   if (view === "system") {
     const explicit = messages.filter(message => message.context_kind === "instructions");
     messages = explicit.length ? explicit : messages.filter((message, index) => message.role === "system" && index === 0);
+  }
+  if (view === "tools") {
+    messages = messages.filter(message => {
+      const content = typeof message.content === "string" ? message.content.trim() : "";
+      const isRequest = message.role === "assistant" && content.startsWith("KENNEDY_TOOL_CALLS");
+      const isResult = message.role === "user" && (
+        message.display_role === "Memory tool result" ||
+        message.display_role === "Web tool result" ||
+        content.startsWith("Kennedy tool result")
+      );
+      return isRequest || isResult;
+    });
+    if (!messages.length) return "No tool calls are currently in the Chatend.";
   }
   return messages
     .filter(message => typeof message.content === "string" && message.content.trim())

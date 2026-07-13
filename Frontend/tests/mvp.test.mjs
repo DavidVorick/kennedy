@@ -5,7 +5,7 @@ import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
 import { ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
-import { inspectorText } from "../public/js/render.js";
+import { conversationControlState, conversationTitle, inspectorText } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
@@ -180,6 +180,26 @@ test("conversation provenance contains only clean dialog", () => {
   assert.equal(session.serialize(), "David: Hi\n\nKennedy: Hello");
 });
 
+test("conversation history titles use the first durable user message", () => {
+  const record = { state: { transcript: [
+    { role: "user", content: "  Plan   a long weekend in San Salvador with excellent coffee and museums  " },
+    { role: "kennedy", content: "Let's do it." },
+  ] } };
+  assert.equal(conversationTitle(record, 32), "Plan a long weekend in San Salv…");
+  assert.equal(conversationTitle({ state: { transcript: [] } }), "New conversation");
+});
+
+test("next request stays editable but cannot send during background ingress", () => {
+  const controls = conversationControlState({
+    hasSession: true, sessionBusy: false, transitionBusy: true,
+    ingressRequired: true, pendingTurn: false, viewingHistory: false, transcriptLength: 0,
+  });
+  assert.equal(controls.inputDisabled, false);
+  assert.equal(controls.sendDisabled, true);
+  assert.equal(controls.endDisabled, true);
+  assert.equal(controls.newDisabled, true);
+});
+
 test("conversation checkpoints the pending query before any model request", async () => {
   const events = [];
   const kweb = new MockKweb([node(1)]);
@@ -297,6 +317,8 @@ test("chatend inspector exposes text tool requests and readable results", () => 
     { role: "user", content: "Hello." },
     { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' },
     { role: "user", display_role: "Memory tool result", content: "Memory load completed.\n\nNode 2: Project" },
+    { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"current evidence"}}]}' },
+    { role: "user", display_role: "Web tool result", content: "Kennedy tool result\nTool: WebSearch\n\nWeb research completed." },
     { role: "assistant", content: "Here is what I found." },
   ];
   const rendered = inspectorText({ chatend, context: { privateDiagnostic: true }, toolLog: [{ name: "LoadNode" }] });
@@ -307,6 +329,20 @@ test("chatend inspector exposes text tool requests and readable results", () => 
   assert.match(rendered, /KENNEDY_TOOL_CALLS/);
   assert.match(rendered, /"LoadNode"/);
   assert.equal(rendered.includes("privateDiagnostic"), false);
+
+  const tools = inspectorText({ chatend }, "tools");
+  assert.match(tools, /KENNEDY_TOOL_CALLS/);
+  assert.match(tools, /"LoadNode"/);
+  assert.match(tools, /Memory tool result\n\nMemory load completed/);
+  assert.match(tools, /"WebSearch"/);
+  assert.match(tools, /Web tool result\n\nKennedy tool result/);
+  assert.ok(tools.indexOf('"LoadNode"') < tools.indexOf("Memory tool result"));
+  assert.ok(tools.indexOf("Memory tool result") < tools.indexOf('"WebSearch"'));
+  assert.ok(tools.indexOf('"WebSearch"') < tools.indexOf("Web tool result"));
+  assert.equal(tools.includes("Readable instructions"), false);
+  assert.equal(tools.includes("Hello."), false);
+  assert.equal(tools.includes("Here is what I found."), false);
+  assert.equal(inspectorText({ chatend: [{ role: "user", content: "No tools yet." }] }, "tools"), "No tool calls are currently in the Chatend.");
 });
 
 test("production frontend never uses HTML string insertion", async () => {
@@ -317,9 +353,9 @@ test("production frontend never uses HTML string insertion", async () => {
   }
 });
 
-test("frontend exposes full, system, and memory inspector controls", async () => {
+test("frontend exposes full, system, tools, and memory inspector controls", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-memory"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "new-conversation", "conversation-history"]) assert.match(html, new RegExp(`id="${id}"`));
   assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
 });

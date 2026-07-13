@@ -41,7 +41,8 @@ active -> ingress_pending -> ingress_in_progress -> complete
 - Only successful history ingress changes the record to `complete`.
 - A new conversation cannot be created while any prior record is unfinished.
 - Startup retrieves the unfinished record. Active work is restored; pending or
-  in-progress ingress is retried before a new conversation is created.
+  in-progress ingress is retried before a new durable conversation is created.
+  The frontend may display an unpersisted draft composer during that retry.
 
 Every mutation supplies `expected_version`. Stale browser tabs receive
 `409 state_conflict` rather than overwriting newer state. Starting and
@@ -61,6 +62,9 @@ been reached.
 - `POST /api/v1/conversations/{id}/ingress-completed`
 
 `current` returns `{ "conversation": null }` when no unfinished record exists.
+The list endpoint returns every durable record, including its opaque state, so
+the frontend can render conversation history; the record endpoint retrieves one
+complete record and its full saved transcript state.
 Create accepts `started_at` plus opaque `state`. Checkpoint and
 `request-ingress` accept `expected_version` plus `state`. `ingress-started`
 accepts `expected_version` plus `provenance_id`; `ingress-completed` accepts

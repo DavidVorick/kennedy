@@ -243,11 +243,14 @@ answer, Kennedy resumes that turn from a fresh provider chain.
 
 Ending or replacing a conversation creates a durable history-ingress
 obligation. The conversation moves through active, ingress-pending,
-ingress-in-progress, and complete states. The frontend may not create or expose
-a new conversation until the previous conversation's history ingress has
-completed. If the UI closes during this workflow, startup resumes it. Kweb
-provenance creation uses an idempotency key so retrying the workflow does not
-create duplicate provenance for the same conversation.
+ingress-in-progress, and complete states. The frontend immediately exposes an
+empty next-conversation composer and performs history ingress in the
+background, so the user can begin drafting their next request. It may not
+create the next durable conversation record or send the drafted request until
+the previous conversation's history ingress has completed. If the UI closes
+during this workflow, startup resumes it. Kweb provenance creation uses an
+idempotency key so retrying the workflow does not create duplicate provenance
+for the same conversation.
 
 ## Session Types
 
@@ -290,8 +293,9 @@ user and Kennedy, not the other context) is turned into a history provenance
 node, and then a History Ingress session is called on the conversation.
 
 Conversations are ended when the user deliberately ends the conversation, or
-otherwise starts a new conversation. This request first performs the durable
-history-ingress workflow; the new conversation exists only after it succeeds.
+otherwise starts a new conversation. The UI prepares the new conversation
+immediately while performing durable history ingress in the background, but
+does not persist or submit the new conversation until ingress succeeds.
 
 Note: calling ResetContext mid-conversation will preserve both the conversation
 history with the user, and also the LoadNode counter.
@@ -332,6 +336,10 @@ etc, all appear on the right for the user to inspect.
 The UI also provides a memory explorer, where the user can open up their own
 node, see its contents, and then from there open up other nodes and explore the
 contents of the kweb.
+
+The conversation view includes a sidebar of durable active and completed
+conversations. Selecting an older entry loads its full saved transcript from
+the conversation history backend without making it the active conversation.
 
 A conversation 'ends' when the user clicks an end conversation button or starts
 a new conversation. Closing the UI abruptly does not lose the last durable

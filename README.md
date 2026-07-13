@@ -11,7 +11,8 @@ browser-native frontend:
 - `kennedy-conversation-history` checkpoints active conversations and durably
   gates new conversations on successful history ingress.
 - `Frontend/public` owns live conversations, context, tool execution, durable
-  recovery orchestration, and automatic history ingress.
+  recovery orchestration, conversation-history browsing, and automatic
+  background history ingress.
 
 All three backends are separate library crates with separate listeners, state,
 and databases. One `kennedy-server` binary hosts them without allowing the

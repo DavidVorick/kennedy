@@ -178,8 +178,11 @@ Ending a conversation first transitions its durable record to
 `ingress_pending`. The frontend creates one idempotent data provenance node
 containing the clean transcript, records its opaque ID while transitioning to
 `ingress_in_progress`, and starts history ingress. The record becomes
-`complete` only after ingress succeeds; only then may the frontend create the
-next conversation.
+`complete` only after ingress succeeds. In parallel, the frontend prepares and
+shows an empty in-memory next session so the user can type. Sending remains
+disabled and the next durable record is created only after ingress completes.
+Completed records and their opaque transcript state remain queryable for the
+conversation-history sidebar.
 
 ### 5.2 History Ingress
 
@@ -196,7 +199,8 @@ with zero knowledge mutations is valid.
 At startup an `active` record restores its transcript, directly loaded nodes,
 and pending-turn flag. A pending user query is regenerated from a fresh
 provider chain. An `ingress_pending` or `ingress_in_progress` record resumes
-the ingress workflow before normal conversation input is enabled.
+the ingress workflow while a fresh composer is prepared; input is editable but
+submission remains disabled until the workflow succeeds.
 
 ## 6. Kweb Data Model
 

@@ -14,9 +14,11 @@ canonical documents; this file is not an append-only log.
   response IDs, credentials, and non-context bookkeeping.
 - Organize system instructions as prose sections and loaded Kmap nodes and tool
   results as clear YAML-like text rather than serialized JSON.
-- Provide Full, System Prompts, and expandable Memory Tree views. Distinguish
-  directly loaded nodes, full nodes included through active connections, and
-  summary-only fanout references.
+- Provide Full, System Prompts, Tool Calls, and expandable Memory Tree views.
+  The Tool Calls view contains each transparent tool request and its readable
+  response in chronological order. Distinguish directly loaded nodes, full
+  nodes included through active connections, and summary-only fanout
+  references.
 - Keep exact context occupancy and remaining-window telemetry visible in the
   Chatend header. Also report provider cache reads, cache writes, and total
   token usage where available.
@@ -56,6 +58,12 @@ canonical documents; this file is not an append-only log.
   were unrelated processes.
 - Show live history-ingress tool requests and results in the conversation UI
   so the user can follow memory updates.
+- Show durable conversation history in a sidebar and allow completed
+  transcripts to be reopened read-only.
+- When a conversation ends, switch immediately to an editable empty composer
+  and run required history ingress in the background. Keep Send disabled and
+  defer creation of the next durable conversation until ingress succeeds, then
+  preserve and unlock whatever next request the user has already drafted.
 - Serve the local frontend without reusable browser caching and version its
   entry assets so HTML and JavaScript revisions cannot be mixed.
 - Surface startup exceptions as visible failures instead of leaving the UI

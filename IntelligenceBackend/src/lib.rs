@@ -46,6 +46,8 @@ struct WebConfig {
     search_context_size: String,
     search_reasoning_effort: String,
     max_search_sources: usize,
+    search_timeout_seconds: u64,
+    search_poll_interval_milliseconds: u64,
     fetch_timeout_seconds: u64,
     max_fetch_bytes: usize,
     max_fetch_characters: usize,
@@ -58,6 +60,8 @@ impl Default for WebConfig {
             search_context_size: "high".into(),
             search_reasoning_effort: "high".into(),
             max_search_sources: 12,
+            search_timeout_seconds: 600,
+            search_poll_interval_milliseconds: 1_000,
             fetch_timeout_seconds: 30,
             max_fetch_bytes: 2_000_000,
             max_fetch_characters: 50_000,
@@ -258,6 +262,8 @@ fn initialize_providers(config: &Config) -> anyhow::Result<HashMap<String, Provi
     }
     if config.web.fetch_timeout_seconds == 0
         || config.web.max_search_sources == 0
+        || config.web.search_timeout_seconds == 0
+        || config.web.search_poll_interval_milliseconds == 0
         || config.web.max_fetch_bytes == 0
         || config.web.max_fetch_characters == 0
     {
@@ -417,7 +423,8 @@ fn web_search_request_body(question: &str, model: &str, web: &WebConfig) -> Valu
         }],
         "tool_choice": "required",
         "include": ["web_search_call.action.sources"],
-        "store": false
+        "background": true,
+        "store": true
     })
 }
 
@@ -519,32 +526,7 @@ async fn web_search(
     let body = web_search_request_body(question, model, &state.config.web);
     let request_id = Uuid::new_v4();
     let started = Instant::now();
-    let url = format!(
-        "{}/responses",
-        provider.config.base_url.trim_end_matches('/')
-    );
-    let response = provider
-        .client
-        .post(url)
-        .bearer_auth(&provider.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| map_transport_error(error).with_request_id(request_id))?;
-    let status = response.status();
-    let payload: Value = response.json().await.map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "provider_error",
-            "Search provider returned a response that was not valid JSON.",
-        )
-        .with_request_id(request_id)
-    })?;
-    if !status.is_success() {
-        let mapped = map_provider_status(status, &payload).with_request_id(request_id);
-        tracing::warn!(%request_id,provider=%provider_name,%model,status=%status,code=%mapped.code,latency_ms=started.elapsed().as_millis(),"web research failed");
-        return Err(mapped);
-    }
+    let payload = run_background_search(provider, &body, &state.config.web, request_id).await?;
     let (answer, sources, usage) =
         normalize_openai_web_search(payload, state.config.web.max_search_sources)
             .map_err(|error| error.with_request_id(request_id))?;
@@ -556,6 +538,137 @@ async fn web_search(
         model: model.into(),
         usage,
     }))
+}
+
+async fn run_background_search(
+    provider: &ProviderRuntime,
+    body: &Value,
+    web: &WebConfig,
+    request_id: Uuid,
+) -> Result<Value, ApiError> {
+    let base_url = provider.config.base_url.trim_end_matches('/');
+    let response = provider
+        .client
+        .post(format!("{base_url}/responses"))
+        .bearer_auth(&provider.api_key)
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| map_transport_error(error).with_request_id(request_id))?;
+    let mut payload = read_search_provider_response(response, request_id).await?;
+    let response_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let deadline = Instant::now() + Duration::from_secs(web.search_timeout_seconds);
+
+    while matches!(response_status(&payload), Some("queued" | "in_progress")) {
+        let response_id = response_id.as_deref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "provider_error",
+                "Search provider did not return an ID for its background response.",
+            )
+            .with_request_id(request_id)
+        })?;
+        if Instant::now() >= deadline {
+            return Err(ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "provider_timeout",
+                "Web research did not finish before the configured search deadline.",
+            )
+            .with_request_id(request_id));
+        }
+        tokio::time::sleep(Duration::from_millis(web.search_poll_interval_milliseconds)).await;
+        let retrieve_url = background_response_url(base_url, response_id)
+            .map_err(|error| error.with_request_id(request_id))?;
+        let response = provider
+            .client
+            .get(retrieve_url)
+            .bearer_auth(&provider.api_key)
+            .send()
+            .await
+            .map_err(|error| map_transport_error(error).with_request_id(request_id))?;
+        payload = read_search_provider_response(response, request_id).await?;
+    }
+
+    match response_status(&payload) {
+        None | Some("completed") => Ok(payload),
+        Some("failed") => Err(background_search_failure(&payload).with_request_id(request_id)),
+        Some("cancelled") => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "provider_error",
+            "Search provider cancelled the background response.",
+        )
+        .with_request_id(request_id)),
+        Some("incomplete") => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "provider_error",
+            "Search provider could not complete the background response.",
+        )
+        .with_request_id(request_id)),
+        Some(status) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "provider_error",
+            format!("Search provider returned unexpected response status {status}."),
+        )
+        .with_request_id(request_id)),
+    }
+}
+
+fn background_response_url(base_url: &str, response_id: &str) -> Result<Url, ApiError> {
+    let mut url = Url::parse(&format!("{base_url}/responses/")).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider_error",
+            "The configured provider URL is invalid.",
+        )
+    })?;
+    url.path_segments_mut()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "provider_error",
+                "The configured provider URL cannot address a response.",
+            )
+        })?
+        .pop_if_empty()
+        .push(response_id);
+    url.query_pairs_mut()
+        .append_pair("include[]", "web_search_call.action.sources");
+    Ok(url)
+}
+
+async fn read_search_provider_response(
+    response: reqwest::Response,
+    request_id: Uuid,
+) -> Result<Value, ApiError> {
+    let status = response.status();
+    let payload: Value = response.json().await.map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "provider_error",
+            "Search provider returned a response that was not valid JSON.",
+        )
+        .with_request_id(request_id)
+    })?;
+    if status.is_success() {
+        Ok(payload)
+    } else {
+        Err(map_provider_status(status, &payload).with_request_id(request_id))
+    }
+}
+
+fn response_status(payload: &Value) -> Option<&str> {
+    payload.get("status").and_then(Value::as_str)
+}
+
+fn background_search_failure(payload: &Value) -> ApiError {
+    let message = clean_provider_message(payload)
+        .map(|detail| format!("Search provider failed: {detail}"))
+        .unwrap_or_else(|| "Search provider failed its background response.".into());
+    ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", message)
 }
 
 async fn web_fetch(
@@ -1192,8 +1305,31 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "web_search");
         assert_eq!(body["tools"][0]["search_context_size"], "high");
         assert_eq!(body["tool_choice"], "required");
-        assert_eq!(body["store"], false);
+        assert_eq!(body["background"], true);
+        assert_eq!(body["store"], true);
         assert!(body.get("previous_response_id").is_none());
+    }
+    #[test]
+    fn background_search_statuses_are_classified() {
+        assert_eq!(response_status(&json!({"status":"queued"})), Some("queued"));
+        assert_eq!(
+            response_status(&json!({"status":"completed"})),
+            Some("completed")
+        );
+        assert_eq!(response_status(&json!({})), None);
+        let error = background_search_failure(&json!({
+            "error":{"message":"Remote search worker failed.\n"}
+        }));
+        assert_eq!(error.code, "provider_error");
+        assert_eq!(
+            error.message,
+            "Search provider failed: Remote search worker failed."
+        );
+        let retrieve = background_response_url("https://api.openai.com/v1", "resp_123").unwrap();
+        assert_eq!(
+            retrieve.as_str(),
+            "https://api.openai.com/v1/responses/resp_123?include%5B%5D=web_search_call.action.sources"
+        );
     }
     #[test]
     fn web_search_normalizes_and_deduplicates_sources() {

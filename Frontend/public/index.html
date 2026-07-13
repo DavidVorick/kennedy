@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kennedy</title>
-  <link rel="stylesheet" href="/css/styles.css?v=20260712.3">
+  <link rel="stylesheet" href="/css/styles.css?v=20260713.1">
 </head>
 <body>
   <header class="topbar">
@@ -21,6 +21,13 @@
 
   <main>
     <section id="chat-view" class="workspace">
+      <aside class="panel history-panel" aria-label="Conversation history">
+        <div class="history-heading">
+          <div><span class="eyebrow">YOUR CONVERSATIONS</span><h2>History</h2></div>
+          <button id="new-conversation" class="primary history-new" type="button">New</button>
+        </div>
+        <nav id="conversation-history" class="conversation-history" aria-label="Saved conversations"></nav>
+      </aside>
       <section class="panel conversation-panel" aria-label="Conversation">
         <div id="transcript" class="transcript" aria-live="polite">
           <div class="empty-state">
@@ -58,6 +65,7 @@
         <nav class="inspector-tabs" aria-label="Chatend views">
           <button id="inspector-full" class="inspector-tab active" type="button" aria-pressed="true">Full view</button>
           <button id="inspector-system" class="inspector-tab" type="button" aria-pressed="false">System prompts</button>
+          <button id="inspector-tools" class="inspector-tab" type="button" aria-pressed="false">Tool calls</button>
           <button id="inspector-memory" class="inspector-tab" type="button" aria-pressed="false">Memory tree</button>
         </nav>
         <div id="context-inspector" class="inspector-content" tabindex="0"></div>
@@ -80,6 +88,6 @@
     </section>
   </main>
 
-  <script type="module" src="/js/app.js?v=20260712.3"></script>
+  <script type="module" src="/js/app.js?v=20260713.1"></script>
 </body>
 </html>
