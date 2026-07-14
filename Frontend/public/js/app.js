@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260714.5";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260714.5";
-import { ConversationSession } from "./conversation.js?v=20260714.5";
-import { runHistoryIngress } from "./history_ingress.js?v=20260714.5";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260714.5";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError } from "./render.js?v=20260714.5";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260714.6";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260714.6";
+import { ConversationSession } from "./conversation.js?v=20260714.6";
+import { runHistoryIngress } from "./history_ingress.js?v=20260714.6";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260714.6";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError } from "./render.js?v=20260714.6";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -17,7 +17,7 @@ const MODEL_LIMITS = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "new-conversation", "conversation-history",
+  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["full", "system", "tools", "memory"];
@@ -27,7 +27,6 @@ const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBas
 
 let manuals = null;
 let rootNodeIds = null;
-let rootNodeId = null;
 let provider = null;
 let model = null;
 let reasoningEffort = null;
@@ -430,11 +429,10 @@ async function initialize() {
   update();
   try {
     const [health, user, loadedManuals] = await Promise.all([kweb.health(), kweb.user(), loadPromptManuals(CONFIG.kwebBase)]);
-    rootNodeId = user.root_node_id;
     rootNodeIds = [user.user_root_node_id || user.root_node_id, user.kennedy_root_node_id];
     if (rootNodeIds.some(id => typeof id !== "string" || !id)) throw new Error("Kweb did not provide both required root nodes.");
     manuals = loadedManuals;
-    explorer = new MemoryExplorer({ api: kweb, rootNodeId, content: ui.memory_content, backButton: ui.memory_back, forwardButton: ui.memory_forward });
+    explorer = new MemoryExplorer({ api: kweb, rootNodeIds, content: ui.memory_content, backButton: ui.memory_back, forwardButton: ui.memory_forward });
     ui.service_status.textContent = `${health.status} · memory ready`;
   } catch (error) {
     ui.service_status.textContent = "Kweb unavailable";
@@ -443,7 +441,9 @@ async function initialize() {
     return;
   }
   try {
-    await Promise.all([intelligence.health(), conversationHistory.health()]);
+    await conversationHistory.health();
+    await conversationHistory.discardUnstarted();
+    await intelligence.health();
     const providers = await intelligence.providers();
     provider = providers.default_provider;
     const selected = providers.providers.find(item => item.name === provider);
@@ -528,6 +528,7 @@ ui.memory_tab.addEventListener("click", () => showView(true));
 ui.memory_back.addEventListener("click", () => explorer?.goBack());
 ui.memory_forward.addEventListener("click", () => explorer?.goForward());
 ui.memory_home.addEventListener("click", () => explorer?.home());
+ui.memory_kennedy_home.addEventListener("click", () => explorer?.kennedyHome());
 ui.copy_context.addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(inspectorText(diagnostic(), inspectorMode));

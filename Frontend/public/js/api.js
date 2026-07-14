@@ -50,6 +50,7 @@ export const ConversationHistoryAPI = (base) => ({
   list: () => requestJSON(base, "/api/v1/conversations"),
   current: () => requestJSON(base, "/api/v1/conversations/current"),
   nextIngress: () => requestJSON(base, "/api/v1/conversations/ingress/next"),
+  discardUnstarted: () => requestJSON(base, "/api/v1/conversations/unstarted", { method: "DELETE" }),
   get: (id) => requestJSON(base, `/api/v1/conversations/${id}`),
   create: (body) => requestJSON(base, "/api/v1/conversations", { method: "POST", body: JSON.stringify(body) }),
   checkpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/checkpoint`, { method: "PUT", body: JSON.stringify(body) }),

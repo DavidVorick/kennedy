@@ -96,6 +96,10 @@ canonical documents; this file is not an append-only log.
   entry assets so HTML and JavaScript revisions cannot be mixed.
 - Surface startup exceptions as visible failures instead of leaving the UI
   frozen at “Starting…”.
+- On every frontend refresh, permanently discard all conversation placeholders
+  where the user never sent a message. A conversation becomes durable history
+  as soon as it contains its first user message; started conversations must not
+  be removed by this cleanup.
 
 ## Task Connections
 
@@ -164,6 +168,8 @@ canonical documents; this file is not an append-only log.
 - Tell Kennedy in the conversation-mode manual that completing a conversation
   passes its entire archived Chatend to the separate read-write history-ingress
   mode, which can integrate anything learned during that conversation.
+- Expose both the user root and Kennedy root as direct navigation options in the
+  frontend memory explorer.
 
 ## Automatic Model Attribution
 

@@ -1,12 +1,16 @@
-import { element } from "./render.js?v=20260714.5";
+import { element } from "./render.js?v=20260714.6";
 
 export class MemoryExplorer {
-  constructor({ api, rootNodeId, content, backButton, forwardButton }) {
-    this.api = api; this.rootNodeId = rootNodeId; this.content = content; this.backButton = backButton; this.forwardButton = forwardButton;
+  constructor({ api, rootNodeIds, content, backButton, forwardButton }) {
+    if (!Array.isArray(rootNodeIds) || rootNodeIds.length !== 2 || rootNodeIds.some(id => typeof id !== "string" || !id) || new Set(rootNodeIds).size !== 2) {
+      throw new Error("The memory explorer requires distinct user and Kennedy root node identifiers.");
+    }
+    this.api = api; [this.userRootNodeId, this.kennedyRootNodeId] = rootNodeIds; this.content = content; this.backButton = backButton; this.forwardButton = forwardButton;
     this.currentNodeId = null; this.back = []; this.forward = [];
   }
 
-  async home() { return this.open(this.rootNodeId); }
+  async home() { return this.open(this.userRootNodeId); }
+  async kennedyHome() { return this.open(this.kennedyRootNodeId); }
   async open(id, navigation = true) {
     if (navigation && this.currentNodeId && this.currentNodeId !== id) { this.back.push(this.currentNodeId); this.forward = []; }
     this.currentNodeId = id; this.updateButtons();

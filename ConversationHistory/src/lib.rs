@@ -9,7 +9,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -140,7 +140,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .collect::<anyhow::Result<Vec<_>>>()?;
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([HeaderName::from_static("content-type")]);
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
@@ -153,6 +159,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route("/api/v1/conversations/current", get(current_conversation))
         .route("/api/v1/conversations/ingress/next", get(next_ingress))
+        .route(
+            "/api/v1/conversations/unstarted",
+            delete(discard_unstarted_conversations),
+        )
         .route(
             "/api/v1/conversations/{conversation_id}",
             get(get_conversation),
@@ -276,6 +286,71 @@ async fn list_conversations(State(state): State<AppState>) -> Result<Json<Value>
         .collect::<Result<Vec<_>, _>>()
         .map_err(ApiError::internal)?;
     Ok(Json(json!({"conversations":records})))
+}
+
+fn contains_user_message(messages: Option<&Value>) -> bool {
+    messages.and_then(Value::as_array).is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| matches!(role, "user" | "david"))
+        })
+    })
+}
+
+fn state_contains_user_message(state: &Value) -> bool {
+    contains_user_message(state.get("transcript"))
+        || contains_user_message(state.pointer("/archive/transcript"))
+        || contains_user_message(state.pointer("/archive/retained"))
+        || contains_user_message(state.pointer("/archive/messages"))
+}
+
+fn discard_unstarted(db: &mut Connection) -> Result<Vec<String>, ApiError> {
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let mut statement = tx
+        .prepare(
+            "SELECT id,state_json FROM conversations WHERE last_user_message_at IS NULL ORDER BY id",
+        )
+        .map_err(ApiError::internal)?;
+    let candidates = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(ApiError::internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::internal)?;
+    drop(statement);
+
+    let mut discarded = Vec::new();
+    for (id, state_json) in candidates {
+        let state = serde_json::from_str::<Value>(&state_json).map_err(ApiError::internal)?;
+        if state_contains_user_message(&state) {
+            continue;
+        }
+        let changed = tx
+            .execute(
+                "DELETE FROM conversations WHERE id=?1 AND last_user_message_at IS NULL",
+                [&id],
+            )
+            .map_err(ApiError::internal)?;
+        if changed == 1 {
+            discarded.push(id);
+        }
+    }
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(discarded)
+}
+
+async fn discard_unstarted_conversations(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    let discarded_ids = discard_unstarted(&mut db)?;
+    Ok(Json(json!({
+        "discarded": discarded_ids.len(),
+        "discarded_ids": discarded_ids,
+    })))
 }
 
 async fn current_conversation(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -598,6 +673,30 @@ mod tests {
         apply_migrations(&db).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('a','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('b','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_discards_only_conversations_without_user_messages() {
+        let mut db = database();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('empty','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"transcript\":[]}',1)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('started','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"transcript\":[{\"role\":\"user\",\"content\":\"Hello\"}]}',1,'2026-01-01T00:00:00Z')", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('legacy-started','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"archive\":{\"transcript\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}',1)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('queued','ingress_pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"transcript\":[]}',1)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('complete-empty','complete','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"transcript\":[]}',1)", []).unwrap();
+
+        assert_eq!(
+            discard_unstarted(&mut db).unwrap(),
+            vec!["complete-empty", "empty", "queued"]
+        );
+        assert_eq!(
+            fetch_record(&db, "complete-empty").unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(fetch_record(&db, "empty").unwrap_err().code, "not_found");
+        assert_eq!(fetch_record(&db, "queued").unwrap_err().code, "not_found");
+        assert_eq!(fetch_record(&db, "started").unwrap().phase, "active");
+        assert_eq!(fetch_record(&db, "legacy-started").unwrap().phase, "active");
+        assert!(discard_unstarted(&mut db).unwrap().is_empty());
     }
 
     #[test]

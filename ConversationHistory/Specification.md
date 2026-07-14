@@ -31,7 +31,10 @@ build that could recreate the v1 index after recording the v2 migration.
 The frontend state contains recovery metadata and versioned, opaque JSON
 archives for both the complete conversation Chatend and its history-ingress
 Chatend. The backend interprets only `pendingTurn` when deciding whether an
-idle conversation is safe to close automatically.
+idle conversation is safe to close automatically. For legacy safety during
+unstarted-record cleanup, it also recognizes user-role entries in the stored
+conversation transcript before deleting a record whose activity timestamp is
+null.
 
 ## 3. State Machine and Queue
 
@@ -52,6 +55,11 @@ active -> ingress_pending -> ingress_in_progress -> complete
   and changes the selected record to `ingress_in_progress`.
 - Only successful history ingress changes the record to `complete`.
 - New and existing active conversations are independent of this queue.
+- On frontend startup, records that have neither recorded user activity nor a
+  user message in their stored conversation transcript are permanently
+  discarded, regardless of phase. This also removes an untouched placeholder
+  that was ended or processed without ever becoming a real conversation.
+  Every record containing a user message is ineligible.
 
 Every mutation supplies `expected_version`. Stale browser tabs receive
 `409 state_conflict` rather than overwriting newer state. The unique in-progress
@@ -64,6 +72,7 @@ index serializes memory updates even when several conversations close together.
 - `GET /api/v1/conversations/current` (most recently updated active record,
   retained as a compatibility convenience)
 - `GET /api/v1/conversations/ingress/next`
+- `DELETE /api/v1/conversations/unstarted`
 - `GET /api/v1/conversations/{id}`
 - `PUT /api/v1/conversations/{id}/checkpoint`
 - `POST /api/v1/conversations/{id}/request-ingress`
@@ -74,7 +83,8 @@ index serializes memory updates even when several conversations close together.
 Create accepts `started_at` plus opaque `state`. Checkpoint accepts
 `expected_version`, `state`, and optional `user_activity`. The ingress queue
 endpoint returns `{ "conversation": null }` when empty. All successful
-mutations return the complete updated record.
+record mutations return the complete updated record. Unstarted cleanup is
+idempotent and returns the count and IDs of discarded records.
 
 ## 5. Deployment and Isolation
 
@@ -89,4 +99,5 @@ up to 128 MiB for structured Chatend archives and future inline media.
 Tests cover optimistic-version conflicts, multiple active conversations,
 repair of a v2 database containing the legacy singleton index, the
 single-ingress-worker invariant, 24-hour expiry and pending-response protection,
-structured archives, and phase-restricted ingress checkpoints.
+structured archives, safe unstarted-record cleanup, and phase-restricted ingress
+checkpoints.

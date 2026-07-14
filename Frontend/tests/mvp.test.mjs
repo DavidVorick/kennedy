@@ -10,6 +10,8 @@ import { conversationControlState, conversationIngressActivity, conversationTitl
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
+import { MemoryExplorer } from "../public/js/memory_explorer.js";
+import { ConversationHistoryAPI } from "../public/js/api.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -47,6 +49,42 @@ test("both roots load automatically and survive every reset", async () => {
   assert.deepEqual(context.snapshot().rootIdentifiers, [1, 2]);
   await assert.rejects(() => context.reset([id(1)]), error => error.code === "root_in_reset");
   await assert.rejects(() => context.reset([id(2)]), error => error.code === "root_in_reset");
+});
+
+test("memory explorer provides direct navigation to both Kmap roots", async () => {
+  const explorer = new MemoryExplorer({
+    api: {}, rootNodeIds: [id(1), id(2)], content: {}, backButton: {}, forwardButton: {},
+  });
+  const opened = [];
+  explorer.open = async nodeId => { opened.push(nodeId); };
+  await explorer.home();
+  await explorer.kennedyHome();
+  assert.deepEqual(opened, [id(1), id(2)]);
+  assert.throws(
+    () => new MemoryExplorer({ api: {}, rootNodeIds: [id(1), id(1)], content: {}, backButton: {}, forwardButton: {} }),
+    /distinct user and Kennedy root node identifiers/,
+  );
+});
+
+test("conversation history client permanently discards unstarted records", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ discarded: 2, discarded_ids: ["a", "b"] }),
+    };
+  };
+  try {
+    const result = await ConversationHistoryAPI("http://history").discardUnstarted();
+    assert.deepEqual(result, { discarded: 2, discarded_ids: ["a", "b"] });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(request.url, "http://history/api/v1/conversations/unstarted");
+  assert.equal(request.options.method, "DELETE");
 });
 
 test("Kmap snapshot distinguishes direct loads from active expansions", async () => {
@@ -777,9 +815,15 @@ test("production frontend never uses HTML string insertion", async () => {
   }
 });
 
-test("frontend exposes full, system, tools, and memory inspector controls", async () => {
-  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "new-conversation", "conversation-history"]) assert.match(html, new RegExp(`id="${id}"`));
+test("frontend exposes full, system, tools, memory inspector, and both Kmap root controls", async () => {
+  const [html, app] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+  ]);
+  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history"]) assert.match(html, new RegExp(`id="${id}"`));
+  assert.match(app, /new MemoryExplorer\(\{ api: kweb, rootNodeIds,/);
+  assert.match(app, /memory_kennedy_home\.addEventListener\("click", \(\) => explorer\?\.kennedyHome\(\)\)/);
+  assert.ok(app.indexOf("await conversationHistory.discardUnstarted()") < app.indexOf("historyRecords = (await conversationHistory.list())"));
   assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
 });

@@ -460,7 +460,11 @@ chatend visualization.
    Retain the selected provider's configured reasoning effort alongside its
    model.
 4. Fetch `GET /api/v1/user`.
-5. Fetch `GET /api/v1/conversations` for the sidebar.
+5. Ask the conversation-history backend to permanently discard every record
+   that has never received a user message, then fetch
+   `GET /api/v1/conversations` for the sidebar. This resets abandoned “New
+   conversation” placeholders on every page load without deleting any
+   conversation that actually started.
 6. Restore every `active` record as an independently continuable session. Resume
    each saved pending query from a fresh Codex thread, including in the
    background when another conversation is selected.
@@ -628,7 +632,8 @@ provider response the configured model limit supplies the empty-window size.
 
 ### 11.3 Memory Explorer
 
-The explorer starts at the user root and supports:
+The explorer starts at the user root and provides persistent toolbar actions
+for jumping directly to either the user root or Kennedy root. It also supports:
 
 - viewing a full knowledge node with `GET /api/v1/nodes/{node_id}`,
 - following task, active, and fanout connections,
@@ -675,6 +680,7 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - lossless full-Chatend persistence, including structured media content,
 - response-sized tool-round checkpoints and exact Chatend recovery,
 - unrestricted new-conversation creation while other sessions remain live,
+- refresh-time deletion of conversations that never received a user message,
 - editable next-request drafting during Kennedy work and background ingress,
 - conversation-history titles and read-only transcript selection,
 - per-conversation live and archived history-ingress activity,
