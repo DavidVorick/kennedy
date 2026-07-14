@@ -1,21 +1,28 @@
-import { Chatend } from "./chatend.js?v=20260714.5";
-import { KwebContext } from "./kweb_context.js?v=20260714.5";
-import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.5";
-import { ToolExecutor } from "./tools.js?v=20260714.5";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.5";
+import { Chatend } from "./chatend.js?v=20260714.7";
+import { KwebContext } from "./kweb_context.js?v=20260714.7";
+import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
+import { ToolExecutor } from "./tools.js?v=20260714.7";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.7";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
+function transcriptEndsWithUnansweredUser(transcript) {
+  return Array.isArray(transcript) && transcript.at(-1)?.role === "user";
+}
+
 export class ConversationSession {
-  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, persist = async () => {}, onUpdate }) {
+  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, persist = async () => {}, onUpdate = () => {} }) {
     this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals;
     this.rootNodeIds = rootNodeIds || [rootNodeId]; this.rootNodeId = this.rootNodeIds[0];
     this.provider = provider; this.model = model; this.reasoningEffort = reasoningEffort;
     this.modelAttribution = formatModelAttribution(model, reasoningEffort);
+    if (!["conversation", "telegram"].includes(sessionType)) throw new Error("Unsupported Kennedy session type.");
+    this.sessionType = sessionType;
+    this.channel = channel ? jsonCopy(channel) : null;
     this.persist = persist; this.onUpdate = onUpdate;
-    this.transcript = []; this.startedAt = new Date().toISOString(); this.pendingTurn = false; this.pendingCheckpointed = false; this.busy = false;
+    this.transcript = []; this.media = []; this.startedAt = new Date().toISOString(); this.pendingTurn = false; this.pendingCheckpointed = false; this.pendingExternalEventId = null; this.lastContextWarningBand = 0; this.busy = false;
     this.continuation = new ContinuationState(createCacheKey("conversation"));
     this.usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
   }
@@ -26,7 +33,12 @@ export class ConversationSession {
       const savedTranscript = Array.isArray(restored.transcript) ? restored.transcript : archive?.transcript;
       this.transcript = Array.isArray(savedTranscript) ? jsonCopy(savedTranscript) : [];
       this.startedAt = restored.startedAt || archive?.startedAt || this.startedAt;
-      this.pendingTurn = Boolean(restored.pendingTurn);
+      this.sessionType = restored.sessionType || archive?.sessionType || this.sessionType;
+      this.channel = jsonCopy(restored.channel || archive?.channel || this.channel);
+      this.media = jsonCopy(restored.media || archive?.media || []);
+      this.pendingTurn = Boolean(restored.pendingTurn) || transcriptEndsWithUnansweredUser(this.transcript);
+      this.pendingExternalEventId = restored.pendingExternalEventId || archive?.pendingExternalEventId || null;
+      this.lastContextWarningBand = Number(restored.lastContextWarningBand ?? archive?.lastContextWarningBand) || 0;
       this.pendingCheckpointed = this.pendingTurn;
     }
     this.context = new KwebContext(this.kweb, this.rootNodeIds);
@@ -40,7 +52,7 @@ export class ConversationSession {
         if (!this.rootNodeIds.includes(durableId) && !this.context.loadedNodeIds.includes(durableId)) await this.context.loadDurable(durableId);
       }
     }
-    this.chatend = new Chatend(composePrompt(this.manuals, "conversation", { model: this.model, reasoningEffort: this.reasoningEffort }), this.context, this.retainedTranscript());
+    this.chatend = new Chatend(composePrompt(this.manuals, "conversation", { model: this.model, reasoningEffort: this.reasoningEffort, sessionType: this.sessionType }), this.context, this.retainedTranscript());
     if (Array.isArray(archive?.messages)) {
       this.chatend.restoreMessages(
         jsonCopy(archive.messages),
@@ -62,10 +74,15 @@ export class ConversationSession {
   snapshot() {
     return {
       stateVersion: 2,
+      sessionType: this.sessionType,
+      channel: jsonCopy(this.channel),
       startedAt: this.startedAt,
       transcript: jsonCopy(this.transcript),
+      media: jsonCopy(this.media),
       loadedNodeIds: [...(this.context?.loadedNodeIds || [])],
       pendingTurn: this.pendingTurn,
+      pendingExternalEventId: this.pendingExternalEventId,
+      lastContextWarningBand: this.lastContextWarningBand,
       archive: this.archive(),
     };
   }
@@ -74,7 +91,8 @@ export class ConversationSession {
     return {
       format: "kennedy-chatend",
       version: 2,
-      sessionType: "conversation",
+      sessionType: this.sessionType,
+      channel: jsonCopy(this.channel),
       startedAt: this.startedAt,
       provider: this.provider,
       model: this.model,
@@ -93,7 +111,9 @@ export class ConversationSession {
         log: jsonCopy(this.executor?.toolLog || []),
       },
       usage: jsonCopy(this.usage?.snapshot() || null),
-      media: [],
+      pendingExternalEventId: this.pendingExternalEventId,
+      lastContextWarningBand: this.lastContextWarningBand,
+      media: jsonCopy(this.media),
     };
   }
 
@@ -107,7 +127,10 @@ export class ConversationSession {
     const archive = state?.archive;
     if (!archive || !Array.isArray(archive.messages) || !archive.context?.state) return;
     this.transcript = jsonCopy(state.transcript || archive.transcript || []);
-    this.pendingTurn = Boolean(state.pendingTurn);
+    this.pendingTurn = Boolean(state.pendingTurn) || transcriptEndsWithUnansweredUser(this.transcript);
+    this.pendingExternalEventId = state.pendingExternalEventId || archive.pendingExternalEventId || null;
+    this.lastContextWarningBand = Number(state.lastContextWarningBand ?? archive.lastContextWarningBand) || 0;
+    this.media = jsonCopy(state.media || archive.media || []);
     this.pendingCheckpointed = this.pendingTurn;
     this.chatend.restoreMessages(jsonCopy(archive.messages), jsonCopy(archive.retained || this.retainedTranscript()));
     this.context.restore(archive.context.state);
@@ -131,34 +154,69 @@ export class ConversationSession {
       this.continuation.reset();
       throw error;
     }
-    this.transcript.push({ role: "kennedy", content: answer });
+    const response = { role: "kennedy", content: answer };
+    if (this.pendingExternalEventId) response.externalEventId = this.pendingExternalEventId;
+    const usage = this.usage.snapshot();
+    if (this.sessionType === "telegram" && usage.contextWindowTokens) {
+      const band = Math.floor(usage.contextTokens / 100000);
+      if (band > this.lastContextWarningBand) {
+        response.contextWarning = `${usage.contextTokens.toLocaleString("en-US")} out of ${usage.contextWindowTokens.toLocaleString("en-US")} context tokens used. Consider resetting with /reset.`;
+      }
+      this.lastContextWarningBand = band;
+    }
+    this.transcript.push(response);
     this.chatend.retained = this.retainedTranscript();
+    this.pendingTurn = false;
+    this.pendingExternalEventId = null;
+    this.pendingCheckpointed = false;
     try {
-      await this.persistSnapshot({ ...this.snapshot(), pendingTurn: false });
+      await this.persistSnapshot(this.snapshot());
     } catch (error) {
       this.restoreDurableState();
       this.continuation.reset();
       throw error;
     }
-    this.pendingTurn = false;
-    this.pendingCheckpointed = false;
     this.onUpdate();
     return answer;
   }
 
-  async send(text) {
+  async send(text, metadata = {}) {
     if (this.pendingTurn) throw new Error("Kennedy must finish the saved pending query before accepting another message.");
     const content = text.trim(); if (!content) return;
-    this.busy = true; this.transcript.push({ role: "user", content });
+    const externalEventId = typeof metadata.externalEventId === "string" ? metadata.externalEventId : null;
+    if (externalEventId && this.transcript.some(item => item.externalEventId === externalEventId)) {
+      return this.answerForExternalEvent(externalEventId)?.content || null;
+    }
+    const inputKind = metadata.inputKind === "voice" ? "voice" : "text";
+    let chatendContent = content;
+    const transcriptItem = { role: "user", content, inputKind };
+    if (externalEventId) transcriptItem.externalEventId = externalEventId;
+    if (inputKind === "voice") {
+      const mediaId = metadata.media?.id || crypto.randomUUID();
+      transcriptItem.mediaId = mediaId;
+      transcriptItem.transcriptionModel = metadata.transcriptionModel || null;
+      if (metadata.media) this.media.push({ ...jsonCopy(metadata.media), id: mediaId, transcription: content, transcriptionModel: metadata.transcriptionModel || null });
+      chatendContent = [
+        "The user sent a voice note. The selected model transport does not support native audio, so the intelligence backend produced this paid transcription:",
+        "",
+        content,
+      ].join("\n");
+    }
+    this.busy = true; this.transcript.push(transcriptItem);
     this.pendingTurn = true; this.pendingCheckpointed = false;
+    this.pendingExternalEventId = externalEventId;
     this.chatend.retained = this.retainedTranscript();
-    this.chatend.append({ role: "user", content });
+    this.chatend.append({ role: "user", content: chatendContent });
     this.executor.resetLoadCalls(); this.onUpdate();
     try {
       await this.persistSnapshot(this.snapshot(), { userActivity: true });
       this.pendingCheckpointed = true;
       return await this.runPendingTurn();
     } finally { this.busy = false; this.onUpdate(); }
+  }
+
+  answerForExternalEvent(id) {
+    return [...this.transcript].reverse().find(item => item.role === "kennedy" && item.externalEventId === id) || null;
   }
 
   async resumePendingTurn() {

@@ -49,6 +49,7 @@ The frontend defaults to:
 - Kweb API and static origin: `http://127.0.0.1:4321`
 - Intelligence API: `http://127.0.0.1:4322`
 - Conversation history API: `http://127.0.0.1:4323`
+- Telegram relay API: `http://127.0.0.1:4324`
 
 The values are defined once in `app.js` so alternate local ports do not require
 changes throughout the codebase.
@@ -59,10 +60,17 @@ Live application state is held in JavaScript memory:
 
 ```js
 {
+  activeView: "conversation", // conversation | telegram | memory
   selectedConversationId: null,
+  selectedByView: { conversation: null, telegram: null },
   historyRecords: [],
   liveSessions: new Map(), // durable ID -> independent ConversationSession
   drafts: new Map(),       // durable ID -> unsent composer text
+  voiceDrafts: new Map(),  // durable ID -> original audio + transcription metadata
+  telegramBridge: {
+    webLock: "kennedy-telegram-bridge",
+    inFlightEventIds: new Set()
+  },
   ingressWorker: {
     running: false,
     activeRecord: null,
@@ -86,8 +94,8 @@ caches for persistence. Instead it checkpoints an opaque recovery snapshot to
 the conversation history API. The versioned snapshot contains recovery fields
 plus a lossless JSON Chatend archive: composed system prompt, retained content,
 structured messages, structured Kmap snapshot and durable-ID diagnostics, tool
-log and counters, usage telemetry, and a media collection reserved for future
-serializable image/audio/video payloads or attachment references. Provider
+log and counters, usage telemetry, and a media collection containing original
+voice recordings plus future serializable media or attachment references. Provider
 response IDs and credentials are transport details and are not archived.
 
 The archive never projects message `content` to text. Arrays and objects are
@@ -455,7 +463,7 @@ chatend visualization.
 ### 9.1 Start
 
 1. Fetch all system-prompt manuals.
-2. Check all three backend health endpoints.
+2. Check all four backend health endpoints.
 3. Fetch `GET /api/v1/providers` from the intelligence backend.
    Retain the selected provider's configured reasoning effort alongside its
    model.
@@ -661,7 +669,40 @@ The explorer does not edit durable data.
 - Support `Ctrl+Enter` and `Cmd+Enter` for message submission.
 - Use no remote scripts, fonts, stylesheets, or other CDN assets.
 
-## 13. Verification
+## 13. Telegram Sessions and Audio
+
+The top navigation exposes `TG Bot` beside Conversation and Memory. It reuses
+the conversation transcript and Chatend inspector but filters the sidebar to
+Telegram records and has no message composer: Telegram itself is the input
+surface. Each Telegram user maps to a separate `sessionType: telegram`
+Conversation History record and can run in parallel with other users and UI
+conversations. The record stores channel metadata, while the system prompt
+explicitly says `telegram session`. Ordinary browser records explicitly say
+`conversation session`.
+
+One browser tab holds the `kennedy-telegram-bridge` Web Lock. It polls the
+relay's durable per-user head events, binds each event to its Conversation
+History ID, runs the normal read-only conversation session, and returns only
+Kennedy's final conversational output. Event IDs are stored on user and
+assistant transcript items so reload can resume generation or retry delivery
+without regenerating a completed answer. A `/reset` event closes that user's
+active record, queues its full archive for history ingress, and leaves creation
+of the next Telegram record until the next message. History-ingress prompt
+composition and provenance source identify the source as Telegram or UI.
+
+The normal composer includes a microphone control implemented with
+`MediaRecorder`. Both browser recordings and Telegram voice notes are sent as
+multipart data to the intelligence backend only when provider metadata lacks
+the `audio` input modality. The paid transcription is editable in the normal UI
+and clearly labeled inside the Chatend. Original bytes, content type, size, and
+transcription model are retained in the archive; Telegram originals also
+remain in the relay. History provenance retains those originals, but its
+model-facing history-ingress text replaces base64 audio with bounded metadata
+because this transport cannot consume it as audio. For a Telegram turn, crossing a new 100,000-token current-
+context band attaches a separate delivery warning to the answer. The warning
+is sent after the answer and never inserted into the Chatend.
+
+## 14. Verification
 
 Frontend tests may run directly in a browser or with lightweight Rust-served
 fixtures; they must not introduce a production build step. At minimum verify:
@@ -686,3 +727,6 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - per-conversation live and archived history-ingress activity,
 - HTML escaping,
 - recovery from failed intelligence, Kweb, and conversation-history requests.
+- explicit conversation/Telegram prompt labels and source-aware history ingress,
+- paid multipart transcription and original-media persistence,
+- durable Telegram event correlation, reset, and context-warning delivery.

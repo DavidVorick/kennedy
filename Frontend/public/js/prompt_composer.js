@@ -21,11 +21,18 @@ export function formatModelAttribution(model, reasoningEffort) {
   return `${runtimeValue(model, "unknown-model")}-${runtimeValue(reasoningEffort, "unknown-thinking")}`;
 }
 
-export function composePrompt(manuals, mode, { model, reasoningEffort } = {}) {
+export function composePrompt(manuals, mode, { model, reasoningEffort, sessionType = "conversation", sourceSessionType = "conversation" } = {}) {
   const session = mode === "conversation" ? manuals.conversation : manuals.ingress;
   const sessionTitle = mode === "conversation" ? "Conversation session instructions" : "History-ingress session instructions";
   const currentModel = runtimeValue(model, "unknown-model");
   const currentThinkingMode = runtimeValue(reasoningEffort, "unknown-thinking");
+  const sessionDescription = mode === "conversation"
+    ? sessionType === "telegram"
+      ? "This is a telegram session. The user is talking to you through Kennedy's Telegram bot. Your final conversational output will be relayed to Telegram; the visible Chatend and tool loop still run in Kennedy's browser UI."
+      : "This is a conversation session in Kennedy's browser UI."
+    : sourceSessionType === "telegram"
+      ? "This is a history-ingress session. You are ingressing an archived telegram session."
+      : "This is a history-ingress session. You are ingressing an archived UI conversation session.";
   return [
     "Kennedy's identity",
     "",
@@ -34,6 +41,10 @@ export function composePrompt(manuals, mode, { model, reasoningEffort } = {}) {
     sessionTitle,
     "",
     session,
+    "",
+    "Current session",
+    "",
+    sessionDescription,
     "",
     "Current runtime",
     "",

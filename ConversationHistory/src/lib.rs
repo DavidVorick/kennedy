@@ -306,6 +306,14 @@ fn state_contains_user_message(state: &Value) -> bool {
         || contains_user_message(state.pointer("/archive/messages"))
 }
 
+fn is_telegram_session(state: &Value) -> bool {
+    state.get("sessionType").and_then(Value::as_str) == Some("telegram")
+        || state
+            .pointer("/archive/sessionType")
+            .and_then(Value::as_str)
+            == Some("telegram")
+}
+
 fn discard_unstarted(db: &mut Connection) -> Result<Vec<String>, ApiError> {
     let tx = db.transaction().map_err(ApiError::internal)?;
     let mut statement = tx
@@ -325,7 +333,7 @@ fn discard_unstarted(db: &mut Connection) -> Result<Vec<String>, ApiError> {
     let mut discarded = Vec::new();
     for (id, state_json) in candidates {
         let state = serde_json::from_str::<Value>(&state_json).map_err(ApiError::internal)?;
-        if state_contains_user_message(&state) {
+        if state_contains_user_message(&state) || is_telegram_session(&state) {
             continue;
         }
         let changed = tx
@@ -458,11 +466,12 @@ fn checkpoint_user_activity(
         .map_err(ApiError::internal)?;
     drop(statement);
     for (stale_id, stale_state) in candidates {
-        let pending_turn = serde_json::from_str::<Value>(&stale_state)
-            .ok()
-            .and_then(|value| value.get("pendingTurn").and_then(Value::as_bool))
+        let state = serde_json::from_str::<Value>(&stale_state).unwrap_or(Value::Null);
+        let pending_turn = state
+            .get("pendingTurn")
+            .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !pending_turn {
+        if !pending_turn && !is_telegram_session(&state) {
             tx.execute(
                 "UPDATE conversations SET phase='ingress_pending',updated_at=?1,ended_at=?1,version=version+1 WHERE id=?2 AND phase='active'",
                 params![now_text,stale_id],
@@ -648,9 +657,11 @@ mod tests {
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('current','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1,'2026-01-01T00:00:00Z')", []).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('stale','active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','{\"pendingTurn\":false}',1,'2020-01-01T00:00:00Z')", []).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('pending','active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','{\"pendingTurn\":true}',1,'2020-01-01T00:00:00Z')", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('telegram','active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','{\"sessionType\":\"telegram\",\"pendingTurn\":false}',1,'2020-01-01T00:00:00Z')", []).unwrap();
         checkpoint_user_activity(&mut db, "current", 1, &json!({"pendingTurn":true})).unwrap();
         assert_eq!(fetch_record(&db, "stale").unwrap().phase, "ingress_pending");
         assert_eq!(fetch_record(&db, "pending").unwrap().phase, "active");
+        assert_eq!(fetch_record(&db, "telegram").unwrap().phase, "active");
     }
 
     #[test]
@@ -683,6 +694,7 @@ mod tests {
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('legacy-started','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"archive\":{\"transcript\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}',1)", []).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('queued','ingress_pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"transcript\":[]}',1)", []).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('complete-empty','complete','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"transcript\":[]}',1)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('telegram-bound','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"sessionType\":\"telegram\",\"transcript\":[]}',1)", []).unwrap();
 
         assert_eq!(
             discard_unstarted(&mut db).unwrap(),
@@ -696,6 +708,7 @@ mod tests {
         assert_eq!(fetch_record(&db, "queued").unwrap_err().code, "not_found");
         assert_eq!(fetch_record(&db, "started").unwrap().phase, "active");
         assert_eq!(fetch_record(&db, "legacy-started").unwrap().phase, "active");
+        assert_eq!(fetch_record(&db, "telegram-bound").unwrap().phase, "active");
         assert!(discard_unstarted(&mut db).unwrap().is_empty());
     }
 

@@ -1,14 +1,15 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260714.6";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260714.6";
-import { ConversationSession } from "./conversation.js?v=20260714.6";
-import { runHistoryIngress } from "./history_ingress.js?v=20260714.6";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260714.6";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError } from "./render.js?v=20260714.6";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, TelegramRelayAPI } from "./api.js?v=20260714.7";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260714.7";
+import { ConversationSession } from "./conversation.js?v=20260714.8";
+import { runHistoryIngress } from "./history_ingress.js?v=20260714.7";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260714.7";
 
 const CONFIG = {
   kwebBase: window.location.origin,
   intelligenceBase: "http://127.0.0.1:4322",
   conversationHistoryBase: "http://127.0.0.1:4323",
+  telegramRelayBase: "http://127.0.0.1:4324",
 };
 
 const MODEL_LIMITS = {
@@ -17,13 +18,14 @@ const MODEL_LIMITS = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history",
+  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["full", "system", "tools", "memory"];
 const kweb = KwebAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
+const telegramRelay = TelegramRelayAPI(CONFIG.telegramRelayBase);
 
 let manuals = null;
 let rootNodeIds = null;
@@ -32,9 +34,13 @@ let model = null;
 let reasoningEffort = null;
 let contextWindowTokens = 0;
 let maxInputTokens = 0;
+let inputModalities = ["text"];
+let transcriptionAvailable = false;
 let explorer = null;
 let historyRecords = [];
 let selectedConversationId = null;
+let selectedByView = { conversation: null, telegram: null };
+let activeView = "conversation";
 let liveSessions = new Map();
 let drafts = new Map();
 let conversationErrors = new Map();
@@ -44,6 +50,21 @@ let ingressWorkerRunning = false;
 let activeIngressRecord = null;
 let ingressDiagnostic = null;
 let inspectorMode = "full";
+let recorder = null;
+let recorderChunks = [];
+let recordingStream = null;
+let voiceDrafts = new Map();
+let telegramBridgeRunning = false;
+let telegramInFlight = new Set();
+
+function sessionTypeOf(record) {
+  return record?.state?.sessionType || record?.state?.archive?.sessionType || "conversation";
+}
+
+function recordsForView(view = activeView) {
+  const type = view === "telegram" ? "telegram" : "conversation";
+  return historyRecords.filter(record => sessionTypeOf(record) === type);
+}
 
 function selectedRecord() {
   return historyRecords.find(record => record.id === selectedConversationId) || null;
@@ -95,13 +116,17 @@ function update() {
   const record = selectedRecord();
   const session = selectedSession();
   const viewingHistory = Boolean(record && record.phase !== "active");
+  const telegramView = activeView === "telegram";
   const ingressActivity = visibleIngressActivity();
   renderTranscript(
     ui.transcript,
     viewingHistory ? (record.state?.transcript || []) : (session?.transcript || []),
     ingressActivity,
   );
-  renderConversationHistory(ui.conversation_history, historyRecords, {
+  if (telegramView && !(viewingHistory ? record?.state?.transcript : session?.transcript)?.length && !ingressActivity?.diagnostic) {
+    ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Keep this page open: the relay queues messages while it is closed, and this visible UI owns Kennedy's Chatend and tool loop."));
+  }
+  renderConversationHistory(ui.conversation_history, recordsForView(), {
     selectedId: selectedConversationId,
     onSelect: id => selectConversation(id).catch(error => showError(ui.error_banner, error.message)),
   });
@@ -119,7 +144,7 @@ function update() {
     sessionBusy: Boolean(session?.busy),
     transitionBusy: creatingConversation || endingIds.has(selectedConversationId),
     pendingTurn: Boolean(session?.pendingTurn),
-    viewingHistory,
+    viewingHistory: viewingHistory || telegramView,
     transcriptLength: session?.transcript.length || 0,
   });
   ui.message_form.classList.toggle("hidden", controls.composerHidden);
@@ -127,14 +152,22 @@ function update() {
   ui.send_button.disabled = controls.sendDisabled;
   ui.end_button.disabled = controls.endDisabled;
   ui.new_conversation.disabled = controls.newDisabled;
+  ui.new_conversation.classList.toggle("hidden", telegramView);
+  ui.voice_button.disabled = controls.sendDisabled || !transcriptionAvailable
+    || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function";
+  ui.history_eyebrow.textContent = telegramView ? "TELEGRAM SESSIONS" : "YOUR CONVERSATIONS";
+  ui.history_title.textContent = telegramView ? "Bot chats" : "History";
+  ui.chatend_title.textContent = telegramView ? "Telegram Chatend" : "Chatend";
   ui.end_button.textContent = session?.pendingTurn ? "Retry saved query" : "End conversation";
-  ui.activity.textContent = viewingHistory
+  ui.activity.textContent = telegramView
+    ? session?.busy ? "Kennedy is answering this Telegram message" : "Messages are delivered automatically"
+    : viewingHistory
     ? "This conversation is closed and read only"
     : session?.busy
       ? "Kennedy is working — you can draft your next message"
       : session?.pendingTurn
         ? "Saved query needs a response — you can keep drafting"
-        : "";
+      : "";
 }
 
 function upsertHistory(record) {
@@ -144,7 +177,7 @@ function upsertHistory(record) {
 }
 
 function saveDraft() {
-  if (selectedSession()) drafts.set(selectedConversationId, ui.message_input.value);
+  if (activeView === "conversation" && selectedSession()) drafts.set(selectedConversationId, ui.message_input.value);
 }
 
 function restoreDraft() {
@@ -187,6 +220,82 @@ function finishComposerResize(event) {
   ui.message_resize_handle.classList.remove("resizing");
 }
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error("Could not archive the voice recording."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function audioExtension(mimeType) {
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("mpeg")) return "mp3";
+  if (mimeType.includes("wav")) return "wav";
+  return "webm";
+}
+
+async function finishVoiceRecording() {
+  const id = selectedConversationId;
+  const mimeType = recorder?.mimeType || recorderChunks[0]?.type || "audio/webm";
+  const blob = new Blob(recorderChunks, { type: mimeType });
+  recordingStream?.getTracks().forEach(track => track.stop());
+  recordingStream = null;
+  recorder = null;
+  recorderChunks = [];
+  ui.voice_button.classList.remove("recording");
+  ui.voice_button.setAttribute("aria-pressed", "false");
+  ui.voice_button.textContent = "Record voice";
+  if (!blob.size || selectedConversationId !== id) return;
+  ui.activity.textContent = "Transcribing voice note with OpenAI…";
+  ui.voice_button.disabled = true;
+  clearError(ui.error_banner);
+  try {
+    if (inputModalities.includes("audio")) throw new Error("The selected native-audio transport is not enabled in this UI build.");
+    const fileName = `voice-note.${audioExtension(mimeType)}`;
+    const result = await intelligence.transcribe({ provider, model, file: blob, fileName });
+    const dataUrl = await blobToDataUrl(blob);
+    voiceDrafts.set(id, {
+      inputKind: "voice",
+      transcriptionModel: result.transcription_model,
+      media: { id: crypto.randomUUID(), kind: "voice", mimeType, fileName, dataUrl, sizeBytes: blob.size },
+    });
+    ui.message_input.value = result.text;
+    drafts.set(id, result.text);
+    ui.message_input.focus();
+  } catch (error) {
+    showError(ui.error_banner, `Voice note could not be transcribed: ${error.message}`);
+  }
+  update();
+}
+
+async function toggleVoiceRecording() {
+  if (recorder?.state === "recording") {
+    recorder.stop();
+    return;
+  }
+  clearError(ui.error_banner);
+  try {
+    recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorderChunks = [];
+    recorder = new MediaRecorder(recordingStream);
+    recorder.addEventListener("dataavailable", event => { if (event.data.size) recorderChunks.push(event.data); });
+    recorder.addEventListener("stop", () => finishVoiceRecording());
+    recorder.start();
+    ui.voice_button.classList.add("recording");
+    ui.voice_button.setAttribute("aria-pressed", "true");
+    ui.voice_button.textContent = "Stop recording";
+    ui.activity.textContent = "Recording voice note…";
+  } catch (error) {
+    recordingStream?.getTracks().forEach(track => track.stop());
+    recordingStream = null;
+    recorder = null;
+    showError(ui.error_banner, `Microphone access failed: ${error.message}`);
+  }
+}
+
 function reconcileLiveSessions(records) {
   historyRecords = [...records].sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
   const activeIds = new Set(historyRecords.filter(record => record.phase === "active").map(record => record.id));
@@ -221,8 +330,11 @@ async function persistSession(id, state, metadata = {}) {
 }
 
 async function buildConversation(record) {
+  const sessionType = sessionTypeOf(record);
   const session = new ConversationSession({
     kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+    sessionType,
+    channel: record.state?.channel || record.state?.archive?.channel || null,
     persist: (state, metadata) => persistSession(record.id, state, metadata),
     onUpdate: update,
   });
@@ -240,6 +352,7 @@ async function createNewConversation() {
   try {
     const session = new ConversationSession({
       kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+      sessionType: "conversation",
       onUpdate: update,
     });
     await session.initialize();
@@ -249,6 +362,7 @@ async function createNewConversation() {
     drafts.set(record.id, "");
     upsertHistory(record);
     selectedConversationId = record.id;
+    selectedByView.conversation = record.id;
     restoreDraft();
     update();
     ui.transcript.scrollTop = ui.transcript.scrollHeight;
@@ -267,6 +381,7 @@ async function selectConversation(id) {
   upsertHistory(record);
   if (record.phase === "active" && !liveSessions.has(id)) await buildConversation(record);
   selectedConversationId = id;
+  selectedByView[sessionTypeOf(record)] = id;
   restoreDraft();
   update();
   ui.transcript.scrollTop = ui.transcript.scrollHeight;
@@ -284,10 +399,12 @@ async function submitMessage(event) {
   if (!text.trim()) return;
   ui.message_input.value = "";
   drafts.set(id, "");
+  const metadata = voiceDrafts.get(id) || {};
+  voiceDrafts.delete(id);
   conversationErrors.delete(id);
   clearError(ui.error_banner);
   try {
-    await session.send(text);
+    await session.send(text, metadata);
   } catch (error) {
     const message = error.message || "Kennedy could not answer the saved query.";
     conversationErrors.set(id, message);
@@ -324,7 +441,9 @@ async function endConversation() {
     upsertHistory(closed);
     liveSessions.delete(id);
     drafts.delete(id);
-    selectedConversationId = historyRecords.find(item => item.phase === "active" && liveSessions.has(item.id))?.id || id;
+    selectedConversationId = historyRecords.find(item => item.phase === "active"
+      && sessionTypeOf(item) === "conversation"
+      && liveSessions.has(item.id))?.id || id;
     restoreDraft();
     update();
     kickHistoryIngress();
@@ -335,6 +454,171 @@ async function endConversation() {
     endingIds.delete(id);
     update();
   }
+}
+
+async function createTelegramConversation(event) {
+  const channel = {
+    kind: "telegram",
+    telegramUserId: event.telegramUserId,
+    chatId: event.chatId,
+    username: event.username || null,
+    displayName: event.displayName,
+  };
+  const session = new ConversationSession({
+    kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort,
+    contextWindowTokens, maxInputTokens, sessionType: "telegram", channel, onUpdate: update,
+  });
+  await session.initialize();
+  const record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
+  session.persist = (state, metadata) => persistSession(record.id, state, metadata);
+  liveSessions.set(record.id, session);
+  upsertHistory(record);
+  return { record, session };
+}
+
+async function telegramConversationFor(event) {
+  let record = event.conversationId
+    ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
+    : null;
+  if (!record) {
+    record = historyRecords.find(item => item.phase === "active"
+      && sessionTypeOf(item) === "telegram"
+      && String(item.state?.channel?.telegramUserId) === String(event.telegramUserId));
+  }
+  let session = record?.phase === "active" ? liveSessions.get(record.id) : null;
+  if (record?.phase === "active" && !session) session = await buildConversation(record);
+  if (!record || record.phase !== "active") ({ record, session } = await createTelegramConversation(event));
+  if (event.conversationId !== record.id) await telegramRelay.bind(event.id, record.id);
+  return { record, session };
+}
+
+async function processTelegramReset(event) {
+  let record = event.conversationId
+    ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
+    : null;
+  if (!record || record.phase !== "active") {
+    record = historyRecords.find(item => item.phase === "active" && sessionTypeOf(item) === "telegram"
+      && String(item.state?.channel?.telegramUserId) === String(event.telegramUserId));
+  }
+  if (!record || record.phase !== "active") {
+    await telegramRelay.resetCompleted(event.id, "There is no active Telegram session to reset. Your next message will begin one.");
+    return;
+  }
+  let session = liveSessions.get(record.id);
+  if (!session) session = await buildConversation(record);
+  if (session.busy) throw new Error("The Telegram session is still completing its previous message.");
+  if (session.pendingTurn) await session.resumePendingTurn();
+  const latest = historyRecords.find(item => item.id === record.id) || record;
+  const closed = await conversationHistory.requestIngress(record.id, { expected_version: latest.version, state: session.snapshot() });
+  upsertHistory(closed);
+  liveSessions.delete(record.id);
+  if (selectedConversationId === record.id) update();
+  kickHistoryIngress();
+  await telegramRelay.resetCompleted(event.id, "Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session.");
+}
+
+async function telegramVoiceInput(event) {
+  const blob = await telegramRelay.media(event.id);
+  let text = event.transcription;
+  let transcriptionModel = event.transcriptionModel;
+  if (!text) {
+    if (inputModalities.includes("audio")) throw new Error("The selected model advertises native audio, but this Kennedy transport cannot yet forward it.");
+    const mimeType = blob.type || event.mimeType || "audio/ogg";
+    const result = await intelligence.transcribe({
+      provider, model, file: blob, fileName: `telegram-voice.${audioExtension(mimeType)}`,
+    });
+    text = result.text;
+    transcriptionModel = result.transcription_model;
+    await telegramRelay.saveTranscription(event.id, text, transcriptionModel);
+  }
+  const mimeType = blob.type || event.mimeType || "audio/ogg";
+  return {
+    text,
+    metadata: {
+      externalEventId: event.id,
+      inputKind: "voice",
+      transcriptionModel,
+      media: {
+        id: `telegram:${event.id}`,
+        kind: "voice",
+        source: "telegram",
+        mimeType,
+        fileName: `telegram-voice.${audioExtension(mimeType)}`,
+        dataUrl: await blobToDataUrl(blob),
+        sizeBytes: blob.size,
+        durationSeconds: event.durationSeconds,
+      },
+    },
+  };
+}
+
+async function processTelegramEvent(event) {
+  if (event.kind === "reset") {
+    await processTelegramReset(event);
+    return;
+  }
+  const { record, session } = await telegramConversationFor(event);
+  let response = session.answerForExternalEvent(event.id);
+  if (!response) {
+    if (session.pendingTurn && session.pendingExternalEventId === event.id) {
+      await session.resumePendingTurn();
+    } else if (session.pendingTurn) {
+      throw new Error("This Telegram session has an earlier saved query to finish.");
+    } else if (event.kind === "voice") {
+      const voice = await telegramVoiceInput(event);
+      await session.send(voice.text, voice.metadata);
+    } else {
+      await session.send(event.text || "", { externalEventId: event.id, inputKind: "text" });
+    }
+    response = session.answerForExternalEvent(event.id);
+  }
+  if (!response) throw new Error("Kennedy completed the turn without a recoverable Telegram response.");
+  await telegramRelay.reply(event.id, record.id, response.content, response.contextWarning || null);
+}
+
+async function pollTelegramEvents() {
+  const events = (await telegramRelay.events()).events || [];
+  if (ui.service_status.textContent === "Telegram relay unavailable") ui.service_status.textContent = `Ready · ${model}`;
+  await Promise.all(events.map(async event => {
+    if (telegramInFlight.has(event.id)) return;
+    telegramInFlight.add(event.id);
+    try {
+      await processTelegramEvent(event);
+      await refreshHistory();
+      if (ui.service_status.textContent === "Telegram queue needs attention") ui.service_status.textContent = `Ready · ${model}`;
+    } catch (error) {
+      console.error("Telegram event processing failed", event.id, error);
+      ui.service_status.textContent = "Telegram queue needs attention";
+      if (activeView === "telegram") showError(ui.error_banner, `Telegram delivery will retry: ${error.message}`);
+    } finally {
+      telegramInFlight.delete(event.id);
+    }
+  }));
+}
+
+async function telegramBridgeLoop() {
+  while (telegramBridgeRunning) {
+    await pollTelegramEvents().catch(error => {
+      console.error("Telegram relay poll failed", error);
+      ui.service_status.textContent = "Telegram relay unavailable";
+    });
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+}
+
+function startTelegramBridge() {
+  if (telegramBridgeRunning) return;
+  telegramBridgeRunning = true;
+  const run = () => telegramBridgeLoop();
+  const work = navigator.locks?.request
+    ? navigator.locks.request("kennedy-telegram-bridge", { ifAvailable: true }, lock => {
+      if (lock) return run();
+      telegramBridgeRunning = false;
+      setTimeout(startTelegramBridge, 2000);
+      return undefined;
+    })
+    : run();
+  Promise.resolve(work).catch(error => console.error("Telegram bridge stopped", error));
 }
 
 async function processIngressQueue() {
@@ -350,9 +634,9 @@ async function processIngressQueue() {
       if (archive?.format !== "kennedy-chatend") throw new Error("The queued conversation is missing its durable Chatend archive.");
       const provenance = await kweb.createProvenance({
         data: JSON.stringify(archive, null, 2),
-        source: "conversation",
+        source: archive.sessionType === "telegram" ? "telegram" : "conversation",
         source_created_at: record.started_at,
-        idempotency_key: `conversation:${record.id}`,
+        idempotency_key: `${archive.sessionType === "telegram" ? "telegram" : "conversation"}:${record.id}`,
       });
       try {
         record = await conversationHistory.ingressStarted(record.id, { expected_version: record.version, provenance_id: provenance.id });
@@ -386,6 +670,7 @@ async function processIngressQueue() {
       await runHistoryIngress({
         kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
         provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+        sourceSessionType: record.state?.archive?.sessionType || "conversation",
         restoredArchive: record.state?.historyIngress,
         checkpoint: persistIngress,
         onUpdate: value => { ingressDiagnostic = value; update(); },
@@ -417,11 +702,25 @@ function kickHistoryIngress() {
   });
 }
 
-function showView(memory) {
+function showView(view) {
+  if (!["conversation", "telegram", "memory"].includes(view)) return;
+  if (activeView !== "memory") selectedByView[activeView] = selectedConversationId;
+  saveDraft();
+  activeView = view;
+  const memory = view === "memory";
   ui.chat_view.classList.toggle("hidden", memory);
   ui.memory_view.classList.toggle("hidden", !memory);
-  ui.chat_tab.classList.toggle("active", !memory);
+  ui.chat_tab.classList.toggle("active", view === "conversation");
+  ui.tg_tab.classList.toggle("active", view === "telegram");
   ui.memory_tab.classList.toggle("active", memory);
+  if (!memory) {
+    const records = recordsForView(view);
+    const preferred = selectedByView[view];
+    selectedConversationId = records.some(record => record.id === preferred) ? preferred : records[0]?.id || null;
+    selectedByView[view] = selectedConversationId;
+    restoreDraft();
+    update();
+  }
   if (memory && explorer && !explorer.currentNodeId) explorer.home();
 }
 
@@ -449,6 +748,8 @@ async function initialize() {
     const selected = providers.providers.find(item => item.name === provider);
     model = selected.default_model;
     reasoningEffort = selected.reasoning_effort;
+    inputModalities = selected.model_capabilities?.[model]?.input_modalities || selected.input_modalities || ["text"];
+    transcriptionAvailable = Boolean(selected.transcription_available);
     if (typeof reasoningEffort !== "string" || !reasoningEffort) throw new Error("The intelligence service did not provide the model thinking mode.");
     const fallbackLimits = MODEL_LIMITS[model] || {};
     contextWindowTokens = selected.context_window_tokens || fallbackLimits.contextWindowTokens || 0;
@@ -456,16 +757,17 @@ async function initialize() {
     historyRecords = (await conversationHistory.list()).conversations || [];
     const activeRecords = historyRecords.filter(record => record.phase === "active");
     for (const record of activeRecords) await buildConversation(record);
-    if (activeRecords.length) {
-      selectedConversationId = activeRecords[0].id;
+    const activeConversations = activeRecords.filter(record => sessionTypeOf(record) === "conversation");
+    if (activeConversations.length) {
+      selectedConversationId = activeConversations[0].id;
+      selectedByView.conversation = selectedConversationId;
       restoreDraft();
       update();
     } else {
       await createNewConversation();
     }
-    for (const record of activeRecords) {
-      if (liveSessions.get(record.id)?.pendingTurn) resumeSavedQuery(record.id);
-    }
+    await telegramRelay.health();
+    startTelegramBridge();
     kickHistoryIngress();
     ui.service_status.textContent = `Ready · ${model}`;
   } catch (error) {
@@ -476,7 +778,11 @@ async function initialize() {
 }
 
 ui.message_form.addEventListener("submit", submitMessage);
-ui.message_input.addEventListener("input", () => { if (selectedSession()) drafts.set(selectedConversationId, ui.message_input.value); });
+ui.message_input.addEventListener("input", () => {
+  if (!selectedSession()) return;
+  drafts.set(selectedConversationId, ui.message_input.value);
+  if (!ui.message_input.value.trim()) voiceDrafts.delete(selectedConversationId);
+});
 ui.message_input.addEventListener("keydown", event => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
     event.preventDefault();
@@ -487,6 +793,7 @@ ui.message_size_button.addEventListener("click", () => {
   setComposerExpanded(!ui.message_form.classList.contains("composer-expanded"));
   ui.message_input.focus();
 });
+ui.voice_button.addEventListener("click", () => toggleVoiceRecording());
 ui.message_resize_handle.addEventListener("pointerdown", event => {
   if (event.button !== 0) return;
   event.preventDefault();
@@ -523,8 +830,9 @@ messageInputResizeObserver?.observe(ui.message_input);
 ui.end_button.addEventListener("click", () => selectedSession()?.pendingTurn ? resumeSavedQuery() : endConversation());
 ui.new_conversation.addEventListener("click", () => createNewConversation().catch(error => showError(ui.error_banner, error.message)));
 for (const mode of INSPECTOR_MODES) ui[`inspector_${mode}`].addEventListener("click", () => { inspectorMode = mode; update(); });
-ui.chat_tab.addEventListener("click", () => showView(false));
-ui.memory_tab.addEventListener("click", () => showView(true));
+ui.chat_tab.addEventListener("click", () => showView("conversation"));
+ui.tg_tab.addEventListener("click", () => showView("telegram"));
+ui.memory_tab.addEventListener("click", () => showView("memory"));
 ui.memory_back.addEventListener("click", () => explorer?.goBack());
 ui.memory_forward.addEventListener("click", () => explorer?.goForward());
 ui.memory_home.addEventListener("click", () => explorer?.home());

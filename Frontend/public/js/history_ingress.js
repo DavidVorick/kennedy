@@ -1,14 +1,30 @@
-import { Chatend } from "./chatend.js?v=20260714.5";
-import { KwebContext } from "./kweb_context.js?v=20260714.5";
-import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.5";
-import { ToolExecutor } from "./tools.js?v=20260714.5";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.5";
+import { Chatend } from "./chatend.js?v=20260714.7";
+import { KwebContext } from "./kweb_context.js?v=20260714.7";
+import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
+import { ToolExecutor } from "./tools.js?v=20260714.7";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.7";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
+function modelReadableProvenance(data) {
+  try {
+    const archive = JSON.parse(data);
+    if (Array.isArray(archive?.media)) {
+      archive.media = archive.media.map(item => {
+        if (!item || typeof item !== "object" || typeof item.dataUrl !== "string") return item;
+        const { dataUrl: _archivedBytes, ...metadata } = item;
+        return { ...metadata, archivedOriginal: "Original audio retained in provenance; binary data omitted from model context." };
+      });
+    }
+    return JSON.stringify(archive, null, 2);
+  } catch {
+    return data;
+  }
+}
+
+export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
   const provenance = await kweb.provenance(provenanceId);
   rootNodeIds = rootNodeIds || [rootNodeId];
   const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
@@ -20,7 +36,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     "",
     "Archived Chatend (JSON)",
     "",
-    provenance.data,
+    modelReadableProvenance(provenance.data),
   ].join("\n") }];
   const archive = restoredArchive?.format === "kennedy-chatend" && restoredArchive?.sessionType === "history-ingress" ? restoredArchive : null;
   if (archive?.context?.state) {
@@ -32,7 +48,8 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     }
   }
   const modelAttribution = formatModelAttribution(model, reasoningEffort);
-  const chatend = new Chatend(composePrompt(manuals, "ingress", { model, reasoningEffort }), context, retained);
+  sourceSessionType = restoredArchive?.sourceSessionType || sourceSessionType;
+  const chatend = new Chatend(composePrompt(manuals, "ingress", { model, reasoningEffort, sourceSessionType }), context, retained);
   if (Array.isArray(archive?.messages)) {
     chatend.restoreMessages(jsonCopy(archive.messages), Array.isArray(archive.retained) ? jsonCopy(archive.retained) : retained);
   }
@@ -50,6 +67,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     format: "kennedy-chatend",
     version: 2,
     sessionType: "history-ingress",
+    sourceSessionType,
     provenanceId,
     completed,
     provider,

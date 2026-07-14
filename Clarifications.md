@@ -183,3 +183,37 @@ canonical documents; this file is not an append-only log.
   show it in Kennedy's Kmap context and the human memory UI.
 - Add a dynamic system-prompt element telling Kennedy which model and thinking
   mode is executing the current conversation or history-ingress session.
+
+## Telegram Relay and Voice Input
+
+- Add a Rust Telegram relay to the existing Kennedy binary, using a mature Rust
+  Telegram library. The relay is transport and durable queue only: it must not
+  construct Kennedy's prompt, translate Kmap identifiers, run tools, or receive
+  non-conversational Chatend content. The browser remains the visible owner of
+  each Telegram Chatend and therefore must be open for Kennedy to answer;
+  messages queue durably while it is closed.
+- Add `TG Bot` beside Conversation and Memory. Reuse ordinary conversation
+  mechanics and support parallel Telegram users as distinct sidebar sessions,
+  but dynamically and durably label browser sessions `conversation` and bot
+  sessions `telegram` so Kennedy explicitly knows the current surface.
+- `/reset` is the explicit end boundary for Telegram. It queues the full
+  Telegram Chatend for normal sequential history ingress. Both provenance and
+  the history-ingress prompt must distinguish an archived Telegram session from
+  an archived UI conversation. Do not apply the UI conversation's 24-hour idle
+  closure rule to Telegram sessions.
+- Initially authorize only `@taek42`. Use that username solely to bootstrap the
+  first binding, then persist and authorize the stable numeric Telegram user
+  ID even if the username changes. Refuse unpaired users without storing their
+  message content. Design storage so more allowed users can later have separate
+  parallel conversations.
+- After every newly crossed 100,000-token line in current Telegram context,
+  send a separate notice containing current and maximum context usage and
+  suggesting `/reset`. This notice is delivery metadata and must not enter the
+  Chatend.
+- Add voice notes to both the normal UI composer and Telegram. Preserve the
+  original audio. The intelligence backend owns capability detection and paid
+  transcription: only transcribe when the selected active model transport
+  cannot ingest audio natively. The current `gpt-5.6-sol` transport is
+  text/image-only, so use OpenAI's higher-quality paid
+  `gpt-4o-transcribe` API rather than local Whisper, and clearly label the
+  transcript presented to Kennedy.

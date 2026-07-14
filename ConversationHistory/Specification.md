@@ -3,7 +3,7 @@
 ## 1. Scope
 
 The conversation history backend is a logically independent Rust API that owns
-durable browser conversation checkpoints and the queue of conversations that
+durable browser and Telegram conversation checkpoints and the queue of conversations that
 must undergo history ingress. It shares a deployment binary with the Kweb and
 intelligence backends but has its own listener, router, state, SQLite database,
 and crate. It imports neither backend and calls neither backend.
@@ -30,8 +30,10 @@ build that could recreate the v1 index after recording the v2 migration.
 
 The frontend state contains recovery metadata and versioned, opaque JSON
 archives for both the complete conversation Chatend and its history-ingress
-Chatend. The backend interprets only `pendingTurn` when deciding whether an
-idle conversation is safe to close automatically. For legacy safety during
+Chatend. The backend interprets `pendingTurn` and the top-level/archive
+`sessionType` when deciding whether an idle conversation is safe to close
+automatically. Telegram sessions never idle-close; `/reset` explicitly closes
+them. For legacy safety during
 unstarted-record cleanup, it also recognizes user-role entries in the stored
 conversation transcript before deleting a record whose activity timestamp is
 null.
@@ -47,6 +49,7 @@ active -> ingress_pending -> ingress_in_progress -> complete
   last user-message time. In the same transaction, other active conversations
   idle for more than 24 hours become `ingress_pending`, except records whose
   opaque state says Kennedy still owes a response (`pendingTurn: true`).
+  Records whose state identifies a Telegram session are also exempt.
 - Explicitly ending a conversation checkpoints its final state and changes
   `active` to `ingress_pending` immediately.
 - The oldest queued conversation is selected by last user activity, falling
@@ -59,7 +62,9 @@ active -> ingress_pending -> ingress_in_progress -> complete
   user message in their stored conversation transcript are permanently
   discarded, regardless of phase. This also removes an untouched placeholder
   that was ended or processed without ever becoming a real conversation.
-  Every record containing a user message is ineligible.
+  Every record containing a user message is ineligible. Telegram records are
+  also ineligible because they can be created and bound to a relay event just
+  before the first durable user-message checkpoint.
 
 Every mutation supplies `expected_version`. Stale browser tabs receive
 `409 state_conflict` rather than overwriting newer state. The unique in-progress
@@ -98,6 +103,7 @@ up to 128 MiB for structured Chatend archives and future inline media.
 
 Tests cover optimistic-version conflicts, multiple active conversations,
 repair of a v2 database containing the legacy singleton index, the
-single-ingress-worker invariant, 24-hour expiry and pending-response protection,
+single-ingress-worker invariant, 24-hour expiry plus pending-response and
+Telegram-session protection,
 structured archives, safe unstarted-record cleanup, and phase-restricted ingress
 checkpoints.

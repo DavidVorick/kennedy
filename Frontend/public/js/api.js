@@ -22,6 +22,22 @@ export async function requestJSON(base, path, options = {}) {
   return payload;
 }
 
+export async function requestFormJSON(base, path, form) {
+  let response;
+  try {
+    response = await fetch(`${base}${path}`, { method: "POST", body: form });
+  } catch {
+    throw new ApiError(`Could not reach ${base}.`, 0, "network_error");
+  }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const remote = payload?.error;
+    const requestId = remote?.request_id ? ` (request ID: ${remote.request_id})` : "";
+    throw new ApiError(`${remote?.message || `Request failed (${response.status}).`}${requestId}`, response.status, remote?.code || "request_failed");
+  }
+  return payload;
+}
+
 export const KwebAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   user: () => requestJSON(base, "/api/v1/user"),
@@ -43,6 +59,13 @@ export const IntelligenceAPI = (base) => ({
   generate: (body) => requestJSON(base, "/api/v1/generate", { method: "POST", body: JSON.stringify(body) }),
   webSearch: (body) => requestJSON(base, "/api/v1/web/search", { method: "POST", body: JSON.stringify(body) }),
   webFetch: (body) => requestJSON(base, "/api/v1/web/fetch", { method: "POST", body: JSON.stringify(body) }),
+  transcribe: ({ provider, model, file, fileName = "voice-note.webm" }) => {
+    const form = new FormData();
+    if (provider) form.append("provider", provider);
+    if (model) form.append("model", model);
+    form.append("file", file, fileName);
+    return requestFormJSON(base, "/api/v1/audio/transcriptions", form);
+  },
 });
 
 export const ConversationHistoryAPI = (base) => ({
@@ -58,4 +81,20 @@ export const ConversationHistoryAPI = (base) => ({
   ingressStarted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-started`, { method: "POST", body: JSON.stringify(body) }),
   ingressCheckpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
   ingressCompleted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-completed`, { method: "POST", body: JSON.stringify(body) }),
+});
+
+export const TelegramRelayAPI = (base) => ({
+  health: () => requestJSON(base, "/health"),
+  events: () => requestJSON(base, "/api/v1/events"),
+  media: async (id) => {
+    let response;
+    try { response = await fetch(`${base}/api/v1/events/${id}/media`, { cache: "no-store" }); }
+    catch { throw new ApiError(`Could not reach ${base}.`, 0, "network_error"); }
+    if (!response.ok) throw new ApiError(`Telegram audio fetch failed (${response.status}).`, response.status, "request_failed");
+    return response.blob();
+  },
+  bind: (id, conversationId) => requestJSON(base, `/api/v1/events/${id}/bind`, { method: "POST", body: JSON.stringify({ conversationId }) }),
+  saveTranscription: (id, text, transcriptionModel) => requestJSON(base, `/api/v1/events/${id}/transcription`, { method: "POST", body: JSON.stringify({ text, transcriptionModel }) }),
+  reply: (id, conversationId, text, contextWarning = null) => requestJSON(base, `/api/v1/events/${id}/reply`, { method: "POST", body: JSON.stringify({ conversationId, text, contextWarning }) }),
+  resetCompleted: (id, message) => requestJSON(base, `/api/v1/events/${id}/reset-completed`, { method: "POST", body: JSON.stringify({ message }) }),
 });

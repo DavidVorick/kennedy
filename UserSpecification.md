@@ -30,16 +30,19 @@ persistence between sessions.
 'Backend' refers to any of the backend services that are providing APIs to the
 frontend.
 
-Kennedy has three backends: Kweb, intelligence, and conversation history. They
+Kennedy has four backends: Kweb, intelligence, conversation history, and a
+Telegram relay. They
 are architecturally independent services with separate APIs and storage and do
 not communicate with or access one another. For operational simplicity they
-are compiled into one Rust binary, which hosts all three APIs on separate local
+are compiled into one Rust binary, which hosts all four APIs on separate local
 listeners. The frontend treats them exactly as though they were unrelated
 processes.
 
 ## User Management
 
-For now, there is only one hardcoded user, and that user is David Vorick. A
+For now, there is only one hardcoded Kmap user, and that user is David Vorick.
+Telegram transport identities map to separate conversations over this shared
+Kmap and do not add Kmap access control. A
 more complex user management system will be added later. We explicitly do not
 want to add access controls to the knowledge graph. This design is 'borg-like',
 all knowledge is shared between users. More safety can be added later.
@@ -337,6 +340,7 @@ uses an idempotency key so retries do not create duplicates.
 Kennedy can be called using a few different session types:
 
 + Conversation
++ Telegram Conversation
 + History Ingress
 + Self-Action
 
@@ -366,6 +370,31 @@ rule during activity in another conversation.
 
 Note: calling ResetContext mid-conversation will preserve both the conversation
 history with the user, and also the LoadNode counter.
+
+### Telegram Conversation
+
+A Telegram conversation uses the same read-only tool set, roots, Chatend, and
+conversation manual as a UI conversation, but its dynamic system prompt
+explicitly labels it a `telegram session`. The Rust Telegram relay only queues
+private-chat text, voice, and `/reset` events and sends Kennedy's final
+conversational text; the browser remains responsible for prompt composition,
+short identifiers, tools, and the inspectable Chatend.
+
+The initial allowed identity is `@taek42`. A matching first message binds the
+stable numeric Telegram user ID, and all future checks use that ID. Each allowed
+user has a separate durable conversation visible under `TG Bot`. Telegram
+sessions do not expire after 24 hours. `/reset` ends the current session and
+queues its complete archive for ordinary history ingress; the ingress session
+explicitly knows that its source was Telegram. Each newly crossed 100,000-token
+current-context band produces a separate delivery notice containing current
+and maximum context usage and recommending `/reset`. That operational notice
+is not part of Kennedy's Chatend.
+
+UI recordings and Telegram voice notes preserve their original audio. The
+intelligence backend publishes model input modalities and uses paid OpenAI
+`gpt-4o-transcribe` only when the selected Kennedy transport lacks native audio.
+The configured `gpt-5.6-sol` transport is text/image-only, so its clearly
+labeled transcription is placed in the normal text Chatend.
 
 ### History Ingress
 
@@ -402,7 +431,7 @@ ResetContext starts a fresh one.
 ## UI
 
 The UI is a pure html/css/js webapp (no nodejs, no typescript, just pure js)
-that connects to three pure-Rust backend APIs hosted by one binary.
+that connects to four pure-Rust backend APIs hosted by one binary.
 
 The UI itself is a chat interface beween the user and Kennedy. On the left,
 there is the unpolluted conversation between the user and Kennedy. On the right
@@ -413,6 +442,11 @@ etc, all appear on the right for the user to inspect.
 The UI also provides a memory explorer, where the user can open up their own
 node, see its contents, and then from there open up other nodes and explore the
 contents of the kweb.
+
+The top navigation has Conversation, TG Bot, and Memory views. TG Bot filters
+the conversation sidebar to Telegram users and reuses the transcript and full
+Chatend inspector, but has no browser composer. The ordinary conversation
+composer includes a microphone control and an editable paid transcription.
 
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from

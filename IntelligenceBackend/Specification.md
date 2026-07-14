@@ -3,9 +3,14 @@
 ## 1. Scope
 
 The intelligence backend is a Rust HTTP bridge between the local browser, a
-host launcher for the Podman-sandboxed Codex CLI, and public web pages. Model generation and web
-research use the user's ChatGPT-authenticated Codex subscription; the runtime
-does not send an OpenAI API key or call the Responses HTTP API.
+host launcher for the Podman-sandboxed Codex CLI, OpenAI's paid transcription
+API, and public web pages. Model generation and web
+research use the user's ChatGPT-authenticated Codex subscription. Audio
+transcription is the deliberately separate billed path and reads
+the generic vault name in `audio.api_key_secret`; `kennedy-server` resolves and
+passes that credential directly to the trusted transcription connector.
+Ordinary generation never receives that key and does not call the Responses
+HTTP API.
 
 The service stores no Kennedy or Kmap state. It accepts normalized text
 messages, resumes opaque Codex thread IDs, returns normalized text and usage,
@@ -27,6 +32,9 @@ backends.
 - Execute fresh, ephemeral Codex web-research turns and return deduplicated
   HTTP(S) links found in the grounded answer.
 - Fetch one public web page safely and return bounded readable text.
+- Publish the selected model transport's input modalities and forward a
+  bounded multipart recording to OpenAI `gpt-4o-transcribe` only when that
+  transport does not support native audio.
 - Keep local paths, authentication material, and raw process output out of
   browser-visible errors and logs.
 
@@ -37,9 +45,12 @@ or internet tools. Only `/api/v1/web/search` enables Codex web search.
 ## 3. Configuration
 
 ```yaml
+credentials:
+  vault_path: ./kennedy-secrets.age
+
 server:
   bind: 127.0.0.1:4322
-  max_request_bytes: 10485760
+  max_request_bytes: 27262976
   allowed_origins:
     - http://127.0.0.1:4321
 
@@ -53,6 +64,17 @@ web:
   max_fetch_characters: 50000
   max_redirects: 5
 
+audio:
+  api_base: https://api.openai.com/v1/
+  api_key_secret: openai-api-key
+  transcription_model: gpt-4o-transcribe
+  transcription_prompt: "Transcribe faithfully, including discernible relevant non-speech audio."
+  timeout_seconds: 120
+  max_upload_bytes: 26214400
+
+telegram:
+  bot_token_secret: telegram-bot-token
+
 default_provider: primary
 
 providers:
@@ -65,10 +87,13 @@ providers:
     reasoning_effort: xhigh
     context_window_tokens: 1050000
     max_input_tokens: 922000
+    native_audio_input_models: []
     timeout_seconds: 600
 ```
 
-`codex-safe` is a host executable on Kennedy's `PATH` that forwards all
+This tracked top-level `config.yaml` contains secret names, not credential
+values. `kennedy-server` unlocks the separate encrypted vault before starting
+the backends. `codex-safe` is a host executable on Kennedy's `PATH` that forwards all
 arguments and piped stdin/stdout to Codex inside a persistent Podman sandbox.
 The host does not need a directly installed `codex` binary. The launcher must
 runs. For noninteractive Kennedy calls it must use `podman run -i`, not require
@@ -77,9 +102,15 @@ interactive terminal invocation. The launcher must mount its Codex state
 directory so login and thread resumes survive container
 runs. `working_directory` must exist. It should contain no project instructions or
 user data; `/tmp` is the default. `context_window_tokens` and
-`max_input_tokens` are optional overrides. Legacy `api_key`, `base_url`, and
-Responses polling fields are accepted only for configuration compatibility and
-are ignored by the active Codex runtime.
+`max_input_tokens` are optional overrides. Legacy Responses polling fields are
+accepted only for configuration compatibility and are ignored by the active
+Codex runtime.
+
+`native_audio_input_models` is empty for the configured `gpt-5.6-sol` Codex
+transport. A model belongs in that list only when its active Kennedy transport
+can actually forward native audio. The transcription API rejects rather than
+transcribes requests for a listed model, ensuring that paid transcription is a
+fallback and not an accidental downgrade.
 
 ## 4. Codex Execution
 
@@ -112,15 +143,31 @@ answer with direct links. It never joins Kennedy's conversation thread.
 
 ### 5.1 Health and Providers
 
-`GET /health` reports local service availability. Startup has already verified
-the configured ChatGPT login.
+`GET /health` reports local service availability, including whether paid audio
+transcription is configured. Startup has already verified the configured
+ChatGPT login. A missing transcription key does not disable text generation.
 
 `GET /api/v1/providers` returns provider name, `kind: codex`, default and
 allowed models, configured `reasoning_effort`, and context limits. The browser
 uses the model plus reasoning effort for runtime prompt disclosure and automatic
-Kmap mutation attribution. The endpoint never returns authentication details.
+Kmap mutation attribution. It also returns per-model `input_modalities` and
+whether transcription is available. The endpoint never returns authentication
+details.
 
-### 5.2 Generate
+### 5.2 Audio Transcription
+
+`POST /api/v1/audio/transcriptions` accepts multipart fields `provider`,
+`model`, and one `file`. The recording must use a supported audio/container
+media type and remain within `audio.max_upload_bytes`. The service first checks
+the selected model capability. If native audio is supported it returns
+`native_audio_supported` without calling transcription; otherwise it forwards
+the bytes to OpenAI's `/v1/audio/transcriptions` endpoint with
+`gpt-4o-transcribe` and returns the paid transcript, transcription model, input
+model, and any reported usage. A configured prompt asks transcription to retain
+concise annotations for discernible relevant non-speech sounds, speaker changes,
+tone, pauses, music, and background audio. Audio content and API keys are never logged.
+
+### 5.3 Generate
 
 `POST /api/v1/generate` accepts:
 
@@ -159,14 +206,14 @@ Successful responses contain:
 The bridge does not interpret whether assistant text is a final answer or a
 Kennedy text-tool request.
 
-### 5.3 Web Search
+### 5.4 Web Search
 
 `POST /api/v1/web/search` accepts provider/model plus a natural-language
 `question` of 1–4000 characters. It returns `answer`, deduplicated `sources`,
 provider/model, and optional usage. A valid answer may have no public source
 URL for a live-data lookup; ordinary cited research should include links.
 
-### 5.4 Web Fetch
+### 5.5 Web Fetch
 
 `POST /api/v1/web/fetch` accepts one absolute public HTTP(S) URL. It resolves
 and pins public addresses, rejects credentials, localhost/private/reserved IPs,
@@ -183,14 +230,15 @@ Invalid inputs return `400 invalid_request`. Unknown providers/models return
 5xx errors; deadlines use `504 provider_timeout`. Errors may include a local
 request UUID but never credentials or full prompts.
 
-The service binds to loopback by default, accepts JSON, exposes explicit GET
-and POST routes, permits only configured frontend origins, and applies a
+The service binds to loopback by default, accepts JSON plus bounded multipart
+audio, exposes explicit GET and POST routes, permits only configured frontend origins, and applies a
 request-body limit before deserialization.
 
 ## 7. Verification
 
 Tests cover request and thread-ID validation, Codex JSONL event normalization,
 last-message selection, usage mapping, source extraction/deduplication, config
-defaults, public-URL safety, and readable-content bounds. A smoke test should
+defaults, model modality metadata, paid-transcription configuration, safe audio
+filenames, public-URL safety, and readable-content bounds. A smoke test should
 confirm fresh generation, thread resume, and web search with the machine's
 actual ChatGPT login.

@@ -1,5 +1,5 @@
 [workspace]
-members = ["BackendKweb", "ConversationHistory", "IntelligenceBackend", "KennedyServer"]
+members = ["BackendKweb", "ConversationHistory", "IntelligenceBackend", "TelegramRelay", "KennedyServer"]
 resolver = "2"
 
 [workspace.package]
@@ -8,13 +8,15 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
-axum = "0.8"
+age = "0.12.1"
+axum = { version = "0.8", features = ["multipart"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 http = "1"
 rand = "0.9"
-reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "rustls-no-provider"] }
+rpassword = "7.5.4"
+reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "multipart", "rustls-no-provider"] }
 html2text = "0.16"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -26,3 +28,6 @@ tower-http = { version = "0.7", features = ["cors", "fs", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+zeroize = "1.9"
+futures = "0.3"
+teloxide = { version = "0.17", default-features = false, features = ["rustls", "rustls-native-roots", "tracing"] }

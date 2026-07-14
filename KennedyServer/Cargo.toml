@@ -6,11 +6,19 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+age.workspace = true
 clap.workspace = true
 kennedy-conversation-history = { path = "../ConversationHistory" }
 kennedy-intelligence = { path = "../IntelligenceBackend" }
 kennedy-kweb = { path = "../BackendKweb" }
+kennedy-telegram-relay = { path = "../TelegramRelay" }
 rustls.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
+zeroize.workspace = true

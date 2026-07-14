@@ -7,7 +7,7 @@ Kennedy is a local-first memory application built around the kweb described in
 document defines the architecture used to implement that behavior, and the
 component specifications define the detailed contracts.
 
-The MVP has four logical runtime components:
+The MVP has five logical runtime components:
 
 1. **Frontend**: a browser-native HTML/CSS/JavaScript application. It owns the
    user interface, the live chatend, short identifiers, prompt
@@ -20,12 +20,23 @@ The MVP has four logical runtime components:
    requests.
 4. **Conversation history backend**: a Rust HTTP service. It durably checkpoints
    active browser conversations and owns the sequential history-ingress queue.
+5. **Telegram relay**: a Rust service built on `teloxide`. It long-polls
+   Telegram, durably queues authorized text/voice/reset events, and ferries
+   conversational output between Telegram and the browser without constructing
+   prompts or running Kennedy.
 
-The three backends are independent library crates compiled into one
+The four backends are independent library crates compiled into one
 `kennedy-server` executable. The executable starts their listeners but shares
 no router, database, application state, or service handle among them. No
 backend crate depends on another backend crate; all coordination happens in the
 frontend through their public HTTP APIs.
+
+`kennedy-server` also owns a generic named credential vault stored as the
+passphrase-encrypted `kennedy-secrets.age` file. The tracked top-level
+`config.yaml` contains only vault names. At startup the server unlocks the vault
+and passes the configured OpenAI and Telegram values directly to their trusted
+connectors. The vault has terminal-only set/remove/list/passphrase commands and
+no HTTP, browser, Kennedy-tool, Codex, or reveal surface.
 
 System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 Every session composes `KennedyIdentity.txt` with exactly one technical mode
@@ -40,7 +51,7 @@ to every composed system prompt.
 - The Kweb backend is the single authority for durable memory.
 - The conversation history backend is the single authority for unfinished and
   completed conversation records.
-- Logical backend isolation is preserved even though all three services share
+- Logical backend isolation is preserved even though all four services share
   one deployment binary.
 - The intelligence backend never needs to understand the kweb, short
   identifiers, or Kennedy's text-tool protocol.
@@ -62,12 +73,14 @@ to every composed system prompt.
 
 ```text
 One kennedy-server process
+  ├─ Encrypted credential vault -------- kennedy-secrets.age
   ├─ Kweb API :4321 --------------------- kennedy.sqlite3
   │    └─ serves frontend and manuals
-  ├─ Intelligence API :4322 ------------ Podman Codex launcher + public web
-  └─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
+  ├─ Intelligence API :4322 ------------ Podman Codex + OpenAI transcription + public web
+  ├─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
+  └─ Telegram Relay API :4324 ---------- kennedy-telegram.sqlite3 + Telegram long polling
 
-Browser frontend calls all three APIs directly. No backend calls another.
+Browser frontend calls all four APIs directly. No backend calls another.
 ```
 
 Default addresses:
@@ -77,10 +90,16 @@ Default addresses:
 | Kweb backend | `http://127.0.0.1:4321` |
 | Intelligence backend | `http://127.0.0.1:4322` |
 | Conversation history backend | `http://127.0.0.1:4323` |
+| Telegram relay | `http://127.0.0.1:4324` |
 
-The browser calls all three services directly. Cross-origin backends permit
+The browser calls all four services directly. Cross-origin backends permit
 requests from the Kweb frontend origin. Every listener binds to loopback by
 default.
+
+The encrypted vault is portable rather than machine-bound. Copying it with the
+three databases preserves configured credentials on a new machine, where the
+same passphrase unlocks it. The vault is excluded from Git; `config.yaml` is
+tracked because it contains no credential values.
 
 ## 4. Ownership Boundaries
 
@@ -142,7 +161,10 @@ The intelligence backend owns:
 - translating Codex text, thread IDs, errors, and detailed token usage
   into one response shape,
 - executing isolated Codex WebSearch research runs,
-- safely fetching and extracting bounded text from public pages for WebFetch.
+- safely fetching and extracting bounded text from public pages for WebFetch,
+- publishing model input modalities and using paid OpenAI
+  `gpt-4o-transcribe` only when the selected model transport does not accept
+  native audio.
 
 It stores no local LLM session and never parses Kennedy's tool envelopes. The
 normal generation path has no provider tools. The frontend recognizes
@@ -163,7 +185,19 @@ It does not call the Kweb or intelligence APIs or validate their identifiers.
 It permits multiple `active` and `ingress_pending` records while enforcing one
 `ingress_in_progress` record. A user-activity checkpoint also closes other
 active conversations idle for more than 24 hours, unless Kennedy still owes a
-response in that record.
+response in that record. Telegram sessions are exempt and remain active until
+their user sends `/reset`.
+
+### 4.5 Telegram Relay
+
+The relay owns the bot token, numeric Telegram authorization bindings, original
+Telegram voice bytes, and the per-user inbound/outbound delivery queue. It
+bootstraps the configured `@taek42` username once and thereafter authorizes by
+stable numeric Telegram user ID. It accepts private chats only and refuses all
+unpaired users without storing their content. The browser binds each event to a
+Conversation History record, runs the normal frontend Chatend/tool loop, and
+returns Kennedy's final conversational text. The relay never receives the rest
+of the Chatend.
 
 ## 5. Session Model
 
@@ -231,6 +265,25 @@ and pending-turn flag. Pending user queries resume from fresh Codex threads.
 Queued ingress resumes independently and sequentially without disabling any
 live composer.
 
+### 5.3 Telegram and Audio
+
+Conversation records declare `sessionType: conversation` or
+`sessionType: telegram`. Prompt composition tells Kennedy which one she is in;
+history ingress separately declares whether its archive came from a Telegram
+session or a browser conversation. A Telegram session uses the ordinary
+conversation manual and read-only conversation tool set. It ends only on
+`/reset`, which queues the complete archived Chatend for normal sequential
+history ingress. Each time current context crosses another 100,000-token band,
+the relay sends a separate operational notice with current and maximum tokens
+and suggests `/reset`; the notice is not added to the Chatend.
+
+Browser recordings and Telegram voice notes follow the same capability-aware
+path. The frontend preserves the original recording and asks the intelligence
+backend to transcribe it only when the selected transport lacks native audio.
+For the configured text/image-only `gpt-5.6-sol` transport this uses the paid
+OpenAI `gpt-4o-transcribe` API, then adds a clearly labeled transcription to the
+ordinary text Chatend.
+
 ## 6. Kweb Data Model
 
 SQLite stores exactly the three durable node types from the user specification:
@@ -255,12 +308,13 @@ high, medium, or low task slot.
 
 ## 7. API Conventions
 
-All three backends expose versioned JSON APIs under `/api/v1` and an
+All four backends expose versioned APIs under `/api/v1` and an
 unversioned `GET /health` endpoint.
 
 - Durable identifiers are lowercase hexadecimal encodings of 20 random bytes.
 - Timestamps are RFC 3339 UTC strings.
-- Requests and responses use `application/json`.
+- Requests and responses use `application/json`, except multipart audio upload
+  and raw relay media retrieval.
 - Successful deletion-style operations, where defined, may return `204`; all
   other successful operations return JSON.
 - Errors use one envelope:
@@ -286,6 +340,8 @@ BackendKweb/
   Specification.md
 ConversationHistory/
   Specification.md
+TelegramRelay/
+  Specification.md
 Frontend/
   Specification.md
   SystemPrompts/
@@ -303,7 +359,8 @@ Implementation code belongs under its owning component directory.
 
 ## 9. MVP Non-Goals
 
-- Multiple users or access control.
+- General-purpose user administration beyond configured Telegram bootstrap
+  identities.
 - Network deployment beyond the local machine.
 - Manual knowledge editing, deletion, or fanout pruning.
 - Self-action sessions.

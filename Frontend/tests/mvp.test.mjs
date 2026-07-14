@@ -11,7 +11,7 @@ import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/inte
 import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
-import { ConversationHistoryAPI } from "../public/js/api.js";
+import { ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -404,7 +404,7 @@ test("a structured Chatend archive retains activity while refreshing current man
 
 test("history ingress checkpoints its whole Chatend and completed archives resume without regeneration", async () => {
   const kweb = new MockKweb([node(1)]);
-  kweb.provenance = async () => ({ source: "conversation", source_created_at: "2026-07-13T00:00:00Z", data: '{"format":"kennedy-chatend"}' });
+  kweb.provenance = async () => ({ source: "conversation", source_created_at: "2026-07-13T00:00:00Z", data: '{"format":"kennedy-chatend","media":[{"kind":"voice","dataUrl":"data:audio/ogg;base64,AAAA"}]}' });
   let generations = 0;
   const intelligence = { generate: async () => {
     generations += 1;
@@ -422,6 +422,8 @@ test("history ingress checkpoints its whole Chatend and completed archives resum
   assert.equal("modelAttribution" in checkpoints.at(-1), false);
   assert.match(checkpoints.at(-1).systemPrompt, /Ingress/);
   assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend \(JSON\)/);
+  assert.match(checkpoints.at(-1).retained[0].content, /Original audio retained in provenance/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /base64,AAAA/);
   assert.equal(checkpoints.at(-1).messages.at(-1).content, "Memory review complete.");
   assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
 
@@ -474,6 +476,21 @@ test("next message stays editable but cannot send while Kennedy is working", () 
   assert.equal(controls.sendDisabled, true);
   assert.equal(controls.endDisabled, true);
   assert.equal(controls.newDisabled, false);
+});
+
+test("a saved unanswered query is retryable only when no response is in flight", () => {
+  const idle = conversationControlState({
+    hasSession: true, sessionBusy: false, transitionBusy: false,
+    pendingTurn: true, viewingHistory: false, transcriptLength: 1,
+  });
+  assert.equal(idle.endDisabled, false);
+  assert.equal(idle.sendDisabled, true);
+
+  const responding = conversationControlState({
+    hasSession: true, sessionBusy: true, transitionBusy: false,
+    pendingTurn: true, viewingHistory: false, transcriptLength: 1,
+  });
+  assert.equal(responding.endDisabled, true);
 });
 
 test("closed conversations do not render a message composer", async () => {
@@ -580,6 +597,24 @@ test("restored pending conversation resumes from durable transcript and context"
   assert.equal(generated, 1);
   assert.equal(session.pendingTurn, false);
   assert.equal(session.transcript.at(-1).content, "Recovered answer.");
+});
+
+test("a restored user tail is retryable even when an older checkpoint omitted pendingTurn", async () => {
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1)]),
+    intelligence: { generate: async () => ({ status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered." }, usage: null }) },
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    persist: async () => {}, onUpdate: () => {},
+  });
+  await session.initialize({ transcript: [{ role: "user", content: "Unanswered" }], pendingTurn: false });
+  assert.equal(session.pendingTurn, true);
+  assert.equal(session.busy, false);
+});
+
+test("cold start leaves saved conversation retries under explicit user control", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.doesNotMatch(app, /for \(const record of activeRecords\)[\s\S]{0,240}resumeSavedQuery\(record\.id\)/);
+  assert.match(app, /end_button\.addEventListener\("click", \(\) => selectedSession\(\)\?\.pendingTurn \? resumeSavedQuery\(\) : endConversation\(\)\)/);
 });
 
 test("a structured pending Chatend resumes from cold start without duplicating its user query", async () => {
@@ -692,7 +727,9 @@ test("Kmap context is readable text rather than JSON", async () => {
 
 test("system prompt composition uses readable sections rather than markup wrappers", () => {
   const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation", { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
-  assert.equal(prompt, "Kennedy's identity\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
+  assert.equal(prompt, "Kennedy's identity\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.\n\nCurrent session\n\nThis is a conversation session in Kennedy's browser UI.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
+  assert.match(composePrompt({ shared: "Shared.", conversation: "Conversation." }, "conversation", { sessionType: "telegram" }), /This is a telegram session/);
+  assert.match(composePrompt({ shared: "Shared.", ingress: "Ingress." }, "ingress", { sourceSessionType: "telegram" }), /ingressing an archived telegram session/);
   assert.equal(formatModelAttribution("gpt-5.6-sol", "xhigh"), "gpt-5.6-sol-xhigh");
   assert.equal(prompt.includes("<kennedy_"), false);
 });
@@ -820,10 +857,63 @@ test("frontend exposes full, system, tools, memory inspector, and both Kmap root
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
   ]);
-  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "tg-tab", "voice-button"]) assert.match(html, new RegExp(`id="${id}"`));
   assert.match(app, /new MemoryExplorer\(\{ api: kweb, rootNodeIds,/);
   assert.match(app, /memory_kennedy_home\.addEventListener\("click", \(\) => explorer\?\.kennedyHome\(\)\)/);
   assert.ok(app.indexOf("await conversationHistory.discardUnstarted()") < app.indexOf("historyRecords = (await conversationHistory.list())"));
   assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
+});
+
+test("telegram voice sessions archive media, correlate delivery, and emit context notices outside the Chatend", async () => {
+  const checkpoints = [];
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1)]),
+    intelligence: { generate: async () => ({
+      status: "complete", response_id: "telegram-response",
+      message: { role: "assistant", content: "I heard you." },
+      usage: { input_tokens: 100001, output_tokens: 20, cached_tokens: 90000, cache_write_tokens: 0, reasoning_tokens: 0 },
+    }) },
+    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1),
+    provider: "p", model: "m", contextWindowTokens: 1050000, sessionType: "telegram",
+    channel: { telegramUserId: 42, username: "taek42" },
+    persist: async state => checkpoints.push(structuredClone(state)), onUpdate: () => {},
+  });
+  await session.initialize();
+  await session.send("There is music behind me.", {
+    externalEventId: "tg-event", inputKind: "voice", transcriptionModel: "gpt-4o-transcribe",
+    media: { id: "voice-1", mimeType: "audio/ogg", dataUrl: "data:audio/ogg;base64,AAAA" },
+  });
+  const answer = session.answerForExternalEvent("tg-event");
+  assert.equal(answer.content, "I heard you.");
+  assert.match(answer.contextWarning, /100,021 out of 1,050,000 context tokens used/);
+  assert.equal(session.chatend.messages.some(message => message.content === answer.contextWarning), false);
+  assert.match(session.chatend.messages.find(message => message.role === "user" && message.content.includes("paid transcription")).content, /There is music behind me/);
+  assert.equal(session.archive().sessionType, "telegram");
+  assert.equal(session.archive().media[0].dataUrl, "data:audio/ogg;base64,AAAA");
+  assert.equal(checkpoints.at(-1).pendingExternalEventId, null);
+});
+
+test("audio and Telegram API clients use multipart and durable relay endpoints", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ text: "Transcript", events: [] }),
+    };
+  };
+  try {
+    await IntelligenceAPI("http://intelligence").transcribe({ provider: "p", model: "m", file: new Blob(["audio"], { type: "audio/ogg" }), fileName: "note.ogg" });
+    await TelegramRelayAPI("http://telegram").bind("event", "019f5ca7-020f-7b63-be2f-82785fb68c03");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(requests[0].url, "http://intelligence/api/v1/audio/transcriptions");
+  assert.equal(requests[0].options.body instanceof FormData, true);
+  assert.equal(requests[0].options.headers, undefined);
+  assert.equal(requests[1].url, "http://telegram/api/v1/events/event/bind");
+  assert.match(requests[1].options.body, /conversationId/);
 });

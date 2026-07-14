@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kennedy</title>
-  <link rel="stylesheet" href="/css/styles.css?v=20260714.6">
+  <link rel="stylesheet" href="/css/styles.css?v=20260714.7">
 </head>
 <body>
   <header class="topbar">
@@ -15,6 +15,7 @@
     <div class="top-actions">
       <span id="service-status" class="status" role="status">Starting…</span>
       <button id="chat-tab" class="tab active" type="button">Conversation</button>
+      <button id="tg-tab" class="tab" type="button">TG Bot</button>
       <button id="memory-tab" class="tab" type="button">Memory</button>
     </div>
   </header>
@@ -23,7 +24,7 @@
     <section id="chat-view" class="workspace">
       <aside class="panel history-panel" aria-label="Conversation history">
         <div class="history-heading">
-          <div><span class="eyebrow">YOUR CONVERSATIONS</span><h2>History</h2></div>
+          <div><span id="history-eyebrow" class="eyebrow">YOUR CONVERSATIONS</span><h2 id="history-title">History</h2></div>
           <button id="new-conversation" class="primary history-new" type="button">New</button>
         </div>
         <nav id="conversation-history" class="conversation-history" aria-label="Saved conversations"></nav>
@@ -51,6 +52,7 @@
           <div class="composer-actions">
             <button id="end-button" class="secondary" type="button">End conversation</button>
             <span id="activity" class="activity" aria-live="polite"></span>
+            <button id="voice-button" class="secondary voice-button" type="button" aria-pressed="false">Record voice</button>
             <button id="send-button" class="primary" type="submit">Send</button>
           </div>
         </form>
@@ -58,7 +60,7 @@
 
       <aside class="panel inspector-panel" aria-label="Kennedy context inspector">
         <div class="panel-heading">
-          <div><span class="eyebrow">KENNEDY'S CURRENT CONTEXT</span><h2>Chatend</h2></div>
+          <div><span class="eyebrow">KENNEDY'S CURRENT CONTEXT</span><h2 id="chatend-title">Chatend</h2></div>
           <div class="inspector-heading-actions">
             <div id="usage-metrics" class="context-usage" aria-label="Token and cache usage"></div>
             <button id="copy-context" class="quiet" type="button">Copy view</button>
@@ -91,6 +93,6 @@
     </section>
   </main>
 
-  <script type="module" src="/js/app.js?v=20260714.6"></script>
+  <script type="module" src="/js/app.js?v=20260714.8"></script>
 </body>
 </html>

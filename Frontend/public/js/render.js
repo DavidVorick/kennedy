@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260714.5";
+import { formatKmapContext } from "./human_format.js?v=20260714.7";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -42,7 +42,9 @@ export function renderTranscript(container, transcript, ingressActivity = null) 
   for (const item of transcript) {
     const message = element("article", `message ${item.role === "kennedy" ? "assistant" : "user"}`);
     const body = element("div", "body"); appendLinkedText(body, item.content);
-    message.append(element("span", "role", item.role === "kennedy" ? "Kennedy" : "You"), body);
+    message.append(element("span", "role", item.role === "kennedy" ? "Kennedy" : "You"));
+    if (item.inputKind === "voice") message.append(element("span", "voice-note-badge", "Voice note · paid transcription"));
+    message.append(body);
     container.append(message);
   }
   if (ingressActivity?.diagnostic) {
@@ -52,6 +54,11 @@ export function renderTranscript(container, transcript, ingressActivity = null) 
 }
 
 export function conversationTitle(record, limit = 54) {
+  if ((record?.state?.sessionType || record?.state?.archive?.sessionType) === "telegram") {
+    const username = record?.state?.channel?.username || record?.state?.archive?.channel?.username;
+    const displayName = record?.state?.channel?.displayName || record?.state?.archive?.channel?.displayName || "Telegram user";
+    return username ? `@${String(username).replace(/^@/, "")}` : displayName;
+  }
   const transcript = Array.isArray(record?.state?.transcript) ? record.state.transcript : [];
   const firstUserMessage = transcript.find(item => item?.role === "user" && typeof item.content === "string")?.content;
   const normalized = (firstUserMessage || "New conversation").replace(/\s+/g, " ").trim() || "New conversation";
