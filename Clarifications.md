@@ -128,6 +128,11 @@ canonical documents; this file is not an append-only log.
   sequentially, with at most one Kmap-mutating ingress session at a time. Live
   conversation reads remain available during Kmap updates.
 - Mark sidebar records clearly as live/continuable or closed/read-only.
+- Hide the entire message composer when a closed/read-only conversation is
+  selected; do not show a disabled textarea for an unavailable action.
+- Let the user resize the live message box substantially from either its top
+  edge or lower-right corner, and provide an explicit one-click larger mode for
+  composing long messages to Kennedy.
 - On startup, idempotently remove the obsolete singleton-conversation index
   even from databases already marked migration v2; an early v2 build could
   recreate that index after the version advanced.
@@ -140,3 +145,22 @@ canonical documents; this file is not an append-only log.
 - Treat a completed hosted-search answer as successful even when the provider
   returns only a URL-less live-data feed (such as time, weather, finance, or
   sports). Preserve and display HTTP(S) citations whenever they are present.
+
+## Kmap-Learned Harness Strategy and Dual Roots
+
+- Replace the former shared Kmap manual and agent-mode manuals with
+  `KennedyIdentity.txt`, `ConversationManual.txt`, and `HistoryIngress.txt`.
+  The identity explains who Kennedy is and that harness strategy is learned
+  through the Kmap. Each mode manual stays concise and contains only exact mode,
+  Kmap, tool-protocol, argument, and hard-limit mechanics; strategic judgment
+  belongs in Kennedy's graph.
+- Give Kennedy a durable MVP root node alongside the user's root. Both roots
+  load automatically in every conversation and history-ingress context and
+  survive every `ResetContext`; neither is included in reset arguments.
+- Replace the former per-user seven-node model with one shared maximum of ten
+  directly loaded nodes across both graphs. Kennedy chooses the allocation.
+  Active-connection expansions do not count as direct loads, and existing
+  per-turn/session LoadNode request budgets remain enforced.
+- Tell Kennedy in the conversation-mode manual that completing a conversation
+  passes its entire archived Chatend to the separate read-write history-ingress
+  mode, which can integrate anything learned during that conversation.

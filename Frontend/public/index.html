@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kennedy</title>
-  <link rel="stylesheet" href="/css/styles.css?v=20260713.8">
+  <link rel="stylesheet" href="/css/styles.css?v=20260714.2">
 </head>
 <body>
   <header class="topbar">
@@ -37,8 +37,17 @@
         </div>
         <div id="error-banner" class="error-banner hidden" role="alert"></div>
         <form id="message-form" class="composer">
-          <label class="sr-only" for="message-input">Message Kennedy</label>
-          <textarea id="message-input" rows="3" placeholder="Message Kennedy…" required></textarea>
+          <div class="composer-heading">
+            <label for="message-input">Message Kennedy</label>
+            <div class="composer-sizing">
+              <span id="message-resize-hint">Drag the top grip or lower-right corner to resize</span>
+              <button id="message-size-button" class="quiet composer-size-button" type="button" aria-controls="message-input" aria-expanded="false">Make larger</button>
+            </div>
+          </div>
+          <div class="message-input-frame">
+            <div id="message-resize-handle" class="message-resize-handle" role="separator" aria-label="Resize message box from its top edge" aria-controls="message-input" aria-orientation="horizontal" aria-valuemin="96" aria-valuemax="720" aria-valuenow="96" tabindex="0"></div>
+            <textarea id="message-input" rows="4" placeholder="Message Kennedy…" aria-describedby="message-resize-hint" required></textarea>
+          </div>
           <div class="composer-actions">
             <button id="end-button" class="secondary" type="button">End conversation</button>
             <span id="activity" class="activity" aria-live="polite"></span>
@@ -81,6 +90,6 @@
     </section>
   </main>
 
-  <script type="module" src="/js/app.js?v=20260713.8"></script>
+  <script type="module" src="/js/app.js?v=20260714.2"></script>
 </body>
 </html>

@@ -1,5 +1,15 @@
+export const MAX_DIRECTLY_LOADED_NODES = 10;
+
 export class KwebContext {
-  constructor(api, rootNodeId) { this.api = api; this.rootNodeId = rootNodeId; this.clear(); }
+  constructor(api, rootNodeIds) {
+    this.api = api;
+    this.rootNodeIds = Array.isArray(rootNodeIds) ? [...rootNodeIds] : [rootNodeIds];
+    if (!this.rootNodeIds.length || this.rootNodeIds.some(id => typeof id !== "string" || !id) || new Set(this.rootNodeIds).size !== this.rootNodeIds.length) {
+      throw new Error("Kmap root node identifiers must be distinct non-empty strings.");
+    }
+    this.rootNodeId = this.rootNodeIds[0];
+    this.clear();
+  }
 
   clear() {
     this.loadedNodeIds = [];
@@ -36,9 +46,9 @@ export class KwebContext {
     else if (!this.nodesById.has(node.id)) this.nodesById.set(node.id, node);
   }
 
-  async loadDurable(durableId, { internal = false } = {}) {
-    if (!internal && this.loadedNodeIds.length >= 7) throw Object.assign(new Error("Seven nodes are already directly loaded. Reset the context to continue."), { code: "loaded_node_limit" });
+  async loadDurable(durableId) {
     if (this.loadedNodeIds.includes(durableId)) throw Object.assign(new Error("That node is already directly loaded."), { code: "already_loaded" });
+    if (this.loadedNodeIds.length >= MAX_DIRECTLY_LOADED_NODES) throw Object.assign(new Error("Ten nodes are already directly loaded. Reset the context to continue."), { code: "loaded_node_limit" });
     const payload = await this.api.context(durableId);
     this.ingestNode(payload.requested_node, true, "direct");
     for (const node of payload.active_connection_nodes) this.ingestNode(node, true, "active");
@@ -46,15 +56,28 @@ export class KwebContext {
     return { requestedNode: this.toContextNode(payload.requested_node), activeConnectionNodes: payload.active_connection_nodes.map(node => this.toContextNode(node)) };
   }
 
-  async initialize() { this.clear(); return this.loadDurable(this.rootNodeId, { internal: true }); }
+  async ensureRootsLoaded() {
+    const loads = [];
+    for (const rootNodeId of this.rootNodeIds) this.shortId(rootNodeId);
+    for (const rootNodeId of this.rootNodeIds) {
+      if (!this.loadedNodeIds.includes(rootNodeId)) loads.push(await this.loadDurable(rootNodeId));
+    }
+    return loads;
+  }
+
+  async initialize() {
+    this.clear();
+    const loads = await this.ensureRootsLoaded();
+    return { loads, context: this.snapshot() };
+  }
 
   async reset(durableIds) {
-    if (durableIds.includes(this.rootNodeId)) throw Object.assign(new Error("The root node is loaded automatically and must not be listed."), { code: "root_in_reset" });
+    if (durableIds.some(id => this.rootNodeIds.includes(id))) throw Object.assign(new Error("Root nodes are loaded automatically and must not be listed."), { code: "root_in_reset" });
     if (new Set(durableIds).size !== durableIds.length) throw Object.assign(new Error("Reset identifiers must be distinct."), { code: "duplicate_identifier" });
-    if (durableIds.length + 1 > 7) throw Object.assign(new Error("Reset would exceed the seven directly loaded node limit."), { code: "loaded_node_limit" });
+    if (durableIds.length + this.rootNodeIds.length > MAX_DIRECTLY_LOADED_NODES) throw Object.assign(new Error("Reset would exceed the ten directly loaded node limit."), { code: "loaded_node_limit" });
     this.clear();
-    const loads = [await this.loadDurable(this.rootNodeId, { internal: true })];
-    for (const id of durableIds) loads.push(await this.loadDurable(id, { internal: true }));
+    const loads = await this.ensureRootsLoaded();
+    for (const id of durableIds) loads.push(await this.loadDurable(id));
     return { loads, context: this.snapshot() };
   }
 
@@ -76,6 +99,7 @@ export class KwebContext {
 
   snapshot() {
     return {
+      rootIdentifiers: this.rootNodeIds.map(id => this.shortId(id)),
       directlyLoadedIdentifiers: this.loadedNodeIds.map(id => this.shortId(id)),
       nodes: [...this.fullNodeIds].map(id => ({ ...this.toContextNode(this.nodesById.get(id)), contextSources: [...(this.nodeOrigins.get(id) || [])] })),
     };
@@ -95,6 +119,9 @@ export class KwebContext {
   restore(archive) {
     if (!archive || !Array.isArray(archive.loadedNodeIds) || !Array.isArray(archive.nodesById) || !Array.isArray(archive.shortToDurable)) {
       throw new Error("The saved Kmap context archive is invalid.");
+    }
+    if (archive.loadedNodeIds.length > MAX_DIRECTLY_LOADED_NODES || new Set(archive.loadedNodeIds).size !== archive.loadedNodeIds.length) {
+      throw new Error("The saved Kmap context exceeds the directly loaded node limit or contains duplicates.");
     }
     this.loadedNodeIds = [...archive.loadedNodeIds];
     this.fullNodeIds = new Set(archive.fullNodeIds || []);

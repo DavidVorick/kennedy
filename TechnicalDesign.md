@@ -28,6 +28,9 @@ backend crate depends on another backend crate; all coordination happens in the
 frontend through their public HTTP APIs.
 
 System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
+Every session composes `KennedyIdentity.txt` with exactly one technical mode
+manual. Harness strategy is durable Kmap knowledge rather than static prompt
+policy.
 
 ## 2. Design Principles
 
@@ -105,15 +108,16 @@ Provider IDs and credentials remain hidden.
 The frontend itself has no persistent state. It saves versioned, opaque,
 lossless Chatend archives to the conversation history API before generation,
 after complete tool rounds, and after final output. Structured content is
-preserved for future media support. It reconstructs the exact live session
-from that backend after a reload or abrupt close.
+preserved for future media support. It reconstructs the live session from that
+backend after a reload or abrupt close while refreshing the active manuals and
+required root context.
 
 ### 4.2 Kweb Backend
 
 The Kweb backend owns:
 
 - creation and migration of the SQLite schema,
-- the hardcoded MVP user and root node,
+- the hardcoded MVP user root and Kennedy root,
 - knowledge, provenance, and history nodes,
 - connection ordering, promotion, and demotion,
 - atomic create, update, and connect operations,
@@ -195,8 +199,8 @@ remain queryable from the sidebar.
 
 ### 5.2 History Ingress
 
-History ingress uses a separate chatend composed from the Kmap and
-HistoryIngress manuals, the provenance data, and the loaded user root node.
+History ingress uses a separate chatend composed from `KennedyIdentity.txt` and
+`HistoryIngress.txt`, the provenance data, and both loaded root nodes.
 Kennedy may navigate the kweb, connect nodes, reorganize fanout, manage task
 slots, and create or update knowledge nodes. WebSearch and WebFetch are not
 available; ingress must interpret only the archived conversation and Kmap
@@ -274,9 +278,9 @@ ConversationHistory/
 Frontend/
   Specification.md
   SystemPrompts/
-    KmapAgentManual.txt
-    ConversationAgentManual.txt
-    HistoryIngressAgentManual.txt
+    KennedyIdentity.txt
+    ConversationManual.txt
+    HistoryIngress.txt
   public/
 IntelligenceBackend/
   Specification.md

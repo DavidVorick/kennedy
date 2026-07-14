@@ -17,7 +17,7 @@ const MODEL_LIMITS = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "send-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "new-conversation", "conversation-history",
+  "service-status", "chat-view", "memory-view", "chat-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "new-conversation", "conversation-history",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["full", "system", "tools", "memory"];
@@ -26,6 +26,7 @@ const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
 
 let manuals = null;
+let rootNodeIds = null;
 let rootNodeId = null;
 let provider = null;
 let model = null;
@@ -121,6 +122,7 @@ function update() {
     viewingHistory,
     transcriptLength: session?.transcript.length || 0,
   });
+  ui.message_form.classList.toggle("hidden", controls.composerHidden);
   ui.message_input.disabled = controls.inputDisabled;
   ui.send_button.disabled = controls.sendDisabled;
   ui.end_button.disabled = controls.endDisabled;
@@ -147,6 +149,42 @@ function saveDraft() {
 
 function restoreDraft() {
   ui.message_input.value = selectedSession() ? (drafts.get(selectedConversationId) || "") : "";
+}
+
+function composerHeightBounds() {
+  const min = Number.parseFloat(getComputedStyle(ui.message_input).minHeight) || 96;
+  const max = Math.max(min, Math.min(window.innerHeight * .64, 720, window.innerHeight - 250));
+  return { min, max };
+}
+
+function syncComposerResizeValue() {
+  const { min, max } = composerHeightBounds();
+  const height = Math.round(ui.message_input.getBoundingClientRect().height);
+  ui.message_resize_handle.setAttribute("aria-valuemin", String(Math.round(min)));
+  ui.message_resize_handle.setAttribute("aria-valuemax", String(Math.round(max)));
+  ui.message_resize_handle.setAttribute("aria-valuenow", String(height));
+}
+
+function setMessageInputHeight(height) {
+  const { min, max } = composerHeightBounds();
+  const nextHeight = Math.min(max, Math.max(min, height));
+  ui.message_input.style.height = `${nextHeight}px`;
+  syncComposerResizeValue();
+}
+
+function setComposerExpanded(expanded) {
+  ui.message_form.classList.toggle("composer-expanded", expanded);
+  setMessageInputHeight(expanded ? Math.min(620, Math.max(320, window.innerHeight * .52)) : 96);
+  ui.message_size_button.setAttribute("aria-expanded", String(expanded));
+  ui.message_size_button.textContent = expanded ? "Use compact size" : "Make larger";
+}
+
+let composerResize = null;
+
+function finishComposerResize(event) {
+  if (!composerResize || (event.pointerId !== undefined && event.pointerId !== composerResize.pointerId)) return;
+  composerResize = null;
+  ui.message_resize_handle.classList.remove("resizing");
 }
 
 function reconcileLiveSessions(records) {
@@ -184,7 +222,7 @@ async function persistSession(id, state, metadata = {}) {
 
 async function buildConversation(record) {
   const session = new ConversationSession({
-    kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens, maxInputTokens,
+    kweb, intelligence, manuals, rootNodeIds, provider, model, contextWindowTokens, maxInputTokens,
     persist: (state, metadata) => persistSession(record.id, state, metadata),
     onUpdate: update,
   });
@@ -201,7 +239,7 @@ async function createNewConversation() {
   update();
   try {
     const session = new ConversationSession({
-      kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens, maxInputTokens,
+      kweb, intelligence, manuals, rootNodeIds, provider, model, contextWindowTokens, maxInputTokens,
       onUpdate: update,
     });
     await session.initialize();
@@ -346,7 +384,7 @@ async function processIngressQueue() {
         update();
       };
       await runHistoryIngress({
-        kweb, intelligence, manuals, rootNodeId, provenanceId: record.provenance_id,
+        kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
         provider, model, contextWindowTokens, maxInputTokens,
         restoredArchive: record.state?.historyIngress,
         checkpoint: persistIngress,
@@ -392,6 +430,8 @@ async function initialize() {
   try {
     const [health, user, loadedManuals] = await Promise.all([kweb.health(), kweb.user(), loadPromptManuals(CONFIG.kwebBase)]);
     rootNodeId = user.root_node_id;
+    rootNodeIds = [user.user_root_node_id || user.root_node_id, user.kennedy_root_node_id];
+    if (rootNodeIds.some(id => typeof id !== "string" || !id)) throw new Error("Kweb did not provide both required root nodes.");
     manuals = loadedManuals;
     explorer = new MemoryExplorer({ api: kweb, rootNodeId, content: ui.memory_content, backButton: ui.memory_back, forwardButton: ui.memory_forward });
     ui.service_status.textContent = `${health.status} · memory ready`;
@@ -440,6 +480,43 @@ ui.message_input.addEventListener("keydown", event => {
     ui.message_form.requestSubmit();
   }
 });
+ui.message_size_button.addEventListener("click", () => {
+  setComposerExpanded(!ui.message_form.classList.contains("composer-expanded"));
+  ui.message_input.focus();
+});
+ui.message_resize_handle.addEventListener("pointerdown", event => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  composerResize = {
+    pointerId: event.pointerId,
+    startY: event.clientY,
+    startHeight: ui.message_input.getBoundingClientRect().height,
+  };
+  ui.message_resize_handle.setPointerCapture(event.pointerId);
+  ui.message_resize_handle.classList.add("resizing");
+});
+ui.message_resize_handle.addEventListener("pointermove", event => {
+  if (!composerResize || event.pointerId !== composerResize.pointerId) return;
+  setMessageInputHeight(composerResize.startHeight + composerResize.startY - event.clientY);
+});
+ui.message_resize_handle.addEventListener("pointerup", finishComposerResize);
+ui.message_resize_handle.addEventListener("pointercancel", finishComposerResize);
+ui.message_resize_handle.addEventListener("lostpointercapture", finishComposerResize);
+ui.message_resize_handle.addEventListener("keydown", event => {
+  const currentHeight = ui.message_input.getBoundingClientRect().height;
+  const step = event.shiftKey ? 72 : 24;
+  const { min, max } = composerHeightBounds();
+  const requestedHeight = event.key === "ArrowUp" ? currentHeight + step
+    : event.key === "ArrowDown" ? currentHeight - step
+      : event.key === "Home" ? min
+        : event.key === "End" ? max
+          : null;
+  if (requestedHeight === null) return;
+  event.preventDefault();
+  setMessageInputHeight(requestedHeight);
+});
+const messageInputResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(syncComposerResizeValue) : null;
+messageInputResizeObserver?.observe(ui.message_input);
 ui.end_button.addEventListener("click", () => selectedSession()?.pendingTurn ? resumeSavedQuery() : endConversation());
 ui.new_conversation.addEventListener("click", () => createNewConversation().catch(error => showError(ui.error_banner, error.message)));
 for (const mode of INSPECTOR_MODES) ui[`inspector_${mode}`].addEventListener("click", () => { inspectorMode = mode; update(); });

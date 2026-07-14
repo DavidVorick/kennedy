@@ -1,7 +1,7 @@
 const FILES = {
-  shared: "KmapAgentManual.txt",
-  conversation: "ConversationAgentManual.txt",
-  ingress: "HistoryIngressAgentManual.txt",
+  identity: "KennedyIdentity.txt",
+  conversation: "ConversationManual.txt",
+  ingress: "HistoryIngress.txt",
 };
 
 export async function loadPromptManuals(base = "") {
@@ -17,9 +17,9 @@ export function composePrompt(manuals, mode) {
   const session = mode === "conversation" ? manuals.conversation : manuals.ingress;
   const sessionTitle = mode === "conversation" ? "Conversation session instructions" : "History-ingress session instructions";
   return [
-    "Kennedy's shared instructions",
+    "Kennedy's identity",
     "",
-    manuals.shared,
+    manuals.identity ?? manuals.shared,
     "",
     sessionTitle,
     "",

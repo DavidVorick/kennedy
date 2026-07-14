@@ -17,9 +17,9 @@ data or backend mutation rules.
 Frontend/
   Specification.md
   SystemPrompts/
-    KmapAgentManual.txt
-    ConversationAgentManual.txt
-    HistoryIngressAgentManual.txt
+    KennedyIdentity.txt
+    ConversationManual.txt
+    HistoryIngress.txt
   public/
     index.html
     css/
@@ -134,9 +134,10 @@ The frontend can rebuild a chatend from:
 3. freshly materialized Kweb context.
 
 `ResetContext` first resolves all supplied short identifiers to durable IDs.
-It then clears loaded Kweb data and short-ID mappings, reloads the user root and
-the supplied nodes, and rebuilds the chatend. Previous Kweb context and tool
-activity are omitted. The clean transcript or provenance input remains.
+It then clears loaded Kweb data and short-ID mappings, reloads the user and
+Kennedy roots followed by the supplied nodes, and rebuilds the chatend. Previous
+Kweb context and tool activity are omitted. The clean transcript or provenance
+input remains.
 During an active tool loop, the rebuilt chatend ends with the assistant's
 visible ResetContext request and a readable result containing the newly loaded
 context. Reset abandons the old `previous_response_id` thread and submits the
@@ -189,10 +190,13 @@ fully materialized knowledge.
 
 A directly loaded node is one for which the frontend executed the LoadNode
 operation. Active connections returned alongside it are in context and receive
-short identifiers, but do not count toward the seven-loaded-node limit.
+short identifiers, but do not count toward the ten-directly-loaded-node limit.
 
-The user root is directly loaded at session start, is always the first loaded
-node after reset, and counts toward the limit.
+The user root and Kennedy root are directly loaded at session start, survive
+every reset, and both count toward the shared limit. In a fresh or reset
+context, they are loaded first in that order. Restoring a legacy one-root
+archive automatically materializes the missing Kennedy root and refreshes the
+archived system and Kmap context messages before generation.
 
 ## 7. Prompt Composition
 
@@ -200,18 +204,23 @@ The frontend fetches manuals from `/system-prompts/{filename}`.
 
 Conversation instructions are composed, in order, from:
 
-1. `KmapAgentManual.txt`,
-2. `ConversationAgentManual.txt`.
+1. `KennedyIdentity.txt`,
+2. `ConversationManual.txt`.
 
 History-ingress instructions are composed from:
 
-1. `KmapAgentManual.txt`,
-2. `HistoryIngressAgentManual.txt`.
+1. `KennedyIdentity.txt`,
+2. `HistoryIngress.txt`.
 
 Manual contents are inserted without rewriting. The prompt composer may add
 short human-readable section headings and the current context block, but must
 not add XML wrappers, JSON serialization, or duplicate behavioral instructions
-already present in the manuals.
+already present in the manuals. The identity establishes Kennedy's purpose and
+Kmap-based learning model. Mode manuals contain only mode mechanics, exact Kmap
+facts, and tool contracts; Kmap usage strategy belongs in Kennedy's own graph.
+The conversation manual also states the lifecycle fact that the complete
+archived Chatend is passed to read-write history ingress when the conversation
+ends, where learned information can be integrated into the Kmap.
 
 ## 8. Agent Tools
 
@@ -250,7 +259,7 @@ Text-protocol arguments:
 Execution:
 
 1. Reject the call if the session's LoadNode call budget is exhausted.
-2. Reject the call if seven nodes are already directly loaded.
+2. Reject the call if ten nodes are already directly loaded.
 3. Resolve the short identifier.
 4. Call `GET /api/v1/nodes/{durable_id}/context`.
 5. Add the requested durable ID to the directly loaded set.
@@ -274,9 +283,9 @@ Text-protocol arguments:
 ```
 
 The frontend resolves the identifiers before clearing the old map, then reloads
-the root followed by the supplied nodes in their given order. The root must not
-also appear in the argument list, and the resulting direct-load set must not
-exceed seven nodes.
+both roots followed by the supplied nodes in their given order. Neither root
+may appear in the argument list, and the resulting direct-load set must not
+exceed ten nodes; therefore the argument list contains at most eight IDs.
 
 Reset preserves the current LoadNode counter. Its tool result contains the
 complete newly loaded Kweb context.
@@ -503,7 +512,7 @@ conversation's Kweb tool history.
 1. Fetch `GET /api/v1/provenance/{provenance_id}` from the Kweb backend.
 2. Compose history-ingress instructions.
 3. place the provenance data into the retained session content,
-4. load the user root,
+4. load the user and Kennedy roots,
 5. set the session LoadNode counter to zero,
 6. generate with the ingress manual describing the memory navigation and
    mutation tools; WebSearch and WebFetch are unavailable,
@@ -536,6 +545,16 @@ short title from its first user message, shows its phase/date and a clear live
 or closed indicator. Selecting a live entry restores its draft and continuable
 session; selecting a closed entry opens its clean transcript read-only. New
 always creates and selects another durable live conversation.
+
+The message composer is not rendered while a closed record is selected. Its
+textarea, Send control, and End Conversation control return only after the user
+selects or creates a live conversation.
+
+In a live conversation, the textarea has a visible larger/compact toggle for
+long messages and remains vertically resizable using either its top-edge grip
+or the browser's lower-right corner. The top grip also supports the arrow,
+Home, and End keys. Manual resizing is allowed up to most of the viewport
+rather than being limited to a short box.
 
 History-ingress activity belongs to the conversation record that created it
 and is hidden while a live conversation is selected. Selecting an in-progress
@@ -608,7 +627,8 @@ Frontend tests may run directly in a browser or with lightweight Rust-served
 fixtures; they must not introduce a production build step. At minimum verify:
 
 - stable short-ID assignment and reset,
-- seven-direct-load enforcement,
+- two-root initialization and reset survival,
+- ten-direct-load enforcement,
 - conversation and ingress LoadNode budgets,
 - parsing and sequential execution of multiple text tool calls from one round,
 - continuation requests sending only newly appended messages,

@@ -43,6 +43,9 @@ export function formatContextNode(node) {
 }
 
 export function formatKmapContext(snapshot) {
+  const roots = snapshot.rootIdentifiers?.length
+    ? snapshot.rootIdentifiers.join(", ")
+    : "none";
   const identifiers = snapshot.directlyLoadedIdentifiers?.length
     ? snapshot.directlyLoadedIdentifiers.join(", ")
     : "none";
@@ -52,6 +55,8 @@ export function formatKmapContext(snapshot) {
   return [
     "Current Kmap context",
     "",
+    `Always-loaded root identifiers: ${roots}`,
+    `Directly loaded node limit: 10`,
     `Directly loaded memory identifiers: ${identifiers}`,
     "",
     nodes,

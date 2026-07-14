@@ -9,8 +9,9 @@ function jsonCopy(value) {
 }
 
 export class ConversationSession {
-  constructor({ kweb, intelligence, manuals, rootNodeId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, persist = async () => {}, onUpdate }) {
-    this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals; this.rootNodeId = rootNodeId;
+  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, persist = async () => {}, onUpdate }) {
+    this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals;
+    this.rootNodeIds = rootNodeIds || [rootNodeId]; this.rootNodeId = this.rootNodeIds[0];
     this.provider = provider; this.model = model; this.persist = persist; this.onUpdate = onUpdate;
     this.transcript = []; this.startedAt = new Date().toISOString(); this.pendingTurn = false; this.pendingCheckpointed = false; this.busy = false;
     this.continuation = new ContinuationState(createCacheKey("conversation"));
@@ -26,21 +27,23 @@ export class ConversationSession {
       this.pendingTurn = Boolean(restored.pendingTurn);
       this.pendingCheckpointed = this.pendingTurn;
     }
-    this.context = new KwebContext(this.kweb, this.rootNodeId);
+    this.context = new KwebContext(this.kweb, this.rootNodeIds);
     if (archive?.context?.state) {
       this.context.restore(archive.context.state);
+      await this.context.ensureRootsLoaded();
     } else {
       await this.context.initialize();
       const loadedNodeIds = restored?.loadedNodeIds || archive?.context?.diagnostics?.loadedNodeIds || [];
       for (const durableId of loadedNodeIds) {
-        if (durableId !== this.rootNodeId && !this.context.loadedNodeIds.includes(durableId)) await this.context.loadDurable(durableId, { internal: true });
+        if (!this.rootNodeIds.includes(durableId) && !this.context.loadedNodeIds.includes(durableId)) await this.context.loadDurable(durableId);
       }
     }
     this.chatend = new Chatend(composePrompt(this.manuals, "conversation"), this.context, this.retainedTranscript());
     if (Array.isArray(archive?.messages)) {
-      this.chatend.messages = jsonCopy(archive.messages);
-      this.chatend.systemPrompt = archive.systemPrompt || this.chatend.systemPrompt;
-      this.chatend.retained = Array.isArray(archive.retained) ? jsonCopy(archive.retained) : this.retainedTranscript();
+      this.chatend.restoreMessages(
+        jsonCopy(archive.messages),
+        Array.isArray(archive.retained) ? jsonCopy(archive.retained) : this.retainedTranscript(),
+      );
     }
     this.executor = new ToolExecutor({ mode: "conversation", context: this.context, api: this.kweb, intelligence: this.intelligence, provider: this.provider, model: this.model, loadLimit: 20, onUpdate: this.onUpdate });
     if (archive?.tools) {
@@ -68,7 +71,7 @@ export class ConversationSession {
   archive() {
     return {
       format: "kennedy-chatend",
-      version: 1,
+      version: 2,
       sessionType: "conversation",
       startedAt: this.startedAt,
       provider: this.provider,
@@ -104,9 +107,7 @@ export class ConversationSession {
     this.transcript = jsonCopy(state.transcript || archive.transcript || []);
     this.pendingTurn = Boolean(state.pendingTurn);
     this.pendingCheckpointed = this.pendingTurn;
-    this.chatend.messages = jsonCopy(archive.messages);
-    this.chatend.systemPrompt = archive.systemPrompt || this.chatend.systemPrompt;
-    this.chatend.retained = jsonCopy(archive.retained || this.retainedTranscript());
+    this.chatend.restoreMessages(jsonCopy(archive.messages), jsonCopy(archive.retained || this.retainedTranscript()));
     this.context.restore(archive.context.state);
     this.executor.loadCalls = Number.isInteger(archive.tools?.loadCalls) ? archive.tools.loadCalls : 0;
     this.executor.toolLog = jsonCopy(archive.tools?.log || []);

@@ -22,15 +22,31 @@ class MockKweb {
 }
 
 test("short IDs are stable within a context and reset from one", async () => {
-  const api = new MockKweb([node(1, [2]), node(2), node(3)]);
-  const context = new KwebContext(api, id(1));
+  const api = new MockKweb([node(1, [3]), node(2), node(3)]);
+  const context = new KwebContext(api, [id(1), id(2)]);
   await context.initialize();
   assert.equal(context.shortId(id(1)), 1);
   assert.equal(context.shortId(id(2)), 2);
   assert.equal(context.shortId(id(2)), 2);
+  assert.equal(context.shortId(id(3)), 3);
   await context.reset([id(3)]);
   assert.equal(context.shortId(id(1)), 1);
+  assert.equal(context.shortId(id(2)), 2);
+  assert.deepEqual(context.loadedNodeIds, [id(1), id(2), id(3)]);
   assert.equal(context.resolve(context.shortId(id(3))), id(3));
+});
+
+test("both roots load automatically and survive every reset", async () => {
+  const api = new MockKweb([node(1), node(2), node(3), node(4)]);
+  const context = new KwebContext(api, [id(1), id(2)]);
+  await context.initialize();
+  assert.deepEqual(context.loadedNodeIds, [id(1), id(2)]);
+  await context.loadDurable(id(3));
+  await context.reset([id(4)]);
+  assert.deepEqual(context.loadedNodeIds, [id(1), id(2), id(4)]);
+  assert.deepEqual(context.snapshot().rootIdentifiers, [1, 2]);
+  await assert.rejects(() => context.reset([id(1)]), error => error.code === "root_in_reset");
+  await assert.rejects(() => context.reset([id(2)]), error => error.code === "root_in_reset");
 });
 
 test("Kmap snapshot distinguishes direct loads from active expansions", async () => {
@@ -65,12 +81,14 @@ test("Kmap archives restore raw nodes and short identifiers exactly", async () =
   assert.deepEqual(restored.snapshot(), context.snapshot());
 });
 
-test("seven direct loads are enforced", async () => {
-  const nodes = Array.from({ length: 8 }, (_, index) => node(index + 1));
-  const context = new KwebContext(new MockKweb(nodes), id(1));
+test("ten direct loads are enforced across both root graphs", async () => {
+  const nodes = Array.from({ length: 11 }, (_, index) => node(index + 1));
+  const context = new KwebContext(new MockKweb(nodes), [id(1), id(2)]);
   await context.initialize();
-  for (let n = 2; n <= 7; n++) await context.loadDurable(id(n));
-  await assert.rejects(() => context.loadDurable(id(8)), error => error.code === "loaded_node_limit");
+  for (let n = 3; n <= 10; n++) await context.loadDurable(id(n));
+  assert.equal(context.loadedNodeIds.length, 10);
+  await assert.rejects(() => context.loadDurable(id(11)), error => error.code === "loaded_node_limit");
+  await assert.rejects(() => context.reset(Array.from({ length: 9 }, (_, index) => id(index + 3))), error => error.code === "loaded_node_limit");
 });
 
 test("LoadNode attempts consume the tool budget, including failures", async () => {
@@ -279,7 +297,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
   });
   const archive = JSON.parse(session.serialize());
   assert.equal(archive.format, "kennedy-chatend");
-  assert.equal(archive.version, 1);
+  assert.equal(archive.version, 2);
   assert.match(archive.systemPrompt, /Shared/);
   assert.equal(archive.context.snapshot.nodes[0].longDescription, "Details 1");
   assert.match(archive.messages.find(message => typeof message.content === "string" && message.content.includes("KENNEDY_TOOL_CALLS")).content, /LoadNode/);
@@ -287,8 +305,8 @@ test("conversation provenance preserves the complete structured Chatend", async 
   assert.equal(archive.messages.at(-1).content[1].image_url, "data:image/png;base64,AAAA");
 });
 
-test("a structured Chatend archive is restored exactly while legacy snapshots remain supported", async () => {
-  const kweb = new MockKweb([node(1), node(2)]);
+test("a structured Chatend archive retains activity while refreshing current manuals and context", async () => {
+  const kweb = new MockKweb([node(1), node(2), node(3)]);
   const source = new ConversationSession({
     kweb, intelligence: {}, manuals: { shared: "Shared", conversation: "Conversation" },
     rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
@@ -304,11 +322,13 @@ test("a structured Chatend archive is restored exactly while legacy snapshots re
 
   const restored = new ConversationSession({
     kweb, intelligence: {}, manuals: { shared: "Changed", conversation: "Changed" },
-    rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
+    rootNodeIds: [id(1), id(3)], provider: "p", model: "m", onUpdate: () => {},
   });
   await restored.initialize(saved);
-  assert.deepEqual(restored.chatend.messages, saved.archive.messages);
-  assert.deepEqual(restored.context.loadedNodeIds, [id(1), id(2)]);
+  assert.match(restored.chatend.messages[0].content, /Changed/);
+  assert.equal(restored.chatend.messages.some(message => message.content?.includes?.("LoadNode")), true);
+  assert.deepEqual(restored.context.loadedNodeIds, [id(1), id(2), id(3)]);
+  assert.match(restored.chatend.messages.find(message => message.context_kind === "memory").content, /Always-loaded root identifiers: 1, 3/);
   assert.equal(restored.executor.loadCalls, 3);
   assert.deepEqual(restored.executor.toolLog, [{ name: "LoadNode", ok: true }]);
   assert.equal(restored.usage.snapshot().totalInputTokens, 12);
@@ -385,6 +405,33 @@ test("next message stays editable but cannot send while Kennedy is working", () 
   assert.equal(controls.sendDisabled, true);
   assert.equal(controls.endDisabled, true);
   assert.equal(controls.newDisabled, false);
+});
+
+test("closed conversations do not render a message composer", async () => {
+  const controls = conversationControlState({
+    hasSession: false, sessionBusy: false, transitionBusy: false,
+    pendingTurn: false, viewingHistory: true, transcriptLength: 0,
+  });
+  assert.equal(controls.composerHidden, true);
+  assert.equal(controls.inputDisabled, true);
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /message_form\.classList\.toggle\("hidden", controls\.composerHidden\)/);
+});
+
+test("message composer supports manual resizing and a large editor mode", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/css/styles.css", import.meta.url), "utf8");
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(html, /id="message-size-button"[^>]+aria-controls="message-input"/);
+  assert.match(html, /id="message-resize-handle"[^>]+role="separator"[^>]+aria-controls="message-input"/);
+  assert.match(styles, /\.composer textarea \{[^}]*max-height: min\(64vh,720px,calc\(100vh - 250px\)\);[^}]*resize: vertical;/s);
+  assert.match(styles, /\.message-resize-handle \{[^}]*cursor: ns-resize;[^}]*touch-action: none;/s);
+  assert.match(styles, /\.composer\.composer-expanded textarea \{ height: clamp\(320px,52vh,620px\); \}/);
+  assert.match(app, /message_size_button\.addEventListener\("click"/);
+  assert.match(app, /message_resize_handle\.addEventListener\("pointerdown"/);
+  assert.match(app, /startHeight \+ composerResize\.startY - event\.clientY/);
+  assert.match(app, /message_resize_handle\.addEventListener\("keydown"/);
+  assert.doesNotMatch(styles, /max-height: 220px/);
 });
 
 test("history ingress activity belongs only to its selected conversation", () => {
@@ -575,7 +622,7 @@ test("Kmap context is readable text rather than JSON", async () => {
 
 test("system prompt composition uses readable sections rather than markup wrappers", () => {
   const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation");
-  assert.equal(prompt, "Kennedy's shared instructions\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.");
+  assert.equal(prompt, "Kennedy's identity\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.");
   assert.equal(prompt.includes("<kennedy_"), false);
 });
 
@@ -589,7 +636,7 @@ test("chatend inspector system view excludes conversation and Kmap context", asy
   assert.match(inspectorText(diagnostic, "memory"), /Current Kmap context/);
 });
 
-test("system prompt loader requests the renamed Kmap manual", async () => {
+test("system prompt loader requests the identity and mode manuals", async () => {
   const originalFetch = globalThis.fetch;
   const requested = [];
   globalThis.fetch = async path => {
@@ -602,36 +649,38 @@ test("system prompt loader requests the renamed Kmap manual", async () => {
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(requested.sort(), [
-    "/base/system-prompts/ConversationAgentManual.txt",
-    "/base/system-prompts/HistoryIngressAgentManual.txt",
-    "/base/system-prompts/KmapAgentManual.txt",
+    "/base/system-prompts/ConversationManual.txt",
+    "/base/system-prompts/HistoryIngress.txt",
+    "/base/system-prompts/KennedyIdentity.txt",
   ]);
 });
 
 test("session manuals enforce exclusive tool-request responses", async () => {
-  for (const file of ["ConversationAgentManual.txt", "HistoryIngressAgentManual.txt"]) {
+  for (const file of ["ConversationManual.txt", "HistoryIngress.txt"]) {
     const manual = await readFile(new URL(`../SystemPrompts/${file}`, import.meta.url), "utf8");
     assert.match(manual, /closing brace must be the final non-whitespace character/);
-    assert.match(manual, /Do not use a Markdown code fence/);
-    assert.match(manual, /Do not put explanations, status updates/);
-    assert.match(manual, /no text after the final brace/);
+    assert.match(manual, /Do not use a Markdown fence/);
+    assert.match(manual, /include any other text before or after the object/);
   }
 });
 
-test("only history ingress exposes Kmap mutations and narrowly scoped task assignment", async () => {
-  const shared = await readFile(new URL("../SystemPrompts/KmapAgentManual.txt", import.meta.url), "utf8");
-  assert.match(shared, /Task connections are reserved for concrete, outstanding work/);
-  assert.match(shared, /only when there is a clear need for that task to be completed/);
-  const conversation = await readFile(new URL("../SystemPrompts/ConversationAgentManual.txt", import.meta.url), "utf8");
+test("mode manuals expose technical contracts without embedding Kmap strategy", async () => {
+  const identity = await readFile(new URL("../SystemPrompts/KennedyIdentity.txt", import.meta.url), "utf8");
+  assert.match(identity, /use the kmap itself to understand the best way to use the kmap/i);
+  const conversation = await readFile(new URL("../SystemPrompts/ConversationManual.txt", import.meta.url), "utf8");
   assert.doesNotMatch(conversation, /ConnectNodes\n  Call:/);
   assert.doesNotMatch(conversation, /ConsolidateFanout\n  Call:/);
   assert.doesNotMatch(conversation, /AssignTask\n  Call:/);
-  assert.match(conversation, /cannot mutate it/);
-  const ingress = await readFile(new URL("../SystemPrompts/HistoryIngressAgentManual.txt", import.meta.url), "utf8");
+  assert.match(conversation, /Kmap is read-only in this mode/);
+  assert.match(conversation, /entire archived Chatend is passed to a separate read-write history-ingress mode/);
+  assert.match(conversation, /At most ten nodes may be directly loaded at once, including both roots/);
+  const ingress = await readFile(new URL("../SystemPrompts/HistoryIngress.txt", import.meta.url), "utf8");
   assert.match(ingress, /ConsolidateFanout\n  Call:/);
   assert.match(ingress, /AssignTask\n  Call:/);
-  assert.match(ingress, /only when there is a clear need for concrete work/);
-  assert.match(ingress, /Pass the string "blank" as childIdentifier/);
+  assert.match(ingress, /Use the string "blank" as childIdentifier/);
+  for (const manual of [conversation, ingress]) {
+    assert.doesNotMatch(manual, /knowledge-hungry|use a promising|navigate enough|prefer to|consider assigning/i);
+  }
 });
 
 test("transcript rerenders follow only readers already at the bottom", async () => {

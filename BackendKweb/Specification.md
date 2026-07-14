@@ -51,6 +51,10 @@ hexadecimal characters at the API boundary.
 
 Exactly one knowledge node has `is_user_root = true`.
 
+`kmap_roots` maps the unique roles `user` and `kennedy` to distinct knowledge
+nodes. This role table lets existing databases retain their user-root marker
+while adding Kennedy's durable root idempotently.
+
 ### 3.2 Data Provenance Nodes
 
 `data_provenance_nodes` contains:
@@ -101,16 +105,18 @@ legacy databases simply return an empty task list until tasks are assigned.
 Connection rows are supporting structure, not an additional durable node type.
 
 Schema constraints enforce 20-byte IDs, valid connection tiers, non-self
-connections, required foreign keys, and a single user root. Foreign-key delete
-actions are restrictive; the MVP exposes no deletion path.
+connections, required foreign keys, a single user root, and distinct user and
+Kennedy role roots. Foreign-key delete actions are restrictive; the MVP exposes
+no deletion path.
 
 ## 4. Bootstrap
 
-After migrations, the backend checks for the user root. If none exists, it
-creates, in one transaction:
+After migrations, the backend ensures both required roots exist. In one
+transaction it registers the existing user root or creates it when absent, and
+creates Kennedy's root when absent. Every newly created root receives:
 
 1. a bootstrap provenance node,
-2. the minimal `David Vorick` knowledge node,
+2. a minimal knowledge node (`David Vorick` or `Kennedy's Root`),
 3. its first history node pointing to the bootstrap provenance node,
 4. the knowledge node's history-head reference.
 
@@ -220,16 +226,20 @@ uses these status codes consistently:
 
 Returns `503` if the database cannot be queried.
 
-### 8.2 User Root
+### 8.2 User and Kennedy Roots
 
 #### `GET /api/v1/user`
 
 ```json
 {
   "name": "David Vorick",
-  "root_node_id": "0123456789abcdef0123456789abcdef01234567"
+  "root_node_id": "0123456789abcdef0123456789abcdef01234567",
+  "user_root_node_id": "0123456789abcdef0123456789abcdef01234567",
+  "kennedy_root_node_id": "89abcdef0123456789abcdef0123456789abcdef"
 }
 ```
+
+`root_node_id` remains as a compatibility alias for `user_root_node_id`.
 
 ### 8.3 Read a Knowledge Node
 

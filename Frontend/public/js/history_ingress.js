@@ -8,9 +8,10 @@ function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeId, provenanceId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
+export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
   const provenance = await kweb.provenance(provenanceId);
-  const context = new KwebContext(kweb, rootNodeId); await context.initialize();
+  rootNodeIds = rootNodeIds || [rootNodeId];
+  const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
   const retained = [{ role: "user", content: [
     "Conversation provenance",
     "",
@@ -24,16 +25,15 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   const archive = restoredArchive?.format === "kennedy-chatend" && restoredArchive?.sessionType === "history-ingress" ? restoredArchive : null;
   if (archive?.context?.state) {
     context.restore(archive.context.state);
+    await context.ensureRootsLoaded();
   } else {
     for (const durableId of archive?.context?.diagnostics?.loadedNodeIds || []) {
-      if (durableId !== rootNodeId && !context.loadedNodeIds.includes(durableId)) await context.loadDurable(durableId, { internal: true });
+      if (!rootNodeIds.includes(durableId) && !context.loadedNodeIds.includes(durableId)) await context.loadDurable(durableId);
     }
   }
   const chatend = new Chatend(composePrompt(manuals, "ingress"), context, retained);
   if (Array.isArray(archive?.messages)) {
-    chatend.messages = jsonCopy(archive.messages);
-    chatend.systemPrompt = archive.systemPrompt || chatend.systemPrompt;
-    chatend.retained = Array.isArray(archive.retained) ? jsonCopy(archive.retained) : retained;
+    chatend.restoreMessages(jsonCopy(archive.messages), Array.isArray(archive.retained) ? jsonCopy(archive.retained) : retained);
   }
   const continuation = new ContinuationState(createCacheKey("ingress"));
   const usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
@@ -47,7 +47,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   }
   const archiveSnapshot = () => ({
     format: "kennedy-chatend",
-    version: 1,
+    version: 2,
     sessionType: "history-ingress",
     provenanceId,
     completed,

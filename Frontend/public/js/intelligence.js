@@ -1,7 +1,7 @@
 import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260713.6";
 
 export function createCacheKey(mode) {
-  return `kennedy-${mode}-prompt-v1`;
+  return `kennedy-${mode}-prompt-v2`;
 }
 
 export class ContinuationState {

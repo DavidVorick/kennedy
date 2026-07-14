@@ -68,12 +68,14 @@ known to the bridge.
 Kennedy's live system prompts are deliberately plain-text files in
 [`Frontend/SystemPrompts`](Frontend/SystemPrompts/README.md):
 
-- `KmapAgentManual.txt` — identity, job, shared memory rules, and
-  safety boundaries.
-- `ConversationAgentManual.txt` — user-facing problem solving and memory
-  navigation.
-- `HistoryIngressAgentManual.txt` — conservative conversation-to-memory
-  extraction.
+- `KennedyIdentity.txt` — Kennedy's identity and Kmap-based learning model.
+- `ConversationManual.txt` — exact live-mode, read-only Kmap, and tool
+  mechanics.
+- `HistoryIngress.txt` — exact ingress-mode and Kmap mutation mechanics.
+
+Kennedy's strategy for using her harness is intentionally learned and stored in
+her own Kmap graph rather than embedded in the mode manuals. Every session
+starts with both the user's root and Kennedy's root loaded.
 
 Kennedy's local tools use a text protocol documented in the session manuals,
 so tool requests and results are visible in the chatend. Live conversations can

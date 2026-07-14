@@ -1,0 +1,40 @@
+This is a history-ingress session. There is no interaction with the user. The retained input is conversation provenance; CreateNode and UpdateNode use it in node history. The available tools are LoadNode, ResetContext, ConnectNodes, ConsolidateFanout, AssignTask, CreateNode, and UpdateNode.
+
+The Kmap is a graph of knowledge nodes. A node contains a short name, short description, long description, up to one high-, medium-, and low-priority task connection, and lists of active and fanout connections. A directly loaded node is present with its complete contents; loading it also places its active-connection nodes in full context. Those active expansions do not count as directly loaded nodes. A connection entry is only a summary; operations requiring complete contents accept its identifier only when the corresponding node also appears in full in the current context.
+
+Identifiers exposed in context are positive integer short identifiers, not durable database IDs. They remain stable until ResetContext. The user's root and Kennedy's root are loaded automatically, are listed as the always-loaded roots in the Kmap context, and survive every ResetContext. At most ten nodes may be directly loaded at once, including both roots.
+
+Tool requests use this exact exclusive text protocol:
+
+KENNEDY_TOOL_CALLS
+{"calls":[{"name":"LoadNode","arguments":{"identifier":3}}]}
+
+KENNEDY_TOOL_CALLS must be the first characters of the response, followed by exactly one newline and exactly one valid JSON object containing only a non-empty calls array. Each call contains exactly name and arguments. Do not use a Markdown fence or include any other text before or after the object; its closing brace must be the final non-whitespace character. Calls execute sequentially in array order. ResetContext must be the only call in its response. Tool results arrive as user-role messages headed "Kennedy tool result." A failed result means the operation did not succeed. A normal response without the marker completes ingress.
+
+LoadNode
+  Call: {"identifier":3}
+  Loads the identified node and its active-connection nodes. An ingress session permits at most 50 LoadNode requests, including failed requests. Automatically loaded roots and loads performed while resetting do not consume this request budget. Loading an already directly loaded node fails.
+
+ResetContext
+  Call: {"identifiers":[3,8]}
+  Clears all loaded Kmap context except the two roots, then directly loads the listed known nodes in order. The list must contain distinct identifiers, must omit both root identifiers, and may contain at most eight identifiers. Short identifiers are rebuilt with the user root first and Kennedy's root second. The provenance input is preserved.
+
+ConnectNodes
+  Call: {"identifiers":[2,3,8]}
+  Requires at least two distinct identifiers whose complete contents are in context. It makes every supplied node an active connection of every other supplied node. Backend active-connection overflow is demoted to fanout according to connection recency; the mutation fails atomically if a fanout limit would be exceeded.
+
+ConsolidateFanout
+  Call: {"parentIdentifier":2,"aggregatorIdentifier":3,"fanoutIdentifiers":[8,9]}
+  Requires complete parent and aggregator nodes. The aggregator and every moved node must be distinct current fanout connections of the parent. It keeps the aggregator under the parent and moves the listed fanout connections under the aggregator. The mutation fails atomically if the aggregator's fanout limit would be exceeded.
+
+AssignTask
+  Call: {"parentIdentifier":2,"childIdentifier":3,"priority":"high"}
+  Requires complete parent and child nodes and a priority of high, medium, or low. It replaces that directional task slot. Use the string "blank" as childIdentifier to clear the slot.
+
+CreateNode
+  Call: {"parentIdentifiers":[2,3],"shortName":"New Memory","shortDescription":"Short description.","longDescription":"Complete durable knowledge."}
+  Requires one or more distinct, fully available parent nodes. It creates a node, connects it to all supplied parents, and returns the new node in full context. The short name is 4–50 characters, the short description is at most 200 characters, and the long description is at most 1000 words.
+
+UpdateNode
+  Call: {"identifier":3,"newShortName":"Updated Memory","newShortDescription":"Updated description.","newLongDescription":"Complete updated durable knowledge."}
+  Requires a fully available node. It replaces all three descriptive fields, appends the current provenance to node history, and returns the updated node. The same field limits as CreateNode apply; omitted prior text is removed.

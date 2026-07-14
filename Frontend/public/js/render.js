@@ -93,6 +93,7 @@ export function renderConversationHistory(container, records, { selectedId = nul
 
 export function conversationControlState({ hasSession, sessionBusy, transitionBusy, pendingTurn, viewingHistory, transcriptLength }) {
   return {
+    composerHidden: viewingHistory,
     inputDisabled: viewingHistory || !hasSession,
     sendDisabled: sessionBusy || transitionBusy || pendingTurn || viewingHistory || !hasSession,
     endDisabled: sessionBusy || transitionBusy || viewingHistory || !hasSession || (!pendingTurn && !transcriptLength),

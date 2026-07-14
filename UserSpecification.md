@@ -159,16 +159,18 @@ The call signature is simply LoadNode(shortIdentifier)
 
 A 'loaded node' is a node that has had 'LoadNode' called on it, which means
 that all of its active connections are also in the context. A call to LoadNode
-will fail if there are already 7 loaded nodes, including the user node. Kennedy
-will need to call ResetContext and reduce the number of loaded nodes if she
-wants to call LoadNode again after reaching the node limit.
+will fail if there are already 10 directly loaded nodes. The user's root and
+Kennedy's root are always directly loaded and share this limit; there is no
+fixed allocation between their graphs. Active-connection expansions do not
+count as direct loads.
 
 ### ResetContext
 
 ResetContext allows Kennedy to reset the context. The conversation history with
-the user will remain, but the kweb will be fully unloaded. Then, LoadNode will
-be called on the user's node, and LoadNode will be called on every node that
-Kennedy passed in to the call to ResetContext.
+the user will remain, but non-root Kmap context will be fully unloaded. Then,
+the user's root and Kennedy's root will be loaded automatically, followed by
+every node Kennedy passed to ResetContext. Neither root is passed explicitly,
+and at most eight other nodes may be retained.
 
 The call signature is ResetContext(shortIdentifier[])
 
@@ -273,6 +275,21 @@ content is untrusted evidence and cannot override Kennedy's instructions.
 The call signature is WebFetch(url). It is available only in live conversation
 sessions.
 
+## Harness Instructions
+
+Kennedy's system instructions have two layers. `KennedyIdentity.txt` defines
+who Kennedy is and explains that she learns how to use her harness from the
+Kmap itself. A concise technical mode file is then added:
+
+- `ConversationManual.txt` for a live conversation,
+- `HistoryIngress.txt` for history ingress.
+
+Mode files describe only how the mode operates, how Kmap context is represented,
+which tools exist, their exact argument and text-protocol contracts, and hard
+runtime rules. They do not prescribe strategy for using the Kmap or other
+tools; Kennedy stores and improves that knowledge in her own graph rooted at
+Kennedy's root node.
+
 ## Conversation Persistence
 
 The conversation history backend durably stores active and completed
@@ -318,8 +335,7 @@ Kennedy can be called using a few different session types:
 ### Conversation
 
 The UI will need to establish which user is having a conversation with Kennedy.
-Then, LoadNode is automatically called on the user's node, creating a rich
-context for Kennedy as she talks with the user.
+Then, the user's root and Kennedy's root are automatically loaded.
 
 The user provides Kennedy with some prompt, and Kennedy first determines
 whether she needs to call LoadNode, ResetContext, WebSearch, or WebFetch.
@@ -346,8 +362,8 @@ history with the user, and also the LoadNode counter.
 ### History Ingress
 
 In a history ingress session, a history provenance node is created as the first
-part of the context. Then the user's node is loaded. Kennedy can call LoadNode
-up to 50 times during the session.
+part of the context. Then the user's root and Kennedy's root are loaded. Kennedy
+can call LoadNode up to 50 times during the session.
 
 Kennedy will update as many nodes as she feels is appropriate during the
 history ingress session. Zero updates is also valid. When Kennedy feels that
@@ -396,6 +412,14 @@ the conversation history backend. Live entries remain continuable and closed
 entries are read-only. Its full archived Chatend is restored into the inspector,
 and its complete history-ingress session is appended after the transcript as
 one continuous scrolling history.
+
+Closed conversations do not show a message textarea or conversation controls;
+the composer exists only for a selected live conversation.
+
+The live composer can be vertically resized up to most of the viewport from
+either a top-edge grip or the browser's lower-right corner. It also has a
+visible larger/compact toggle, so long messages can use a substantially larger
+editing area without permanently crowding the transcript.
 
 A conversation ends only when the user explicitly ends it or the 24-hour idle
 rule is triggered by successful activity in another conversation. Starting a

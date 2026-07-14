@@ -23,14 +23,15 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const PROVENANCE_IDEMPOTENCY_MIGRATION: &str =
     include_str!("../migrations/002_provenance_idempotency.sql");
+const SYSTEM_ROOTS_MIGRATION: &str = include_str!("../migrations/003_system_roots.sql");
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const TASK_HIGH_ORDER: i64 = -1;
 const TASK_MEDIUM_ORDER: i64 = -2;
 const TASK_LOW_ORDER: i64 = -3;
 const PROMPT_FILES: [&str; 3] = [
-    "KmapAgentManual.txt",
-    "ConversationAgentManual.txt",
-    "HistoryIngressAgentManual.txt",
+    "KennedyIdentity.txt",
+    "ConversationManual.txt",
+    "HistoryIngress.txt",
 ];
 
 #[derive(Clone, Debug)]
@@ -196,6 +197,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     connection
         .execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION)
         .context("applying provenance idempotency migration")?;
+    connection
+        .execute_batch(SYSTEM_ROOTS_MIGRATION)
+        .context("applying system roots migration")?;
     bootstrap(&mut connection)?;
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
@@ -275,33 +279,85 @@ fn validate_node_text(name: &str, short: &str, long: &str) -> Result<(String, St
     Ok((name, short))
 }
 
-fn bootstrap(db: &mut Connection) -> anyhow::Result<()> {
-    let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM knowledge_nodes WHERE is_user_root=1)",
-        [],
-        |r| r.get(0),
-    )?;
-    if exists {
-        return Ok(());
-    }
-    let tx = db.transaction()?;
-    let provenance_id = new_id();
+fn insert_bootstrap_node(
+    tx: &Transaction<'_>,
+    provenance_id: &[u8],
+    short_name: &str,
+    short_description: &str,
+    long_description: &str,
+    is_user_root: bool,
+) -> anyhow::Result<Vec<u8>> {
     let node_id = new_id();
     let history_id = new_id();
     tx.execute(
-        "INSERT INTO data_provenance_nodes(id,data,source,source_created_at) VALUES(?1,?2,?3,?4)",
-        params![
-            provenance_id,
-            "Initial local user bootstrap.",
-            "bootstrap",
-            Utc::now().to_rfc3339()
-        ],
+        "INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root) VALUES(?1,?2,?3,?4,?5)",
+        params![node_id, short_name, short_description, long_description, is_user_root],
     )?;
-    tx.execute("INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root) VALUES(?1,?2,?3,?4,1)", params![node_id, "David Vorick", "The user Kennedy assists.", "David Vorick is the user of this local Kennedy installation."])?;
     tx.execute("INSERT INTO data_history_nodes(id,knowledge_node_id,previous_history_id,provenance_id) VALUES(?1,?2,NULL,?3)", params![history_id, node_id, provenance_id])?;
     tx.execute(
         "UPDATE knowledge_nodes SET history_head_id=?1 WHERE id=?2",
-        params![history_id, node_id],
+        params![history_id, &node_id],
+    )?;
+    Ok(node_id)
+}
+
+fn bootstrap(db: &mut Connection) -> anyhow::Result<()> {
+    let tx = db.transaction()?;
+    let mut user_id: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM knowledge_nodes WHERE is_user_root=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut kennedy_id: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT knowledge_node_id FROM kmap_roots WHERE role='kennedy'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if user_id.is_none() || kennedy_id.is_none() {
+        let provenance_id = new_id();
+        tx.execute(
+            "INSERT INTO data_provenance_nodes(id,data,source,source_created_at) VALUES(?1,?2,?3,?4)",
+            params![
+                provenance_id,
+                "Initial local user and Kennedy root bootstrap.",
+                "bootstrap",
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        if user_id.is_none() {
+            user_id = Some(insert_bootstrap_node(
+                &tx,
+                &provenance_id,
+                "David Vorick",
+                "The user Kennedy assists.",
+                "David Vorick is the user of this local Kennedy installation.",
+                true,
+            )?);
+        }
+        if kennedy_id.is_none() {
+            kennedy_id = Some(insert_bootstrap_node(
+                &tx,
+                &provenance_id,
+                "Kennedy's Root",
+                "The root of Kennedy's own Kmap knowledge.",
+                "This is Kennedy's root node. It anchors Kennedy's own durable knowledge and learned lessons in the Kmap.",
+                false,
+            )?);
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO kmap_roots(role,knowledge_node_id) VALUES('user',?1) ON CONFLICT(role) DO UPDATE SET knowledge_node_id=excluded.knowledge_node_id",
+        [user_id.as_ref().expect("bootstrap creates user root")],
+    )?;
+    tx.execute(
+        "INSERT INTO kmap_roots(role,knowledge_node_id) VALUES('kennedy',?1) ON CONFLICT(role) DO UPDATE SET knowledge_node_id=excluded.knowledge_node_id",
+        [kennedy_id.as_ref().expect("bootstrap creates Kennedy root")],
     )?;
     tx.commit()?;
     Ok(())
@@ -338,16 +394,23 @@ async fn get_prompt(
 
 async fn get_user(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
-    let id: Vec<u8> = db
-        .query_row(
-            "SELECT id FROM knowledge_nodes WHERE is_user_root=1",
-            [],
-            |r| r.get(0),
+    let root = |role: &str| {
+        db.query_row(
+            "SELECT knowledge_node_id FROM kmap_roots WHERE role=?1",
+            [role],
+            |row| row.get::<_, Vec<u8>>(0),
         )
-        .map_err(ApiError::internal)?;
-    Ok(Json(
-        json!({"name":"David Vorick","root_node_id":hex::encode(id)}),
-    ))
+        .map(hex::encode)
+        .map_err(ApiError::internal)
+    };
+    let user_root_node_id = root("user")?;
+    let kennedy_root_node_id = root("kennedy")?;
+    Ok(Json(json!({
+        "name":"David Vorick",
+        "root_node_id":user_root_node_id,
+        "user_root_node_id":user_root_node_id,
+        "kennedy_root_node_id":kennedy_root_node_id
+    })))
 }
 
 fn fetch_summaries(
@@ -890,6 +953,7 @@ mod tests {
         configure_database(&db).unwrap();
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
+        db.execute_batch(SYSTEM_ROOTS_MIGRATION).unwrap();
         bootstrap(&mut db).unwrap();
         db
     }
@@ -964,10 +1028,69 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_has_valid_history() {
-        let db = db();
-        let count:i64=db.query_row("SELECT COUNT(*) FROM knowledge_nodes n JOIN data_history_nodes h ON h.id=n.history_head_id JOIN data_provenance_nodes p ON p.id=h.provenance_id WHERE n.is_user_root=1",[],|r|r.get(0)).unwrap();
-        assert_eq!(count, 1);
+    fn bootstrap_has_two_roots_with_valid_history() {
+        let mut db = db();
+        bootstrap(&mut db).unwrap();
+        let count:i64=db.query_row("SELECT COUNT(*) FROM kmap_roots r JOIN knowledge_nodes n ON n.id=r.knowledge_node_id JOIN data_history_nodes h ON h.id=n.history_head_id JOIN data_provenance_nodes p ON p.id=h.provenance_id",[],|r|r.get(0)).unwrap();
+        assert_eq!(count, 2);
+        let distinct: i64 = db
+            .query_row(
+                "SELECT COUNT(DISTINCT knowledge_node_id) FROM kmap_roots",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct, 2);
+    }
+
+    #[test]
+    fn bootstrap_upgrades_an_existing_single_root_database() {
+        let mut db = Connection::open_in_memory().unwrap();
+        configure_database(&db).unwrap();
+        db.execute_batch(MIGRATION).unwrap();
+        db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
+        db.execute_batch(SYSTEM_ROOTS_MIGRATION).unwrap();
+        let tx = db.transaction().unwrap();
+        let provenance_id = new_id();
+        tx.execute(
+            "INSERT INTO data_provenance_nodes(id,data,source,source_created_at) VALUES(?1,'Legacy bootstrap','bootstrap',?2)",
+            params![provenance_id, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        let original_user = insert_bootstrap_node(
+            &tx,
+            &provenance_id,
+            "David Vorick",
+            "The user Kennedy assists.",
+            "Existing user root.",
+            true,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        bootstrap(&mut db).unwrap();
+        let user: Vec<u8> = db
+            .query_row(
+                "SELECT knowledge_node_id FROM kmap_roots WHERE role='user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let root_count: i64 = db
+            .query_row("SELECT COUNT(*) FROM kmap_roots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user, original_user);
+        assert_eq!(root_count, 2);
+    }
+
+    #[tokio::test]
+    async fn user_metadata_exposes_both_root_ids() {
+        let response = get_user(State(state(db()))).await.unwrap();
+        assert_eq!(response.0["root_node_id"], response.0["user_root_node_id"]);
+        assert_ne!(
+            response.0["user_root_node_id"],
+            response.0["kennedy_root_node_id"]
+        );
     }
 
     #[test]
