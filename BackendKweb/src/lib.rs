@@ -24,6 +24,7 @@ const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const PROVENANCE_IDEMPOTENCY_MIGRATION: &str =
     include_str!("../migrations/002_provenance_idempotency.sql");
 const SYSTEM_ROOTS_MIGRATION: &str = include_str!("../migrations/003_system_roots.sql");
+const MODEL_ATTRIBUTION_MIGRATION: &str = include_str!("../migrations/004_model_attribution.sql");
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const TASK_HIGH_ORDER: i64 = -1;
 const TASK_MEDIUM_ORDER: i64 = -2;
@@ -130,6 +131,7 @@ struct KnowledgeNode {
     short_name: String,
     short_description: String,
     long_description: String,
+    last_modified_by: String,
     task_connections: Vec<TaskConnectionSummary>,
     active_connections: Vec<ConnectionSummary>,
     fanout_connections: Vec<ConnectionSummary>,
@@ -148,6 +150,7 @@ struct ProvenanceInput {
 #[derive(Deserialize)]
 struct CreateNodeInput {
     provenance_id: String,
+    model_attribution: String,
     parent_node_ids: Vec<String>,
     short_name: String,
     short_description: String,
@@ -157,6 +160,7 @@ struct CreateNodeInput {
 #[derive(Deserialize)]
 struct UpdateNodeInput {
     provenance_id: String,
+    model_attribution: String,
     short_name: String,
     short_description: String,
     long_description: String,
@@ -165,6 +169,7 @@ struct UpdateNodeInput {
 #[derive(Deserialize)]
 struct ConnectInput {
     node_ids: Vec<String>,
+    model_attribution: String,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +177,7 @@ struct ConsolidateFanoutInput {
     parent_node_id: String,
     aggregator_node_id: String,
     fanout_node_ids: Vec<String>,
+    model_attribution: String,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +185,7 @@ struct AssignTaskInput {
     parent_node_id: String,
     child_node_id: Option<String>,
     priority: String,
+    model_attribution: String,
 }
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
@@ -200,6 +207,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     connection
         .execute_batch(SYSTEM_ROOTS_MIGRATION)
         .context("applying system roots migration")?;
+    connection
+        .execute_batch(MODEL_ATTRIBUTION_MIGRATION)
+        .context("applying model attribution migration")?;
     bootstrap(&mut connection)?;
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
@@ -279,6 +289,30 @@ fn validate_node_text(name: &str, short: &str, long: &str) -> Result<(String, St
     Ok((name, short))
 }
 
+fn validate_model_attribution(value: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_string();
+    if value.is_empty() || value.chars().count() > 200 {
+        return Err(ApiError::bad(
+            "model_attribution must contain 1 to 200 characters.",
+        ));
+    }
+    Ok(value)
+}
+
+fn set_model_attribution(
+    tx: &Transaction<'_>,
+    node_ids: &[Vec<u8>],
+    model_attribution: &str,
+) -> rusqlite::Result<()> {
+    for node_id in node_ids {
+        tx.execute(
+            "INSERT INTO knowledge_node_model_attribution(knowledge_node_id,last_modified_by) VALUES(?1,?2) ON CONFLICT(knowledge_node_id) DO UPDATE SET last_modified_by=excluded.last_modified_by",
+            params![node_id, model_attribution],
+        )?;
+    }
+    Ok(())
+}
+
 fn insert_bootstrap_node(
     tx: &Transaction<'_>,
     provenance_id: &[u8],
@@ -298,6 +332,7 @@ fn insert_bootstrap_node(
         "UPDATE knowledge_nodes SET history_head_id=?1 WHERE id=?2",
         params![history_id, &node_id],
     )?;
+    set_model_attribution(tx, std::slice::from_ref(&node_id), "system-bootstrap")?;
     Ok(node_id)
 }
 
@@ -470,8 +505,9 @@ fn fetch_task_summaries(
 }
 
 fn fetch_node(db: &Connection, id: &[u8]) -> Result<KnowledgeNode, ApiError> {
-    let core = db.query_row("SELECT short_name,short_description,long_description,history_head_id FROM knowledge_nodes WHERE id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<Vec<u8>>>(3)?))).optional().map_err(ApiError::internal)?;
-    let Some((short_name, short_description, long_description, history)) = core else {
+    let core = db.query_row("SELECT n.short_name,n.short_description,n.long_description,n.history_head_id,COALESCE(a.last_modified_by,'legacy-unknown') FROM knowledge_nodes n LEFT JOIN knowledge_node_model_attribution a ON a.knowledge_node_id=n.id WHERE n.id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<Vec<u8>>>(3)?,r.get::<_,String>(4)?))).optional().map_err(ApiError::internal)?;
+    let Some((short_name, short_description, long_description, history, last_modified_by)) = core
+    else {
         return Err(ApiError::not_found("Knowledge node not found."));
     };
     Ok(KnowledgeNode {
@@ -479,6 +515,7 @@ fn fetch_node(db: &Connection, id: &[u8]) -> Result<KnowledgeNode, ApiError> {
         short_name,
         short_description,
         long_description,
+        last_modified_by,
         task_connections: fetch_task_summaries(db, id).map_err(ApiError::internal)?,
         active_connections: fetch_summaries(db, id, "active").map_err(ApiError::internal)?,
         fanout_connections: fetch_summaries(db, id, "fanout").map_err(ApiError::internal)?,
@@ -683,9 +720,11 @@ async fn connect_nodes(
     Json(input): Json<ConnectInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ids = validate_distinct_ids(&input.node_ids, 2, "ConnectNodes")?;
+    let model_attribution = validate_model_attribution(&input.model_attribution)?;
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     connect_in_tx(&tx, &ids, state.active_limit, state.fanout_limit)?;
+    set_model_attribution(&tx, &ids, &model_attribution).map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
     let nodes = ids
         .iter()
@@ -792,12 +831,17 @@ async fn consolidate_fanout(
     let aggregator = decode_id(&input.aggregator_node_id)?;
     let fanout_ids =
         validate_distinct_ids(&input.fanout_node_ids, 1, "ConsolidateFanout fanout list")?;
+    let model_attribution = validate_model_attribution(&input.model_attribution)?;
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     consolidate_fanout_in_tx(&tx, &parent, &aggregator, &fanout_ids, state.fanout_limit)?;
+    let mut affected = vec![parent.clone(), aggregator.clone()];
+    affected.extend(fanout_ids.iter().cloned());
+    set_model_attribution(&tx, &affected, &model_attribution).map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
-    let nodes = [parent, aggregator]
-        .iter()
+    let visible = [&parent, &aggregator];
+    let nodes = visible
+        .into_iter()
         .map(|id| fetch_node(&db, id))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({"nodes":nodes})))
@@ -810,6 +854,7 @@ async fn assign_task(
     let parent = decode_id(&input.parent_node_id)?;
     let child = input.child_node_id.as_deref().map(decode_id).transpose()?;
     let priority_order = task_order(&input.priority)?;
+    let model_attribution = validate_model_attribution(&input.model_attribution)?;
     if child.as_deref() == Some(parent.as_slice()) {
         return Err(ApiError::bad("A node cannot be its own task connection."));
     }
@@ -829,6 +874,16 @@ async fn assign_task(
     {
         replaced = None;
     }
+    let mut affected = vec![parent.clone()];
+    if let Some(child) = child.as_ref() {
+        affected.push(child.clone());
+    }
+    if let Some(replaced_task) = replaced.as_ref() {
+        let replaced_id = decode_id(&replaced_task.id)?;
+        if !affected.contains(&replaced_id) {
+            affected.push(replaced_id);
+        }
+    }
     tx.execute(
         "DELETE FROM knowledge_connections WHERE source_node_id=?1 AND tier='fanout' AND activation_order=?2",
         params![parent, priority_order],
@@ -841,6 +896,7 @@ async fn assign_task(
         )
         .map_err(ApiError::internal)?;
     }
+    set_model_attribution(&tx, &affected, &model_attribution).map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
     let node = fetch_node(&db, &parent)?;
     Ok(Json(json!({"node":node,"replaced_task":replaced})))
@@ -851,6 +907,7 @@ async fn create_node(
     Json(input): Json<CreateNodeInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let provenance = decode_id(&input.provenance_id)?;
+    let model_attribution = validate_model_attribution(&input.model_attribution)?;
     let parents = validate_distinct_ids(&input.parent_node_ids, 1, "CreateNode parent list")?;
     let (name, short) = validate_node_text(
         &input.short_name,
@@ -875,11 +932,16 @@ async fn create_node(
     let mut connected = vec![node_id.clone()];
     connected.extend(parents);
     connect_in_tx(&tx, &connected, state.active_limit, state.fanout_limit)?;
+    set_model_attribution(&tx, &connected, &model_attribution).map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
     let node = fetch_node(&db, &node_id)?;
+    let nodes = connected
+        .iter()
+        .map(|id| fetch_node(&db, id))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({"node":node,"history_node_id":hex::encode(history_id)})),
+        Json(json!({"node":node,"nodes":nodes,"history_node_id":hex::encode(history_id)})),
     ))
 }
 
@@ -890,6 +952,7 @@ async fn update_node(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = decode_id(&node_id)?;
     let provenance = decode_id(&input.provenance_id)?;
+    let model_attribution = validate_model_attribution(&input.model_attribution)?;
     let (name, short) = validate_node_text(
         &input.short_name,
         &input.short_description,
@@ -910,6 +973,8 @@ async fn update_node(
         .ok_or_else(|| ApiError::not_found("Knowledge node not found."))?;
     tx.execute("INSERT INTO data_history_nodes(id,knowledge_node_id,previous_history_id,provenance_id) VALUES(?1,?2,?3,?4)",params![history_id,id,previous,provenance]).map_err(ApiError::internal)?;
     tx.execute("UPDATE knowledge_nodes SET short_name=?1,short_description=?2,long_description=?3,history_head_id=?4 WHERE id=?5",params![name,short,input.long_description,history_id,id]).map_err(ApiError::internal)?;
+    set_model_attribution(&tx, std::slice::from_ref(&id), &model_attribution)
+        .map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
     let node = fetch_node(&db, &id)?;
     Ok(Json(
@@ -954,6 +1019,7 @@ mod tests {
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
         db.execute_batch(SYSTEM_ROOTS_MIGRATION).unwrap();
+        db.execute_batch(MODEL_ATTRIBUTION_MIGRATION).unwrap();
         bootstrap(&mut db).unwrap();
         db
     }
@@ -982,6 +1048,11 @@ mod tests {
         assert!(validate_node_text("abc", "", "ok").is_err());
         assert!(validate_node_text("Valid", "", "word ".repeat(1001).as_str()).is_err());
         assert!(validate_node_text(" Valid Name ", " short ", "ok").is_ok());
+        assert!(validate_model_attribution("").is_err());
+        assert_eq!(
+            validate_model_attribution(" gpt-5.6-sol-xhigh ").unwrap(),
+            "gpt-5.6-sol-xhigh"
+        );
     }
 
     #[test]
@@ -1044,12 +1115,34 @@ mod tests {
     }
 
     #[test]
+    fn model_attribution_migration_backfills_legacy_nodes_idempotently() {
+        let db = Connection::open_in_memory().unwrap();
+        configure_database(&db).unwrap();
+        db.execute_batch(MIGRATION).unwrap();
+        db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
+        db.execute_batch(SYSTEM_ROOTS_MIGRATION).unwrap();
+        let legacy = insert_node(&db, "Legacy Node");
+
+        db.execute_batch(MODEL_ATTRIBUTION_MIGRATION).unwrap();
+        db.execute_batch(MODEL_ATTRIBUTION_MIGRATION).unwrap();
+        let attribution: String = db
+            .query_row(
+                "SELECT last_modified_by FROM knowledge_node_model_attribution WHERE knowledge_node_id=?1",
+                [&legacy],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attribution, "legacy-unknown");
+    }
+
+    #[test]
     fn bootstrap_upgrades_an_existing_single_root_database() {
         let mut db = Connection::open_in_memory().unwrap();
         configure_database(&db).unwrap();
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
         db.execute_batch(SYSTEM_ROOTS_MIGRATION).unwrap();
+        db.execute_batch(MODEL_ATTRIBUTION_MIGRATION).unwrap();
         let tx = db.transaction().unwrap();
         let provenance_id = new_id();
         tx.execute(
@@ -1105,6 +1198,81 @@ mod tests {
             .unwrap();
         let node = fetch_node(&db, &root).unwrap();
         assert!(node.task_connections.is_empty());
+        assert_eq!(node.last_modified_by, "system-bootstrap");
+    }
+
+    #[tokio::test]
+    async fn descriptive_and_connection_mutations_update_model_attribution() {
+        let db = db();
+        let parent: Vec<u8> = db
+            .query_row(
+                "SELECT id FROM knowledge_nodes WHERE is_user_root=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let provenance: Vec<u8> = db
+            .query_row("SELECT id FROM data_provenance_nodes LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let peer = insert_node(&db, "Peer Node");
+        let state = state(db);
+
+        let connected = connect_nodes(
+            State(state.clone()),
+            Json(ConnectInput {
+                node_ids: vec![hex::encode(&parent), hex::encode(&peer)],
+                model_attribution: "gpt-5.5-medium".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            connected.0["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|node| node["last_modified_by"] == "gpt-5.5-medium")
+        );
+
+        let created = create_node(
+            State(state.clone()),
+            Json(CreateNodeInput {
+                provenance_id: hex::encode(&provenance),
+                model_attribution: "gpt-5.6-sol-high".into(),
+                parent_node_ids: vec![hex::encode(&parent)],
+                short_name: "Created Memory".into(),
+                short_description: "Created by a model.".into(),
+                long_description: "Durable model-attributed knowledge.".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.1.0["node"]["last_modified_by"], "gpt-5.6-sol-high");
+        assert!(
+            created.1.0["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|node| node["last_modified_by"] == "gpt-5.6-sol-high")
+        );
+        let created_id = created.1.0["node"]["id"].as_str().unwrap().to_string();
+
+        let updated = update_node(
+            State(state),
+            Path(created_id),
+            Json(UpdateNodeInput {
+                provenance_id: hex::encode(provenance),
+                model_attribution: "gpt-5.6-sol-xhigh".into(),
+                short_name: "Updated Memory".into(),
+                short_description: "Updated by a model.".into(),
+                long_description: "Updated durable model-attributed knowledge.".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.0["node"]["last_modified_by"], "gpt-5.6-sol-xhigh");
     }
 
     #[tokio::test]
@@ -1127,6 +1295,7 @@ mod tests {
                 parent_node_id: hex::encode(&parent),
                 child_node_id: Some(hex::encode(&first)),
                 priority: "high".into(),
+                model_attribution: "gpt-test-low".into(),
             }),
         )
         .await
@@ -1140,6 +1309,13 @@ mod tests {
             "high"
         );
         assert_eq!(assigned.0["node"]["fanout_connections"], json!([]));
+        assert_eq!(assigned.0["node"]["last_modified_by"], "gpt-test-low");
+        assert_eq!(
+            fetch_node(&state.db.lock().unwrap(), &first)
+                .unwrap()
+                .last_modified_by,
+            "gpt-test-low"
+        );
 
         let replaced = assign_task(
             State(state.clone()),
@@ -1147,6 +1323,7 @@ mod tests {
                 parent_node_id: hex::encode(&parent),
                 child_node_id: Some(hex::encode(&second)),
                 priority: "high".into(),
+                model_attribution: "gpt-test-high".into(),
             }),
         )
         .await
@@ -1156,19 +1333,40 @@ mod tests {
             replaced.0["node"]["task_connections"][0]["id"],
             hex::encode(&second)
         );
+        assert_eq!(replaced.0["node"]["last_modified_by"], "gpt-test-high");
+        assert_eq!(
+            fetch_node(&state.db.lock().unwrap(), &first)
+                .unwrap()
+                .last_modified_by,
+            "gpt-test-high"
+        );
+        assert_eq!(
+            fetch_node(&state.db.lock().unwrap(), &second)
+                .unwrap()
+                .last_modified_by,
+            "gpt-test-high"
+        );
 
         let cleared = assign_task(
-            State(state),
+            State(state.clone()),
             Json(AssignTaskInput {
                 parent_node_id: hex::encode(parent),
                 child_node_id: None,
                 priority: "high".into(),
+                model_attribution: "gpt-test-xhigh".into(),
             }),
         )
         .await
         .unwrap();
-        assert_eq!(cleared.0["replaced_task"]["id"], hex::encode(second));
+        assert_eq!(cleared.0["replaced_task"]["id"], hex::encode(&second));
         assert_eq!(cleared.0["node"]["task_connections"], json!([]));
+        assert_eq!(cleared.0["node"]["last_modified_by"], "gpt-test-xhigh");
+        assert_eq!(
+            fetch_node(&state.db.lock().unwrap(), &second)
+                .unwrap()
+                .last_modified_by,
+            "gpt-test-xhigh"
+        );
     }
 
     #[tokio::test]
@@ -1193,11 +1391,12 @@ mod tests {
         }
         let state = state(db);
         let result = consolidate_fanout(
-            State(state),
+            State(state.clone()),
             Json(ConsolidateFanoutInput {
                 parent_node_id: hex::encode(&parent),
                 aggregator_node_id: hex::encode(&aggregator),
                 fanout_node_ids: vec![hex::encode(&first), hex::encode(&second)],
+                model_attribution: "gpt-test-medium".into(),
             }),
         )
         .await
@@ -1220,6 +1419,15 @@ mod tests {
                 .len(),
             2
         );
+        assert_eq!(result.0["nodes"][0]["last_modified_by"], "gpt-test-medium");
+        assert_eq!(result.0["nodes"][1]["last_modified_by"], "gpt-test-medium");
+        let db = state.db.lock().unwrap();
+        for id in [&first, &second] {
+            assert_eq!(
+                fetch_node(&db, id).unwrap().last_modified_by,
+                "gpt-test-medium"
+            );
+        }
     }
 
     #[tokio::test]

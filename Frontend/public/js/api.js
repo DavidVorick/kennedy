@@ -32,7 +32,7 @@ export const KwebAPI = (base) => ({
   createProvenance: (body) => requestJSON(base, "/api/v1/provenance", { method: "POST", body: JSON.stringify(body) }),
   createNode: (body) => requestJSON(base, "/api/v1/nodes", { method: "POST", body: JSON.stringify(body) }),
   updateNode: (id, body) => requestJSON(base, `/api/v1/nodes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  connect: (nodeIds) => requestJSON(base, "/api/v1/connections", { method: "POST", body: JSON.stringify({ node_ids: nodeIds }) }),
+  connect: (nodeIds, modelAttribution) => requestJSON(base, "/api/v1/connections", { method: "POST", body: JSON.stringify({ node_ids: nodeIds, model_attribution: modelAttribution }) }),
   consolidateFanout: (body) => requestJSON(base, "/api/v1/connections/consolidate-fanout", { method: "POST", body: JSON.stringify(body) }),
   assignTask: (body) => requestJSON(base, "/api/v1/tasks", { method: "POST", body: JSON.stringify(body) }),
 });

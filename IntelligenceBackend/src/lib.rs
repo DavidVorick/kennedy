@@ -392,6 +392,7 @@ async fn list_providers(State(state): State<AppState>) -> Json<Value> {
                 "kind": p.kind,
                 "default_model": p.default_model,
                 "models": p.models,
+                "reasoning_effort": p.reasoning_effort,
                 "context_window_tokens": context_window_tokens,
                 "max_input_tokens": max_input_tokens,
             })
@@ -1365,6 +1366,18 @@ mod tests {
             model_limits(&provider.config, "gpt-5.6-sol"),
             (1_050_000, 922_000)
         );
+    }
+
+    #[tokio::test]
+    async fn provider_metadata_exposes_the_model_reasoning_effort() {
+        let config: Config = serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
+        let providers = initialize_providers(&config).unwrap();
+        let response = list_providers(State(AppState {
+            config: Arc::new(config),
+            providers: Arc::new(providers),
+        }))
+        .await;
+        assert_eq!(response.0["providers"][0]["reasoning_effort"], "xhigh");
     }
 
     #[test]

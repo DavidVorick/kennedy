@@ -8,17 +8,17 @@ import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { conversationControlState, conversationIngressActivity, conversationTitle, ingressMutationSummary, inspectorText } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
-import { composePrompt, loadPromptManuals } from "../public/js/prompt_composer.js";
+import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
-const node = (n, active = [], fanout = [], tasks = []) => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}`, long_description: `Details ${n}`, task_connections: tasks.map(([task, priority]) => ({ ...summary(task), priority })), active_connections: active.map(summary), fanout_connections: fanout.map(summary), history_head_id: id(100 + n) });
+const node = (n, active = [], fanout = [], tasks = [], lastModifiedBy = "legacy-unknown") => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}`, long_description: `Details ${n}`, last_modified_by: lastModifiedBy, task_connections: tasks.map(([task, priority]) => ({ ...summary(task), priority })), active_connections: active.map(summary), fanout_connections: fanout.map(summary), history_head_id: id(100 + n) });
 
 class MockKweb {
   constructor(nodes) { this.nodes = new Map(nodes.map(n => [n.id, n])); this.connected = null; }
   async context(nodeId) { const requested = this.nodes.get(nodeId); return { requested_node: requested, active_connection_nodes: requested.active_connections.map(item => this.nodes.get(item.id)) }; }
-  async connect(nodeIds) { this.connected = nodeIds; return { nodes: nodeIds.map(nodeId => this.nodes.get(nodeId)) }; }
+  async connect(nodeIds, modelAttribution) { this.connected = nodeIds; this.modelAttribution = modelAttribution; return { nodes: nodeIds.map(nodeId => ({ ...this.nodes.get(nodeId), last_modified_by: modelAttribution })) }; }
 }
 
 test("short IDs are stable within a context and reset from one", async () => {
@@ -105,10 +105,12 @@ test("LoadNode attempts consume the tool budget, including failures", async () =
 test("ConnectNodes translates short IDs to durable IDs", async () => {
   const api = new MockKweb([node(1, [2]), node(2)]);
   const context = new KwebContext(api, id(1)); await context.initialize();
-  const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", loadLimit: 20 });
+  const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", modelAttribution: "gpt-test-xhigh", loadLimit: 20 });
   const result = await executor.execute({ id: "a", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
   assert.match(result.message.content, /Memory connections updated/);
   assert.deepEqual(api.connected, [id(1), id(2)]);
+  assert.equal(api.modelAttribution, "gpt-test-xhigh");
+  assert.match(result.message.content, /Last modified by: gpt-test-xhigh/);
 });
 
 test("ConsolidateFanout and AssignTask translate short IDs and refresh task connections", async () => {
@@ -117,25 +119,52 @@ test("ConsolidateFanout and AssignTask translate short IDs and refresh task conn
   await context.loadDurable(id(2));
   api.consolidateFanout = async body => {
     api.consolidated = body;
-    return { nodes: [node(1, [], [2]), node(2, [], [3, 4])] };
+    return { nodes: [node(1, [], [2], [], body.model_attribution), node(2, [], [3, 4], [], body.model_attribution)] };
   };
   api.assignTask = async body => {
     api.assigned = body;
-    return { node: body.child_node_id ? node(1, [], [3, 4], [[2, body.priority]]) : node(1, [], [3, 4]), replaced_task: null };
+    return { node: body.child_node_id ? node(1, [], [3, 4], [[2, body.priority]], body.model_attribution) : node(1, [], [3, 4], [], body.model_attribution), replaced_task: null };
   };
-  const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", loadLimit: 20 });
+  const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", modelAttribution: "gpt-test-xhigh", loadLimit: 20 });
   const consolidated = await executor.execute({ id: "a", name: "ConsolidateFanout", arguments: { parentIdentifier: 1, aggregatorIdentifier: 2, fanoutIdentifiers: [3, 4] } });
   assert.match(consolidated.message.content, /Fanout connections consolidated/);
-  assert.deepEqual(api.consolidated, { parent_node_id: id(1), aggregator_node_id: id(2), fanout_node_ids: [id(3), id(4)] });
+  assert.deepEqual(api.consolidated, { parent_node_id: id(1), aggregator_node_id: id(2), fanout_node_ids: [id(3), id(4)], model_attribution: "gpt-test-xhigh" });
+  assert.deepEqual(context.diagnostics().fullNodeIds.sort(), [id(1), id(2)].sort());
 
   const assigned = await executor.execute({ id: "b", name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: 2, priority: "high" } });
   assert.match(assigned.message.content, /Task connection assigned/);
-  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: id(2), priority: "high" });
+  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: id(2), priority: "high", model_attribution: "gpt-test-xhigh" });
   assert.equal(context.snapshot().nodes.find(item => item.identifier === 1).taskConnections[0].priority, "high");
 
   const cleared = await executor.execute({ id: "c", name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: "blank", priority: "high" } });
   assert.match(cleared.message.content, /Task slot cleared/);
-  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: null, priority: "high" });
+  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: null, priority: "high", model_attribution: "gpt-test-xhigh" });
+});
+
+test("CreateNode and UpdateNode add model attribution outside Kennedy's arguments", async () => {
+  const api = new MockKweb([node(1)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  api.createNode = async body => {
+    api.created = body;
+    const created = node(2, [], [], [], body.model_attribution);
+    return { node: created, nodes: [node(1, [2], [], [], body.model_attribution), created] };
+  };
+  api.updateNode = async (nodeId, body) => {
+    api.updated = [nodeId, body];
+    return { node: node(2, [], [], [], body.model_attribution) };
+  };
+  const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", modelAttribution: "gpt-5.6-sol-xhigh", loadLimit: 20 });
+  const createArguments = { parentIdentifiers: [1], shortName: "New Memory", shortDescription: "Summary.", longDescription: "Details." };
+  const created = await executor.execute({ id: "create", name: "CreateNode", arguments: createArguments });
+  assert.equal(api.created.model_attribution, "gpt-5.6-sol-xhigh");
+  assert.equal("model_attribution" in createArguments, false);
+  assert.match(created.message.content, /Last modified by: gpt-5.6-sol-xhigh/);
+
+  const updateArguments = { identifier: 2, newShortName: "Updated Memory", newShortDescription: "Updated.", newLongDescription: "Updated details." };
+  await executor.execute({ id: "update", name: "UpdateNode", arguments: updateArguments });
+  assert.equal(api.updated[0], id(2));
+  assert.equal(api.updated[1].model_attribution, "gpt-5.6-sol-xhigh");
+  assert.equal("model_attribution" in updateArguments, false);
 });
 
 test("WebSearch and WebFetch expose only minimal model-facing arguments", async () => {
@@ -298,6 +327,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
   const archive = JSON.parse(session.serialize());
   assert.equal(archive.format, "kennedy-chatend");
   assert.equal(archive.version, 2);
+  assert.equal("modelAttribution" in archive, false);
   assert.match(archive.systemPrompt, /Shared/);
   assert.equal(archive.context.snapshot.nodes[0].longDescription, "Details 1");
   assert.match(archive.messages.find(message => typeof message.content === "string" && message.content.includes("KENNEDY_TOOL_CALLS")).content, /LoadNode/);
@@ -351,6 +381,7 @@ test("history ingress checkpoints its whole Chatend and completed archives resum
   assert.equal(generations, 1);
   assert.equal(checkpoints[0].completed, false);
   assert.equal(checkpoints.at(-1).completed, true);
+  assert.equal("modelAttribution" in checkpoints.at(-1), false);
   assert.match(checkpoints.at(-1).systemPrompt, /Ingress/);
   assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend \(JSON\)/);
   assert.equal(checkpoints.at(-1).messages.at(-1).content, "Memory review complete.");
@@ -615,14 +646,16 @@ test("Kmap context is readable text rather than JSON", async () => {
   const formatted = formatKmapContext(context.snapshot());
   assert.match(formatted, /Current Kmap context/);
   assert.match(formatted, /Node 1: Node 1/);
+  assert.match(formatted, /Last modified by: legacy-unknown/);
   assert.match(formatted, /Task connections:\n  - high: 2: Node 2/);
   assert.match(formatted, /Active connections:\n  - 2: Node 2/);
   assert.equal(formatted.includes('{'), false);
 });
 
 test("system prompt composition uses readable sections rather than markup wrappers", () => {
-  const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation");
-  assert.equal(prompt, "Kennedy's identity\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.");
+  const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation", { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+  assert.equal(prompt, "Kennedy's identity\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
+  assert.equal(formatModelAttribution("gpt-5.6-sol", "xhigh"), "gpt-5.6-sol-xhigh");
   assert.equal(prompt.includes("<kennedy_"), false);
 });
 

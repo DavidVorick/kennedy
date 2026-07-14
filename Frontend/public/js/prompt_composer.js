@@ -13,9 +13,19 @@ export async function loadPromptManuals(base = "") {
   return Object.fromEntries(entries);
 }
 
-export function composePrompt(manuals, mode) {
+function runtimeValue(value, fallback) {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+export function formatModelAttribution(model, reasoningEffort) {
+  return `${runtimeValue(model, "unknown-model")}-${runtimeValue(reasoningEffort, "unknown-thinking")}`;
+}
+
+export function composePrompt(manuals, mode, { model, reasoningEffort } = {}) {
   const session = mode === "conversation" ? manuals.conversation : manuals.ingress;
   const sessionTitle = mode === "conversation" ? "Conversation session instructions" : "History-ingress session instructions";
+  const currentModel = runtimeValue(model, "unknown-model");
+  const currentThinkingMode = runtimeValue(reasoningEffort, "unknown-thinking");
   return [
     "Kennedy's identity",
     "",
@@ -24,5 +34,9 @@ export function composePrompt(manuals, mode) {
     sessionTitle,
     "",
     session,
+    "",
+    "Current runtime",
+    "",
+    `You are currently running on ${currentModel} with ${currentThinkingMode} thinking mode.`,
   ].join("\n");
 }

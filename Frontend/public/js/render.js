@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260713.6";
+import { formatKmapContext } from "./human_format.js?v=20260714.5";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -257,6 +257,7 @@ function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, dept
   details.append(summary);
   const body = element("div", "memory-node-body");
   if (node.shortDescription) body.append(element("p", "memory-node-short", node.shortDescription));
+  body.append(element("p", "memory-node-attribution", `Last modified by: ${node.lastModifiedBy || "legacy-unknown"}`));
   body.append(element("p", "memory-node-long", node.longDescription || "No detailed description."));
   body.append(
     connectionGroup("Task connections", node.taskConnections || [], "task", nodeByIdentifier, directlyLoaded, path, depth),

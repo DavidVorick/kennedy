@@ -30,7 +30,8 @@ frontend through their public HTTP APIs.
 System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 Every session composes `KennedyIdentity.txt` with exactly one technical mode
 manual. Harness strategy is durable Kmap knowledge rather than static prompt
-policy.
+policy. The frontend appends provider-reported current model and thinking mode
+to every composed system prompt.
 
 ## 2. Design Principles
 
@@ -94,6 +95,8 @@ The frontend owns:
 - conversation and history-ingress call budgets,
 - the transparent text tool protocol and tool loops,
 - prompt composition from system-prompt manuals,
+- automatic derivation of model attribution from the selected model and the
+  provider's configured reasoning effort,
 - the context inspector and memory explorer state,
 - checkpoint and recovery orchestration across backend APIs.
 
@@ -121,6 +124,7 @@ The Kweb backend owns:
 - knowledge, provenance, and history nodes,
 - connection ordering, promotion, and demotion,
 - atomic create, update, and connect operations,
+- opaque latest-model attribution for every knowledge node,
 - read APIs used by context loading and the memory explorer,
 - serving the frontend and prompt-manual files.
 
@@ -207,6 +211,13 @@ available; ingress must interpret only the archived conversation and Kmap
 material in front of it. The current provenance identifier is held by the
 frontend and supplied implicitly when it translates CreateNode and UpdateNode
 tool calls into Kweb API requests.
+
+The frontend likewise holds the active model attribution. For every Kmap
+mutation it adds `{model}-{reasoning_effort}` to the Kweb request outside
+Kennedy's text-tool arguments. The Kweb backend atomically applies that value to
+every semantically affected node. Full node responses expose it as
+`last_modified_by`; summary-only nodes remain summary-only, even when their
+durable attribution changes.
 
 The session ends when Kennedy returns final text. Its whole Chatend is
 checkpointed on the owning conversation record after each tool round and at

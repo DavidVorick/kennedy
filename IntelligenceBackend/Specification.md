@@ -116,7 +116,9 @@ answer with direct links. It never joins Kennedy's conversation thread.
 the configured ChatGPT login.
 
 `GET /api/v1/providers` returns provider name, `kind: codex`, default and
-allowed models, and context limits. It never returns authentication details.
+allowed models, configured `reasoning_effort`, and context limits. The browser
+uses the model plus reasoning effort for runtime prompt disclosure and automatic
+Kmap mutation attribution. The endpoint never returns authentication details.
 
 ### 5.2 Generate
 

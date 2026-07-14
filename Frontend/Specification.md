@@ -78,7 +78,8 @@ Live application state is held in JavaScript memory:
 
 Each `ConversationSession` owns its clean transcript, complete Chatend, Kweb
 context and short-ID maps, LoadNode counter, tool log, usage, continuation,
-start time, pending-turn flag, and busy state.
+start time, pending-turn flag, busy state, configured model and reasoning effort,
+and their combined model-attribution value.
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. Instead it checkpoints an opaque recovery snapshot to
@@ -168,6 +169,7 @@ Kennedy into an in-context node:
   "shortName": "Example Node",
   "shortDescription": "Short description.",
   "longDescription": "Long description.",
+  "lastModifiedBy": "gpt-5.6-sol-xhigh",
   "taskConnections": [
     {"identifier": 5, "shortName": "Outstanding Task", "priority": "high"}
   ],
@@ -182,6 +184,10 @@ Short identifiers are positive integers allocated in first-seen order. A
 durable node receives one short identifier per context, even if it appears in
 multiple LoadNode results. Durable IDs are never included in LLM-visible tool
 results or prompt context.
+
+`lastModifiedBy` is backend-owned metadata identifying the model and thinking
+mode responsible for the node's latest mutation. It is shown in readable Kmap
+context and the memory UI. It is not editable by Kennedy.
 
 `fullNodeIds` distinguishes nodes whose complete long description is in context
 from nodes that appear only as connection summaries. Summary-only nodes still
@@ -222,11 +228,21 @@ The conversation manual also states the lifecycle fact that the complete
 archived Chatend is passed to read-write history ingress when the conversation
 ends, where learned information can be integrated into the Kmap.
 
+After the selected mode manual, the composer adds a short dynamic runtime
+section stating the exact configured model and thinking mode. These values come
+from intelligence-provider metadata rather than a static manual, so restored
+sessions also receive the runtime identity that will actually execute them.
+
 ## 8. Agent Tools
 
 All tool names, argument shapes, usage policy, and the request protocol are
 written in the session's system-prompt manual. No provider-native function or
 custom-tool definitions are sent.
+
+For every mutating Kmap request, the tool executor automatically adds
+`model_attribution` using the active configured model and reasoning effort.
+This transport field never appears in Kennedy's tool schema, request envelope,
+or model-controlled arguments.
 
 Kennedy requests tools using an ordinary assistant response:
 
@@ -308,7 +324,9 @@ includes directly loaded nodes, their full active-connection expansions, and
 full nodes returned by create or update operations; it excludes summary-only
 connection references. The frontend resolves the IDs and calls
 `POST /api/v1/connections`. Returned nodes refresh matching frontend context
-records. The tool result reports the updated in-context node shapes.
+records. The tool result reports the updated in-context node shapes. The
+frontend adds the current model attribution to the backend request; it is not
+part of Kennedy's arguments.
 
 ### 8.4 `ConsolidateFanout`
 
@@ -326,6 +344,9 @@ The parent and aggregator must be full nodes. The moved identifiers may be
 known fanout summaries. The frontend resolves them and calls
 `POST /api/v1/connections/consolidate-fanout`; returned parent and aggregator
 nodes refresh the context.
+
+The frontend records the current model attribution for the parent, aggregator,
+and moved nodes without promoting summary-only nodes to full context.
 
 ### 8.5 `AssignTask`
 
@@ -345,6 +366,9 @@ frontend calls `POST /api/v1/tasks`, refreshes the parent, and reports any
 displaced task. Kennedy is instructed to assign a task only when there is a
 clear need for concrete work represented by that node to be completed.
 
+The frontend attributes the parent, assigned child, and displaced child
+automatically without adding an argument to Kennedy's tool contract.
+
 ### 8.6 `CreateNode`
 
 Available only during history ingress.
@@ -362,6 +386,8 @@ The frontend resolves the parents and calls `POST /api/v1/nodes`, supplying the
 current provenance ID. The created node is assigned a short identifier and
 marked as full before it is returned to Kennedy. Creation does not make the
 node directly loaded unless a later LoadNode call loads it.
+The frontend supplies the current model attribution automatically and refreshes
+the created node and its already-full parents from the response.
 
 ### 8.7 `UpdateNode`
 
@@ -378,7 +404,8 @@ Available only during history ingress.
 
 The frontend resolves the node and calls `PUT /api/v1/nodes/{durable_id}` with
 the current provenance ID. It refreshes the in-context representation and
-returns the updated node.
+returns the updated node. The backend request also receives the frontend's
+current model attribution automatically.
 
 ### 8.8 `WebSearch`
 
@@ -430,6 +457,8 @@ chatend visualization.
 1. Fetch all system-prompt manuals.
 2. Check all three backend health endpoints.
 3. Fetch `GET /api/v1/providers` from the intelligence backend.
+   Retain the selected provider's configured reasoning effort alongside its
+   model.
 4. Fetch `GET /api/v1/user`.
 5. Fetch `GET /api/v1/conversations` for the sidebar.
 6. Restore every `active` record as an independently continuable session. Resume
@@ -520,6 +549,12 @@ conversation's Kweb tool history.
 8. append live requests, results, and completion after the clean transcript in
    the same scroll container,
 9. mark the conversation history record complete.
+
+Prompt composition and every history-ingress mutation use the selected model
+and provider-reported reasoning effort. The combined attribution format is
+`{model}-{reasoning_effort}`, for example `gpt-5.6-sol-xhigh`. The value is
+derived ephemerally by the frontend and sent only to the Kweb mutation API; it
+is not Chatend state and is never exposed as a model-controlled tool argument.
 
 At most 50 model-requested LoadNode calls are allowed across the whole ingress
 session. Zero CreateNode or UpdateNode calls is valid.

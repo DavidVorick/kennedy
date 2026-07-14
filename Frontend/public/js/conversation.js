@@ -1,18 +1,20 @@
-import { Chatend } from "./chatend.js?v=20260713.6";
-import { KwebContext } from "./kweb_context.js?v=20260713.6";
-import { composePrompt } from "./prompt_composer.js?v=20260713.6";
-import { ToolExecutor } from "./tools.js?v=20260713.7";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260713.6";
+import { Chatend } from "./chatend.js?v=20260714.5";
+import { KwebContext } from "./kweb_context.js?v=20260714.5";
+import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.5";
+import { ToolExecutor } from "./tools.js?v=20260714.5";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.5";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
 export class ConversationSession {
-  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, persist = async () => {}, onUpdate }) {
+  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, persist = async () => {}, onUpdate }) {
     this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals;
     this.rootNodeIds = rootNodeIds || [rootNodeId]; this.rootNodeId = this.rootNodeIds[0];
-    this.provider = provider; this.model = model; this.persist = persist; this.onUpdate = onUpdate;
+    this.provider = provider; this.model = model; this.reasoningEffort = reasoningEffort;
+    this.modelAttribution = formatModelAttribution(model, reasoningEffort);
+    this.persist = persist; this.onUpdate = onUpdate;
     this.transcript = []; this.startedAt = new Date().toISOString(); this.pendingTurn = false; this.pendingCheckpointed = false; this.busy = false;
     this.continuation = new ContinuationState(createCacheKey("conversation"));
     this.usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
@@ -38,14 +40,14 @@ export class ConversationSession {
         if (!this.rootNodeIds.includes(durableId) && !this.context.loadedNodeIds.includes(durableId)) await this.context.loadDurable(durableId);
       }
     }
-    this.chatend = new Chatend(composePrompt(this.manuals, "conversation"), this.context, this.retainedTranscript());
+    this.chatend = new Chatend(composePrompt(this.manuals, "conversation", { model: this.model, reasoningEffort: this.reasoningEffort }), this.context, this.retainedTranscript());
     if (Array.isArray(archive?.messages)) {
       this.chatend.restoreMessages(
         jsonCopy(archive.messages),
         Array.isArray(archive.retained) ? jsonCopy(archive.retained) : this.retainedTranscript(),
       );
     }
-    this.executor = new ToolExecutor({ mode: "conversation", context: this.context, api: this.kweb, intelligence: this.intelligence, provider: this.provider, model: this.model, loadLimit: 20, onUpdate: this.onUpdate });
+    this.executor = new ToolExecutor({ mode: "conversation", context: this.context, api: this.kweb, intelligence: this.intelligence, provider: this.provider, model: this.model, modelAttribution: this.modelAttribution, loadLimit: 20, onUpdate: this.onUpdate });
     if (archive?.tools) {
       this.executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
       this.executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];

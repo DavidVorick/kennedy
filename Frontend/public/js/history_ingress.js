@@ -1,14 +1,14 @@
-import { Chatend } from "./chatend.js?v=20260713.6";
-import { KwebContext } from "./kweb_context.js?v=20260713.6";
-import { composePrompt } from "./prompt_composer.js?v=20260713.6";
-import { ToolExecutor } from "./tools.js?v=20260713.7";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260713.6";
+import { Chatend } from "./chatend.js?v=20260714.5";
+import { KwebContext } from "./kweb_context.js?v=20260714.5";
+import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.5";
+import { ToolExecutor } from "./tools.js?v=20260714.5";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.5";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, contextWindowTokens = 0, maxInputTokens = 0, restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
+export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
   const provenance = await kweb.provenance(provenanceId);
   rootNodeIds = rootNodeIds || [rootNodeId];
   const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
@@ -31,7 +31,8 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
       if (!rootNodeIds.includes(durableId) && !context.loadedNodeIds.includes(durableId)) await context.loadDurable(durableId);
     }
   }
-  const chatend = new Chatend(composePrompt(manuals, "ingress"), context, retained);
+  const modelAttribution = formatModelAttribution(model, reasoningEffort);
+  const chatend = new Chatend(composePrompt(manuals, "ingress", { model, reasoningEffort }), context, retained);
   if (Array.isArray(archive?.messages)) {
     chatend.restoreMessages(jsonCopy(archive.messages), Array.isArray(archive.retained) ? jsonCopy(archive.retained) : retained);
   }
@@ -40,7 +41,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   usage.restore(archive?.usage);
   let completed = Boolean(archive?.completed);
   const snapshot = () => ({ chatend, context, executor, continuation, usage, completed });
-  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, provenanceId, loadLimit: 50, onUpdate: () => onUpdate(snapshot()) });
+  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, modelAttribution, provenanceId, loadLimit: 50, onUpdate: () => onUpdate(snapshot()) });
   if (archive?.tools) {
     executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
     executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];

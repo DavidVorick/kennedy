@@ -12,7 +12,8 @@ It has no dependency on and receives no state or handles from the intelligence
 or conversation history backends.
 
 It does not know about LLM providers, chatends, short identifiers, frontend
-sessions, or agent call budgets.
+sessions, or agent call budgets. It persists the frontend-supplied model
+attribution as opaque text and does not derive or interpret it.
 
 ## 2. Runtime Configuration
 
@@ -54,6 +55,16 @@ Exactly one knowledge node has `is_user_root = true`.
 `kmap_roots` maps the unique roles `user` and `kennedy` to distinct knowledge
 nodes. This role table lets existing databases retain their user-root marker
 while adding Kennedy's durable root idempotently.
+
+`knowledge_node_model_attribution` stores one row per knowledge node:
+
+| Column | Meaning |
+| --- | --- |
+| `knowledge_node_id` | Primary key and reference to the attributed node |
+| `last_modified_by` | Latest modifying model and thinking mode, 1–200 characters |
+
+The attribution is mutation metadata, not node history or model-controlled
+content. Migration backfills pre-attribution nodes as `legacy-unknown`.
 
 ### 3.2 Data Provenance Nodes
 
@@ -121,7 +132,7 @@ creates Kennedy's root when absent. Every newly created root receives:
 4. the knowledge node's history-head reference.
 
 Bootstrap is therefore complete before the HTTP listener begins accepting
-requests.
+requests. Newly bootstrapped nodes use `system-bootstrap` attribution.
 
 ## 5. Graph Rules
 
@@ -182,6 +193,7 @@ not permit arbitrary filesystem paths.
   "short_name": "Example Node",
   "short_description": "Short description.",
   "long_description": "Long description.",
+  "last_modified_by": "gpt-5.6-sol-xhigh",
   "task_connections": [
     {
       "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -197,7 +209,9 @@ not permit arbitrary filesystem paths.
 ```
 
 Task connections are ordered high, medium, then low. Active and fanout arrays
-contain connection summaries in descending activation order.
+contain connection summaries in descending activation order. Every full node
+includes `last_modified_by`; legacy data without a stored row reads as
+`legacy-unknown`.
 
 ### 7.3 Error
 
@@ -318,6 +332,7 @@ Request:
 ```json
 {
   "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "model_attribution": "gpt-5.6-sol-xhigh",
   "parent_node_ids": [
     "0123456789abcdef0123456789abcdef01234567"
   ],
@@ -330,16 +345,19 @@ Request:
 The parent list must be non-empty and contain distinct existing nodes. In one
 transaction the backend creates the knowledge node, creates its first history
 node, updates its history head, and applies `ConnectNodes` to the new node and
-all parents.
+all parents. The new node and every parent receive the supplied attribution.
 
 Response `201`:
 
 ```json
 {
   "node": {},
+  "nodes": [{}, {}],
   "history_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 }
 ```
+
+`nodes` contains the created node and refreshed parents.
 
 ### 8.8 Update a Knowledge Node
 
@@ -350,6 +368,7 @@ Request:
 ```json
 {
   "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "model_attribution": "gpt-5.6-sol-xhigh",
   "short_name": "Updated Memory",
   "short_description": "Updated description.",
   "long_description": "Updated long description."
@@ -358,9 +377,10 @@ Request:
 
 All three mutable text fields are replaced. In one transaction the backend
 creates a history node pointing to the supplied provenance and previous history
-head, updates the knowledge node, and moves its history head to the new entry.
+head, updates the knowledge node, moves its history head to the new entry, and
+records the supplied attribution on that node.
 
-Response `200` uses the same shape as knowledge-node creation.
+Response `200` contains the refreshed `node` and new `history_node_id`.
 
 ### 8.9 Connect Knowledge Nodes
 
@@ -370,6 +390,7 @@ Request:
 
 ```json
 {
+  "model_attribution": "gpt-5.6-sol-xhigh",
   "node_ids": [
     "0123456789abcdef0123456789abcdef01234567",
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -378,7 +399,7 @@ Request:
 ```
 
 The IDs must be distinct and refer to existing nodes. The backend applies the
-graph rules in one transaction.
+graph rules and attributes every supplied node in one transaction.
 
 Response:
 
@@ -398,12 +419,15 @@ Response:
 {
   "parent_node_id": "0123456789abcdef0123456789abcdef01234567",
   "aggregator_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "fanout_node_ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+  "fanout_node_ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+  "model_attribution": "gpt-5.6-sol-xhigh"
 }
 ```
 
 The fanout list is non-empty and distinct. The response contains the refreshed
-parent and aggregator nodes in a `nodes` array.
+parent and aggregator nodes in a `nodes` array. The parent, aggregator, and
+every moved node receive the supplied attribution; moved nodes are deliberately
+not expanded into the response because callers may know them only as summaries.
 
 ### 8.11 Assign or Clear a Task Connection
 
@@ -413,13 +437,16 @@ parent and aggregator nodes in a `nodes` array.
 {
   "parent_node_id": "0123456789abcdef0123456789abcdef01234567",
   "child_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "priority": "high"
+  "priority": "high",
+  "model_attribution": "gpt-5.6-sol-xhigh"
 }
 ```
 
 `priority` is `high`, `medium`, or `low`. `child_node_id` may be null to clear
 the selected slot. The response contains the refreshed parent as `node` and
 the displaced task summary as `replaced_task`, or null when none was displaced.
+The parent, assigned child, and displaced child all receive the supplied
+attribution when present.
 
 ### 8.12 Read Knowledge History
 
@@ -460,6 +487,8 @@ state from a mutation.
 - Use parameterized SQL for every value.
 - Validate all referenced IDs before mutating.
 - Preserve connection ordering in every API response.
+- Require a trimmed 1–200 character `model_attribution` on every Kmap mutation
+  and update the attribution atomically with that mutation.
 - Do not log provenance data or full knowledge descriptions.
 - Do not follow symlinks or `..` components in static-file routes.
 - Keep migrations in source control and apply them in order.

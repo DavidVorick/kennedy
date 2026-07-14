@@ -12,8 +12,9 @@ rebuild is needed.
 - `HistoryIngress.txt` describes the non-interactive ingress mode, its Kmap
   mechanics, and the exact mutation tools available there.
 
-The identity is composed first, followed by the mode manual. Mode manuals are
-deliberately limited to mode behavior, technical Kmap facts, the transparent
+The identity is composed first, followed by the mode manual, then a dynamic
+runtime sentence identifying the configured model and thinking mode. Mode
+manuals are deliberately limited to mode behavior, technical Kmap facts, the transparent
 tool-request protocol, and exact tool contracts. Strategy and learned judgment
 belong in Kennedy's Kmap. Keep technical contracts synchronized with validation
 and execution in `Frontend/public/js/tools.js`; hard limits remain enforced in

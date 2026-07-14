@@ -34,6 +34,7 @@ export function formatContextNode(node) {
   return [
     `Node ${node.identifier}: ${text(node.shortName)}`,
     `Summary: ${text(node.shortDescription)}`,
+    `Last modified by: ${text(node.lastModifiedBy, "legacy-unknown")}`,
     "Details:",
     indented(node.longDescription),
     ...taskConnectionLines(node.taskConnections),

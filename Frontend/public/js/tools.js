@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260713.6";
+import { formatToolResult } from "./human_format.js?v=20260714.5";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 
@@ -66,9 +66,9 @@ function string(value, name) { if (typeof value !== "string") throw Object.assig
 function nonemptyString(value, name, maximum) { string(value, name); const trimmed = value.trim(); if (!trimmed || [...trimmed].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return trimmed; }
 
 export class ToolExecutor {
-  constructor({ mode, context, api, intelligence = null, provider = null, model = null, provenanceId = null, loadLimit, onUpdate = () => {} }) {
+  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, onUpdate = () => {} }) {
     this.mode = mode; this.context = context; this.api = api; this.intelligence = intelligence; this.provider = provider; this.model = model; this.provenanceId = provenanceId;
-    this.loadLimit = loadLimit; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
+    this.modelAttribution = modelAttribution; this.loadLimit = loadLimit; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
   }
 
   resetLoadCalls() { this.loadCalls = 0; }
@@ -141,7 +141,7 @@ export class ToolExecutor {
   async connectNodes(args) {
     this.assertIngress(); validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers", 2);
     const durable = args.identifiers.map(id => this.fullDurable(id));
-    const payload = await this.api.connect(durable);
+    const payload = await this.api.connect(durable, this.modelAttribution);
     this.context.refresh(payload.nodes);
     return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
   }
@@ -153,7 +153,8 @@ export class ToolExecutor {
     const parentId = this.fullDurable(args.parentIdentifier);
     const aggregatorId = this.fullDurable(args.aggregatorIdentifier);
     const fanoutIds = args.fanoutIdentifiers.map(id => this.context.resolve(id));
-    const payload = await this.api.consolidateFanout({ parent_node_id: parentId, aggregator_node_id: aggregatorId, fanout_node_ids: fanoutIds });
+    const payload = await this.api.consolidateFanout({ parent_node_id: parentId, aggregator_node_id: aggregatorId, fanout_node_ids: fanoutIds, model_attribution: this.modelAttribution });
+    this.context.recordModelAttribution([parentId, aggregatorId, ...fanoutIds], this.modelAttribution);
     this.context.refresh(payload.nodes);
     return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
   }
@@ -165,7 +166,11 @@ export class ToolExecutor {
     if (!["high", "medium", "low"].includes(args.priority)) throw Object.assign(new Error("priority must be high, medium, or low."), { code: "invalid_arguments" });
     const parentId = this.fullDurable(args.parentIdentifier);
     const childId = args.childIdentifier === "blank" ? null : this.fullDurable(args.childIdentifier);
-    const payload = await this.api.assignTask({ parent_node_id: parentId, child_node_id: childId, priority: args.priority });
+    const payload = await this.api.assignTask({ parent_node_id: parentId, child_node_id: childId, priority: args.priority, model_attribution: this.modelAttribution });
+    const attributedIds = [parentId];
+    if (childId) attributedIds.push(childId);
+    if (payload.replaced_task?.id) attributedIds.push(payload.replaced_task.id);
+    this.context.recordModelAttribution(attributedIds, this.modelAttribution);
     this.context.refresh([payload.node]);
     const replacedTask = payload.replaced_task ? { ...this.context.summary(payload.replaced_task), priority: payload.replaced_task.priority } : null;
     return { result: { node: this.context.toContextNode(payload.node), replacedTask, cleared: childId === null } };
@@ -190,15 +195,15 @@ export class ToolExecutor {
     this.assertIngress(); validateObject(args, ["parentIdentifiers", "shortName", "shortDescription", "longDescription"]);
     integerArray(args.parentIdentifiers, "parentIdentifiers", 1);
     const parentIds = args.parentIdentifiers.map(id => this.fullDurable(id));
-    const payload = await this.api.createNode({ provenance_id: this.provenanceId, parent_node_ids: parentIds, short_name: string(args.shortName, "shortName"), short_description: string(args.shortDescription, "shortDescription"), long_description: string(args.longDescription, "longDescription") });
-    this.context.refresh([payload.node]);
+    const payload = await this.api.createNode({ provenance_id: this.provenanceId, model_attribution: this.modelAttribution, parent_node_ids: parentIds, short_name: string(args.shortName, "shortName"), short_description: string(args.shortDescription, "shortDescription"), long_description: string(args.longDescription, "longDescription") });
+    this.context.refresh(payload.nodes || [payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
   }
 
   async updateNode(args) {
     this.assertIngress(); validateObject(args, ["identifier", "newShortName", "newShortDescription", "newLongDescription"]);
     integer(args.identifier, "identifier"); const durable = this.fullDurable(args.identifier);
-    const payload = await this.api.updateNode(durable, { provenance_id: this.provenanceId, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
+    const payload = await this.api.updateNode(durable, { provenance_id: this.provenanceId, model_attribution: this.modelAttribution, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
     this.context.refresh([payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
   }

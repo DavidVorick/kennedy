@@ -164,3 +164,16 @@ canonical documents; this file is not an append-only log.
 - Tell Kennedy in the conversation-mode manual that completing a conversation
   passes its entire archived Chatend to the separate read-write history-ingress
   mode, which can integrate anything learned during that conversation.
+
+## Automatic Model Attribution
+
+- Track the latest model and thinking mode responsible for every knowledge
+  node creation, update, or graph mutation, using a combined value such as
+  `gpt-5.6-sol-xhigh`.
+- Derive and attach this metadata automatically in the frontend. It must not be
+  a Kennedy-managed field or a model-visible tool argument, and the conversation
+  history backend has no role in it.
+- Persist attribution in the Kweb backend, expose it with full node data, and
+  show it in Kennedy's Kmap context and the human memory UI.
+- Add a dynamic system-prompt element telling Kennedy which model and thinking
+  mode is executing the current conversation or history-ingress session.

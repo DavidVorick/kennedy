@@ -98,6 +98,7 @@ h3 { margin-bottom: 8px; }
 .memory-node-name { flex: 1; min-width: 0; }
 .memory-node-body { padding: 0 13px 13px 25px; }
 .memory-node-short { margin: 2px 0 8px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.memory-node-attribution { margin: 2px 0 8px; color: var(--muted); font-size: 10px; font-weight: 750; }
 .memory-node-long { margin: 0; padding: 10px 12px; border-radius: 8px; background: #f5f2eb; font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
 .memory-badge { display: inline-flex; align-items: center; flex: 0 0 auto; padding: 2px 6px; border-radius: 999px; font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
 .memory-badge.identifier { background: var(--ink); color: white; }
@@ -132,6 +133,7 @@ pre { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 22px; color: #
 .memory-toolbar { justify-content: space-between; margin-bottom: 18px; }
 .memory-content { max-width: 1100px; min-height: 300px; padding: clamp(20px,4vw,42px); border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: var(--shadow); }
 .node-description { color: var(--muted); font-size: 17px; }
+.node-attribution { color: var(--muted); font-size: 12px; font-weight: 700; }
 .long-description { white-space: pre-wrap; line-height: 1.62; }
 .connection-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; margin-top: 28px; }
 .connection-list { padding: 16px; border: 1px solid var(--line); border-radius: 10px; }

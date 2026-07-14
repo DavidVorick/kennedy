@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260713.7";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260713.7";
-import { ConversationSession } from "./conversation.js?v=20260713.7";
-import { runHistoryIngress } from "./history_ingress.js?v=20260713.7";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260713.7";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError } from "./render.js?v=20260713.8";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI } from "./api.js?v=20260714.5";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260714.5";
+import { ConversationSession } from "./conversation.js?v=20260714.5";
+import { runHistoryIngress } from "./history_ingress.js?v=20260714.5";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260714.5";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError } from "./render.js?v=20260714.5";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -30,6 +30,7 @@ let rootNodeIds = null;
 let rootNodeId = null;
 let provider = null;
 let model = null;
+let reasoningEffort = null;
 let contextWindowTokens = 0;
 let maxInputTokens = 0;
 let explorer = null;
@@ -222,7 +223,7 @@ async function persistSession(id, state, metadata = {}) {
 
 async function buildConversation(record) {
   const session = new ConversationSession({
-    kweb, intelligence, manuals, rootNodeIds, provider, model, contextWindowTokens, maxInputTokens,
+    kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
     persist: (state, metadata) => persistSession(record.id, state, metadata),
     onUpdate: update,
   });
@@ -239,7 +240,7 @@ async function createNewConversation() {
   update();
   try {
     const session = new ConversationSession({
-      kweb, intelligence, manuals, rootNodeIds, provider, model, contextWindowTokens, maxInputTokens,
+      kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
       onUpdate: update,
     });
     await session.initialize();
@@ -385,7 +386,7 @@ async function processIngressQueue() {
       };
       await runHistoryIngress({
         kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
-        provider, model, contextWindowTokens, maxInputTokens,
+        provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
         restoredArchive: record.state?.historyIngress,
         checkpoint: persistIngress,
         onUpdate: value => { ingressDiagnostic = value; update(); },
@@ -447,6 +448,8 @@ async function initialize() {
     provider = providers.default_provider;
     const selected = providers.providers.find(item => item.name === provider);
     model = selected.default_model;
+    reasoningEffort = selected.reasoning_effort;
+    if (typeof reasoningEffort !== "string" || !reasoningEffort) throw new Error("The intelligence service did not provide the model thinking mode.");
     const fallbackLimits = MODEL_LIMITS[model] || {};
     contextWindowTokens = selected.context_window_tokens || fallbackLimits.contextWindowTokens || 0;
     maxInputTokens = selected.max_input_tokens || fallbackLimits.maxInputTokens || 0;

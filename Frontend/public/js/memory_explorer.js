@@ -1,4 +1,4 @@
-import { element } from "./render.js?v=20260713.6";
+import { element } from "./render.js?v=20260714.5";
 
 export class MemoryExplorer {
   constructor({ api, rootNodeId, content, backButton, forwardButton }) {
@@ -23,7 +23,7 @@ export class MemoryExplorer {
 
   renderNode(node, history) {
     const root = document.createDocumentFragment();
-    root.append(element("h2", "", node.short_name), element("p", "node-description", node.short_description || "No short description."), element("div", "long-description", node.long_description || "No long description."));
+    root.append(element("h2", "", node.short_name), element("p", "node-description", node.short_description || "No short description."), element("p", "node-attribution", `Last modified by: ${node.last_modified_by || "legacy-unknown"}`), element("div", "long-description", node.long_description || "No long description."));
     const grid = element("div", "connection-grid");
     grid.append(this.connectionList("Task connections", node.task_connections || [], true), this.connectionList("Active connections", node.active_connections), this.connectionList("Fanout connections", node.fanout_connections));
     root.append(grid);

@@ -83,6 +83,13 @@ export class KwebContext {
 
   refresh(nodes) { for (const node of nodes) this.ingestNode(node, true, "operation"); }
 
+  recordModelAttribution(durableIds, modelAttribution) {
+    for (const durableId of durableIds) {
+      const node = this.nodesById.get(durableId);
+      if (node && this.fullNodeIds.has(durableId)) node.last_modified_by = modelAttribution;
+    }
+  }
+
   summary(connection) { return { identifier: this.shortId(connection.id), shortName: connection.short_name, shortDescription: connection.short_description }; }
 
   toContextNode(node) {
@@ -91,6 +98,7 @@ export class KwebContext {
       shortName: node.short_name,
       shortDescription: node.short_description,
       longDescription: node.long_description,
+      lastModifiedBy: node.last_modified_by || "legacy-unknown",
       taskConnections: (node.task_connections || []).map(c => ({ ...this.summary(c), priority: c.priority })),
       activeConnections: (node.active_connections || []).map(c => this.summary(c)),
       fanoutConnections: (node.fanout_connections || []).map(c => this.summary(c)),
