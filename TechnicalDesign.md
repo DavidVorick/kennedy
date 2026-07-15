@@ -162,7 +162,7 @@ The intelligence backend owns:
   read-only non-interactive Codex turns,
 - translating Codex text, thread IDs, errors, and detailed token usage
   into one response shape,
-- executing isolated Codex WebSearch research runs,
+- routing isolated WebSearch runs across compiled Codex and Gemini tiers,
 - safely fetching and extracting bounded text from public pages for WebFetch,
 - publishing model input modalities and using paid OpenAI
   `gpt-4o-transcribe` only when the selected model transport does not accept
@@ -171,8 +171,10 @@ The intelligence backend owns:
 It stores no local LLM session and never parses Kennedy's tool envelopes. The
 normal generation path has no provider tools. The frontend recognizes
 WebSearch and WebFetch text calls, invokes the corresponding intelligence API,
-then appends their readable results to the main conversation chain. Hosted
-search runs are fresh ephemeral Codex threads and cannot alter that chain.
+then appends their readable results to the main conversation chain. Quality
+and balanced search runs are fresh ephemeral Codex threads; fast search is a
+stateless Gemini 3.1 Flash-Lite interaction with Google Search grounding. None
+can alter the conversation continuation chain.
 
 ### 4.4 Conversation History Backend
 

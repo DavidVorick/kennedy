@@ -57,6 +57,13 @@ Kennedy's generic passphrase-encrypted credential vault:
 cargo run -p kennedy-server -- secrets set openai-api-key
 ```
 
+The low-latency `fast` WebSearch tier uses Gemini 3.1 Flash-Lite with Google
+Search grounding. Store its API key under the compiled secret name:
+
+```sh
+cargo run -p kennedy-server -- secrets set gemini-api-key
+```
+
 The first `secrets set` command creates `kennedy-secrets.age`, asks for a vault
 passphrase twice, and then asks for the secret value twice without echoing
 either input. To enable the optional Telegram relay, create a bot with
@@ -113,13 +120,13 @@ Kennedy's local tools use a text protocol documented in the session manuals,
 so tool requests and results are visible in the chatend. Live conversations can
 read Kmap memory and use WebSearch/WebFetch but cannot mutate the Kmap; the
 serialized, offline history-ingress worker owns memory mutation. Kennedy
-chooses `fast` or `quality` for each WebSearch call; the concrete reasoning,
-context, deadline, and retrieval bounds for those modes stay in the
-intelligence backend. The UI also reports
-provider token usage, context-window headroom, and prompt-cache reads and
-writes in the Chatend header, and shows history ingress as it runs. The
-Chatend inspector can display the complete context, just the system prompts,
-or an expandable tree of loaded Kmap memory.
+chooses `quality`, `balanced`, or `fast` for each WebSearch call; the concrete
+provider, model, reasoning, context, deadline, and retrieval bounds for those
+modes stay in the intelligence backend. The UI also reports provider token
+usage, context-window headroom, and prompt-cache reads and writes in the
+Chatend header, and shows history ingress as it runs. The Chatend inspector can
+display the complete context, just the system prompts, or an expandable tree
+of loaded Kmap memory.
 
 The browser fetches these files at session startup. Edit them and reload the
 page; no compilation is required.

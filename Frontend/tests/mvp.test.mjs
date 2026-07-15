@@ -212,10 +212,10 @@ test("WebSearch and WebFetch expose only minimal model-facing arguments", async 
     webFetch: async body => { calls.push(["fetch", body]); return { url: body.url, title: "Guide", retrieved_at: "2026-07-12T00:00:00Z", content_type: "text/html", content: "Page evidence.", truncated: false }; },
   };
   const executor = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, provider: "primary", model: "model", loadLimit: 20 });
-  const search = await executor.execute({ id: "search", name: "WebSearch", arguments: { question: "best brunch in El Salvador", mode: "fast" } });
+  const search = await executor.execute({ id: "search", name: "WebSearch", arguments: { question: "best brunch in El Salvador", mode: "balanced" } });
   const fetch = await executor.execute({ id: "fetch", name: "WebFetch", arguments: { url: "https://example.com/guide" } });
   assert.deepEqual(calls, [
-    ["search", { provider: "primary", model: "model", question: "best brunch in El Salvador", mode: "fast" }],
+    ["search", { provider: "primary", model: "model", question: "best brunch in El Salvador", mode: "balanced" }],
     ["fetch", { url: "https://example.com/guide" }],
   ]);
   assert.equal(search.message.display_role, "Web tool result");
@@ -245,8 +245,8 @@ test("web tools reject extra retrieval knobs and remain unavailable during ingre
   const conversation = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, loadLimit: 20 });
   const extra = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "fast", maxResults: 10 } });
   assert.match(extra.message.content, /Expected exactly: question, mode/);
-  const invalidMode = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "balanced" } });
-  assert.match(invalidMode.message.content, /mode must be one of: fast, quality/);
+  const invalidMode = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "turbo" } });
+  assert.match(invalidMode.message.content, /mode must be one of: quality, balanced, fast/);
   const ingress = new ToolExecutor({ mode: "ingress", context: {}, api: {}, intelligence, provenanceId: "p", loadLimit: 50 });
   const unavailable = await ingress.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "fast" } });
   assert.match(unavailable.message.content, /only available during a live conversation/);

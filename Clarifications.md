@@ -41,11 +41,13 @@ canonical documents; this file is not an append-only log.
   request; return specific protocol feedback for leading or trailing prose.
 - Give live-conversation Kennedy `WebSearch(question, mode)` for delegated
   hosted research and `WebFetch(url)` for inspecting one public page. Kennedy
-  chooses `fast` by default for ordinary latency-sensitive lookups and
-  `quality` for difficult, high-stakes, cross-source, or conflict-resolution
-  research. Search language, geography, freshness, and domains remain natural
-  language in the question; the intelligence layer maps the mode to concrete
-  reasoning, search context, deadline, and retrieval budgets.
+  chooses `balanced` by default, `fast` for simple latency-sensitive lookups
+  where reduced research quality is acceptable, and `quality` for difficult,
+  high-stakes, cross-source, or conflict-resolution research. Search language,
+  geography, freshness, and domains remain natural language in the question;
+  the compiled mappings are `quality` = `gpt-5.6-sol`/`xhigh`, `balanced` =
+  `gpt-5.6-terra`/`low`, and `fast` = Gemini 3.1 Flash-Lite with grounded
+  Google Search and a small amount of latency-conscious thinking.
 - Eliminate the tracked runtime configuration file. Stable provider, model,
   audio, web, secret-name, and safety defaults belong in code. Keep only
   genuinely deployment-specific values such as listeners, data/source paths,

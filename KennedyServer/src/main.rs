@@ -8,6 +8,7 @@ use credentials::CredentialVault;
 use zeroize::Zeroize;
 
 const OPENAI_API_KEY_SECRET: &str = "openai-api-key";
+const GEMINI_API_KEY_SECRET: &str = "gemini-api-key";
 const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
 
 #[derive(Parser, Debug)]
@@ -97,6 +98,8 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     };
     let transcription_api_key =
         resolve_optional_secret(&vault, OPENAI_API_KEY_SECRET, "OpenAI transcription")?;
+    let gemini_api_key =
+        resolve_optional_secret(&vault, GEMINI_API_KEY_SECRET, "Gemini web search")?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?;
     let kweb = kennedy_kweb::Config {
@@ -127,7 +130,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     };
     tokio::try_join!(
         kennedy_kweb::serve(kweb),
-        kennedy_intelligence::serve(intelligence, transcription_api_key),
+        kennedy_intelligence::serve(intelligence, transcription_api_key, gemini_api_key),
         kennedy_conversation_history::serve(history),
         kennedy_telegram_relay::serve(telegram),
     )?;
@@ -256,6 +259,7 @@ mod tests {
     #[test]
     fn secret_names_are_stable_code_defaults() {
         assert_eq!(OPENAI_API_KEY_SECRET, "openai-api-key");
+        assert_eq!(GEMINI_API_KEY_SECRET, "gemini-api-key");
         assert_eq!(TELEGRAM_BOT_TOKEN_SECRET, "telegram-bot-token");
     }
 

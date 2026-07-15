@@ -183,7 +183,7 @@ export class ToolExecutor {
   async webSearch(args) {
     this.assertConversationWeb(); validateObject(args, ["question", "mode"]);
     const question = nonemptyString(args.question, "question", 4000);
-    const mode = choice(args.mode, "mode", ["fast", "quality"]);
+    const mode = choice(args.mode, "mode", ["quality", "balanced", "fast"]);
     return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question, mode }) };
   }
 

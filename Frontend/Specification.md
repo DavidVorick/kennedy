@@ -422,20 +422,21 @@ Available only during live conversation.
 ```json
 {
   "question": "What are the strongest current brunch recommendations in El Salvador, and what evidence supports them?",
-  "mode": "fast"
+  "mode": "balanced"
 }
 ```
 
-The model controls the natural-language question and an exact `fast` or
-`quality` mode. `fast` is the ordinary default for low-latency lookups;
+The model controls the natural-language question and an exact `quality`,
+`balanced`, or `fast` mode. `balanced` is the ordinary default; `fast` is for
+simple latency-sensitive lookups where reduced research quality is acceptable;
 `quality` is for difficult, high-stakes, cross-source, or conflict-resolution
 research. Geographic, language, freshness, and source requirements belong in
-the question. Concrete reasoning effort, search context, timeout, query
-expansion, and result limits remain intelligence-layer policy. The frontend
-calls `POST /api/v1/web/search` with the active provider/model and returns the
-normalized research answer and source URLs as a readable Web tool result. This
-research request is not part of the conversation's provider continuation
-chain.
+the question. Concrete provider, model, reasoning effort, search context,
+timeout, query expansion, and result limits remain intelligence-layer policy.
+The frontend calls `POST /api/v1/web/search` with the active provider/model and
+returns the normalized research answer and source URLs as a readable Web tool
+result. This research request is not part of the conversation's provider
+continuation chain.
 
 ### 8.9 `WebFetch`
 

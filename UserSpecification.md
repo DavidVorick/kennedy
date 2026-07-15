@@ -261,14 +261,15 @@ to express ordinary relevance, a vague possibility, or completed work.
 
 ### WebSearch
 
-WebSearch delegates a natural-language research question to a powerful remote
-web-search backend. Kennedy supplies the question and chooses a `fast` or
-`quality` mode at runtime. `fast` is the normal choice for latency-sensitive
-lookups; `quality` is reserved for difficult, high-stakes, cross-source, or
-conflict-resolution research. The intelligence layer maps those modes to
-reasoning effort, search context, deadlines, page selection, and result limits.
-The result contains a synthesized research answer and the source URLs used to
-produce it.
+WebSearch delegates a natural-language research question to a remote
+web-search backend. Kennedy supplies the question and chooses a `quality`,
+`balanced`, or `fast` mode at runtime. `balanced` is the normal choice; `fast`
+is for simple latency-sensitive lookups where reduced research quality is
+acceptable; `quality` is reserved for difficult, high-stakes, cross-source, or
+conflict-resolution research. The intelligence layer maps those modes to a
+provider, model, reasoning effort, search context, deadlines, page selection,
+and result limits. The result contains a synthesized research answer and the
+source URLs used to produce it.
 
 The call signature is WebSearch(question, mode). It is available only in live
 conversation sessions. Provider live-data feeds may return an answer without a

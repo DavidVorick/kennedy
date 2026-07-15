@@ -20,8 +20,8 @@ ResetContext
   Clears all loaded Kmap context except the two roots, then directly loads the listed known nodes in order. The list must contain distinct identifiers, must omit both root identifiers, and may contain at most eight identifiers. Short identifiers are rebuilt with the user root first and Kennedy's root second. The conversation is preserved.
 
 WebSearch
-  Call: {"question":"A bounded research question.","mode":"fast"}
-  Sends the question to the web-research service and returns a synthesis with source URLs. The question is a non-empty string of at most 4000 characters. mode must be exactly "fast" or "quality". Use fast by default for ordinary factual lookups and time-sensitive interaction. Use quality for difficult, high-stakes, cross-source, or conflict-resolution research where stronger reasoning is worth substantially higher latency.
+  Call: {"question":"A bounded research question.","mode":"balanced"}
+  Sends the question to the web-research service and returns a synthesis with source URLs. The question is a non-empty string of at most 4000 characters. mode must be exactly "quality", "balanced", or "fast". Use balanced by default for ordinary research. Use fast for simple, latency-sensitive lookups where lower research quality is acceptable. Use quality for difficult, high-stakes, cross-source, or conflict-resolution research where stronger reasoning is worth substantially higher latency.
 
 WebFetch
   Call: {"url":"https://example.com/page"}

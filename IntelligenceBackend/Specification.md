@@ -41,7 +41,7 @@ backends.
 
 Kennedy's Kmap and web tools remain ordinary visible text in the Chatend. The
 normal generation path gives Codex no shell, file-mutation, app, multi-agent,
-or internet tools. Only `/api/v1/web/search` enables Codex web search.
+or internet tools. Only `/api/v1/web/search` invokes a web-enabled provider.
 
 ## 3. Compiled Defaults and Deployment Options
 
@@ -53,20 +53,25 @@ limits, bounded public-page fetches, and paid `gpt-4o-transcribe` behavior.
 Changing these policies is a code change reviewed and tested with the rest of
 the adapter.
 
-The two WebSearch modes are also compiled policy:
+The three WebSearch modes are also compiled policy:
 
-| Mode | Reasoning | Search context | Deadline | Returned source cap |
-| --- | --- | --- | --- | --- |
-| `fast` | `low` | `low` | 90 seconds | 6 |
-| `quality` | `xhigh` | `high` | 600 seconds | 12 |
+| Mode | Provider and model | Reasoning | Search context | Deadline | Source cap |
+| --- | --- | --- | --- | --- | --- |
+| `quality` | Codex `gpt-5.6-sol` | `xhigh` | `high` | 600 seconds | 12 |
+| `balanced` | Codex `gpt-5.6-terra` | `low` | `low` | 90 seconds | 8 |
+| `fast` | Gemini `gemini-3.1-flash-lite` | `low` | Google Search grounding | 45 seconds | 6 |
 
-`fast` is the request default for compatibility and Kennedy's recommended
-ordinary choice. `quality` deliberately retains the former thorough-search
-behavior for hard research.
+`balanced` is the request default and Kennedy's recommended ordinary choice.
+`quality` performs thorough research for hard questions. `fast` trades research
+quality for latency, caps output at 2048 tokens, uses Priority service, and
+sets Gemini thinking to `low` rather than `minimal` so it can synthesize the
+retrieved evidence while page retrieval remains the likely dominant cost.
 
-The host supplies only the intelligence listener and allowed frontend origins
-when starting the library. `kennedy-server` exposes listener addresses, source
-and data paths, and the encrypted vault path as deployment CLI options. The
+The host supplies the intelligence listener, allowed frontend origins, and
+optional secret values when starting the library. `kennedy-server` exposes
+listener addresses, source and data paths, and the encrypted vault path as
+deployment CLI options. It resolves `gemini-api-key` for fast search and
+`openai-api-key` for transcription without exposing either to the browser. The
 request-body limit and connector safety bounds remain compiled invariants.
 
 `codex-safe` is a host executable on Kennedy's `PATH` that forwards all
@@ -107,11 +112,20 @@ Codex JSONL may contain intermediate agent messages. Only the last completed
 reasoning tokens. Cache-write tokens are reported as zero because Codex JSONL
 does not expose that measurement.
 
-Web search starts a new ephemeral thread with `--search`, retains the same
-read-only/no-shell restrictions, and asks Codex for an answer with direct
-links. Each request's mode selects the compiled reasoning effort, Codex web
-search context size, deadline, source cap, and focused or thorough research
-prompt. It never joins Kennedy's conversation thread.
+`quality` and `balanced` web search start a new ephemeral Codex thread with
+`--search`, retain the same read-only/no-shell restrictions, and ask Codex for
+an answer with direct links. The mode selects the fixed model, reasoning
+effort, Codex web-search context size, deadline, source cap, and focused or
+thorough research prompt.
+
+`fast` sends a stateless request to Gemini's Interactions API with model
+`gemini-3.1-flash-lite`, the built-in `google_search` tool, `low` thinking,
+Priority service, `store: false`, and a 2048-output-token cap. The bridge reads
+answer text from `model_output` steps, citations from `url_citation`
+annotations, fallback sources from `google_search_result` steps, and token
+usage from the interaction usage object. It records the effective service-tier
+response header for operational logs. No search mode joins Kennedy's
+conversation continuation thread.
 
 ## 5. API
 
@@ -183,11 +197,13 @@ Kennedy text-tool request.
 ### 5.4 Web Search
 
 `POST /api/v1/web/search` accepts provider/model, a natural-language `question`
-of 1–4000 characters, and `mode: "fast" | "quality"`. An omitted mode defaults
-to `fast` for direct-client compatibility, while Kennedy's frontend tool
-contract requires her to choose explicitly. It returns `answer`, deduplicated
-`sources`, provider/model, selected mode, and optional usage. A valid answer
-may have no public source URL for a live-data lookup; ordinary cited research
+of 1–4000 characters, and `mode: "quality" | "balanced" | "fast"`. An omitted
+mode defaults to `balanced`, while Kennedy's frontend tool contract requires
+her to choose explicitly. The requested active provider/model is validated;
+the selected mode then fixes the actual search provider and model. The response
+reports that actual provider/model together with `answer`, deduplicated
+`sources`, selected mode, and optional normalized usage. A valid answer may
+have no public source URL for a live-data lookup; ordinary cited research
 should include links.
 
 ### 5.5 Web Fetch
@@ -200,12 +216,13 @@ content type, bounded readable text, retrieval time, and truncation flag.
 
 ## 6. Errors, Logging, and HTTP
 
-Invalid inputs return `400 invalid_request`. Unknown providers/models return
-`400 provider_not_configured`. ChatGPT login failures use
-`401 provider_auth_failed`; subscription/rate limits use
-`429 provider_rate_limited`; Codex process and protocol failures use sanitized
-5xx errors; deadlines use `504 provider_timeout`. Errors may include a local
-request UUID but never credentials or full prompts.
+Invalid inputs return `400 invalid_request`. Unknown providers/models and a
+missing Gemini fast-search secret return `provider_not_configured`. Provider
+authentication failures use `401 provider_auth_failed`; subscription, quota,
+and rate limits use `429 provider_rate_limited`; provider transport and
+protocol failures use sanitized 5xx errors; deadlines use
+`504 provider_timeout`. Errors may include a local request UUID but never
+credentials or full prompts.
 
 The service binds to the address supplied by `kennedy-server` (loopback by
 default), accepts JSON plus bounded multipart audio, exposes explicit GET and
@@ -216,7 +233,8 @@ request-body limit before deserialization.
 
 Tests cover request and thread-ID validation, Codex JSONL event normalization,
 last-message selection, usage mapping, source extraction/deduplication,
-compiled defaults, fast/quality search profiles, model modality metadata, paid-transcription behavior, safe audio
-filenames, public-URL safety, and readable-content bounds. A smoke test should
-confirm fresh generation, thread resume, and web search with the machine's
-actual ChatGPT login.
+compiled defaults, all three search profiles, Gemini request and interaction
+normalization, model modality metadata, paid-transcription behavior, safe audio
+filenames, public-URL safety, and readable-content bounds. Smoke tests should
+confirm fresh generation, thread resume, Codex search with the machine's actual
+ChatGPT login, and fast search with a configured Gemini key.
