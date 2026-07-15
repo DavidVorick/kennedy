@@ -1,4 +1,5 @@
 import { formatToolResult } from "./human_format.js?v=20260714.7";
+import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 
@@ -67,9 +68,9 @@ function nonemptyString(value, name, maximum) { string(value, name); const trimm
 function choice(value, name, choices) { string(value, name); if (!choices.includes(value)) throw Object.assign(new Error(`${name} must be one of: ${choices.join(", ")}.`), { code: "invalid_arguments" }); return value; }
 
 export class ToolExecutor {
-  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, onUpdate = () => {} }) {
+  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {} }) {
     this.mode = mode; this.context = context; this.api = api; this.intelligence = intelligence; this.provider = provider; this.model = model; this.provenanceId = provenanceId;
-    this.modelAttribution = modelAttribution; this.loadLimit = loadLimit; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
+    this.modelAttribution = modelAttribution; this.loadLimit = loadLimit; this.sessionType = sessionType; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
   }
 
   resetLoadCalls() { this.loadCalls = 0; }
@@ -80,20 +81,33 @@ export class ToolExecutor {
     return id;
   }
 
-  resultMessage(call, content) {
+  resultMessage(call, content, durationMs) {
     const displayRole = call.name === "WebSearch" || call.name === "WebFetch" ? "Web tool result" : "Memory tool result";
     return {
       role: "user",
       display_role: displayRole,
-      content: ["Kennedy tool result", `Tool: ${call.name}`, "", formatToolResult(call.name, content)].join("\n"),
+      content: [`Kennedy tool result · ${call.name} · ${formatDuration(durationMs)}`, "", formatToolResult(call.name, content)].join("\n"),
     };
   }
 
-  failure(call, code, message) {
-    const result = this.resultMessage(call, { ok: false, error: { code, message } });
-    this.toolLog.push({ name: call.name, arguments: call.arguments, ok: false, code, durationMs: 0 });
+  record(entry) {
+    this.toolLog.push(entry);
+    const report = this.intelligence?.recordTiming?.({
+      action: "tool",
+      name: entry.name,
+      status: entry.ok ? "ok" : "error",
+      sessionType: this.sessionType,
+      durationMs: entry.durationMs,
+    });
+    Promise.resolve(report).catch(() => {});
     this.onUpdate();
-    return { message: result, reset: false };
+  }
+
+  failure(call, code, message) {
+    const durationMs = 0;
+    const result = this.resultMessage(call, { ok: false, error: { code, message } }, durationMs);
+    this.record({ name: call.name, arguments: call.arguments, ok: false, code, durationMs });
+    return { message: result, reset: false, durationMs };
   }
 
   async execute(call) {
@@ -112,16 +126,16 @@ export class ToolExecutor {
         case "WebFetch": outcome = await this.webFetch(call.arguments); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
       }
-      const message = this.resultMessage(call, { ok: true, result: outcome.result });
-      this.toolLog.push({ name: call.name, arguments: call.arguments, ok: true, durationMs: Math.round(performance.now() - started) });
-      this.onUpdate();
-      return { message, reset: Boolean(outcome.reset) };
+      const durationMs = elapsedMs(started);
+      const message = this.resultMessage(call, { ok: true, result: outcome.result }, durationMs);
+      this.record({ name: call.name, arguments: call.arguments, ok: true, durationMs });
+      return { message, reset: Boolean(outcome.reset), durationMs };
     } catch (error) {
       const code = error.code || "tool_failed";
       const message = error.message || "Tool execution failed.";
-      this.toolLog.push({ name: call.name, arguments: call.arguments, ok: false, code, message, durationMs: Math.round(performance.now() - started) });
-      this.onUpdate();
-      return { message: this.resultMessage(call, { ok: false, error: { code, message } }), reset: false };
+      const durationMs = elapsedMs(started);
+      this.record({ name: call.name, arguments: call.arguments, ok: false, code, message, durationMs });
+      return { message: this.resultMessage(call, { ok: false, error: { code, message } }, durationMs), reset: false, durationMs };
     }
   }
 

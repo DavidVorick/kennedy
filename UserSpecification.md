@@ -26,6 +26,9 @@ has no persistent state, and relies on APIs to various backend services to get
 persistence between sessions.
 
 'Chatend' refers to the actual context that is being passed to LLMs.
+It includes one concise latency line per LLM/tool call and one final line with
+total and combined call time so Kennedy can reason about response latency
+without a repeated step list.
 
 'Backend' refers to any of the backend services that are providing APIs to the
 frontend.
@@ -380,7 +383,7 @@ history with the user, and also the LoadNode counter.
 A Telegram conversation uses the same read-only tool set, roots, Chatend, and
 conversation manual as a UI conversation, but its dynamic system prompt
 explicitly labels it a `telegram session`. The Rust Telegram relay only queues
-private-chat text, voice, and `/reset` events and sends Kennedy's final
+private-chat text, voice, supported document, and `/reset` events and sends Kennedy's final
 conversational text; the browser remains responsible for prompt composition,
 short identifiers, tools, and the inspectable Chatend.
 
@@ -399,6 +402,11 @@ intelligence backend publishes model input modalities and uses paid OpenAI
 `gpt-4o-transcribe` only when the selected Kennedy transport lacks native audio.
 The configured `gpt-5.6-sol` transport is text/image-only, so its clearly
 labeled transcription is placed in the normal text Chatend.
+
+The browser composer and Telegram accept PDF, DOCX, spreadsheet, CSV, and text
+documents. Kennedy receives a bounded local text conversion together with the
+filename and format, and the original remains archived. Searchable PDFs are
+supported; scanned/image-only PDFs report that OCR is required.
 
 ### History Ingress
 

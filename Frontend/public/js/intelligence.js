@@ -1,4 +1,5 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260714.7";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260715.1";
+import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 
 export function createCacheKey(mode) {
   return `kennedy-${mode}-prompt-v3`;
@@ -95,22 +96,30 @@ function protocolFailureMessage(error) {
   };
 }
 
-export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, onUpdate = () => {}, checkpoint = async () => {} }) {
+export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {} }) {
   for (let round = 0; round < 100; round++) {
     const messages = continuation.requestMessages(chatend);
     if (messages.length === 0) throw new Error("Kennedy has no new context to continue from.");
-    const response = await intelligence.generate({
-      provider,
-      model,
-      messages,
-      previous_response_id: continuation.previousResponseId,
-      prompt_cache_key: continuation.cacheKey,
-    });
+    const llmStarted = performance.now();
+    let response;
+    try {
+      response = await intelligence.generate({
+        provider,
+        model,
+        messages,
+        previous_response_id: continuation.previousResponseId,
+        prompt_cache_key: continuation.cacheKey,
+      });
+    } finally {
+      addTimingStep(timing, "llm", "LLM call", elapsedMs(llmStarted));
+    }
     usage.record(response.usage);
     const content = response.message?.content;
     if (response.status !== "complete" || typeof content !== "string") throw new Error("The intelligence service returned an invalid text generation.");
     chatend.append(response.message);
     continuation.accept(response.response_id, chatend.messages.length);
+    const llmTimingMessage = timingMessage("LLM call", timing.steps.at(-1).durationMs);
+    chatend.append(llmTimingMessage);
     onUpdate();
 
     let calls;
@@ -118,26 +127,42 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     catch (error) {
       chatend.append(protocolFailureMessage(error));
       onUpdate();
+      const checkpointStarted = performance.now();
       await checkpoint();
+      addTimingStep(timing, "checkpoint", "Tool-round save", elapsedMs(checkpointStarted));
       continue;
     }
-    if (!calls) return content;
+    if (!calls) {
+      const summary = updateTimingSummary(timing);
+      chatend.append(summary);
+      onUpdate();
+      return content;
+    }
 
     calls = calls.map((call, index) => ({ ...call, id: `text_call_${round + 1}_${index + 1}` }));
     const resetIsMixed = calls.length > 1 && calls.some(call => call.name === "ResetContext");
     for (const call of calls) {
+      const toolStarted = performance.now();
       const execution = resetIsMixed && call.name === "ResetContext"
         ? executor.failure(call, "mixed_reset_call", "ResetContext must be requested by itself so the chatend can be rebuilt safely.")
         : await executor.execute(call);
+      const durationMs = addTimingStep(
+        timing,
+        "tool",
+        call.name,
+        Number.isInteger(execution.durationMs) ? execution.durationMs : elapsedMs(toolStarted),
+      );
       if (execution.reset) {
-        chatend.rebuildAfterReset(response.message, execution.message);
+        chatend.rebuildAfterReset(response.message, llmTimingMessage, execution.message);
         continuation.reset();
       } else {
         chatend.append(execution.message);
       }
       onUpdate();
     }
+    const checkpointStarted = performance.now();
     await checkpoint();
+    addTimingStep(timing, "checkpoint", "Tool-round save", elapsedMs(checkpointStarted));
   }
   throw new Error("Kennedy exceeded the 100-round tool-loop safety limit.");
 }

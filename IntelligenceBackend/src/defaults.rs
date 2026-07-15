@@ -13,7 +13,7 @@ pub(crate) const QUALITY_SEARCH_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const QUALITY_SEARCH_REASONING_EFFORT: &str = "xhigh";
 pub(crate) const QUALITY_SEARCH_CONTEXT_SIZE: &str = "high";
 pub(crate) const QUALITY_SEARCH_MAX_SOURCES: usize = 12;
-pub(crate) const QUALITY_SEARCH_TIMEOUT_SECONDS: u64 = 600;
+pub(crate) const QUALITY_SEARCH_TIMEOUT_SECONDS: u64 = 15 * 60;
 
 pub(crate) const BALANCED_SEARCH_MODEL: &str = "gpt-5.6-terra";
 pub(crate) const BALANCED_SEARCH_REASONING_EFFORT: &str = "low";
@@ -42,3 +42,6 @@ pub(crate) const TRANSCRIPTION_MODEL: &str = "gpt-4o-transcribe";
 pub(crate) const TRANSCRIPTION_PROMPT: &str = "Transcribe faithfully. When discernible and relevant, include non-speech sounds, speaker changes, tone, pauses, music, and background audio in concise brackets.";
 pub(crate) const TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_AUDIO_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+pub(crate) const MAX_DOCUMENT_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_CHARACTERS: usize = 1_000_000;

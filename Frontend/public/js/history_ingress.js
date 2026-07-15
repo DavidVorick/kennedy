@@ -1,8 +1,9 @@
-import { Chatend } from "./chatend.js?v=20260714.7";
+import { Chatend } from "./chatend.js?v=20260715.1";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
-import { ToolExecutor } from "./tools.js?v=20260714.7";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.7";
+import { ToolExecutor } from "./tools.js?v=20260715.1";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.1";
+import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -15,7 +16,8 @@ function modelReadableProvenance(data) {
       archive.media = archive.media.map(item => {
         if (!item || typeof item !== "object" || typeof item.dataUrl !== "string") return item;
         const { dataUrl: _archivedBytes, ...metadata } = item;
-        return { ...metadata, archivedOriginal: "Original audio retained in provenance; binary data omitted from model context." };
+        const mediaKind = item.kind === "document" ? "document" : "audio";
+        return { ...metadata, archivedOriginal: `Original ${mediaKind} retained in provenance; binary data omitted from model context.` };
       });
     }
     return JSON.stringify(archive, null, 2);
@@ -58,7 +60,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   usage.restore(archive?.usage);
   let completed = Boolean(archive?.completed);
   const snapshot = () => ({ chatend, context, executor, continuation, usage, completed });
-  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, modelAttribution, provenanceId, loadLimit: 50, onUpdate: () => onUpdate(snapshot()) });
+  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, modelAttribution, provenanceId, loadLimit: 50, sessionType: "history-ingress", onUpdate: () => onUpdate(snapshot()) });
   if (archive?.tools) {
     executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
     executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
@@ -91,14 +93,29 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   onUpdate(snapshot());
   await checkpoint(archiveSnapshot());
   if (!completed) {
-    await runAgentLoop({
-      intelligence, provider, model, chatend, executor, continuation, usage,
-      onUpdate: () => onUpdate(snapshot()),
-      checkpoint: () => checkpoint(archiveSnapshot()),
-    });
-    completed = true;
-    onUpdate(snapshot());
-    await checkpoint(archiveSnapshot());
+    const timing = createTurnTiming("history-ingress");
+    try {
+      await runAgentLoop({
+        intelligence, provider, model, chatend, executor, continuation, usage, timing,
+        onUpdate: () => onUpdate(snapshot()),
+        checkpoint: () => checkpoint(archiveSnapshot()),
+      });
+      completed = true;
+      onUpdate(snapshot());
+      await checkpoint(archiveSnapshot());
+      Promise.resolve(intelligence.recordTiming?.({
+        action: "turn", status: "ok", sessionType: "history-ingress",
+        durationMs: elapsedMs(timing.startedAt), llmDurationMs: timing.llmDurationMs,
+        toolDurationMs: timing.toolDurationMs, stepCount: timing.steps.length,
+      })).catch(() => {});
+    } catch (error) {
+      Promise.resolve(intelligence.recordTiming?.({
+        action: "turn", status: "error", sessionType: "history-ingress",
+        durationMs: elapsedMs(timing.startedAt), llmDurationMs: timing.llmDurationMs,
+        toolDurationMs: timing.toolDurationMs, stepCount: timing.steps.length,
+      })).catch(() => {});
+      throw error;
+    }
   }
   return snapshot();
 }

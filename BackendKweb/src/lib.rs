@@ -240,7 +240,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .layer(middleware::map_response(prevent_stale_frontend_assets))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    tracing::info!(address = %config.bind, "Kennedy Kweb listening");
+    tracing::info!(address = %config.bind, "Kweb ready");
     axum::serve(listener, app).await?;
     Ok(())
 }

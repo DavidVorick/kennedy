@@ -6,12 +6,13 @@ import { Chatend } from "../public/js/chatend.js";
 import { ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
-import { conversationControlState, conversationIngressActivity, conversationTitle, ingressMutationSummary, inspectorText } from "../public/js/render.js";
+import { conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
+import { formatDuration } from "../public/js/timing.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -207,9 +208,11 @@ test("CreateNode and UpdateNode add model attribution outside Kennedy's argument
 
 test("WebSearch and WebFetch expose only minimal model-facing arguments", async () => {
   const calls = [];
+  const timings = [];
   const intelligence = {
     webSearch: async body => { calls.push(["search", body]); return { answer: "Two candidates.", sources: [{ title: "Guide", url: "https://example.com/guide" }] }; },
     webFetch: async body => { calls.push(["fetch", body]); return { url: body.url, title: "Guide", retrieved_at: "2026-07-12T00:00:00Z", content_type: "text/html", content: "Page evidence.", truncated: false }; },
+    recordTiming: timing => timings.push(timing),
   };
   const executor = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, provider: "primary", model: "model", loadLimit: 20 });
   const search = await executor.execute({ id: "search", name: "WebSearch", arguments: { question: "best brunch in El Salvador", mode: "balanced" } });
@@ -219,9 +222,21 @@ test("WebSearch and WebFetch expose only minimal model-facing arguments", async 
     ["fetch", { url: "https://example.com/guide" }],
   ]);
   assert.equal(search.message.display_role, "Web tool result");
+  assert.match(search.message.content, /^Kennedy tool result · WebSearch · \d+ ms/);
   assert.match(search.message.content, /Web research completed/);
   assert.match(search.message.content, /https:\/\/example.com\/guide/);
+  assert.match(fetch.message.content, /^Kennedy tool result · WebFetch · \d+ ms/);
   assert.match(fetch.message.content, /Readable page content:\n  Page evidence/);
+  assert.deepEqual(timings.map(timing => [timing.action, timing.name, timing.status]), [
+    ["tool", "WebSearch", "ok"],
+    ["tool", "WebFetch", "ok"],
+  ]);
+});
+
+test("latency formatting retains millisecond precision", () => {
+  assert.equal(formatDuration(7), "7 ms");
+  assert.equal(formatDuration(1234), "1.234 s");
+  assert.equal(formatDuration(62_345), "1m 2.345s");
 });
 
 test("live conversations cannot mutate the Kmap", async () => {
@@ -319,7 +334,10 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.deepEqual(executed, ["First", "Second"]);
   assert.equal(requests.length, 2);
   assert.equal(requests[1].previous_response_id, "resp_1");
-  assert.deepEqual(requests[1].messages.map(message => message.content), ["First completed.", "Second completed."]);
+  assert.deepEqual(requests[1].messages.map(message => message.display_role || message.content), ["Latency", "Memory tool result", "Memory tool result"]);
+  assert.equal(requests[1].messages[1].content, "First completed.");
+  assert.equal(requests[1].messages[2].content, "Second completed.");
+  assert.match(requests[1].messages[0].content, /^Latency: LLM call \d+ ms$/);
   assert.equal("tools" in requests[0], false);
   assert.equal(usage.snapshot().totalCachedTokens, 180);
   assert.equal(usage.snapshot().contextTokens, 135);
@@ -408,10 +426,11 @@ test("history ingress checkpoints its whole Chatend and completed archives resum
   const kweb = new MockKweb([node(1)]);
   kweb.provenance = async () => ({ source: "conversation", source_created_at: "2026-07-13T00:00:00Z", data: '{"format":"kennedy-chatend","media":[{"kind":"voice","dataUrl":"data:audio/ogg;base64,AAAA"}]}' });
   let generations = 0;
+  const timings = [];
   const intelligence = { generate: async () => {
     generations += 1;
     return { status: "complete", response_id: "ingress-response", message: { role: "assistant", content: "Memory review complete." }, usage: null };
-  } };
+  }, recordTiming: timing => timings.push(timing) };
   const checkpoints = [];
   await runHistoryIngress({
     kweb, intelligence, manuals: { shared: "Shared", ingress: "Ingress" },
@@ -426,8 +445,12 @@ test("history ingress checkpoints its whole Chatend and completed archives resum
   assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend \(JSON\)/);
   assert.match(checkpoints.at(-1).retained[0].content, /Original audio retained in provenance/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /base64,AAAA/);
-  assert.equal(checkpoints.at(-1).messages.at(-1).content, "Memory review complete.");
+  assert.equal(checkpoints.at(-1).messages.some(message => message.content === "Memory review complete."), true);
+  assert.match(checkpoints.at(-1).messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
   assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
+  assert.deepEqual(timings.map(timing => [timing.action, timing.status, timing.sessionType]), [
+    ["turn", "ok", "history-ingress"],
+  ]);
 
   const resumed = [];
   await runHistoryIngress({
@@ -439,7 +462,8 @@ test("history ingress checkpoints its whole Chatend and completed archives resum
   });
   assert.equal(resumed.length, 1);
   assert.equal(resumed[0].completed, true);
-  assert.equal(resumed[0].messages.at(-1).content, "Memory review complete.");
+  assert.equal(resumed[0].messages.some(message => message.content === "Memory review complete."), true);
+  assert.match(resumed[0].messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
 });
 
 test("conversation history titles use the first durable user message", () => {
@@ -522,6 +546,12 @@ test("message composer supports manual resizing and a large editor mode", async 
   assert.doesNotMatch(styles, /max-height: 220px/);
 });
 
+test("composer exposes an explicit PDF upload button", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /id="attach-button"[^>]*>Upload PDF<\/button>/);
+  assert.match(html, /id="attachment-input"[^>]+type="file"[^>]+accept="[^"]*\.pdf/);
+});
+
 test("history ingress activity belongs only to its selected conversation", () => {
   const archive = {
     format: "kennedy-chatend", sessionType: "history-ingress",
@@ -566,14 +596,39 @@ test("history ingress summary counts only successful memory mutations", () => {
   });
 });
 
+test("history ingress starts Kennedy and memory tool details collapsed", () => {
+  assert.deepEqual(ingressEntryPresentation({
+    role: "assistant",
+    content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}',
+  }), { collapsed: true, label: "Kennedy tool call" });
+  assert.deepEqual(ingressEntryPresentation({
+    role: "user", display_role: "Memory tool result", content: "Loaded.",
+  }), { collapsed: true, label: "Memory tool result" });
+  assert.deepEqual(ingressEntryPresentation({
+    role: "assistant", content: "Memory review complete.",
+  }), { collapsed: false, label: "Kennedy" });
+});
+
+test("Telegram documents are acknowledged on extraction failure so the queue can advance", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /else if \(event\.kind === "document"\)/);
+  assert.match(app, /document = await telegramDocumentInput\(event\);\s*\} catch \(error\) \{\s*await telegramRelay\.reply\(/s);
+  assert.match(app, /if \(document\) await session\.send\(document\.text, document\.metadata\)/);
+  assert.match(app, /Please try sending it again\./);
+});
+
 test("conversation checkpoints the pending query before any model request", async () => {
   const events = [];
   const metadata = [];
+  const timings = [];
   const kweb = new MockKweb([node(1)]);
-  const intelligence = { generate: async () => {
-    events.push("generate");
-    return { status: "complete", response_id: "response", message: { role: "assistant", content: "Saved answer." }, usage: null };
-  } };
+  const intelligence = {
+    generate: async () => {
+      events.push("generate");
+      return { status: "complete", response_id: "response", message: { role: "assistant", content: "Saved answer." }, usage: null };
+    },
+    recordTiming: timing => timings.push(timing),
+  };
   const session = new ConversationSession({
     kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
     persist: async (state, details) => { events.push(state.pendingTurn ? "checkpoint-pending" : "checkpoint-complete"); metadata.push(details); }, onUpdate: () => {},
@@ -583,6 +638,43 @@ test("conversation checkpoints the pending query before any model request", asyn
   assert.deepEqual(events, ["checkpoint-pending", "generate", "checkpoint-complete"]);
   assert.deepEqual(metadata, [{ userActivity: true }, {}]);
   assert.deepEqual(session.transcript.map(item => item.content), ["Saved question", "Saved answer."]);
+  const turn = timings.find(timing => timing.action === "turn");
+  assert.equal(turn.status, "ok");
+  assert.equal(turn.sessionType, "conversation");
+  assert.equal(Number.isInteger(turn.durationMs), true);
+  assert.equal(turn.stepCount, 3);
+  const summary = session.chatend.messages.find(message => message.display_role === "Latency summary");
+  assert.match(summary.content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
+  assert.equal(summary.content.includes("\n"), false);
+});
+
+test("document attachments become model-readable text without duplicating extraction in media", async () => {
+  const kweb = new MockKweb([node(1)]);
+  const intelligence = { generate: async () => ({
+    status: "complete", response_id: "document-response",
+    message: { role: "assistant", content: "I read the report." }, usage: null,
+  }) };
+  const session = new ConversationSession({
+    kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" },
+    rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
+  });
+  await session.initialize();
+  await session.send("", { attachments: [{
+    id: "document-1", kind: "document", fileName: "report.pdf", mimeType: "application/pdf",
+    sizeBytes: 123, dataUrl: "data:application/pdf;base64,AAAA", format: "pdf",
+    text: "Quarterly revenue increased.", characters: 28, truncated: false, extractionDurationMs: 17,
+  }] });
+  assert.equal(session.transcript[0].content, "Attached report.pdf.");
+  assert.equal(session.transcript[0].inputKind, "document");
+  assert.equal(session.transcript[0].attachments[0].fileName, "report.pdf");
+  const attachmentMessage = session.chatend.messages.find(message => message.role === "user" && message.content.includes("Quarterly revenue"));
+  assert.match(attachmentMessage.content, /Attachment 1: report\.pdf/);
+  assert.match(attachmentMessage.content, /Latency: document extraction 17 ms/);
+  assert.equal(session.media[0].dataUrl, "data:application/pdf;base64,AAAA");
+  assert.equal("text" in session.media[0], false);
+  assert.equal("extractionDurationMs" in session.media[0], false);
+  session.chatend.rebuild();
+  assert.equal(session.chatend.messages.some(message => message.content.includes("Quarterly revenue increased.")), true);
 });
 
 test("restored pending conversation resumes from durable transcript and context", async () => {
@@ -896,7 +988,7 @@ test("telegram voice sessions archive media, correlate delivery, and emit contex
   assert.equal(checkpoints.at(-1).pendingExternalEventId, null);
 });
 
-test("audio and Telegram API clients use multipart and durable relay endpoints", async () => {
+test("audio, document, and Telegram API clients use multipart and durable relay endpoints", async () => {
   const originalFetch = globalThis.fetch;
   const requests = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -909,6 +1001,8 @@ test("audio and Telegram API clients use multipart and durable relay endpoints",
   };
   try {
     await IntelligenceAPI("http://intelligence").transcribe({ provider: "p", model: "m", file: new Blob(["audio"], { type: "audio/ogg" }), fileName: "note.ogg" });
+    await IntelligenceAPI("http://intelligence").extractDocument({ file: new Blob(["report"], { type: "application/pdf" }), fileName: "report.pdf" });
+    await IntelligenceAPI("http://intelligence").recordTiming({ action: "tool", name: "LoadNode", status: "ok", sessionType: "conversation", durationMs: 12 });
     await TelegramRelayAPI("http://telegram").bind("event", "019f5ca7-020f-7b63-be2f-82785fb68c03");
   } finally {
     globalThis.fetch = originalFetch;
@@ -916,6 +1010,10 @@ test("audio and Telegram API clients use multipart and durable relay endpoints",
   assert.equal(requests[0].url, "http://intelligence/api/v1/audio/transcriptions");
   assert.equal(requests[0].options.body instanceof FormData, true);
   assert.equal(requests[0].options.headers, undefined);
-  assert.equal(requests[1].url, "http://telegram/api/v1/events/event/bind");
-  assert.match(requests[1].options.body, /conversationId/);
+  assert.equal(requests[1].url, "http://intelligence/api/v1/documents/extract");
+  assert.equal(requests[1].options.body instanceof FormData, true);
+  assert.equal(requests[2].url, "http://intelligence/api/v1/timings");
+  assert.match(requests[2].options.body, /"durationMs":12/);
+  assert.equal(requests[3].url, "http://telegram/api/v1/events/event/bind");
+  assert.match(requests[3].options.body, /conversationId/);
 });

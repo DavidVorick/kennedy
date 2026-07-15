@@ -59,6 +59,12 @@ export const IntelligenceAPI = (base) => ({
   generate: (body) => requestJSON(base, "/api/v1/generate", { method: "POST", body: JSON.stringify(body) }),
   webSearch: (body) => requestJSON(base, "/api/v1/web/search", { method: "POST", body: JSON.stringify(body) }),
   webFetch: (body) => requestJSON(base, "/api/v1/web/fetch", { method: "POST", body: JSON.stringify(body) }),
+  recordTiming: (body) => requestJSON(base, "/api/v1/timings", { method: "POST", body: JSON.stringify(body) }),
+  extractDocument: ({ file, fileName = "document" }) => {
+    const form = new FormData();
+    form.append("file", file, fileName);
+    return requestFormJSON(base, "/api/v1/documents/extract", form);
+  },
   transcribe: ({ provider, model, file, fileName = "voice-note.webm" }) => {
     const form = new FormData();
     if (provider) form.append("provider", provider);
@@ -90,7 +96,7 @@ export const TelegramRelayAPI = (base) => ({
     let response;
     try { response = await fetch(`${base}/api/v1/events/${id}/media`, { cache: "no-store" }); }
     catch { throw new ApiError(`Could not reach ${base}.`, 0, "network_error"); }
-    if (!response.ok) throw new ApiError(`Telegram audio fetch failed (${response.status}).`, response.status, "request_failed");
+    if (!response.ok) throw new ApiError(`Telegram media fetch failed (${response.status}).`, response.status, "request_failed");
     return response.blob();
   },
   bind: (id, conversationId) => requestJSON(base, `/api/v1/events/${id}/bind`, { method: "POST", body: JSON.stringify({ conversationId }) }),

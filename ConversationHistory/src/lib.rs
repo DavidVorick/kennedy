@@ -192,7 +192,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    tracing::info!(address=%config.bind, "Kennedy conversation history listening");
+    tracing::info!(address=%config.bind, "History ready");
     axum::serve(listener, app).await?;
     Ok(())
 }

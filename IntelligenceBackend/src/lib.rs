@@ -2,6 +2,7 @@ mod defaults;
 
 use std::{
     collections::{HashMap, HashSet},
+    io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
@@ -17,7 +18,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use calamine::{Reader as CalamineReader, open_workbook_auto_from_rs};
 use chrono::{DateTime, Utc};
+use quick_xml::{Reader as XmlReader, events::Event as XmlEvent};
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -301,11 +304,36 @@ struct TranscriptionResponse {
 }
 
 #[derive(Serialize)]
+struct DocumentExtractionResponse {
+    status: String,
+    file_name: String,
+    content_type: String,
+    format: String,
+    text: String,
+    characters: usize,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
 struct NormalizedResponse {
     status: String,
     message: Message,
     response_id: String,
     usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionTiming {
+    action: String,
+    name: Option<String>,
+    status: String,
+    session_type: Option<String>,
+    duration_ms: u64,
+    llm_duration_ms: Option<u64>,
+    tool_duration_ms: Option<u64>,
+    processing_duration_ms: Option<u64>,
+    step_count: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -373,14 +401,16 @@ pub async fn serve(
         .route("/api/v1/providers", get(list_providers))
         .route("/api/v1/generate", post(generate))
         .route("/api/v1/audio/transcriptions", post(transcribe_audio))
+        .route("/api/v1/documents/extract", post(extract_document))
         .route("/api/v1/web/search", post(web_search))
         .route("/api/v1/web/fetch", post(web_fetch))
+        .route("/api/v1/timings", post(record_timing))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&options.bind).await?;
-    tracing::info!(address=%options.bind,"Kennedy intelligence bridge listening");
+    tracing::info!(address=%options.bind, "Intelligence ready");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -551,6 +581,98 @@ async fn list_providers(State(state): State<AppState>) -> Json<Value> {
         })
         .collect::<Vec<_>>();
     Json(json!({"default_provider":state.config.default_provider,"providers":providers}))
+}
+
+async fn record_timing(Json(timing): Json<ActionTiming>) -> Result<StatusCode, ApiError> {
+    if !matches!(timing.status.as_str(), "ok" | "error") {
+        return Err(ApiError::invalid("status must be ok or error."));
+    }
+    if timing.duration_ms > 2_592_000_000 {
+        return Err(ApiError::invalid("durationMs must not exceed 30 days."));
+    }
+    let session = timing.session_type.as_deref().unwrap_or("unknown");
+    if session.is_empty() || session.chars().count() > 40 {
+        return Err(ApiError::invalid(
+            "sessionType must contain between 1 and 40 characters.",
+        ));
+    }
+    match timing.action.as_str() {
+        "tool" => {
+            let tool = timing
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty() && name.chars().count() <= 80)
+                .ok_or_else(|| {
+                    ApiError::invalid("Tool timings require a name of at most 80 characters.")
+                })?;
+            if timing.status == "ok" {
+                tracing::info!(tool, session, duration_ms = timing.duration_ms, "Tool call");
+            } else {
+                tracing::warn!(
+                    tool,
+                    session,
+                    duration_ms = timing.duration_ms,
+                    "Tool call failed"
+                );
+            }
+        }
+        "turn" => {
+            let llm_ms = timing.llm_duration_ms.unwrap_or(0).min(timing.duration_ms);
+            let tool_ms = timing
+                .tool_duration_ms
+                .unwrap_or(0)
+                .min(timing.duration_ms - llm_ms);
+            let other_ms = timing.duration_ms - llm_ms - tool_ms;
+            let steps = timing.step_count.unwrap_or(0);
+            if timing.status == "ok" {
+                tracing::info!(
+                    session,
+                    duration_ms = timing.duration_ms,
+                    llm_ms,
+                    tool_ms,
+                    other_ms,
+                    steps,
+                    "User turn"
+                );
+            } else {
+                tracing::warn!(
+                    session,
+                    duration_ms = timing.duration_ms,
+                    llm_ms,
+                    tool_ms,
+                    other_ms,
+                    steps,
+                    "User turn failed"
+                );
+            }
+        }
+        "delivery" => {
+            let processing_ms = timing
+                .processing_duration_ms
+                .unwrap_or(timing.duration_ms)
+                .min(timing.duration_ms);
+            let queue_ms = timing.duration_ms - processing_ms;
+            if timing.status == "ok" {
+                tracing::info!(
+                    session,
+                    duration_ms = timing.duration_ms,
+                    processing_ms,
+                    queue_ms,
+                    "User delivery"
+                );
+            } else {
+                tracing::warn!(
+                    session,
+                    duration_ms = timing.duration_ms,
+                    processing_ms,
+                    queue_ms,
+                    "User delivery failed"
+                );
+            }
+        }
+        _ => return Err(ApiError::invalid("action must be tool, turn, or delivery.")),
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn model_input_modalities(provider: &ProviderConfig, model: &str) -> Vec<&'static str> {
@@ -909,14 +1031,6 @@ async fn run_codex_turn(
     request_id: Uuid,
 ) -> Result<CodexTurn, ApiError> {
     let web_search = web_search_context_size.is_some();
-    tracing::info!(
-        %request_id,
-        launcher=%provider.config.executable,
-        resume=previous_thread_id.is_some(),
-        web_search,
-        prompt_bytes=prompt.len(),
-        "starting sandboxed Codex turn"
-    );
     let mut command = Command::new(&provider.config.executable);
     command.arg("-a").arg("never");
     if web_search {
@@ -964,7 +1078,6 @@ async fn run_codex_turn(
         )
         .with_request_id(request_id)
     })?;
-    tracing::info!(%request_id, "Codex sandbox launcher started; forwarding prompt on stdin");
     let mut stdin = child.stdin.take().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -993,7 +1106,6 @@ async fn run_codex_turn(
         Ok(Ok(())) => {}
     }
     drop(stdin);
-    tracing::info!(%request_id, "Codex prompt forwarded; waiting for JSONL completion");
     let output = tokio::time::timeout(
         Duration::from_secs(timeout_seconds),
         child.wait_with_output(),
@@ -1320,11 +1432,6 @@ async fn run_gemini_search(
             .with_request_id(request_id)
         })?;
     let status = response.status();
-    let effective_service_tier = response
-        .headers()
-        .get("x-gemini-service-tier")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let body = response.text().await.map_err(|_| {
         gemini_protocol_failure("Gemini search returned an unreadable response.", request_id)
     })?;
@@ -1333,7 +1440,6 @@ async fn run_gemini_search(
     }
     let payload = serde_json::from_str::<Value>(&body)
         .map_err(|_| gemini_protocol_failure("Gemini search returned invalid JSON.", request_id))?;
-    tracing::info!(%request_id,service_tier=?effective_service_tier,"Gemini search response received");
     parse_gemini_search(&payload, max_sources, request_id)
 }
 
@@ -1392,12 +1498,329 @@ fn transcription_failure(status: StatusCode, body: &str, request_id: Uuid) -> Ap
     .with_request_id(request_id)
 }
 
+#[derive(Clone, Copy)]
+enum DocumentFormat {
+    Pdf,
+    Docx,
+    Spreadsheet,
+    PlainText,
+}
+
+impl DocumentFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Docx => "docx",
+            Self::Spreadsheet => "spreadsheet",
+            Self::PlainText => "text",
+        }
+    }
+}
+
+fn document_format(file_name: &str, content_type: &str) -> Option<DocumentFormat> {
+    let extension = file_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    match extension.as_deref() {
+        Some("pdf") => Some(DocumentFormat::Pdf),
+        Some("docx") => Some(DocumentFormat::Docx),
+        Some("xlsx" | "xls" | "xlsb" | "ods") => Some(DocumentFormat::Spreadsheet),
+        Some("csv" | "tsv" | "txt" | "md" | "json" | "yaml" | "yml" | "xml") => {
+            Some(DocumentFormat::PlainText)
+        }
+        _ if content_type == "application/pdf" => Some(DocumentFormat::Pdf),
+        _ if content_type
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" =>
+        {
+            Some(DocumentFormat::Docx)
+        }
+        _ if matches!(
+            content_type,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                | "application/vnd.ms-excel"
+                | "application/vnd.ms-excel.sheet.binary.macroenabled.12"
+                | "application/vnd.oasis.opendocument.spreadsheet"
+        ) =>
+        {
+            Some(DocumentFormat::Spreadsheet)
+        }
+        _ if content_type.starts_with("text/")
+            || matches!(
+                content_type,
+                "application/json" | "application/xml" | "application/yaml" | "application/x-yaml"
+            ) =>
+        {
+            Some(DocumentFormat::PlainText)
+        }
+        _ => None,
+    }
+}
+
+fn safe_document_filename(value: Option<&str>, format: DocumentFormat) -> String {
+    let cleaned = value
+        .unwrap_or("")
+        .chars()
+        .filter(|character| {
+            !character.is_control() && !matches!(character, '/' | '\\' | ':' | '\0')
+        })
+        .take(200)
+        .collect::<String>();
+    if cleaned.trim().is_empty() {
+        format!("document.{}", format.label())
+    } else {
+        cleaned
+    }
+}
+
+fn local_xml_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
+}
+
+fn extract_docx_text(bytes: &[u8]) -> Result<String, String> {
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
+    let mut document = archive
+        .by_name("word/document.xml")
+        .map_err(|error| format!("word/document.xml: {error}"))?;
+    let mut xml = String::new();
+    document
+        .read_to_string(&mut xml)
+        .map_err(|error| error.to_string())?;
+    let mut reader = XmlReader::from_str(&xml);
+    let mut output = String::new();
+    let mut in_text = false;
+    let mut in_cell = false;
+    loop {
+        match reader.read_event() {
+            Ok(XmlEvent::Start(event)) => match local_xml_name(event.name().as_ref()) {
+                b"t" => in_text = true,
+                b"tc" => in_cell = true,
+                _ => {}
+            },
+            Ok(XmlEvent::Empty(event)) => match local_xml_name(event.name().as_ref()) {
+                b"tab" => output.push('\t'),
+                b"br" | b"cr" => output.push('\n'),
+                _ => {}
+            },
+            Ok(XmlEvent::Text(text)) if in_text => {
+                let decoded = text.decode().map_err(|error| error.to_string())?;
+                output.push_str(&decoded);
+            }
+            Ok(XmlEvent::CData(text)) if in_text => {
+                let decoded = text.decode().map_err(|error| error.to_string())?;
+                output.push_str(&decoded);
+            }
+            Ok(XmlEvent::GeneralRef(reference)) if in_text => {
+                let decoded = reference.decode().map_err(|error| error.to_string())?;
+                let escaped = format!("&{decoded};");
+                let resolved =
+                    quick_xml::escape::unescape(&escaped).map_err(|error| error.to_string())?;
+                output.push_str(&resolved);
+            }
+            Ok(XmlEvent::End(event)) => match local_xml_name(event.name().as_ref()) {
+                b"t" => in_text = false,
+                b"p" if in_cell => output.push_str(" / "),
+                b"p" => output.push('\n'),
+                b"tc" => {
+                    if output.ends_with(" / ") {
+                        output.truncate(output.len() - 3);
+                    }
+                    output.push('\t');
+                    in_cell = false;
+                }
+                b"tr" => {
+                    if output.ends_with('\t') {
+                        output.pop();
+                    }
+                    output.push('\n');
+                }
+                _ => {}
+            },
+            Ok(XmlEvent::Eof) => break,
+            Err(error) => return Err(error.to_string()),
+            _ => {}
+        }
+    }
+    Ok(output)
+}
+
+fn extract_spreadsheet_text(bytes: &[u8]) -> Result<String, String> {
+    let mut workbook = open_workbook_auto_from_rs(Cursor::new(bytes.to_vec()))
+        .map_err(|error| error.to_string())?;
+    let sheet_names = workbook.sheet_names().to_vec();
+    let mut output = String::new();
+    for (sheet_index, sheet_name) in sheet_names.iter().enumerate() {
+        if sheet_index > 0 {
+            output.push('\n');
+        }
+        output.push_str("Sheet: ");
+        output.push_str(sheet_name);
+        output.push('\n');
+        let range = workbook
+            .worksheet_range(sheet_name)
+            .map_err(|error| format!("{sheet_name}: {error}"))?;
+        for row in range.rows() {
+            let line = row
+                .iter()
+                .map(ToString::to_string)
+                .map(|cell| cell.replace(['\t', '\r', '\n'], " "))
+                .collect::<Vec<_>>()
+                .join("\t");
+            output.push_str(line.trim_end());
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn normalize_document_text(value: String) -> String {
+    let normalized = value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\0', "");
+    let mut output = String::with_capacity(normalized.len());
+    let mut blank_lines = 0;
+    for line in normalized.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            blank_lines += 1;
+            if blank_lines > 1 {
+                continue;
+            }
+        } else {
+            blank_lines = 0;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output.trim().to_owned()
+}
+
+fn extract_document_text(format: DocumentFormat, bytes: &[u8]) -> Result<String, String> {
+    let extracted = match format {
+        DocumentFormat::Pdf => {
+            pdf_extract::extract_text_from_mem(bytes).map_err(|error| error.to_string())?
+        }
+        DocumentFormat::Docx => extract_docx_text(bytes)?,
+        DocumentFormat::Spreadsheet => extract_spreadsheet_text(bytes)?,
+        DocumentFormat::PlainText => String::from_utf8_lossy(bytes)
+            .trim_start_matches('\u{feff}')
+            .to_owned(),
+    };
+    Ok(normalize_document_text(extracted))
+}
+
+async fn extract_document(
+    mut multipart: Multipart,
+) -> Result<Json<DocumentExtractionResponse>, ApiError> {
+    let request_id = Uuid::new_v4();
+    let started = Instant::now();
+    let mut upload = None;
+    while let Some(field) = multipart.next_field().await.map_err(|_| {
+        ApiError::invalid("The multipart document request could not be read.")
+            .with_request_id(request_id)
+    })? {
+        if field.name() != Some("file") {
+            continue;
+        }
+        if upload.is_some() {
+            return Err(ApiError::invalid("Exactly one document file is required.")
+                .with_request_id(request_id));
+        }
+        let raw_name = field.file_name().unwrap_or("document").to_owned();
+        let content_type = field
+            .content_type()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "application/octet-stream".into())
+            .to_ascii_lowercase();
+        let format = document_format(&raw_name, &content_type).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_document",
+                "Supported documents are PDF, DOCX, XLSX, XLS, XLSB, ODS, CSV, TSV, and plain text.",
+            )
+            .with_request_id(request_id)
+        })?;
+        let file_name = safe_document_filename(Some(&raw_name), format);
+        let bytes = field.bytes().await.map_err(|_| {
+            ApiError::invalid("The uploaded document could not be read.")
+                .with_request_id(request_id)
+        })?;
+        if bytes.is_empty() || bytes.len() > MAX_DOCUMENT_UPLOAD_BYTES {
+            return Err(ApiError::invalid(format!(
+                "Documents must contain between 1 and {MAX_DOCUMENT_UPLOAD_BYTES} bytes."
+            ))
+            .with_request_id(request_id));
+        }
+        upload = Some((bytes.to_vec(), file_name, content_type, format));
+    }
+    let (bytes, file_name, content_type, format) = upload.ok_or_else(|| {
+        ApiError::invalid("One document file field named 'file' is required.")
+            .with_request_id(request_id)
+    })?;
+    let input_bytes = bytes.len();
+    let extracted = tokio::task::spawn_blocking(move || extract_document_text(format, &bytes))
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "document_extraction_failed",
+                "The document extraction worker stopped unexpectedly.",
+            )
+            .with_request_id(request_id)
+        })?
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "document_extraction_failed",
+                format!("The document could not be converted to text: {error}"),
+            )
+            .with_request_id(request_id)
+        })?;
+    if extracted.is_empty() {
+        let message = if matches!(format, DocumentFormat::Pdf) {
+            "The PDF contains no extractable text. It may be scanned or image-only and require OCR."
+        } else {
+            "The document contains no extractable text."
+        };
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "document_text_empty",
+            message,
+        )
+        .with_request_id(request_id));
+    }
+    let (text, truncated) = truncate_characters(&extracted, MAX_DOCUMENT_CHARACTERS);
+    let characters = text.chars().count();
+    tracing::info!(
+        format = format.label(),
+        input_bytes,
+        characters,
+        truncated,
+        duration_ms = started.elapsed().as_millis(),
+        "Document extracted"
+    );
+    Ok(Json(DocumentExtractionResponse {
+        status: "complete".into(),
+        file_name,
+        content_type,
+        format: format.label().into(),
+        text,
+        characters,
+        truncated,
+    }))
+}
+
 async fn transcribe_audio(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<TranscriptionResponse>, ApiError> {
     let request_id = Uuid::new_v4();
-    let started = Instant::now();
     let mut requested_provider = None;
     let mut requested_model = None;
     let mut audio = None;
@@ -1504,71 +1927,78 @@ async fn transcribe_audio(
             )
             .with_request_id(request_id)
         })?;
-    let response = state
-        .audio_client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|error| {
-            let (status, code, message) = if error.is_timeout() {
-                (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "transcription_timeout",
-                    "Audio transcription timed out.",
-                )
-            } else {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "transcription_failed",
-                    "The OpenAI transcription service could not be reached.",
-                )
-            };
-            ApiError::new(status, code, message).with_request_id(request_id)
-        })?;
-    let status = response.status();
-    let body = response.text().await.map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "transcription_failed",
-            "The transcription service returned an unreadable response.",
-        )
-        .with_request_id(request_id)
-    })?;
-    if !status.is_success() {
-        return Err(transcription_failure(status, &body, request_id));
-    }
-    let payload: Value = serde_json::from_str(&body).map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "transcription_failed",
-            "The transcription service returned invalid JSON.",
-        )
-        .with_request_id(request_id)
-    })?;
-    let text = payload
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
+    let started = Instant::now();
+    let result: Result<(Value, String), ApiError> = async {
+        let response = state
+            .audio_client
+            .post(endpoint)
+            .bearer_auth(api_key)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| {
+                let (status, code, message) = if error.is_timeout() {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "transcription_timeout",
+                        "Audio transcription timed out.",
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "transcription_failed",
+                        "The OpenAI transcription service could not be reached.",
+                    )
+                };
+                ApiError::new(status, code, message).with_request_id(request_id)
+            })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|_| {
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "transcription_failed",
-                "The transcription service returned no text.",
+                "The transcription service returned an unreadable response.",
             )
             .with_request_id(request_id)
-        })?
-        .to_owned();
-    tracing::info!(
-        %request_id,
-        provider=%provider_name,
-        input_model=%model,
-        transcription_model=%state.config.audio.transcription_model,
-        latency_ms=started.elapsed().as_millis(),
-        "audio transcription complete"
-    );
+        })?;
+        if !status.is_success() {
+            return Err(transcription_failure(status, &body, request_id));
+        }
+        let payload: Value = serde_json::from_str(&body).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "transcription_failed",
+                "The transcription service returned invalid JSON.",
+            )
+            .with_request_id(request_id)
+        })?;
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "transcription_failed",
+                    "The transcription service returned no text.",
+                )
+                .with_request_id(request_id)
+            })?
+            .to_owned();
+        Ok((payload, text))
+    }
+    .await;
+    let (payload, text) = match result {
+        Ok(result) => {
+            tracing::info!(%request_id, action="transcribe", provider=%provider_name, model=%state.config.audio.transcription_model, duration_ms=started.elapsed().as_millis(), "LLM call");
+            result
+        }
+        Err(error) => {
+            tracing::warn!(%request_id, action="transcribe", provider=%provider_name, model=%state.config.audio.transcription_model, code=%error.code, duration_ms=started.elapsed().as_millis(), "LLM call failed");
+            return Err(error);
+        }
+    };
     Ok(Json(TranscriptionResponse {
         status: "complete".into(),
         provider: provider_name.into(),
@@ -1606,7 +2036,7 @@ async fn generate(
     )
     .await
     .inspect_err(|error| {
-        tracing::warn!(%request_id,provider=%provider_name,%model,code=%error.code,latency_ms=started.elapsed().as_millis(),"provider generation failed");
+        tracing::warn!(%request_id, action="generate", provider=%provider_name, %model, code=%error.code, duration_ms=started.elapsed().as_millis(), "LLM call failed");
     })?;
     let normalized = NormalizedResponse {
         status: "complete".into(),
@@ -1621,13 +2051,13 @@ async fn generate(
         %request_id,
         provider=%provider_name,
         %model,
-        status="ok",
-        latency_ms=started.elapsed().as_millis(),
+        action="generate",
+        duration_ms=started.elapsed().as_millis(),
         input_tokens=?normalized.usage.as_ref().map(|u|u.input_tokens),
         output_tokens=?normalized.usage.as_ref().map(|u|u.output_tokens),
         cached_tokens=?normalized.usage.as_ref().map(|u|u.cached_tokens),
         cache_write_tokens=?normalized.usage.as_ref().map(|u|u.cache_write_tokens),
-        "generation complete"
+        "LLM call"
     );
     Ok(Json(normalized))
 }
@@ -1651,55 +2081,61 @@ async fn web_search(
     let started = Instant::now();
     let mode = request.mode;
     let profile = mode.profile();
-    let (execution_provider, turn) = match profile.backend {
-        SearchBackend::Codex => {
-            let prompt = codex_search_prompt(question, mode);
-            let codex = run_codex_turn(
-                provider,
-                profile.model,
-                profile.reasoning_effort,
-                &prompt,
-                None,
-                profile.context_size,
-                true,
-                profile.timeout_seconds,
-                request_id,
-            )
-            .await?;
-            let sources = extract_http_sources(&codex.answer, profile.max_sources);
-            (
-                provider_name.to_owned(),
-                SearchTurn {
-                    answer: codex.answer,
-                    sources,
-                    usage: codex.usage,
-                },
-            )
-        }
-        SearchBackend::Gemini => {
-            let api_key = state.gemini_api_key.as_deref().ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "provider_not_configured",
-                    format!(
-                        "Fast web search is not configured. Store vault secret '{}' with kennedy-server secrets set.",
-                        GEMINI_SEARCH_API_KEY_SECRET
-                    ),
+    let result: Result<(String, SearchTurn), ApiError> = async {
+        Ok(match profile.backend {
+            SearchBackend::Codex => {
+                let prompt = codex_search_prompt(question, mode);
+                let codex = run_codex_turn(
+                    provider,
+                    profile.model,
+                    profile.reasoning_effort,
+                    &prompt,
+                    None,
+                    profile.context_size,
+                    true,
+                    profile.timeout_seconds,
+                    request_id,
                 )
-                .with_request_id(request_id)
-            })?;
-            let turn = run_gemini_search(
-                &state.gemini_client,
-                api_key,
-                question,
-                profile.max_sources,
-                request_id,
-            )
-            .await?;
-            ("gemini".into(), turn)
-        }
-    };
-    tracing::info!(%request_id,provider=%execution_provider,model=%profile.model,?mode,source_count=turn.sources.len(),latency_ms=started.elapsed().as_millis(),"web research complete");
+                .await?;
+                let sources = extract_http_sources(&codex.answer, profile.max_sources);
+                (
+                    provider_name.to_owned(),
+                    SearchTurn {
+                        answer: codex.answer,
+                        sources,
+                        usage: codex.usage,
+                    },
+                )
+            }
+            SearchBackend::Gemini => {
+                let api_key = state.gemini_api_key.as_deref().ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "provider_not_configured",
+                        format!(
+                            "Fast web search is not configured. Store vault secret '{}' with kennedy-server secrets set.",
+                            GEMINI_SEARCH_API_KEY_SECRET
+                        ),
+                    )
+                    .with_request_id(request_id)
+                })?;
+                let turn = run_gemini_search(
+                    &state.gemini_client,
+                    api_key,
+                    question,
+                    profile.max_sources,
+                    request_id,
+                )
+                .await?;
+                ("gemini".into(), turn)
+            }
+        })
+    }
+    .await;
+    let (execution_provider, turn) = result.inspect_err(|error| {
+        tracing::warn!(%request_id, action="web_search", provider=%provider_name, model=%profile.model, ?mode, code=%error.code, duration_ms=started.elapsed().as_millis(), "LLM call failed");
+    })?;
+    tracing::info!(%request_id, action="web_search", provider=%execution_provider, model=%profile.model, ?mode, duration_ms=started.elapsed().as_millis(), source_count=turn.sources.len(), "LLM call");
     Ok(Json(WebSearchResponse {
         answer: turn.answer,
         sources: turn.sources,
@@ -1716,11 +2152,9 @@ async fn web_fetch(
 ) -> Result<Json<WebFetchResponse>, ApiError> {
     let requested = parse_public_web_url(request.url.trim())?;
     let request_id = Uuid::new_v4();
-    let started = Instant::now();
     let fetched = fetch_readable_page(&requested, &state.config.web)
         .await
         .map_err(|error| error.with_request_id(request_id))?;
-    tracing::info!(%request_id,url_host=?fetched.url.host_str(),bytes=fetched.body.len(),truncated=fetched.truncated,latency_ms=started.elapsed().as_millis(),"web page fetched");
     let content_type = fetched.content_type.clone();
     let raw = String::from_utf8_lossy(&fetched.body);
     let title = is_html_content(&content_type)
@@ -2021,6 +2455,8 @@ fn truncate_characters(value: &str, limit: usize) -> (String, bool) {
 }
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     fn request(messages: Vec<Message>) -> GenerateRequest {
@@ -2038,6 +2474,35 @@ mod tests {
             role: role.into(),
             content: content.into(),
         }
+    }
+
+    fn pdf_with_content_stream(content: &str) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            writeln!(&mut pdf, "{} 0 obj\n{object}\nendobj", index + 1).unwrap();
+        }
+        let xref_offset = pdf.len();
+        writeln!(&mut pdf, "xref\n0 {}", objects.len() + 1).unwrap();
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            writeln!(&mut pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        write!(
+            &mut pdf,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .unwrap();
+        pdf
     }
 
     #[test]
@@ -2206,7 +2671,7 @@ mod tests {
         assert_eq!(quality.model, "gpt-5.6-sol");
         assert_eq!(quality.reasoning_effort, "xhigh");
         assert_eq!(quality.context_size, Some("high"));
-        assert_eq!(quality.timeout_seconds, 600);
+        assert_eq!(quality.timeout_seconds, 15 * 60);
         assert!(codex_search_prompt("topic", WebSearchMode::Balanced).contains("focused"));
         assert!(codex_search_prompt("topic", WebSearchMode::Quality).contains("thorough"));
     }
@@ -2293,5 +2758,75 @@ mod tests {
         );
         assert_eq!(truncate_characters("abcéf", 4), ("abcé".into(), true));
         assert_eq!(truncate_characters("short", 10), ("short".into(), false));
+    }
+
+    #[test]
+    fn document_types_are_selected_by_safe_extensions_and_mime_types() {
+        assert!(matches!(
+            document_format("REPORT.PDF", "application/octet-stream"),
+            Some(DocumentFormat::Pdf)
+        ));
+        assert!(matches!(
+            document_format(
+                "notes",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+            Some(DocumentFormat::Docx)
+        ));
+        assert!(matches!(
+            document_format("table.xlsx", "application/octet-stream"),
+            Some(DocumentFormat::Spreadsheet)
+        ));
+        assert!(matches!(
+            document_format("table", "application/vnd.ms-excel; charset=binary"),
+            Some(DocumentFormat::Spreadsheet)
+        ));
+        assert!(matches!(
+            document_format("data", "application/json"),
+            Some(DocumentFormat::PlainText)
+        ));
+        assert!(document_format("archive.zip", "application/zip").is_none());
+    }
+
+    #[test]
+    fn plain_text_documents_are_normalized() {
+        let text = extract_document_text(
+            DocumentFormat::PlainText,
+            b"\xef\xbb\xbfHeading\r\n\r\n\r\nBody\0\r\n",
+        )
+        .unwrap();
+        assert_eq!(text, "Heading\n\nBody");
+    }
+
+    #[test]
+    fn searchable_pdf_documents_extract_text_and_empty_pages_do_not_invent_it() {
+        let searchable = pdf_with_content_stream("BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET");
+        assert!(
+            extract_document_text(DocumentFormat::Pdf, &searchable)
+                .unwrap()
+                .contains("Hello PDF")
+        );
+        let image_only_shape = pdf_with_content_stream("");
+        assert_eq!(
+            extract_document_text(DocumentFormat::Pdf, &image_only_shape).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn docx_documents_extract_paragraphs_entities_and_tables() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(br#"<w:document xmlns:w="urn:test"><w:body><w:p><w:r><w:t>Hello &amp; goodbye</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        assert_eq!(
+            extract_docx_text(&bytes).unwrap().trim(),
+            "Hello & goodbye\nA\tB"
+        );
     }
 }

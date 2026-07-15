@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, TelegramRelayAPI } from "./api.js?v=20260714.7";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, TelegramRelayAPI } from "./api.js?v=20260715.2";
 import { loadPromptManuals } from "./prompt_composer.js?v=20260714.7";
-import { ConversationSession } from "./conversation.js?v=20260714.8";
-import { runHistoryIngress } from "./history_ingress.js?v=20260714.7";
+import { ConversationSession } from "./conversation.js?v=20260715.2";
+import { runHistoryIngress } from "./history_ingress.js?v=20260715.1";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260714.7";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260715.3";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -18,7 +18,7 @@ const MODEL_LIMITS = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
+  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["full", "system", "tools", "memory"];
@@ -54,6 +54,8 @@ let recorder = null;
 let recorderChunks = [];
 let recordingStream = null;
 let voiceDrafts = new Map();
+let attachmentDrafts = new Map();
+let extractingAttachments = new Set();
 let telegramBridgeRunning = false;
 let telegramInFlight = new Set();
 
@@ -147,14 +149,22 @@ function update() {
     viewingHistory: viewingHistory || telegramView,
     transcriptLength: session?.transcript.length || 0,
   });
+  const extractingAttachment = extractingAttachments.has(selectedConversationId);
   ui.message_form.classList.toggle("hidden", controls.composerHidden);
   ui.message_input.disabled = controls.inputDisabled;
-  ui.send_button.disabled = controls.sendDisabled;
+  ui.send_button.disabled = controls.sendDisabled || extractingAttachment;
   ui.end_button.disabled = controls.endDisabled;
   ui.new_conversation.disabled = controls.newDisabled;
   ui.new_conversation.classList.toggle("hidden", telegramView);
   ui.voice_button.disabled = controls.sendDisabled || !transcriptionAvailable
     || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function";
+  const attachments = attachmentDrafts.get(selectedConversationId) || [];
+  ui.attach_button.disabled = controls.sendDisabled || extractingAttachment;
+  ui.attachment_status.textContent = attachments.length
+    ? `${attachments.length} attached: ${attachments.map(item => item.fileName).join(", ")}`
+    : "PDF, Word, spreadsheet, or text";
+  ui.clear_attachments.classList.toggle("hidden", !attachments.length);
+  ui.clear_attachments.disabled = controls.sendDisabled || extractingAttachment;
   ui.history_eyebrow.textContent = telegramView ? "TELEGRAM SESSIONS" : "YOUR CONVERSATIONS";
   ui.history_title.textContent = telegramView ? "Bot chats" : "History";
   ui.chatend_title.textContent = telegramView ? "Telegram Chatend" : "Chatend";
@@ -229,6 +239,66 @@ function blobToDataUrl(blob) {
   });
 }
 
+const MAX_ATTACHMENT_FILES = 5;
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+async function attachSelectedFiles() {
+  const id = selectedConversationId;
+  const files = Array.from(ui.attachment_input.files || []);
+  ui.attachment_input.value = "";
+  if (!files.length || !selectedSession() || activeView !== "conversation") return;
+  const existing = attachmentDrafts.get(id) || [];
+  if (existing.length + files.length > MAX_ATTACHMENT_FILES) {
+    showError(ui.error_banner, `Attach at most ${MAX_ATTACHMENT_FILES} files to one message.`);
+    return;
+  }
+  const oversized = files.find(file => !file.size || file.size > MAX_ATTACHMENT_BYTES);
+  if (oversized) {
+    showError(ui.error_banner, `${oversized.name} must be between 1 byte and 20 MiB.`);
+    return;
+  }
+  const totalBytes = [...existing, ...files].reduce((total, item) => total + (Number(item.sizeBytes ?? item.size) || 0), 0);
+  if (totalBytes > MAX_ATTACHMENT_BYTES) {
+    showError(ui.error_banner, "Attachments for one message must total 20 MiB or less.");
+    return;
+  }
+  extractingAttachments.add(id);
+  clearError(ui.error_banner);
+  update();
+  ui.activity.textContent = `Reading ${files.length === 1 ? files[0].name : `${files.length} files`}…`;
+  try {
+    const extracted = [];
+    for (const file of files) {
+      const started = performance.now();
+      const result = await intelligence.extractDocument({ file, fileName: file.name });
+      extracted.push({
+        id: crypto.randomUUID(),
+        kind: "document",
+        fileName: result.file_name || file.name,
+        mimeType: file.type || result.content_type || "application/octet-stream",
+        sizeBytes: file.size,
+        dataUrl: await blobToDataUrl(file),
+        format: result.format,
+        text: result.text,
+        characters: result.characters,
+        truncated: Boolean(result.truncated),
+        extractionDurationMs: Math.max(0, Math.round(performance.now() - started)),
+      });
+    }
+    if (liveSessions.has(id)) attachmentDrafts.set(id, [...existing, ...extracted]);
+  } catch (error) {
+    showError(ui.error_banner, `Attachment could not be read: ${error.message}`);
+  } finally {
+    extractingAttachments.delete(id);
+    update();
+  }
+}
+
+function clearAttachmentDraft(id = selectedConversationId) {
+  attachmentDrafts.delete(id);
+  update();
+}
+
 function audioExtension(mimeType) {
   if (mimeType.includes("ogg")) return "ogg";
   if (mimeType.includes("mp4")) return "m4a";
@@ -255,11 +325,14 @@ async function finishVoiceRecording() {
   try {
     if (inputModalities.includes("audio")) throw new Error("The selected native-audio transport is not enabled in this UI build.");
     const fileName = `voice-note.${audioExtension(mimeType)}`;
+    const transcriptionStarted = performance.now();
     const result = await intelligence.transcribe({ provider, model, file: blob, fileName });
+    const transcriptionDurationMs = Math.max(0, Math.round(performance.now() - transcriptionStarted));
     const dataUrl = await blobToDataUrl(blob);
     voiceDrafts.set(id, {
       inputKind: "voice",
       transcriptionModel: result.transcription_model,
+      transcriptionDurationMs,
       media: { id: crypto.randomUUID(), kind: "voice", mimeType, fileName, dataUrl, sizeBytes: blob.size },
     });
     ui.message_input.value = result.text;
@@ -394,13 +467,15 @@ async function submitMessage(event) {
   event.preventDefault();
   const session = selectedSession();
   const id = selectedConversationId;
-  if (!session || session.busy || session.pendingTurn || endingIds.has(id)) return;
+  if (!session || session.busy || session.pendingTurn || endingIds.has(id) || extractingAttachments.has(id)) return;
   const text = ui.message_input.value;
-  if (!text.trim()) return;
+  const attachments = attachmentDrafts.get(id) || [];
+  if (!text.trim() && !attachments.length) return;
   ui.message_input.value = "";
   drafts.set(id, "");
-  const metadata = voiceDrafts.get(id) || {};
+  const metadata = { ...(voiceDrafts.get(id) || {}), attachments };
   voiceDrafts.delete(id);
+  attachmentDrafts.delete(id);
   conversationErrors.delete(id);
   clearError(ui.error_banner);
   try {
@@ -441,6 +516,7 @@ async function endConversation() {
     upsertHistory(closed);
     liveSessions.delete(id);
     drafts.delete(id);
+    attachmentDrafts.delete(id);
     selectedConversationId = historyRecords.find(item => item.phase === "active"
       && sessionTypeOf(item) === "conversation"
       && liveSessions.has(item.id))?.id || id;
@@ -521,12 +597,15 @@ async function telegramVoiceInput(event) {
   const blob = await telegramRelay.media(event.id);
   let text = event.transcription;
   let transcriptionModel = event.transcriptionModel;
+  let transcriptionDurationMs = null;
   if (!text) {
     if (inputModalities.includes("audio")) throw new Error("The selected model advertises native audio, but this Kennedy transport cannot yet forward it.");
     const mimeType = blob.type || event.mimeType || "audio/ogg";
+    const transcriptionStarted = performance.now();
     const result = await intelligence.transcribe({
       provider, model, file: blob, fileName: `telegram-voice.${audioExtension(mimeType)}`,
     });
+    transcriptionDurationMs = Math.max(0, Math.round(performance.now() - transcriptionStarted));
     text = result.text;
     transcriptionModel = result.transcription_model;
     await telegramRelay.saveTranscription(event.id, text, transcriptionModel);
@@ -538,6 +617,7 @@ async function telegramVoiceInput(event) {
       externalEventId: event.id,
       inputKind: "voice",
       transcriptionModel,
+      transcriptionDurationMs,
       media: {
         id: `telegram:${event.id}`,
         kind: "voice",
@@ -552,28 +632,79 @@ async function telegramVoiceInput(event) {
   };
 }
 
+async function telegramDocumentInput(event) {
+  const blob = await telegramRelay.media(event.id);
+  const fileName = event.fileName || "telegram-document";
+  const extractionStarted = performance.now();
+  const result = await intelligence.extractDocument({ file: blob, fileName });
+  const extractionDurationMs = Math.max(0, Math.round(performance.now() - extractionStarted));
+  return {
+    text: event.text || "",
+    metadata: {
+      externalEventId: event.id,
+      inputKind: "document",
+      attachments: [{
+        id: `telegram:${event.id}`,
+        kind: "document",
+        source: "telegram",
+        fileName: result.file_name || fileName,
+        mimeType: blob.type || event.mimeType || result.content_type || "application/octet-stream",
+        sizeBytes: blob.size,
+        dataUrl: await blobToDataUrl(blob),
+        format: result.format,
+        text: result.text,
+        characters: result.characters,
+        truncated: Boolean(result.truncated),
+        extractionDurationMs,
+      }],
+    },
+  };
+}
+
 async function processTelegramEvent(event) {
+  const processingStarted = performance.now();
   if (event.kind === "reset") {
     await processTelegramReset(event);
-    return;
-  }
-  const { record, session } = await telegramConversationFor(event);
-  let response = session.answerForExternalEvent(event.id);
-  if (!response) {
-    if (session.pendingTurn && session.pendingExternalEventId === event.id) {
-      await session.resumePendingTurn();
-    } else if (session.pendingTurn) {
-      throw new Error("This Telegram session has an earlier saved query to finish.");
-    } else if (event.kind === "voice") {
-      const voice = await telegramVoiceInput(event);
-      await session.send(voice.text, voice.metadata);
-    } else {
-      await session.send(event.text || "", { externalEventId: event.id, inputKind: "text" });
+  } else {
+    const { record, session } = await telegramConversationFor(event);
+    let response = session.answerForExternalEvent(event.id);
+    if (!response) {
+      if (session.pendingTurn && session.pendingExternalEventId === event.id) {
+        await session.resumePendingTurn();
+      } else if (session.pendingTurn) {
+        throw new Error("This Telegram session has an earlier saved query to finish.");
+      } else if (event.kind === "voice") {
+        const voice = await telegramVoiceInput(event);
+        await session.send(voice.text, voice.metadata);
+      } else if (event.kind === "document") {
+        let document;
+        try {
+          document = await telegramDocumentInput(event);
+        } catch (error) {
+          await telegramRelay.reply(
+            event.id,
+            record.id,
+            `I couldn't read ${event.fileName || "that document"}: ${error.message} Please try sending it again.`,
+          );
+          response = { content: "" };
+        }
+        if (document) await session.send(document.text, document.metadata);
+      } else {
+        await session.send(event.text || "", { externalEventId: event.id, inputKind: "text" });
+      }
+      if (!response) response = session.answerForExternalEvent(event.id);
     }
-    response = session.answerForExternalEvent(event.id);
+    if (!response) throw new Error("Kennedy completed the turn without a recoverable Telegram response.");
+    if (response.content) await telegramRelay.reply(event.id, record.id, response.content, response.contextWarning || null);
   }
-  if (!response) throw new Error("Kennedy completed the turn without a recoverable Telegram response.");
-  await telegramRelay.reply(event.id, record.id, response.content, response.contextWarning || null);
+  const processingDurationMs = Math.max(0, Math.round(performance.now() - processingStarted));
+  const receivedAt = Date.parse(event.createdAt);
+  const durationMs = Number.isFinite(receivedAt)
+    ? Math.max(processingDurationMs, Date.now() - receivedAt)
+    : processingDurationMs;
+  Promise.resolve(intelligence.recordTiming({
+    action: "delivery", status: "ok", sessionType: "telegram", durationMs, processingDurationMs,
+  })).catch(() => {});
 }
 
 async function pollTelegramEvents() {
@@ -794,6 +925,9 @@ ui.message_size_button.addEventListener("click", () => {
   ui.message_input.focus();
 });
 ui.voice_button.addEventListener("click", () => toggleVoiceRecording());
+ui.attach_button.addEventListener("click", () => ui.attachment_input.click());
+ui.attachment_input.addEventListener("change", () => attachSelectedFiles());
+ui.clear_attachments.addEventListener("click", () => clearAttachmentDraft());
 ui.message_resize_handle.addEventListener("pointerdown", event => {
   if (event.button !== 0) return;
   event.preventDefault();

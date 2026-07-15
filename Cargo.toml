@@ -30,3 +30,7 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1.9"
 futures = "0.3"
 teloxide = { version = "0.17", default-features = false, features = ["rustls", "rustls-native-roots", "tracing"] }
+calamine = "0.35"
+pdf-extract = "0.12"
+quick-xml = "0.41"
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }

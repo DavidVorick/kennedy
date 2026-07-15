@@ -166,6 +166,12 @@ plus output tokens; remaining capacity is computed from provider model metadata.
 These figures are informative and never trigger compaction, truncation, or an
 automatic reset. Only an explicit ResetContext tool request rebuilds context.
 
+The frontend also measures wall-clock latency at the browser boundary. Each LLM
+response is followed by one compact timing line, every tool result includes one
+duration line, and each completed turn ends with one line containing total time
+and combined LLM/tool time. It does not repeat the calls in a summary step list.
+These entries are persisted in the Chatend for later model turns.
+
 ## 6. Context Glue
 
 The Kweb API returns durable IDs. The frontend converts every node exposed to
@@ -674,7 +680,7 @@ The explorer does not edit durable data.
 - Support `Ctrl+Enter` and `Cmd+Enter` for message submission.
 - Use no remote scripts, fonts, stylesheets, or other CDN assets.
 
-## 13. Telegram Sessions and Audio
+## 13. Telegram Sessions, Audio, and Documents
 
 The top navigation exposes `TG Bot` beside Conversation and Memory. It reuses
 the conversation transcript and Chatend inspector but filters the sidebar to
@@ -706,6 +712,21 @@ model-facing history-ingress text replaces base64 audio with bounded metadata
 because this transport cannot consume it as audio. For a Telegram turn, crossing a new 100,000-token current-
 context band attaches a separate delivery warning to the answer. The warning
 is sent after the answer and never inserted into the Chatend.
+
+The normal composer also accepts up to five PDF, DOCX, XLSX/XLS/XLSB/ODS,
+CSV/TSV, or plain-text-family files totaling at most 20 MiB. The intelligence
+backend converts each file locally to at most 1,000,000 readable characters;
+the user may send attachments without typing a message. An explicit `Upload
+PDF` button opens this document picker. Telegram document
+events use the same conversion path and may include a caption. Searchable PDFs
+are supported; a scanned or image-only PDF with no extractable text returns an
+explicit OCR-required error. Original bytes and file metadata are archived,
+while extracted text enters the Chatend once and is not duplicated in media.
+
+In the inline history-ingress review, verbose Kennedy tool requests, memory
+tool results, and tool-protocol errors use closed disclosure controls by
+default. The user can expand and collapse each entry; Kennedy's ordinary final
+review remains visible.
 
 ## 14. Verification
 

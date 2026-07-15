@@ -57,7 +57,7 @@ The three WebSearch modes are also compiled policy:
 
 | Mode | Provider and model | Reasoning | Search context | Deadline | Source cap |
 | --- | --- | --- | --- | --- | --- |
-| `quality` | Codex `gpt-5.6-sol` | `xhigh` | `high` | 600 seconds | 12 |
+| `quality` | Codex `gpt-5.6-sol` | `xhigh` | `high` | 900 seconds | 12 |
 | `balanced` | Codex `gpt-5.6-terra` | `low` | `low` | 90 seconds | 8 |
 | `fast` | Gemini `gemini-3.1-flash-lite` | `low` | Google Search grounding | 45 seconds | 6 |
 
@@ -214,6 +214,15 @@ nonstandard ports, excessive redirects, unsupported media, oversized bodies,
 and unsafe redirect destinations. It returns the final URL, optional title,
 content type, bounded readable text, retrieval time, and truncation flag.
 
+### 5.6 Document Extraction
+
+`POST /api/v1/documents/extract` accepts one multipart file up to 20 MiB and
+returns normalized local text, format, character count, and truncation status.
+It supports searchable PDF, DOCX, XLSX/XLS/XLSB/ODS, CSV/TSV, and plain-text
+formats. Output is capped at 1,000,000 characters. A PDF with no extractable
+text returns an explicit error explaining that image-only input requires OCR;
+the endpoint does not send document content to a remote service.
+
 ## 6. Errors, Logging, and HTTP
 
 Invalid inputs return `400 invalid_request`. Unknown providers/models and a
@@ -225,8 +234,8 @@ protocol failures use sanitized 5xx errors; deadlines use
 credentials or full prompts.
 
 The service binds to the address supplied by `kennedy-server` (loopback by
-default), accepts JSON plus bounded multipart audio, exposes explicit GET and
-POST routes, permits only the supplied frontend origins, and applies a
+default), accepts JSON plus bounded multipart audio/documents, exposes explicit
+GET and POST routes, permits only the supplied frontend origins, and applies a
 request-body limit before deserialization.
 
 ## 7. Verification
@@ -235,6 +244,7 @@ Tests cover request and thread-ID validation, Codex JSONL event normalization,
 last-message selection, usage mapping, source extraction/deduplication,
 compiled defaults, all three search profiles, Gemini request and interaction
 normalization, model modality metadata, paid-transcription behavior, safe audio
-filenames, public-URL safety, and readable-content bounds. Smoke tests should
+filenames, document format and DOCX extraction, public-URL safety, and
+readable-content bounds. Smoke tests should
 confirm fresh generation, thread resume, Codex search with the machine's actual
 ChatGPT login, and fast search with a configured Gemini key.

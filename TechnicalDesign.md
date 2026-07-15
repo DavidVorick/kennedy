@@ -21,7 +21,7 @@ The MVP has five logical runtime components:
 4. **Conversation history backend**: a Rust HTTP service. It durably checkpoints
    active browser conversations and owns the sequential history-ingress queue.
 5. **Telegram relay**: a Rust service built on `teloxide`. It long-polls
-   Telegram, durably queues authorized text/voice/reset events, and ferries
+   Telegram, durably queues authorized text/voice/document/reset events, and ferries
    conversational output between Telegram and the browser without constructing
    prompts or running Kennedy.
 
@@ -127,6 +127,10 @@ system-prompt-only, and expandable Kmap-memory views. The memory view derives
 node provenance from the Kweb context snapshot so direct loads, task edges,
 active-edge expansions, and summary-only fanout references remain visually distinct.
 Token, context-window, and cache telemetry is displayed in the Chatend header.
+Each LLM response and readable tool result also carries one compact measured
+duration line; the end of a turn contains only total and combined LLM/tool time.
+The server emits one concise log per LLM call and tool call plus an aggregate
+turn line that separates LLM, tool, and other orchestration time.
 Provider IDs and credentials remain hidden.
 
 The frontend itself has no persistent state. It saves versioned, opaque,
@@ -195,7 +199,7 @@ their user sends `/reset`.
 ### 4.5 Telegram Relay
 
 The relay owns the bot token, numeric Telegram authorization bindings, original
-Telegram voice bytes, and the per-user inbound/outbound delivery queue. It
+Telegram voice/document bytes, and the per-user inbound/outbound delivery queue. It
 bootstraps the configured `@taek42` username once and thereafter authorizes by
 stable numeric Telegram user ID. It accepts private chats only and refuses all
 unpaired users without storing their content. The browser binds each event to a
@@ -287,6 +291,13 @@ backend to transcribe it only when the selected transport lacks native audio.
 For the configured text/image-only `gpt-5.6-sol` transport this uses the paid
 OpenAI `gpt-4o-transcribe` API, then adds a clearly labeled transcription to the
 ordinary text Chatend.
+
+Browser and Telegram document uploads share a local intelligence-backend
+extraction endpoint. Searchable PDFs use PDF text extraction, DOCX uses its
+OpenXML document body, spreadsheets become sheet-labeled tabular text, and
+plain-text formats are normalized directly. Extracted text is bounded and
+placed once in the Chatend; original bytes and metadata remain in conversation
+media. Image-only PDFs fail with an explicit OCR-required message.
 
 ## 6. Kweb Data Model
 

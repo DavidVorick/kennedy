@@ -44,6 +44,9 @@ export function renderTranscript(container, transcript, ingressActivity = null) 
     const body = element("div", "body"); appendLinkedText(body, item.content);
     message.append(element("span", "role", item.role === "kennedy" ? "Kennedy" : "You"));
     if (item.inputKind === "voice") message.append(element("span", "voice-note-badge", "Voice note · paid transcription"));
+    if (Array.isArray(item.attachments) && item.attachments.length) {
+      message.append(element("span", "voice-note-badge", `${item.attachments.length} document${item.attachments.length === 1 ? "" : "s"} · ${item.attachments.map(attachment => attachment.fileName).join(", ")}`));
+    }
     message.append(body);
     container.append(message);
   }
@@ -131,6 +134,20 @@ export function ingressMutationSummary(diagnostic) {
     else if (entry.name === "ConnectNodes") summary.connectCalls += 1;
     return summary;
   }, { nodesAdded: 0, nodesUpdated: 0, connectCalls: 0 });
+}
+
+export function ingressEntryPresentation(message) {
+  const content = typeof message?.content === "string" ? message.content.trim() : "";
+  if (message?.role === "assistant" && content.startsWith("KENNEDY_TOOL_CALLS")) {
+    return { collapsed: true, label: "Kennedy tool call" };
+  }
+  if (message?.display_role === "Memory tool result") {
+    return { collapsed: true, label: "Memory tool result" };
+  }
+  if (message?.display_role === "Tool protocol error") {
+    return { collapsed: true, label: "Tool protocol error" };
+  }
+  return { collapsed: false, label: message?.display_role || "Kennedy" };
 }
 
 export function renderInspector(container, diagnostic, view = "full") {
@@ -349,8 +366,16 @@ export function renderIngressActivity(container, diagnostic, active) {
     return;
   }
   for (const message of visible) {
-    const item = element("article", "ingress-entry");
-    item.append(element("span", "role", message.display_role || "Kennedy"), element("pre", "ingress-body", message.content));
+    const presentation = ingressEntryPresentation(message);
+    const item = element(presentation.collapsed ? "details" : "article", `ingress-entry${presentation.collapsed ? " ingress-entry-collapsible" : ""}`);
+    if (presentation.collapsed) {
+      const summary = element("summary", "ingress-entry-summary");
+      summary.append(element("span", "role", presentation.label), element("span", "ingress-entry-toggle"));
+      item.append(summary);
+    } else {
+      item.append(element("span", "role", presentation.label));
+    }
+    item.append(element("pre", "ingress-body", message.content));
     continuation.append(item);
   }
   container.append(continuation);

@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -36,6 +36,8 @@ const UPDATE_ORDER_MIGRATION: &str = include_str!("../migrations/002_update_orde
 const UNAUTHORIZED_MESSAGE: &str =
     "Sorry, this Kennedy bot is private and your Telegram account is not authorized.";
 const TELEGRAM_MESSAGE_LIMIT: usize = 4_000;
+const TELEGRAM_POLL_TIMEOUT_SECONDS: u32 = 30;
+const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 40;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -126,6 +128,7 @@ struct RelayEvent {
     kind: String,
     text: Option<String>,
     mime_type: Option<String>,
+    file_name: Option<String>,
     duration_seconds: Option<i64>,
     status: String,
     conversation_id: Option<String>,
@@ -183,7 +186,19 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([HeaderName::from_static("content-type")]);
-    let bot = config.bot_token.as_ref().map(Bot::new);
+    // Teloxide's default 17-second HTTP timeout is shorter than Kennedy's
+    // 30-second Telegram long poll. A quiet, healthy bot would therefore time
+    // out locally before Telegram completed the request.
+    let bot = match config.bot_token.as_ref() {
+        Some(token) => {
+            let client = teloxide::net::default_reqwest_settings()
+                .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECONDS))
+                .build()
+                .context("building Telegram HTTP client")?;
+            Some(Bot::with_client(token, client))
+        }
+        None => None,
+    };
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
         bot: bot.clone(),
@@ -208,7 +223,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    tracing::info!(address=%config.bind, enabled=bot.is_some(), "Kennedy Telegram relay listening");
+    tracing::info!(address=%config.bind, enabled=bot.is_some(), "Telegram ready");
 
     if let Some(bot) = bot {
         bot.get_me()
@@ -232,6 +247,69 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 fn apply_migrations(db: &Connection) -> anyhow::Result<()> {
     db.execute_batch(INITIAL_MIGRATION)?;
     db.execute_batch(UPDATE_ORDER_MIGRATION)?;
+    migrate_document_events(db)?;
+    Ok(())
+}
+
+fn migrate_document_events(db: &Connection) -> anyhow::Result<()> {
+    let schema = db.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='telegram_events'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut columns = db.prepare("PRAGMA table_info(telegram_events)")?;
+    let has_file_name = columns
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "file_name");
+    if schema.contains("'document'") && has_file_name {
+        return Ok(());
+    }
+    let file_name_source = if has_file_name { "file_name" } else { "NULL" };
+    db.execute_batch(&format!(
+        r#"
+        BEGIN IMMEDIATE;
+        DROP INDEX IF EXISTS telegram_events_work_queue;
+        DROP INDEX IF EXISTS telegram_events_user_queue;
+        CREATE TABLE telegram_events_new (
+            id TEXT PRIMARY KEY,
+            update_id INTEGER NOT NULL UNIQUE,
+            message_id INTEGER NOT NULL,
+            telegram_user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            username TEXT,
+            display_name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('text', 'voice', 'document', 'reset')),
+            text TEXT,
+            voice_bytes BLOB,
+            mime_type TEXT,
+            file_name TEXT,
+            duration_seconds INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'complete')),
+            conversation_id TEXT,
+            transcription TEXT,
+            transcription_model TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        INSERT INTO telegram_events_new (
+            id,update_id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,
+            voice_bytes,mime_type,file_name,duration_seconds,status,conversation_id,transcription,
+            transcription_model,created_at,completed_at
+        )
+        SELECT
+            id,update_id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,
+            voice_bytes,mime_type,{file_name_source},duration_seconds,status,conversation_id,
+            transcription,transcription_model,created_at,completed_at
+        FROM telegram_events;
+        DROP TABLE telegram_events;
+        ALTER TABLE telegram_events_new RENAME TO telegram_events;
+        CREATE INDEX telegram_events_work_queue ON telegram_events(status, update_id);
+        CREATE INDEX telegram_events_user_queue ON telegram_events(telegram_user_id, status, update_id);
+        COMMIT;
+        "#
+    ))?;
     Ok(())
 }
 
@@ -273,18 +351,19 @@ fn row_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayEvent> {
         kind: row.get(6)?,
         text: row.get(7)?,
         mime_type: row.get(8)?,
-        duration_seconds: row.get(9)?,
-        status: row.get(10)?,
-        conversation_id: row.get(11)?,
-        transcription: row.get(12)?,
-        transcription_model: row.get(13)?,
-        created_at: row.get(14)?,
+        file_name: row.get(9)?,
+        duration_seconds: row.get(10)?,
+        status: row.get(11)?,
+        conversation_id: row.get(12)?,
+        transcription: row.get(13)?,
+        transcription_model: row.get(14)?,
+        created_at: row.get(15)?,
     })
 }
 
 fn fetch_event(db: &Connection, id: &str) -> Result<RelayEvent, ApiError> {
     db.query_row(
-        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,duration_seconds,status,conversation_id,transcription,transcription_model,created_at FROM telegram_events WHERE id=?1",
+        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at FROM telegram_events WHERE id=?1",
         [id], row_event,
     ).optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)
 }
@@ -292,7 +371,7 @@ fn fetch_event(db: &Connection, id: &str) -> Result<RelayEvent, ApiError> {
 async fn list_events(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
     let mut statement = db.prepare(
-        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,duration_seconds,status,conversation_id,transcription,transcription_model,created_at FROM telegram_events WHERE status IN ('pending','processing') ORDER BY update_id",
+        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at FROM telegram_events WHERE status IN ('pending','processing') ORDER BY update_id",
     ).map_err(ApiError::internal)?;
     let queued = statement
         .query_map([], row_event)
@@ -314,12 +393,13 @@ async fn event_media(
     let db = state.db.lock().map_err(ApiError::internal)?;
     let media = db
         .query_row(
-            "SELECT voice_bytes,mime_type FROM telegram_events WHERE id=?1 AND kind='voice'",
+            "SELECT voice_bytes,mime_type,kind FROM telegram_events WHERE id=?1 AND kind IN ('voice','document')",
             [&id],
             |row| {
                 Ok((
                     row.get::<_, Option<Vec<u8>>>(0)?,
                     row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
                 ))
             },
         )
@@ -327,7 +407,13 @@ async fn event_media(
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
     let bytes = media.0.ok_or_else(ApiError::not_found)?;
-    let mime = media.1.unwrap_or_else(|| "audio/ogg".into());
+    let mime = media.1.unwrap_or_else(|| {
+        if media.2 == "document" {
+            "application/octet-stream".into()
+        } else {
+            "audio/ogg".into()
+        }
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
@@ -430,6 +516,7 @@ async fn reply_event(
     Path(id): Path<String>,
     Json(input): Json<ReplyEvent>,
 ) -> Result<Json<RelayEvent>, ApiError> {
+    let started = Instant::now();
     validate_conversation_id(&input.conversation_id)?;
     if input.text.trim().is_empty() {
         return Err(ApiError::bad("text must not be empty."));
@@ -463,6 +550,7 @@ async fn reply_event(
         params![Utc::now().to_rfc3339(), id],
     )
     .map_err(ApiError::internal)?;
+    tracing::info!(event_id=%id, duration_ms=started.elapsed().as_millis(), "Telegram reply");
     Ok(Json(fetch_event(&db, &id)?))
 }
 
@@ -534,10 +622,16 @@ fn telegram_chunks(text: &str, max_utf16_units: usize) -> Vec<String> {
 async fn poll_telegram(bot: Bot, state: AppState) -> anyhow::Result<()> {
     let mut offset = 0;
     loop {
-        let updates = match bot.get_updates().offset(offset).timeout(30).send().await {
+        let updates = match bot
+            .get_updates()
+            .offset(offset)
+            .timeout(TELEGRAM_POLL_TIMEOUT_SECONDS)
+            .send()
+            .await
+        {
             Ok(updates) => updates,
             Err(error) => {
-                tracing::warn!(%error, "Telegram polling failed; retrying");
+                tracing::debug!(%error, "Telegram poll retry");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
@@ -545,10 +639,52 @@ async fn poll_telegram(bot: Bot, state: AppState) -> anyhow::Result<()> {
         for update in updates {
             offset = i32::try_from(update.id.0.saturating_add(1)).unwrap_or(i32::MAX);
             if let Err(error) = process_update(&bot, &state, update).await {
-                tracing::warn!(%error, "Telegram update could not be ingressed");
+                tracing::warn!(%error, "Telegram ingress failed");
             }
         }
     }
+}
+
+fn supported_document(file_name: Option<&str>, mime_type: Option<&str>) -> bool {
+    let supported_extension = file_name
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "pdf"
+                    | "docx"
+                    | "xlsx"
+                    | "xls"
+                    | "xlsb"
+                    | "ods"
+                    | "csv"
+                    | "tsv"
+                    | "txt"
+                    | "md"
+                    | "json"
+                    | "yaml"
+                    | "yml"
+                    | "xml"
+            )
+        });
+    supported_extension
+        || matches!(
+            mime_type.unwrap_or("").to_ascii_lowercase().as_str(),
+            "application/pdf"
+                | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                | "application/vnd.ms-excel"
+                | "application/vnd.ms-excel.sheet.binary.macroenabled.12"
+                | "application/vnd.oasis.opendocument.spreadsheet"
+                | "application/json"
+                | "application/xml"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "text/plain"
+                | "text/csv"
+                | "text/tab-separated-values"
+        )
 }
 
 async fn process_update(bot: &Bot, state: &AppState, update: Update) -> anyhow::Result<()> {
@@ -586,16 +722,17 @@ async fn process_update(bot: &Bot, state: &AppState, update: Update) -> anyhow::
         return Ok(());
     }
 
-    let (kind, text, voice_bytes, mime_type, duration_seconds) = if let Some(text) = message.text()
+    let (kind, text, media_bytes, mime_type, file_name, duration_seconds) = if let Some(text) =
+        message.text()
     {
         let reset = text.split_whitespace().next().is_some_and(|command| {
             command.eq_ignore_ascii_case("/reset")
                 || command.to_ascii_lowercase().starts_with("/reset@")
         });
         if reset {
-            ("reset", None, None, None, None)
+            ("reset", None, None, None, None, None)
         } else {
-            ("text", Some(text.to_owned()), None, None, None)
+            ("text", Some(text.to_owned()), None, None, None, None)
         }
     } else if let Some(voice) = message.voice() {
         if voice.file.size > state.max_voice_bytes as u32 {
@@ -633,10 +770,60 @@ async fn process_update(bot: &Bot, state: &AppState, update: Update) -> anyhow::
             None,
             Some(bytes),
             Some(mime_type),
+            None,
             Some(i64::from(voice.duration.seconds())),
         )
+    } else if let Some(document) = message.document() {
+        let mime_type = document.mime_type.as_ref().map(ToString::to_string);
+        if !supported_document(document.file_name.as_deref(), mime_type.as_deref()) {
+            bot.send_message(
+                message.chat.id,
+                "Kennedy can read PDF, DOCX, spreadsheet, CSV, and text documents.",
+            )
+            .send()
+            .await?;
+            return Ok(());
+        }
+        if document.file.size > state.max_voice_bytes as u32 {
+            bot.send_message(
+                message.chat.id,
+                "That document is too large for Kennedy to process.",
+            )
+            .send()
+            .await?;
+            return Ok(());
+        }
+        let file = bot.get_file(document.file.id.clone()).send().await?;
+        let mut stream = bot.download_file_stream(&file.path);
+        let mut bytes = Vec::with_capacity(document.file.size as usize);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len().saturating_add(chunk.len()) > state.max_voice_bytes {
+                bot.send_message(
+                    message.chat.id,
+                    "That document is too large for Kennedy to process.",
+                )
+                .send()
+                .await?;
+                return Ok(());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        (
+            "document",
+            message.caption().map(ToOwned::to_owned),
+            Some(bytes),
+            mime_type,
+            Some(
+                document
+                    .file_name
+                    .clone()
+                    .unwrap_or_else(|| "telegram-document".into()),
+            ),
+            None,
+        )
     } else {
-        bot.send_message(message.chat.id, "Kennedy currently accepts text messages and voice notes here. Use /reset to end this Telegram session.").send().await?;
+        bot.send_message(message.chat.id, "Kennedy accepts text, voice notes, and PDF, DOCX, spreadsheet, CSV, or text documents here. Use /reset to end this Telegram session.").send().await?;
         return Ok(());
     };
     let db = state
@@ -652,8 +839,9 @@ async fn process_update(bot: &Bot, state: &AppState, update: Update) -> anyhow::
         &display_name,
         kind,
         text.as_deref(),
-        voice_bytes.as_deref(),
+        media_bytes.as_deref(),
         mime_type.as_deref(),
+        file_name.as_deref(),
         duration_seconds,
     )?;
     Ok(())
@@ -707,6 +895,7 @@ fn insert_event(
     text: Option<&str>,
     voice_bytes: Option<&[u8]>,
     mime_type: Option<&str>,
+    file_name: Option<&str>,
     duration_seconds: Option<i64>,
 ) -> anyhow::Result<()> {
     let conversation_id = db
@@ -718,11 +907,11 @@ fn insert_event(
         .optional()?
         .flatten();
     db.execute(
-        "INSERT INTO telegram_events(id,update_id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,voice_bytes,mime_type,duration_seconds,conversation_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(update_id) DO NOTHING",
+        "INSERT INTO telegram_events(id,update_id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,voice_bytes,mime_type,file_name,duration_seconds,conversation_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(update_id) DO NOTHING",
         params![
             Uuid::new_v4().to_string(), update_id, i64::from(message.id.0), telegram_user_id,
             message.chat.id.0, username, display_name, kind, text, voice_bytes, mime_type,
-            duration_seconds, conversation_id, Utc::now().to_rfc3339(),
+            file_name, duration_seconds, conversation_id, Utc::now().to_rfc3339(),
         ],
     )?;
     Ok(())
@@ -771,6 +960,14 @@ mod tests {
     }
 
     #[test]
+    fn telegram_http_timeout_exceeds_long_poll_timeout() {
+        assert!(
+            TELEGRAM_HTTP_TIMEOUT_SECONDS > u64::from(TELEGRAM_POLL_TIMEOUT_SECONDS),
+            "the HTTP client must outlive each Telegram long poll"
+        );
+    }
+
+    #[test]
     fn queue_returns_only_each_users_head_event() {
         let db = database();
         let now = Utc::now().to_rfc3339();
@@ -780,7 +977,7 @@ mod tests {
                 params![id, update, user, now],
             ).unwrap();
         }
-        let mut statement = db.prepare("SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,duration_seconds,status,conversation_id,transcription,transcription_model,created_at FROM telegram_events WHERE status<>'complete' ORDER BY update_id").unwrap();
+        let mut statement = db.prepare("SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at FROM telegram_events WHERE status<>'complete' ORDER BY update_id").unwrap();
         let queued = statement
             .query_map([], row_event)
             .unwrap()
@@ -835,5 +1032,54 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "state_conflict");
+    }
+
+    #[test]
+    fn existing_relay_schema_migrates_to_document_events() {
+        let db = Connection::open_in_memory().unwrap();
+        let legacy = INITIAL_MIGRATION
+            .replace(
+                "'text', 'voice', 'document', 'reset'",
+                "'text', 'voice', 'reset'",
+            )
+            .replace("    file_name TEXT,\n", "");
+        db.execute_batch(&legacy).unwrap();
+        db.execute(
+            "INSERT INTO telegram_events(id,update_id,message_id,telegram_user_id,chat_id,display_name,kind,text,status,conversation_id,transcription,transcription_model,created_at) VALUES('queued',1,1,42,42,'David','voice','Hello','processing',?1,'Transcript','gpt-4o-transcribe',?2)",
+            params![
+                "019f5ca7-020f-7b63-be2f-82785fb68c03",
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        apply_migrations(&db).unwrap();
+        let queued = fetch_event(&db, "queued").unwrap();
+        assert_eq!(queued.status, "processing");
+        assert_eq!(
+            queued.conversation_id.as_deref(),
+            Some("019f5ca7-020f-7b63-be2f-82785fb68c03")
+        );
+        assert_eq!(queued.transcription.as_deref(), Some("Transcript"));
+        db.execute(
+            "INSERT INTO telegram_events(id,update_id,message_id,telegram_user_id,chat_id,display_name,kind,voice_bytes,mime_type,file_name,created_at) VALUES('doc',2,2,42,42,'David','document',X'01','application/pdf','notes.pdf',?1)",
+            [Utc::now().to_rfc3339()],
+        ).unwrap();
+        let event = fetch_event(&db, "doc").unwrap();
+        assert_eq!(event.kind, "document");
+        assert_eq!(event.file_name.as_deref(), Some("notes.pdf"));
+    }
+
+    #[test]
+    fn document_allowlist_accepts_supported_names_and_types() {
+        assert!(supported_document(Some("report.PDF"), None));
+        assert!(supported_document(None, Some("application/pdf")));
+        assert!(supported_document(
+            Some("sheet.xlsx"),
+            Some("application/octet-stream")
+        ));
+        assert!(!supported_document(
+            Some("archive.zip"),
+            Some("application/zip")
+        ));
     }
 }

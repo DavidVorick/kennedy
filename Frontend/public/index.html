@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kennedy</title>
-  <link rel="stylesheet" href="/css/styles.css?v=20260714.7">
+  <link rel="stylesheet" href="/css/styles.css?v=20260715.3">
 </head>
 <body>
   <header class="topbar">
@@ -47,7 +47,13 @@
           </div>
           <div class="message-input-frame">
             <div id="message-resize-handle" class="message-resize-handle" role="separator" aria-label="Resize message box from its top edge" aria-controls="message-input" aria-orientation="horizontal" aria-valuemin="96" aria-valuemax="720" aria-valuenow="96" tabindex="0"></div>
-            <textarea id="message-input" rows="4" placeholder="Message Kennedy…" aria-describedby="message-resize-hint" required></textarea>
+            <textarea id="message-input" rows="4" placeholder="Message Kennedy…" aria-describedby="message-resize-hint"></textarea>
+          </div>
+          <div class="attachment-actions">
+            <button id="attach-button" class="secondary" type="button" aria-label="Upload a PDF or another supported document">Upload PDF</button>
+            <input id="attachment-input" class="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.xlsb,.ods,.csv,.tsv,.txt,.md,.json,.yaml,.yml,.xml">
+            <span id="attachment-status" aria-live="polite"></span>
+            <button id="clear-attachments" class="quiet hidden" type="button">Clear</button>
           </div>
           <div class="composer-actions">
             <button id="end-button" class="secondary" type="button">End conversation</button>
@@ -93,6 +99,6 @@
     </section>
   </main>
 
-  <script type="module" src="/js/app.js?v=20260714.8"></script>
+  <script type="module" src="/js/app.js?v=20260715.3"></script>
 </body>
 </html>

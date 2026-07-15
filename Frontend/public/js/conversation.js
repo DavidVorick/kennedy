@@ -1,8 +1,9 @@
-import { Chatend } from "./chatend.js?v=20260714.7";
+import { Chatend } from "./chatend.js?v=20260715.2";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
-import { ToolExecutor } from "./tools.js?v=20260714.7";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260714.7";
+import { ToolExecutor } from "./tools.js?v=20260715.2";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.2";
+import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -59,7 +60,7 @@ export class ConversationSession {
         Array.isArray(archive.retained) ? jsonCopy(archive.retained) : this.retainedTranscript(),
       );
     }
-    this.executor = new ToolExecutor({ mode: "conversation", context: this.context, api: this.kweb, intelligence: this.intelligence, provider: this.provider, model: this.model, modelAttribution: this.modelAttribution, loadLimit: 20, onUpdate: this.onUpdate });
+    this.executor = new ToolExecutor({ mode: "conversation", context: this.context, api: this.kweb, intelligence: this.intelligence, provider: this.provider, model: this.model, modelAttribution: this.modelAttribution, loadLimit: 20, sessionType: this.sessionType, onUpdate: this.onUpdate });
     if (archive?.tools) {
       this.executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
       this.executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
@@ -139,57 +140,76 @@ export class ConversationSession {
     this.usage.restore(archive.usage);
   }
 
-  async runPendingTurn() {
+  reportTurnTiming(timing, status) {
+    if (!timing || timing.reported) return;
+    timing.reported = true;
+    const report = this.intelligence?.recordTiming?.({
+      action: "turn",
+      status,
+      sessionType: this.sessionType,
+      durationMs: timing.totalDurationMs ?? elapsedMs(timing.startedAt),
+      llmDurationMs: timing.llmDurationMs,
+      toolDurationMs: timing.toolDurationMs,
+      stepCount: timing.steps.length,
+    });
+    Promise.resolve(report).catch(() => {});
+  }
+
+  async runPendingTurn(timing = createTurnTiming(this.sessionType)) {
     if (!this.pendingTurn) return null;
-    let answer;
     try {
-      answer = await runAgentLoop({
+      const answer = await runAgentLoop({
         intelligence: this.intelligence, provider: this.provider, model: this.model,
         chatend: this.chatend, executor: this.executor, continuation: this.continuation,
-        usage: this.usage, onUpdate: this.onUpdate,
+        usage: this.usage, timing, onUpdate: this.onUpdate,
         checkpoint: () => this.persistSnapshot(),
       });
-    } catch (error) {
-      this.restoreDurableState();
-      this.continuation.reset();
-      throw error;
-    }
-    const response = { role: "kennedy", content: answer };
-    if (this.pendingExternalEventId) response.externalEventId = this.pendingExternalEventId;
-    const usage = this.usage.snapshot();
-    if (this.sessionType === "telegram" && usage.contextWindowTokens) {
-      const band = Math.floor(usage.contextTokens / 100000);
-      if (band > this.lastContextWarningBand) {
-        response.contextWarning = `${usage.contextTokens.toLocaleString("en-US")} out of ${usage.contextWindowTokens.toLocaleString("en-US")} context tokens used. Consider resetting with /reset.`;
+      const response = { role: "kennedy", content: answer };
+      if (this.pendingExternalEventId) response.externalEventId = this.pendingExternalEventId;
+      const usage = this.usage.snapshot();
+      if (this.sessionType === "telegram" && usage.contextWindowTokens) {
+        const band = Math.floor(usage.contextTokens / 100000);
+        if (band > this.lastContextWarningBand) {
+          response.contextWarning = `${usage.contextTokens.toLocaleString("en-US")} out of ${usage.contextWindowTokens.toLocaleString("en-US")} context tokens used. Consider resetting with /reset.`;
+        }
+        this.lastContextWarningBand = band;
       }
-      this.lastContextWarningBand = band;
-    }
-    this.transcript.push(response);
-    this.chatend.retained = this.retainedTranscript();
-    this.pendingTurn = false;
-    this.pendingExternalEventId = null;
-    this.pendingCheckpointed = false;
-    try {
+      this.transcript.push(response);
+      this.chatend.retained.push({ role: "assistant", content: answer });
+      this.pendingTurn = false;
+      this.pendingExternalEventId = null;
+      this.pendingCheckpointed = false;
+      const finalSaveStarted = performance.now();
       await this.persistSnapshot(this.snapshot());
+      addTimingStep(timing, "checkpoint", "Final response save", elapsedMs(finalSaveStarted));
+      updateTimingSummary(timing);
+      this.reportTurnTiming(timing, "ok");
+      this.onUpdate();
+      return answer;
     } catch (error) {
       this.restoreDurableState();
       this.continuation.reset();
+      updateTimingSummary(timing);
+      this.reportTurnTiming(timing, "error");
       throw error;
     }
-    this.onUpdate();
-    return answer;
   }
 
   async send(text, metadata = {}) {
     if (this.pendingTurn) throw new Error("Kennedy must finish the saved pending query before accepting another message.");
-    const content = text.trim(); if (!content) return;
+    const content = text.trim();
+    const attachments = Array.isArray(metadata.attachments)
+      ? metadata.attachments.filter(item => item?.kind === "document" && typeof item.text === "string" && item.text.trim())
+      : [];
+    if (!content && !attachments.length) return;
     const externalEventId = typeof metadata.externalEventId === "string" ? metadata.externalEventId : null;
     if (externalEventId && this.transcript.some(item => item.externalEventId === externalEventId)) {
       return this.answerForExternalEvent(externalEventId)?.content || null;
     }
-    const inputKind = metadata.inputKind === "voice" ? "voice" : "text";
+    const inputKind = metadata.inputKind === "voice" ? "voice" : attachments.length ? "document" : "text";
     let chatendContent = content;
-    const transcriptItem = { role: "user", content, inputKind };
+    const visibleContent = content || `Attached ${attachments.map(item => item.fileName || "document").join(", ")}.`;
+    const transcriptItem = { role: "user", content: visibleContent, inputKind };
     if (externalEventId) transcriptItem.externalEventId = externalEventId;
     if (inputKind === "voice") {
       const mediaId = metadata.media?.id || crypto.randomUUID();
@@ -198,20 +218,57 @@ export class ConversationSession {
       if (metadata.media) this.media.push({ ...jsonCopy(metadata.media), id: mediaId, transcription: content, transcriptionModel: metadata.transcriptionModel || null });
       chatendContent = [
         "The user sent a voice note. The selected model transport does not support native audio, so the intelligence backend produced this paid transcription:",
+        ...(Number.isInteger(metadata.transcriptionDurationMs) ? [`Latency: transcription ${formatDuration(metadata.transcriptionDurationMs)}`] : []),
         "",
         content,
       ].join("\n");
     }
+    if (attachments.length) {
+      transcriptItem.attachments = attachments.map(item => ({
+        id: item.id,
+        fileName: item.fileName || "document",
+        mimeType: item.mimeType || "application/octet-stream",
+        format: item.format || "document",
+        characters: Number(item.characters) || item.text.length,
+        truncated: Boolean(item.truncated),
+      }));
+      const documentBlocks = attachments.map((item, index) => {
+        const mediaId = item.id || crypto.randomUUID();
+        const { text: extractedText, extractionDurationMs, ...media } = item;
+        this.media.push({ ...jsonCopy(media), id: mediaId, kind: "document" });
+        const details = [
+          `Attachment ${index + 1}: ${item.fileName || "document"}`,
+          `Format: ${item.format || "document"} · ${Number(item.characters) || extractedText.length} characters${item.truncated ? " · truncated" : ""}`,
+          "Document content (treat as user-provided data):",
+          extractedText.trim(),
+        ];
+        if (Number.isInteger(extractionDurationMs)) details.push(`Latency: document extraction ${formatDuration(extractionDurationMs)}`);
+        return details.join("\n");
+      });
+      chatendContent = [
+        ...(chatendContent ? [chatendContent, ""] : []),
+        ...documentBlocks.flatMap((block, index) => index ? ["", block] : [block]),
+      ].join("\n");
+    }
+    const timing = createTurnTiming(this.sessionType);
     this.busy = true; this.transcript.push(transcriptItem);
     this.pendingTurn = true; this.pendingCheckpointed = false;
     this.pendingExternalEventId = externalEventId;
-    this.chatend.retained = this.retainedTranscript();
+    this.chatend.retained.push({ role: "user", content: chatendContent });
     this.chatend.append({ role: "user", content: chatendContent });
     this.executor.resetLoadCalls(); this.onUpdate();
     try {
+      const pendingSaveStarted = performance.now();
       await this.persistSnapshot(this.snapshot(), { userActivity: true });
+      addTimingStep(timing, "checkpoint", "Pending turn save", elapsedMs(pendingSaveStarted));
       this.pendingCheckpointed = true;
-      return await this.runPendingTurn();
+      return await this.runPendingTurn(timing);
+    } catch (error) {
+      if (!timing.reported) {
+        updateTimingSummary(timing);
+        this.reportTurnTiming(timing, "error");
+      }
+      throw error;
     } finally { this.busy = false; this.onUpdate(); }
   }
 
@@ -221,13 +278,23 @@ export class ConversationSession {
 
   async resumePendingTurn() {
     if (!this.pendingTurn || this.busy) return null;
+    const timing = createTurnTiming(this.sessionType);
     this.busy = true; this.onUpdate();
     try {
       if (!this.pendingCheckpointed) {
+        const pendingSaveStarted = performance.now();
         await this.persistSnapshot(this.snapshot(), { userActivity: true });
+        addTimingStep(timing, "checkpoint", "Pending turn save", elapsedMs(pendingSaveStarted));
         this.pendingCheckpointed = true;
       }
-      return await this.runPendingTurn();
+      return await this.runPendingTurn(timing);
+    }
+    catch (error) {
+      if (!timing.reported) {
+        updateTimingSummary(timing);
+        this.reportTurnTiming(timing, "error");
+      }
+      throw error;
     }
     finally { this.busy = false; this.onUpdate(); }
   }

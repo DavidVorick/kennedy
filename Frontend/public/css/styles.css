@@ -24,7 +24,7 @@ h1 { margin-bottom: 0; font: 600 31px/1.05 Georgia, serif; letter-spacing: -.02e
 h2 { margin: 3px 0 0; font: 600 22px/1.2 Georgia, serif; }
 h3 { margin-bottom: 8px; }
 .eyebrow { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .16em; }
-.top-actions, .composer-actions, .memory-toolbar, .panel-heading, .inspector-heading-actions { display: flex; align-items: center; gap: 10px; }
+.top-actions, .composer-actions, .attachment-actions, .memory-toolbar, .panel-heading, .inspector-heading-actions { display: flex; align-items: center; gap: 10px; }
 .tab, .secondary, .quiet, .primary { border-radius: 9px; padding: 9px 13px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
 .tab.active { border-color: var(--ink); background: var(--ink); color: white; }
 .primary { background: var(--accent); border-color: var(--accent); color: white; min-width: 82px; font-weight: 700; }
@@ -71,6 +71,9 @@ h3 { margin-bottom: 8px; }
 .composer.composer-expanded textarea { height: clamp(320px,52vh,620px); }
 .composer-actions { margin-top: 9px; }
 .composer-actions .activity { flex: 1; text-align: center; color: var(--muted); font-size: 13px; }
+.attachment-actions { min-height: 31px; margin-top: 8px; color: var(--muted); font-size: 11px; }
+.attachment-actions #attachment-status { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-actions .secondary { padding: 6px 10px; }
 .voice-button.recording { border-color: var(--danger); background: #fff0ee; color: var(--danger); font-weight: 800; }
 .voice-note-badge { display: inline-flex; align-items: center; gap: 5px; margin-bottom: 7px; padding: 4px 8px; border-radius: 999px; background: #dceaf0; color: #28536a; font-size: 10px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
 .telegram-empty { max-width: 480px; margin: 18vh auto 0; color: var(--muted); text-align: center; }
@@ -128,6 +131,14 @@ h3 { margin-bottom: 8px; }
 .ingress-summary-item span { display: block; margin-top: 4px; color: var(--muted); font-size: 9px; font-weight: 700; line-height: 1.2; text-transform: uppercase; }
 .ingress-entry { margin: 0 12px 12px; }
 .ingress-entry .role { display: block; margin-bottom: 4px; color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.ingress-entry-collapsible { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: white; }
+.ingress-entry-summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 10px; cursor: pointer; background: #fdfbf6; }
+.ingress-entry-summary:hover { background: #f0ebe1; }
+.ingress-entry-summary .role { margin: 0; }
+.ingress-entry-toggle { color: var(--muted); font-size: 10px; font-weight: 700; }
+.ingress-entry-toggle::after { content: "Expand"; }
+.ingress-entry-collapsible[open] .ingress-entry-toggle::after { content: "Collapse"; }
+.ingress-entry-collapsible .ingress-body { border-top: 1px solid var(--line); border-radius: 0; }
 .ingress-body { display: block; overflow: visible; padding: 10px; border-radius: 8px; background: white; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 .ingress-empty { margin: 0 12px 12px; color: var(--muted); font-size: 13px; }
 .ingress-usage { margin: 0 0 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: #ebe5d9; color: var(--muted); font-size: 11px; }

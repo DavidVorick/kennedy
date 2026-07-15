@@ -11,7 +11,7 @@ browser-native frontend:
   stores complete conversation and history-ingress Chatend archives, with
   multiple live conversations and a serialized history-ingress queue.
 - `kennedy-telegram-relay` uses `teloxide` to queue authorized Telegram text,
-  voice, and reset events while the browser remains the visible Chatend owner.
+  voice, document, and reset events while the browser remains the visible Chatend owner.
 - `Frontend/public` owns live conversations, context, tool execution, durable
   recovery orchestration, conversation-history browsing, and automatic
   background history ingress.
@@ -35,9 +35,10 @@ codex-safe login status
 
 For service calls, `codex-safe` must use `podman run -i` so the Chatend reaches
 Codex over stdin. It must not require a TTY; add `-t` only when its own stdin is
-a terminal. Kennedy logs separate launcher-started, prompt-forwarded, and
-Codex-completed stages, and fails prompt forwarding after 30 seconds rather
-than hanging silently.
+a terminal. Kennedy logs one duration for the complete LLM call and fails
+prompt forwarding after 30 seconds rather than hanging silently. Tool calls and
+complete user turns have their own concise duration logs and matching Chatend
+latency entries.
 
 Kennedy has no runtime configuration file. Stable provider, model, search,
 audio, and safety defaults are compiled into the codebase. Deployment-specific
@@ -137,6 +138,11 @@ queued while it is closed. `/reset` closes the current Telegram session and
 queues its full Chatend for the same history-ingress flow as an ended UI
 conversation. The browser composer also has a microphone button; both sources
 preserve the original audio with the paid transcription.
+
+The browser composer and Telegram also accept PDF, DOCX, spreadsheet, CSV, and
+text documents up to 20 MiB. Kennedy receives locally extracted, bounded text;
+searchable PDFs work directly, while scanned/image-only PDFs report that OCR is
+required.
 
 ## Verification
 

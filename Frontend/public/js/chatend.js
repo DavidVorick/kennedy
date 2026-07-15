@@ -18,7 +18,7 @@ export class Chatend {
     else this.messages.push(this.contextMessage());
   }
 
-  rebuildAfterReset(assistantMessage, toolResult) { this.rebuild(); this.messages.push(assistantMessage, toolResult); }
+  rebuildAfterReset(assistantMessage, ...followingMessages) { this.rebuild(); this.messages.push(assistantMessage, ...followingMessages); }
   append(message) { this.messages.push(message); }
   replaceRetained(retained) { this.retained = retained; this.rebuild(); }
 }

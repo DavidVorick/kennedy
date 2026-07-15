@@ -63,6 +63,14 @@ canonical documents; this file is not an append-only log.
   control.
 - Return actionable, sanitized provider errors, including request IDs when
   useful, without exposing credentials or other sensitive provider data.
+- Keep operational logs concise and action-oriented. Emit one timed log line
+  for an entire LLM call, one for each Kennedy tool call, and one aggregate
+  user-turn line. In the Chatend, add only one compact line after each LLM or
+  tool call and one final line with total turn time plus combined LLM/tool time;
+  do not repeat those calls in a step list.
+- Telegram's HTTP request timeout must exceed its long-poll timeout. Healthy
+  idle long polls must not produce warning noise; genuine polling failures may
+  still warn and retry.
 
 ## Frontend Behavior
 
@@ -225,3 +233,16 @@ canonical documents; this file is not an append-only log.
   text/image-only, so use OpenAI's higher-quality paid
   `gpt-4o-transcribe` API rather than local Whisper, and clearly label the
   transcript presented to Kennedy.
+- Accept PDF, DOCX, spreadsheet, CSV, and text attachments in both the browser
+  composer and Telegram. Convert them locally to bounded readable text for the
+  Chatend while retaining the original file and useful metadata. Searchable
+  PDFs are required; image-only PDFs should fail clearly when OCR is needed.
+- Quality web searches can take longer than ten minutes, so their deadline is
+  15 minutes; balanced and fast search deadlines should
+  remain latency-oriented.
+- Make PDF upload discoverable through an explicitly labeled composer button.
+- During history ingress, show Kennedy's final review normally but start
+  Kennedy tool requests, memory tool results, and protocol-error details
+  collapsed until the user expands them.
+- A failed Telegram document extraction must receive an error reply and finish
+  that relay event so one document cannot block all later messages for the user.
