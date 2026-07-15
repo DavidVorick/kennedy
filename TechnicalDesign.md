@@ -63,8 +63,10 @@ to every composed system prompt.
 - The Codex adapter uses the machine's ChatGPT-authenticated CLI and resumes
   persisted Codex threads. A `ResetContext` call deliberately abandons the old
   thread and sends the rebuilt chatend as a fresh request.
-- `ResetContext` rebuilds the chatend from retained session content and newly
-  loaded kweb nodes, so unloaded node content is genuinely absent afterward.
+- `ResetContext` rebuilds the chatend from retained session content, an optional
+  assistant-role note to self capped at 400,000 characters, and newly loaded
+  kweb nodes. Reset notes remain in retained history across later resets, while
+  unloaded node content is genuinely absent afterward.
 - Short identifiers never cross the Kweb backend API boundary. The frontend
   resolves them to durable identifiers before making backend calls.
 - All Kweb mutations that affect more than one row are SQLite transactions.
@@ -121,12 +123,19 @@ The frontend owns:
 - the context inspector and memory explorer state,
 - checkpoint and recovery orchestration across backend APIs.
 
-The context inspector renders the human-readable chatend, including Kennedy's
-text tool requests and readable tool results. It provides full-context,
+The context inspector renders the canonical human-readable Chatend, including
+Kennedy's text tool requests and readable tool results. Its Full view and the
+generation path share one formatter over the current messages, so the Full
+view is the application prompt text sent to Kennedy, not a representation of a
+JSON recovery archive. It provides full-context,
 system-prompt-only, and expandable Kmap-memory views. The memory view derives
 node provenance from the Kweb context snapshot so direct loads, task edges,
 active-edge expansions, and summary-only fanout references remain visually distinct.
 Token, context-window, and cache telemetry is displayed in the Chatend header.
+The canonical request and Full inspector end with the terse line
+`context window usage: {used-or-unknown} / {advertised-effective-limit}`.
+It uses the previous completed response's exact provider usage; fresh/reset
+threads use `unknown` so abandoned-thread data cannot mislead Kennedy.
 Each LLM response and readable tool result also carries one compact measured
 duration line; the end of a turn contains only total and combined LLM/tool time.
 The server emits one concise log per LLM call and tool call plus an aggregate
@@ -134,11 +143,11 @@ turn line that separates LLM, tool, and other orchestration time.
 Provider IDs and credentials remain hidden.
 
 The frontend itself has no persistent state. It saves versioned, opaque,
-lossless Chatend archives to the conversation history API before generation,
+lossless recovery archives to the conversation history API before generation,
 after complete tool rounds, and after final output. Structured content is
-preserved for future media support. It reconstructs the live session from that
-backend after a reload or abrupt close while refreshing the active manuals and
-required root context.
+preserved for future media support, but the JSON archive is never used as a
+model prompt. It reconstructs the live session from that backend after a reload
+or abrupt close while refreshing the active manuals and required root context.
 
 ### 4.2 Kweb Backend
 
@@ -161,9 +170,13 @@ budgets, or provider APIs.
 The intelligence backend owns:
 
 - validating ChatGPT Codex login and loading model/CLI configuration,
-- validating the normalized generation request,
-- translating normalized text messages and continuation controls into bounded,
+- discovering each configured model's effective context window from Codex's
+  advertised catalog rather than a local constant,
+- validating the canonical plaintext generation request,
+- passing canonical plaintext and continuation controls into bounded,
   read-only non-interactive Codex turns,
+- suppressing Codex auto-compaction beyond every reachable context so Kmap
+  material is never silently summarized,
 - translating Codex text, thread IDs, errors, and detailed token usage
   into one response shape,
 - routing isolated WebSearch runs across compiled Codex and Gemini tiers,
@@ -187,6 +200,8 @@ checkpoints, optimistic record versions, and the conversation phase machine:
 
 ```text
 active -> ingress_pending -> ingress_in_progress -> complete
+             |               |
+             +---------------+-> ingress_failed (fifth failure)
 ```
 
 It does not call the Kweb or intelligence APIs or validate their identifiers.
@@ -195,6 +210,10 @@ It permits multiple `active` and `ingress_pending` records while enforcing one
 active conversations idle for more than 24 hours, unless Kennedy still owes a
 response in that record. Telegram sessions are exempt and remain active until
 their user sends `/reset`.
+The backend atomically records concise ingress failure diagnostics. The fifth
+failure moves the record to `ingress_failed`, removes it from queue selection,
+and frees the worker to process the next conversation; failed records and all
+five logs remain queryable.
 
 ### 4.5 Telegram Relay
 
@@ -222,23 +241,33 @@ Only user and Kennedy text is added to the clean transcript.
 Ordinary model generations invoke `codex-safe`, which runs
 `codex exec --json` inside a persistent Podman sandbox with `gpt-5.6-sol` and
 `xhigh`, resuming by Codex thread ID. The child process is bounded by a total
-deadline, uses the ChatGPT login, and cannot use shell/file/internet tools. If
+deadline, uses the ChatGPT login, receives canonical Chatend text on stdin,
+disables automatic compaction, and cannot use shell/file/internet tools. Model
+capacity comes from Codex's advertised effective window at startup. If
 generation or a tool-round checkpoint fails, the frontend restores the last
 durable Chatend and local execution state and retries the pending turn from a
 fresh Codex thread.
 
 The Kweb portion of the chatend accumulates during the conversation. A
-`ResetContext` call resolves its arguments, removes all Kweb context, resets
-short identifiers, reloads the root and requested nodes, and rebuilds the
-chatend while retaining the clean transcript and the current turn's LoadNode
-counter.
+`ResetContext` call resolves its arguments, validates its optional 400,000
+character note to self, removes all Kweb context, resets short identifiers,
+reloads the roots and requested nodes, and rebuilds the chatend while retaining
+the clean transcript, prior reset notes, and the current shared context-loading
+counter. LoadNode and ResetContext consume the same per-turn or per-session
+context-loading budget, while ResetContext's internal node loads consume no
+extra calls. The rebuild places a complete, duplicate-grouped reset history
+before the latest note, using node names because short identifiers are unstable
+across resets. The latest note precedes the new Kweb context; root nodes precede
+explicitly requested nodes. The Full inspector and next fresh-thread request
+are formatted from this rebuilt list, so wiped Kmap material is absent from
+both.
 
 Explicitly ending a conversation transitions its durable record to
 `ingress_pending`; starting a new conversation does not end existing live ones.
 A successful user-message checkpoint in another conversation also queues active
 records idle for more than 24 hours, except pending Kennedy turns. The frontend
 worker processes queued records oldest-activity-first, creates idempotent data
-provenance from each complete Chatend archive, transitions exactly one record
+provenance from each complete recovery archive, transitions exactly one record
 to `ingress_in_progress`, and completes it before claiming the next. Live
 conversations remain usable throughout. Completed records and both archives
 remain queryable from the sidebar.
@@ -246,7 +275,11 @@ remain queryable from the sidebar.
 ### 5.2 History Ingress
 
 History ingress uses a separate chatend composed from `KennedyIdentity.txt` and
-`HistoryIngress.txt`, the provenance data, and both loaded root nodes.
+`HistoryIngress.txt`, the canonical archived conversation text, and both loaded
+root nodes. The provenance node stores the complete recovery JSON for
+durability, but ingress parses it and formats only its `messages`; recovery
+counters, diagnostics, media data URLs, and the JSON envelope do not enter
+Kennedy's context.
 Kennedy may navigate the kweb, connect nodes, reorganize fanout, manage task
 slots, and create or update knowledge nodes. WebSearch and WebFetch are not
 available; ingress must interpret only the archived conversation and Kmap
@@ -268,6 +301,14 @@ when that record is selected, appended after its clean transcript in the same
 scrolling flow; completed records reconstruct that continuation from the saved
 archive. Completing with zero knowledge mutations is valid.
 
+The ingress session permits at most 100 model rounds in total. That count is
+checkpointed before each request and survives recovery and ResetContext; reset
+may start a fresh Codex thread but never refreshes the logical-session guard.
+The outer worker separately permits five failed attempts across provenance,
+model-loop, checkpoint, and completion stages. Each failure records its stage,
+sanitized error, round, and measured occupancy. Attempt five aborts the record
+permanently instead of starting another retry loop.
+
 At startup every `active` record restores its transcript, directly loaded nodes,
 and pending-turn flag. Pending user queries resume from fresh Codex threads.
 Queued ingress resumes independently and sequentially without disabling any
@@ -280,8 +321,8 @@ Conversation records declare `sessionType: conversation` or
 history ingress separately declares whether its archive came from a Telegram
 session or a browser conversation. A Telegram session uses the ordinary
 conversation manual and read-only conversation tool set. It ends only on
-`/reset`, which queues the complete archived Chatend for normal sequential
-history ingress. Each time current context crosses another 100,000-token band,
+`/reset`, which queues the complete recovery archive; normal sequential history
+ingress extracts its canonical Chatend text. Each time current context crosses another 100,000-token band,
 the relay sends a separate operational notice with current and maximum tokens
 and suggests `/reset`; the notice is not added to the Chatend.
 

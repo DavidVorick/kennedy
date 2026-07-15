@@ -1,8 +1,8 @@
-import { Chatend } from "./chatend.js?v=20260715.2";
+import { Chatend } from "./chatend.js?v=20260715.7";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
-import { ToolExecutor } from "./tools.js?v=20260715.2";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.2";
+import { ToolExecutor } from "./tools.js?v=20260715.7";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.9";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 
 function jsonCopy(value) {
@@ -66,6 +66,7 @@ export class ConversationSession {
       this.executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
     }
     this.usage.restore(archive?.usage);
+    if (archive) this.usage.resetThread();
     this.durableState = this.snapshot();
     this.onUpdate();
   }

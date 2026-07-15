@@ -50,8 +50,21 @@ export function formatKmapContext(snapshot) {
   const identifiers = snapshot.directlyLoadedIdentifiers?.length
     ? snapshot.directlyLoadedIdentifiers.join(", ")
     : "none";
+  const rootOrder = new Map((snapshot.rootIdentifiers || []).map((identifier, index) => [identifier, index]));
+  const directOrder = new Map((snapshot.directlyLoadedIdentifiers || []).map((identifier, index) => [identifier, index]));
   const nodes = snapshot.nodes?.length
-    ? snapshot.nodes.map(formatContextNode).join("\n\n")
+    ? [...snapshot.nodes]
+      .sort((left, right) => {
+        const rank = node => rootOrder.has(node.identifier)
+          ? [0, rootOrder.get(node.identifier)]
+          : directOrder.has(node.identifier)
+            ? [1, directOrder.get(node.identifier)]
+            : [2, 0];
+        const leftRank = rank(left);
+        const rightRank = rank(right);
+        return leftRank[0] - rightRank[0] || leftRank[1] - rightRank[1];
+      })
+      .map(formatContextNode).join("\n\n")
     : "No memory nodes are currently loaded.";
   return [
     "Current Kmap context",

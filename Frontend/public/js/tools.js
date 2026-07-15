@@ -1,7 +1,8 @@
-import { formatToolResult } from "./human_format.js?v=20260714.7";
+import { formatToolResult } from "./human_format.js?v=20260715.7";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
+export const MAX_RESET_SELF_MESSAGE_CHARACTERS = 400_000;
 
 function splitToolEnvelope(value) {
   if (!value.startsWith("{")) throw Object.assign(new Error("The tool request must contain one JSON object immediately after the marker."), { code: "invalid_tool_protocol" });
@@ -56,15 +57,20 @@ export function parseToolCalls(content) {
   });
 }
 
-function validateObject(args, keys) {
+function validateObject(args, keys, optionalKeys = []) {
   if (!args || typeof args !== "object" || Array.isArray(args)) throw Object.assign(new Error("Arguments must be a JSON object."), { code: "invalid_arguments" });
   const actual = Object.keys(args);
-  if (actual.length !== keys.length || keys.some(key => !actual.includes(key))) throw Object.assign(new Error(`Expected exactly: ${keys.join(", ")}.`), { code: "invalid_arguments" });
+  const allowed = new Set([...keys, ...optionalKeys]);
+  if (keys.some(key => !actual.includes(key)) || actual.some(key => !allowed.has(key))) {
+    const optional = optionalKeys.length ? ` Optional: ${optionalKeys.join(", ")}.` : "";
+    throw Object.assign(new Error(`Expected exactly: ${keys.join(", ")}.${optional}`), { code: "invalid_arguments" });
+  }
 }
 function integer(value, name) { if (!Number.isInteger(value) || value < 1) throw Object.assign(new Error(`${name} must be a positive integer.`), { code: "invalid_arguments" }); return value; }
 function integerArray(value, name, minimum = 0) { if (!Array.isArray(value) || value.length < minimum) throw Object.assign(new Error(`${name} must contain at least ${minimum} identifiers.`), { code: "invalid_arguments" }); value.forEach((v, i) => integer(v, `${name}[${i}]`)); if (new Set(value).size !== value.length) throw Object.assign(new Error(`${name} must not contain duplicates.`), { code: "invalid_arguments" }); return value; }
 function string(value, name) { if (typeof value !== "string") throw Object.assign(new Error(`${name} must be a string.`), { code: "invalid_arguments" }); return value; }
 function nonemptyString(value, name, maximum) { string(value, name); const trimmed = value.trim(); if (!trimmed || [...trimmed].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return trimmed; }
+function nonemptyPreservedString(value, name, maximum) { string(value, name); if (!value.trim() || [...value].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return value; }
 function choice(value, name, choices) { string(value, name); if (!choices.includes(value)) throw Object.assign(new Error(`${name} must be one of: ${choices.join(", ")}.`), { code: "invalid_arguments" }); return value; }
 
 export class ToolExecutor {
@@ -74,6 +80,11 @@ export class ToolExecutor {
   }
 
   resetLoadCalls() { this.loadCalls = 0; }
+
+  consumeContextLoadBudget() {
+    this.loadCalls += 1;
+    if (this.loadCalls > this.loadLimit) throw Object.assign(new Error(`Context-loading budget of ${this.loadLimit} is exhausted.`), { code: "load_budget_exhausted" });
+  }
 
   fullDurable(identifier) {
     const id = this.context.resolve(identifier);
@@ -129,7 +140,7 @@ export class ToolExecutor {
       const durationMs = elapsedMs(started);
       const message = this.resultMessage(call, { ok: true, result: outcome.result }, durationMs);
       this.record({ name: call.name, arguments: call.arguments, ok: true, durationMs });
-      return { message, reset: Boolean(outcome.reset), durationMs };
+      return { message, reset: Boolean(outcome.reset), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, durationMs };
     } catch (error) {
       const code = error.code || "tool_failed";
       const message = error.message || "Tool execution failed.";
@@ -141,16 +152,25 @@ export class ToolExecutor {
 
   async loadNode(args) {
     validateObject(args, ["identifier"]); integer(args.identifier, "identifier");
-    this.loadCalls += 1;
-    if (this.loadCalls > this.loadLimit) throw Object.assign(new Error(`LoadNode budget of ${this.loadLimit} is exhausted.`), { code: "load_budget_exhausted" });
+    this.consumeContextLoadBudget();
     const durable = this.context.resolve(args.identifier);
     return { result: await this.context.loadDurable(durable) };
   }
 
   async resetContext(args) {
-    validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers");
+    validateObject(args, ["identifiers"], ["selfMessage"]); integerArray(args.identifiers, "identifiers");
+    const selfMessage = Object.hasOwn(args, "selfMessage")
+      ? nonemptyPreservedString(args.selfMessage, "selfMessage", MAX_RESET_SELF_MESSAGE_CHARACTERS)
+      : null;
+    this.consumeContextLoadBudget();
     const durable = args.identifiers.map(id => this.context.resolve(id));
-    return { result: await this.context.reset(durable), reset: true };
+    const retainedNodeNames = durable.map(id => this.context.nodesById.get(id)?.short_name || "Unnamed memory");
+    return {
+      result: await this.context.reset(durable),
+      reset: true,
+      selfMessage,
+      resetHistoryEntry: { retainedNodeNames, budgetUsed: this.loadCalls, budgetLimit: this.loadLimit },
+    };
   }
 
   async connectNodes(args) {

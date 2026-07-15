@@ -12,22 +12,23 @@ passes that credential directly to the trusted transcription connector.
 Ordinary generation never receives that key and does not call the Responses
 HTTP API.
 
-The service stores no Kennedy or Kmap state. It accepts normalized text
-messages, resumes opaque Codex thread IDs, returns normalized text and usage,
-and safely fetches bounded public pages. It is an independent backend hosted by
-`kennedy-server` and neither imports nor calls the Kweb or conversation-history
-backends.
+The service stores no Kennedy or Kmap state. It accepts one canonical plaintext
+Chatend (or continuation suffix), resumes opaque Codex thread IDs, returns
+normalized text and usage, and safely fetches bounded public pages. It is an
+independent backend hosted by `kennedy-server` and neither imports nor calls
+the Kweb or conversation-history backends.
 
 ## 2. Responsibilities
 
 - Apply compiled defaults for the Codex sandbox launcher, working directory,
-  allowed models, reasoning effort, timeouts, model-context limits, audio, and
-  web safety bounds.
+  allowed models, reasoning effort, timeouts, audio, and web safety bounds.
+- Discover configured models' advertised effective context windows from Codex
+  at startup and fail closed rather than substitute local context estimates.
 - Require the launcher's successful `login status` response to
   identify ChatGPT login inside the sandbox.
 - Remove API-key environment variables from spawned Codex processes so
   generation cannot silently switch to direct API billing.
-- Validate normalized, text-only generation requests.
+- Validate canonical plaintext generation requests.
 - Start or resume non-interactive Codex threads and normalize the last
   `agent_message`, thread ID, token usage, and failures.
 - Execute fresh, ephemeral Codex web-research turns and return deduplicated
@@ -48,8 +49,8 @@ or internet tools. Only `/api/v1/web/search` invokes a web-enabled provider.
 The backend has no runtime configuration file. Stable defaults live in
 `IntelligenceBackend/src/defaults.rs`: provider `primary`, launcher
 `codex-safe`, temporary working directory, model `gpt-5.6-sol`, ordinary
-generation at `xhigh`, a 600-second generation deadline, known model context
-limits, bounded public-page fetches, and paid `gpt-4o-transcribe` behavior.
+generation at `xhigh`, a 600-second generation deadline, bounded public-page
+fetches, and paid `gpt-4o-transcribe` behavior.
 Changing these policies is a code change reviewed and tested with the rest of
 the adapter.
 
@@ -83,6 +84,12 @@ terminal invocation. It must mount its Codex state directory so login and
 thread resumes survive runs. The temporary working directory must contain no
 project instructions or user data.
 
+At startup the backend runs `codex-safe debug models`, reads each model's
+`context_window` and `effective_context_window_percent`, and exposes their
+product as the usable context and input window. The selected model must be
+present with valid advertised values or startup fails. There is no hardcoded
+fallback window.
+
 The native-audio model list is empty for the `gpt-5.6-sol` Codex transport. A
 model belongs in that list only when its active Kennedy transport can actually
 forward native audio. The transcription API rejects rather than transcribes
@@ -97,8 +104,11 @@ Generation asks the `codex-safe` launcher to run `codex exec --json` with:
 - saved CLI authentication but ignored user/project configuration and rules;
 - approval policy `never` and a read-only sandbox;
 - multi-agent, apps, shell, unified-exec, and web search disabled;
-- the normalized Chatend serialized through stdin rather than command-line
-  arguments;
+- the canonical plaintext Chatend passed unchanged through stdin rather than
+  command-line arguments or a JSON prompt envelope;
+- `model_auto_compact_token_limit` set to the largest signed 64-bit value,
+  beyond every reachable advertised context window, so Codex does not
+  automatically compact Kennedy's Chatend;
 - a bounded total deadline and child termination on timeout.
 
 The first call starts a persisted Codex thread. Later calls use
@@ -109,8 +119,10 @@ thread ID and sends the rebuilt full Chatend to a new thread.
 Codex JSONL may contain intermediate agent messages. Only the last completed
 `agent_message` is Kennedy's response. `thread.started` supplies
 `response_id`; `turn.completed.usage` supplies input, cached-input, output, and
-reasoning tokens. Cache-write tokens are reported as zero because Codex JSONL
-does not expose that measurement.
+reasoning tokens. Codex's values are cumulative for the provider thread; the
+response marks them as cumulative so the frontend can difference continuation
+rounds. Cache-write tokens are reported as zero because Codex JSONL does not
+expose that measurement.
 
 `quality` and `balanced` web search start a new ephemeral Codex thread with
 `--search`, retain the same read-only/no-shell restrictions, and ask Codex for
@@ -136,11 +148,12 @@ transcription is configured. Startup has already verified the configured
 ChatGPT login. A missing transcription key does not disable text generation.
 
 `GET /api/v1/providers` returns provider name, `kind: codex`, default and
-allowed models, configured `reasoning_effort`, and context limits. The browser
+allowed models, configured `reasoning_effort`, and the effective context limits
+discovered from Codex's advertised model catalog. The browser
 uses the model plus reasoning effort for runtime prompt disclosure and automatic
 Kmap mutation attribution. It also returns per-model `input_modalities` and
-whether transcription is available. The endpoint never returns authentication
-details.
+effective context/input limits, plus whether transcription is available. The
+endpoint never returns authentication details.
 
 ### 5.2 Audio Transcription
 
@@ -163,16 +176,25 @@ tone, pauses, music, and background audio. Audio content and API keys are never 
 {
   "provider": "primary",
   "model": "gpt-5.6-sol",
-  "messages": [{"role": "user", "content": "New text for this round."}],
+  "chatend": "David\n\nNew text for this round.",
   "previous_response_id": "019f5ca7-020f-7b63-be2f-82785fb68c03",
   "prompt_cache_key": "kennedy-conversation-prompt-v1"
 }
 ```
 
 The first request omits `previous_response_id` and sends the complete Chatend.
-Continuation IDs must be Codex UUID thread IDs. `prompt_cache_key` remains in
+A continuation sends only the newly appended suffix, formatted by the same
+canonical frontend formatter as the Full inspector. The backend passes this
+string to Codex without wrapping or reformatting it. Continuation IDs must be
+Codex UUID thread IDs. `prompt_cache_key` remains in
 the stable browser/backend contract but Codex manages caching per thread, so
 the bridge does not pass the key to the CLI.
+
+The frontend ends the string with
+`context window usage: {used-or-unknown} / {advertised-effective-limit}`.
+Usage comes from the latest completed provider response; fresh threads use
+`unknown`. The intelligence backend treats this terse line like every other
+part of the canonical plaintext and does not rewrite it.
 
 Successful responses contain:
 
@@ -186,7 +208,8 @@ Successful responses contain:
     "output_tokens": 80,
     "cached_tokens": 768,
     "cache_write_tokens": 0,
-    "reasoning_tokens": 30
+    "reasoning_tokens": 30,
+    "cumulative": true
   }
 }
 ```

@@ -25,10 +25,15 @@ The live parameters in the codebase may be materially different.
 has no persistent state, and relies on APIs to various backend services to get
 persistence between sessions.
 
-'Chatend' refers to the actual context that is being passed to LLMs.
-It includes one concise latency line per LLM/tool call and one final line with
+'Chatend' refers to the canonical human-readable application text that is
+passed to LLMs. The Full inspector displays that text using the same formatter;
+it is not a pretty-printed recovery object or a second approximation of what
+Kennedy sees. It includes one concise latency line per LLM/tool call and one final line with
 total and combined call time so Kennedy can reason about response latency
-without a repeated step list.
+without a repeated step list. Every request also ends with the terse line
+`context window usage: {used-or-unknown} / {advertised-effective-limit}`.
+A fresh or reset thread uses `unknown` rather than reusing the abandoned
+thread's number.
 
 'Backend' refers to any of the backend services that are providing APIs to the
 frontend.
@@ -170,17 +175,26 @@ that all of its active connections are also in the context. A call to LoadNode
 will fail if there are already 10 directly loaded nodes. The user's root and
 Kennedy's root are always directly loaded and share this limit; there is no
 fixed allocation between their graphs. Active-connection expansions do not
-count as direct loads.
+count as direct loads. LoadNode and ResetContext share a budget of 20 calls per
+conversation turn; either tool consumes one call, including failed calls.
 
 ### ResetContext
 
 ResetContext allows Kennedy to reset the context. The conversation history with
-the user will remain, but non-root Kmap context will be fully unloaded. Then,
-the user's root and Kennedy's root will be loaded automatically, followed by
-every node Kennedy passed to ResetContext. Neither root is passed explicitly,
-and at most eight other nodes may be retained.
+the user will remain, along with any notes to self Kennedy supplied during prior
+resets, but non-root Kmap context will be fully unloaded. Kennedy may optionally
+supply a non-empty note to self of at most 400,000 characters to preserve ideas
+that would otherwise fall out of context. The latest note is added after prior
+conversation history and reset notes. Then, the user's root and Kennedy's root
+will be loaded automatically, followed by every node Kennedy passed to
+ResetContext. Neither root is passed explicitly, and at most eight other nodes
+may be retained. Each reset consumes one call from the shared 20-call
+LoadNode/ResetContext budget; the automatic node loads inside it consume no
+additional calls. The rebuilt Chatend contains a compact history of every
+successful reset, grouped by the names of requested nodes so that
+Kennedy can recognize repeated exploration after short identifiers change.
 
-The call signature is ResetContext(shortIdentifier[])
+The call signature is ResetContext(shortIdentifier[], optional selfMessage)
 
 ### ConnectNodes
 
@@ -313,10 +327,11 @@ it is not part of any Kennedy tool signature.
 The conversation history backend durably stores active and completed
 conversation records separately from the kweb. Before the frontend sends a new
 user query to an LLM, it must save the query, pending-turn state, and a lossless
-versioned archive of the whole Chatend: system prompts, structured messages,
+versioned recovery archive of the whole Chatend: system prompts, structured messages,
 tool requests and results, loaded memory context, usage, and any serializable
 media content or attachment references. If that save fails, generation must
-not begin. Complete tool rounds are checkpointed while a turn is running.
+not begin. This JSON archive is a durability format and is never itself sent to
+Kennedy. Complete tool rounds are checkpointed while a turn is running.
 
 When the UI starts, it retrieves every durable conversation. Every active
 conversation is restored where it left off; if a last user query has no answer,
@@ -335,6 +350,9 @@ than 24 hours and the user successfully sends a message in a different
 conversation. Viewing, switching, or typing alone does not trigger the timeout,
 and a conversation never times out while Kennedy owes a response. Closed
 records move through ingress-pending, ingress-in-progress, and complete states.
+An ingress session that reaches five total failed outer attempts instead moves
+to a terminal failed state. Every attempt keeps a concise durable diagnostic,
+and terminal failures are not selected for automatic retry.
 
 History ingress is sequential: at most one record mutates the Kmap at a time,
 while all live conversations remain readable and writable. SQLite WAL permits
@@ -367,9 +385,9 @@ state are checkpointed again before another query is accepted.
 While the conversation session is ongoing, Kennedy may only call LoadNode,
 ResetContext, WebSearch, and WebFetch. Conversation sessions cannot mutate the
 Kmap. WebSearch and WebFetch are unavailable during history ingress. When the
-conversation session ends, the full archived Chatend—not merely the clean
-dialog—is turned into a history provenance node, and then a History Ingress
-session is called on that archive.
+conversation session ends, the complete recovery archive—not merely the clean
+dialog—is turned into a history provenance node. History Ingress then extracts
+the canonical Chatend message text from that archive.
 
 Starting a new conversation does not end existing live conversations.
 Conversations end when the user deliberately ends them, or by the 24-hour idle
@@ -411,8 +429,12 @@ supported; scanned/image-only PDFs report that OCR is required.
 ### History Ingress
 
 In a history ingress session, a history provenance node is created as the first
-part of the context. Then the user's root and Kennedy's root are loaded. Kennedy
-can call LoadNode up to 50 times during the session.
+part of the context. Its provenance data is parsed as a recovery archive, and
+only the archive's canonical human-readable message text is placed under
+`Archived Chatend`; the JSON envelope, media data URLs, counters, diagnostics,
+and other recovery bookkeeping are excluded. Then the user's root and
+Kennedy's root are loaded. Kennedy can call LoadNode or ResetContext up to 50
+times in aggregate during the session.
 
 Kennedy will update as many nodes as she feels is appropriate during the
 history ingress session. Zero updates is also valid. When Kennedy feels that
@@ -422,6 +444,13 @@ only from its archived conversation and available Kmap context. It may use
 ConnectNodes, ConsolidateFanout, AssignTask, CreateNode, and UpdateNode only
 when justified; task connections require a clear outstanding need for work to
 be completed.
+The entire logical history-ingress session is limited to 100 LLM rounds. This
+count survives checkpoints, retries, and ResetContext calls; ResetContext does
+not create a fresh allowance.
+The outer history-ingress worker permits five failed attempts total. It records
+the stage, error code/message, current round, and measured context usage when
+available. The fifth failure aborts the session, preserves the log for later
+inspection, and allows the queue to advance instead of retrying forever.
 
 ### Self Action
 
@@ -463,9 +492,9 @@ composer includes a microphone control and an editable paid transcription.
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from
 the conversation history backend. Live entries remain continuable and closed
-entries are read-only. Its full archived Chatend is restored into the inspector,
-and its complete history-ingress session is appended after the transcript as
-one continuous scrolling history.
+entries are read-only. Its canonical Chatend is reconstructed from archived
+messages in the inspector, and its complete history-ingress session is appended
+after the transcript as one continuous scrolling history.
 
 Closed conversations do not show a message textarea or conversation controls;
 the composer exists only for a selected live conversation.

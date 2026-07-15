@@ -6,8 +6,7 @@ pub(crate) const CODEX_EXECUTABLE: &str = "codex-safe";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const GENERATION_REASONING_EFFORT: &str = "xhigh";
 pub(crate) const GENERATION_TIMEOUT_SECONDS: u64 = 600;
-pub(crate) const CONTEXT_WINDOW_TOKENS: u64 = 1_050_000;
-pub(crate) const MAX_INPUT_TOKENS: u64 = 922_000;
+pub(crate) const DISABLED_AUTO_COMPACT_TOKEN_LIMIT: i64 = i64::MAX;
 
 pub(crate) const QUALITY_SEARCH_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const QUALITY_SEARCH_REASONING_EFFORT: &str = "xhigh";

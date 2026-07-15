@@ -13,15 +13,19 @@ and crate. It imports neither backend and calls neither backend.
 Each conversation record contains:
 
 - UUID conversation ID,
-- phase: `active`, `ingress_pending`, `ingress_in_progress`, or `complete`,
+- phase: `active`, `ingress_pending`, `ingress_in_progress`, `ingress_failed`,
+  or `complete`,
 - conversation start, last-update, last-user-message, and optional end times,
 - opaque JSON frontend state,
 - optional opaque Kweb provenance ID,
 - monotonically increasing version for optimistic concurrency.
+- durable history-ingress failure count and a concise JSON log of all attempts
+  (at most five), including timestamp, stage, code/message, model-round count,
+  and measured context occupancy when available.
 
 SQLite permits any number of `active` and `ingress_pending` records but at most
-one `ingress_in_progress` record. Completed records remain available as
-conversation history. A migration removes the older one-unfinished-record
+one `ingress_in_progress` record. Completed and failed records remain available
+as conversation history. A migration removes the older one-unfinished-record
 index; legacy rows receive null activity/end times and remain valid.
 
 A current startup also drops the obsolete singleton index idempotently even
@@ -42,6 +46,8 @@ null.
 
 ```text
 active -> ingress_pending -> ingress_in_progress -> complete
+             |               |
+             +---------------+-> ingress_failed (fifth failure)
 ```
 
 - Checkpoints may update only an `active` conversation.
@@ -57,6 +63,11 @@ active -> ingress_pending -> ingress_in_progress -> complete
 - The frontend creates or retrieves idempotent Kweb provenance, records its ID,
   and changes the selected record to `ingress_in_progress`.
 - Only successful history ingress changes the record to `complete`.
+- The frontend records a failed ingress attempt atomically. Attempts one
+  through four leave the record queued or in progress; attempt five changes it
+  to terminal `ingress_failed`, releases the single-worker slot, and excludes
+  the record from future queue selection. Failed records remain queryable with
+  their diagnostic logs.
 - New and existing active conversations are independent of this queue.
 - On frontend startup, records that have neither recorded user activity nor a
   user message in their stored conversation transcript are permanently
@@ -84,12 +95,16 @@ index serializes memory updates even when several conversations close together.
 - `POST /api/v1/conversations/{id}/ingress-started`
 - `PUT /api/v1/conversations/{id}/ingress-checkpoint`
 - `POST /api/v1/conversations/{id}/ingress-completed`
+- `POST /api/v1/conversations/{id}/ingress-failure`
 
 Create accepts `started_at` plus opaque `state`. Checkpoint accepts
 `expected_version`, `state`, and optional `user_activity`. The ingress queue
 endpoint returns `{ "conversation": null }` when empty. All successful
 record mutations return the complete updated record. Unstarted cleanup is
 idempotent and returns the count and IDs of discarded records.
+The failure endpoint accepts `expected_version`, stage, optional error code,
+message, round count, and optional context usage. It normalizes and bounds
+diagnostic text before atomically incrementing the attempt count.
 
 ## 5. Deployment and Isolation
 
@@ -106,4 +121,4 @@ repair of a v2 database containing the legacy singleton index, the
 single-ingress-worker invariant, 24-hour expiry plus pending-response and
 Telegram-session protection,
 structured archives, safe unstarted-record cleanup, and phase-restricted ingress
-checkpoints.
+checkpoints, plus terminal fifth-failure behavior and queue advancement.

@@ -1,4 +1,5 @@
-import { formatKmapContext } from "./human_format.js?v=20260714.7";
+import { formatKmapContext } from "./human_format.js?v=20260715.7";
+import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -51,7 +52,7 @@ export function renderTranscript(container, transcript, ingressActivity = null) 
     container.append(message);
   }
   if (ingressActivity?.diagnostic) {
-    renderIngressActivity(container, ingressActivity.diagnostic, ingressActivity.active);
+    renderIngressActivity(container, ingressActivity.diagnostic, ingressActivity.active, ingressActivity.failed, ingressActivity.failures);
   }
   container.scrollTop = wasAtBottom ? container.scrollHeight : previousTop;
 }
@@ -89,6 +90,7 @@ export function renderConversationHistory(container, records, { selectedId = nul
       active: "Live · Continue",
       ingress_pending: "Closed · Memory queued",
       ingress_in_progress: "Closed · Updating memory",
+      ingress_failed: "Closed · Memory failed",
       complete: "Saved · Read only",
     };
     const phase = phases[record.phase] || record.phase.replaceAll("_", " ");
@@ -117,11 +119,17 @@ export function conversationIngressActivity({ record, liveRecordId = null, liveD
   const saved = archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
     ? { chatend: { messages: archive.messages || [] }, usage: { snapshot: () => archive.usage || null }, toolLog: archive.tools?.log || [] }
     : null;
-  const diagnostic = record.id === liveRecordId && liveDiagnostic ? liveDiagnostic : saved;
+  const failed = record.phase === "ingress_failed";
+  const failures = Array.isArray(record.ingress_failures) ? record.ingress_failures : [];
+  const diagnostic = record.id === liveRecordId && liveDiagnostic
+    ? liveDiagnostic
+    : saved || (failed ? { chatend: { messages: [] }, usage: { snapshot: () => null }, toolLog: [] } : null);
   if (!diagnostic) return null;
   return {
     diagnostic,
     active: record.phase === "ingress_pending" || record.phase === "ingress_in_progress",
+    failed,
+    failures,
   };
 }
 
@@ -161,7 +169,6 @@ export function renderInspector(container, diagnostic, view = "full") {
 
 export function inspectorText(diagnostic, view = "full") {
   if (view === "memory") return formatKmapContext(diagnostic.memory || { directlyLoadedIdentifiers: [], nodes: [] });
-  const labels = { system: "System context", user: "David", assistant: "Kennedy" };
   let messages = diagnostic.chatend || [];
   if (view === "system") {
     const explicit = messages.filter(message => message.context_kind === "instructions");
@@ -180,10 +187,7 @@ export function inspectorText(diagnostic, view = "full") {
     });
     if (!messages.length) return "No tool calls are currently in the Chatend.";
   }
-  return messages
-    .filter(message => typeof message.content === "string" && message.content.trim())
-    .map(message => `${message.display_role || labels[message.role] || "Context"}\n\n${message.content.trim()}`)
-    .join("\n\n────────────────────────\n\n");
+  return formatChatend(messages, view === "full" ? diagnostic.usage : null);
 }
 
 function tokenCount(value) {
@@ -204,10 +208,14 @@ export function renderUsage(container, diagnostic) {
   }
   const contextPercent = usage.contextWindowTokens ? 100 * usage.contextTokens / usage.contextWindowTokens : 0;
   const cachePercent = usage.cacheReadPercent || 0;
-  const primary = usage.contextWindowTokens
+  const primary = usage.contextWindowTokens && usage.contextKnown === false
+    ? `Not yet measured / ${exactTokenCount(usage.contextWindowTokens)}`
+    : usage.contextWindowTokens
     ? `${exactTokenCount(usage.contextTokens)} / ${exactTokenCount(usage.contextWindowTokens)}`
     : `${exactTokenCount(usage.contextTokens)} used`;
-  const remaining = usage.contextRemaining === null ? "window unknown" : `${exactTokenCount(usage.contextRemaining)} remaining`;
+  const remaining = usage.contextKnown === false
+    ? "fresh thread"
+    : usage.contextRemaining === null ? "window unknown" : `${exactTokenCount(usage.contextRemaining)} remaining`;
   const text = element("div", "context-usage-text");
   text.append(
     element("strong", "context-usage-primary", primary),
@@ -322,17 +330,38 @@ function renderMemoryTree(container, snapshot) {
   }
 }
 
-export function renderIngressActivity(container, diagnostic, active) {
+export function renderIngressActivity(container, diagnostic, active, failed = false, failures = []) {
   const continuation = element("section", "ingress-continuation");
-  continuation.setAttribute("aria-label", active ? "History ingress in progress" : "Completed history ingress");
+  continuation.setAttribute("aria-label", failed ? "Failed history ingress" : active ? "History ingress in progress" : "Completed history ingress");
   const heading = element("div", "ingress-heading");
   const headingText = element("div");
   headingText.append(
     element("span", "eyebrow", "MEMORY UPDATE"),
-    element("strong", "", active ? "History ingress · live" : "History ingress · complete"),
+    element("strong", "", failed ? "History ingress · failed" : active ? "History ingress · live" : "History ingress · complete"),
   );
   heading.append(headingText);
   continuation.append(heading);
+  if (failures.length) {
+    const failureSection = element("section", "ingress-failures");
+    failureSection.append(
+      element("span", "eyebrow", failed ? "FAILURE LOG" : "RETRY LOG"),
+      element("strong", "", failed
+        ? `Stopped after ${failures.length} failed attempt${failures.length === 1 ? "" : "s"}`
+        : `${failures.length} failed attempt${failures.length === 1 ? "" : "s"} recorded`),
+    );
+    for (const failure of failures) {
+      const context = Number.isFinite(failure?.context_tokens) && Number.isFinite(failure?.context_window_tokens)
+        ? ` · context ${exactTokenCount(failure.context_tokens)}/${exactTokenCount(failure.context_window_tokens)}`
+        : "";
+      const rounds = Number.isFinite(failure?.rounds_used) ? ` · round ${failure.rounds_used}` : "";
+      failureSection.append(element(
+        "pre",
+        "ingress-failure-entry",
+        `Attempt ${failure?.attempt || "?"} · ${failure?.stage || "unknown"}${rounds}${context}\n${failure?.code || "ingress_error"}: ${failure?.message || "No error detail was recorded."}\n${failure?.occurred_at || "Time unavailable"}`,
+      ));
+    }
+    continuation.append(failureSection);
+  }
   const summary = ingressMutationSummary(diagnostic);
   const review = element("section", "ingress-summary");
   review.setAttribute("aria-label", "History ingress memory changes");

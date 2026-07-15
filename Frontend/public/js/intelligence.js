@@ -1,5 +1,8 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260715.1";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260715.7";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
+import { formatChatend } from "./chatend_format.js?v=20260715.9";
+
+export const AGENT_LOOP_ROUND_LIMIT = 100;
 
 export function createCacheKey(mode) {
   return `kennedy-${mode}-prompt-v3`;
@@ -32,24 +35,35 @@ export class UsageTracker {
     this.totalCacheWriteTokens = 0;
     this.totalReasoningTokens = 0;
     this.last = null;
+    this.providerThreadTotals = null;
   }
 
-  record(usage) {
+  record(usage, { continued = false } = {}) {
     this.requests += 1;
     if (!usage) return;
-    const normalized = {
+    const reported = {
       inputTokens: Number(usage.input_tokens) || 0,
       outputTokens: Number(usage.output_tokens) || 0,
       cachedTokens: Number(usage.cached_tokens) || 0,
       cacheWriteTokens: Number(usage.cache_write_tokens) || 0,
       reasoningTokens: Number(usage.reasoning_tokens) || 0,
     };
+    const previous = usage.cumulative === true && continued ? this.providerThreadTotals : null;
+    const normalized = previous
+      ? Object.fromEntries(Object.entries(reported).map(([key, value]) => [key, Math.max(0, value - (previous[key] || 0))]))
+      : reported;
+    this.providerThreadTotals = usage.cumulative === true ? reported : null;
     this.totalInputTokens += normalized.inputTokens;
     this.totalOutputTokens += normalized.outputTokens;
     this.totalCachedTokens += normalized.cachedTokens;
     this.totalCacheWriteTokens += normalized.cacheWriteTokens;
     this.totalReasoningTokens += normalized.reasoningTokens;
     this.last = normalized;
+  }
+
+  resetThread() {
+    this.last = null;
+    this.providerThreadTotals = null;
   }
 
   restore(snapshot) {
@@ -61,15 +75,18 @@ export class UsageTracker {
     this.totalCacheWriteTokens = Number(snapshot.totalCacheWriteTokens) || 0;
     this.totalReasoningTokens = Number(snapshot.totalReasoningTokens) || 0;
     this.last = snapshot.last && typeof snapshot.last === "object" ? { ...snapshot.last } : null;
+    this.providerThreadTotals = snapshot.providerThreadTotals && typeof snapshot.providerThreadTotals === "object" ? { ...snapshot.providerThreadTotals } : null;
   }
 
   snapshot() {
-    const contextTokens = this.last ? this.last.inputTokens + this.last.outputTokens : 0;
-    const contextRemaining = this.contextWindowTokens ? Math.max(0, this.contextWindowTokens - contextTokens) : null;
+    const contextKnown = Boolean(this.last);
+    const contextTokens = contextKnown ? this.last.inputTokens + this.last.outputTokens : 0;
+    const contextRemaining = contextKnown && this.contextWindowTokens ? Math.max(0, this.contextWindowTokens - contextTokens) : null;
     return {
       requests: this.requests,
       contextWindowTokens: this.contextWindowTokens,
       maxInputTokens: this.maxInputTokens,
+      contextKnown,
       contextTokens,
       contextRemaining,
       totalInputTokens: this.totalInputTokens,
@@ -79,6 +96,7 @@ export class UsageTracker {
       totalReasoningTokens: this.totalReasoningTokens,
       cacheReadPercent: this.totalInputTokens ? (100 * this.totalCachedTokens / this.totalInputTokens) : 0,
       last: this.last,
+      providerThreadTotals: this.providerThreadTotals,
     };
   }
 }
@@ -96,24 +114,26 @@ function protocolFailureMessage(error) {
   };
 }
 
-export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {} }) {
-  for (let round = 0; round < 100; round++) {
+export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {} }) {
+  for (let round = roundOffset; round < AGENT_LOOP_ROUND_LIMIT; round++) {
+    await onRoundStart(round + 1);
     const messages = continuation.requestMessages(chatend);
     if (messages.length === 0) throw new Error("Kennedy has no new context to continue from.");
     const llmStarted = performance.now();
     let response;
+    const continued = Boolean(continuation.previousResponseId);
     try {
       response = await intelligence.generate({
         provider,
         model,
-        messages,
+        chatend: formatChatend(messages, usage.snapshot()),
         previous_response_id: continuation.previousResponseId,
         prompt_cache_key: continuation.cacheKey,
       });
     } finally {
       addTimingStep(timing, "llm", "LLM call", elapsedMs(llmStarted));
     }
-    usage.record(response.usage);
+    usage.record(response.usage, { continued });
     const content = response.message?.content;
     if (response.status !== "complete" || typeof content !== "string") throw new Error("The intelligence service returned an invalid text generation.");
     chatend.append(response.message);
@@ -153,8 +173,9 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
         Number.isInteger(execution.durationMs) ? execution.durationMs : elapsedMs(toolStarted),
       );
       if (execution.reset) {
-        chatend.rebuildAfterReset(response.message, llmTimingMessage, execution.message);
+        chatend.rebuildAfterReset(execution.selfMessage, execution.resetHistoryEntry, response.message, llmTimingMessage, execution.message);
         continuation.reset();
+        usage.resetThread();
       } else {
         chatend.append(execution.message);
       }
@@ -164,5 +185,5 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     await checkpoint();
     addTimingStep(timing, "checkpoint", "Tool-round save", elapsedMs(checkpointStarted));
   }
-  throw new Error("Kennedy exceeded the 100-round tool-loop safety limit.");
+  throw new Error(`Kennedy exceeded the ${AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit.`);
 }

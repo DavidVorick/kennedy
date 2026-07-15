@@ -87,6 +87,7 @@ export const ConversationHistoryAPI = (base) => ({
   ingressStarted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-started`, { method: "POST", body: JSON.stringify(body) }),
   ingressCheckpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
   ingressCompleted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-completed`, { method: "POST", body: JSON.stringify(body) }),
+  ingressFailure: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-failure`, { method: "POST", body: JSON.stringify(body) }),
 });
 
 export const TelegramRelayAPI = (base) => ({

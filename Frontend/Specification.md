@@ -92,16 +92,19 @@ and their combined model-attribution value.
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. Instead it checkpoints an opaque recovery snapshot to
 the conversation history API. The versioned snapshot contains recovery fields
-plus a lossless JSON Chatend archive: composed system prompt, retained content,
-structured messages, structured Kmap snapshot and durable-ID diagnostics, tool
-log and counters, usage telemetry, and a media collection containing original
-voice recordings plus future serializable media or attachment references. Provider
-response IDs and credentials are transport details and are not archived.
+plus a lossless JSON recovery archive: composed system prompt, retained
+content, structured messages, structured Kmap snapshot and durable-ID
+diagnostics, tool log and counters, usage telemetry, and a media collection
+containing original voice recordings plus future serializable media or
+attachment references. This JSON is storage format, not Chatend text and never
+becomes a generation prompt. Provider response IDs and credentials are
+transport details and are not archived.
 
 The archive never projects message `content` to text. Arrays and objects are
 preserved recursively, so future multimodal content blocks survive storage
 even before every inspector has a renderer for that media type. Active records
-restore the exact archived Chatend on a fresh Codex thread. Legacy
+reconstruct the canonical Chatend from the archived messages on a fresh Codex
+thread. Legacy
 transcript-only snapshots remain readable and recover through the old rebuild
 path.
 
@@ -113,7 +116,12 @@ Draft text is not durable until submitted.
 
 ## 5. Chatend Model
 
-The chatend is the complete human-readable logical context Kennedy has formed.
+The Chatend is the canonical human-readable application prompt supplied to
+Kennedy. The Full inspector and generation path call the same formatter over
+the same current message list. Consequently the Full view shows the text sent
+for a fresh Codex thread exactly—role labels, separators, and content included;
+there is no hidden application-side JSON envelope or differently formatted
+prompt. Provider thread IDs and runtime protocol data are not Chatend content.
 It contains:
 
 - the composed system prompt,
@@ -122,16 +130,22 @@ It contains:
 - transparent text tool requests and readable tool results that remain in
   context.
 
-The frontend submits the entire chatend when starting a Codex thread. Later
-requests use `previous_response_id` as the Codex thread ID and submit only text
-appended after the referenced response. The frontend still retains and displays the
-whole logical chatend. System instructions are prose sections, Kmap context is
-YAML-like text, tool requests are ordinary assistant text, and local tool
-results are readable memory updates.
+Canonical formatting labels system messages `System context`, user messages
+`David`, and assistant messages `Kennedy` unless a message supplies a more
+specific visible role. Nonempty messages are separated by
+`────────────────────────`. The frontend submits the entire formatted Chatend
+when starting a Codex thread. Later requests use `previous_response_id` as the
+Codex thread ID and submit the canonically formatted newly appended suffix;
+the preceding Chatend is already in that provider thread. System instructions
+are prose sections, Kmap context is YAML-like text, tool requests are ordinary
+assistant text, and local tool results are readable memory updates.
 
 The clean transcript is maintained separately for the uncluttered conversation
-panel. Conversation provenance is created from the complete versioned Chatend
-archive rather than from that transcript.
+panel. Conversation provenance stores the complete versioned recovery archive
+rather than only that transcript. During history ingress the frontend parses
+the archive and canonically formats its `messages` array as the `Archived
+Chatend`; the archive object itself, media data URLs, counters, usage,
+diagnostics, and other recovery fields are not sent to Kennedy.
 
 ### 5.1 Context Rebuild
 
@@ -139,18 +153,30 @@ The frontend can rebuild a chatend from:
 
 1. the active system-prompt manuals,
 2. session content that must survive reset—the clean conversation transcript
-   for conversation sessions or provenance data for history ingress,
-3. freshly materialized Kweb context.
+   for conversation sessions or provenance data for history ingress—plus any
+   notes to self retained by earlier resets,
+3. one compact history of every successful ResetContext call,
+   grouped by retained node-name set and annotated with the shared context-load
+   budget position at the latest reset,
+4. the current reset's optional note to self,
+5. freshly materialized Kweb context, with mandatory roots before explicitly
+   requested nodes and active-connection expansions after direct loads.
 
 `ResetContext` first resolves all supplied short identifiers to durable IDs.
 It then clears loaded Kweb data and short-ID mappings, reloads the user and
-Kennedy roots followed by the supplied nodes, and rebuilds the chatend. Previous
-Kweb context and tool activity are omitted. The clean transcript or provenance
-input remains.
+Kennedy roots followed by the supplied nodes, and rebuilds the chatend. When a
+`selfMessage` is supplied, the frontend retains it as an assistant-role note
+immediately before the new Kweb context. Before that note, it places the compact
+ResetContext history. Node names are used because short identifiers are rebuilt
+by every reset; repeated node sets are collapsed into counted lines. Previous
+Kweb context and other tool activity are omitted. The clean transcript or
+provenance input and notes from prior resets remain.
 During an active tool loop, the rebuilt chatend ends with the assistant's
 visible ResetContext request and a readable result containing the newly loaded
 context. Reset abandons the old `previous_response_id` thread and submits the
-rebuilt chatend as a fresh request.
+rebuilt chatend as a fresh request. Because the Full inspector is formatted
+from that same rebuilt message list, removed nodes and tool results disappear
+from both the inspector and Kennedy's next fresh-thread prompt.
 
 ### 5.2 Continuation, caching, and context growth
 
@@ -161,10 +187,22 @@ the latest Codex thread ID, keeping unchanged prefixes eligible for Codex cache
 reads.
 
 The frontend aggregates provider-reported input, output, reasoning, cache-read,
-and cache-write tokens. Current context occupancy is the latest request's input
-plus output tokens; remaining capacity is computed from provider model metadata.
-These figures are informative and never trigger compaction, truncation, or an
-automatic reset. Only an explicit ResetContext tool request rebuilds context.
+and cache-write tokens. Codex reports cumulative thread usage, so continuation
+rounds are differenced before per-call and session totals are updated. Current
+context occupancy is the latest request's input plus output tokens; remaining
+capacity uses the effective context window that Codex advertises for the
+selected model. These figures are informative and never trigger compaction,
+truncation, or an automatic reset. Every Codex invocation suppresses automatic
+compaction; only an explicit ResetContext tool request rebuilds context.
+
+Every generation request ends with exactly one terse context clue:
+`context window usage: {used-or-unknown} / {advertised-effective-limit}`.
+The numbers use thousands separators and no token labels, percentages,
+remaining-token prose, or other explanation. A new, reset, or recovered fresh
+thread uses `unknown` rather than presenting usage from the abandoned thread.
+The Full inspector uses the same formatter and line. A known measurement comes
+from the previous completed response, so it does not include the newly appended
+suffix being submitted with it.
 
 The frontend also measures wall-clock latency at the browser boundary. Each LLM
 response is followed by one compact timing line, every tool result includes one
@@ -238,9 +276,9 @@ not add XML wrappers, JSON serialization, or duplicate behavioral instructions
 already present in the manuals. The identity establishes Kennedy's purpose and
 Kmap-based learning model. Mode manuals contain only mode mechanics, exact Kmap
 facts, and tool contracts; Kmap usage strategy belongs in Kennedy's own graph.
-The conversation manual also states the lifecycle fact that the complete
-archived Chatend is passed to read-write history ingress when the conversation
-ends, where learned information can be integrated into the Kmap.
+The conversation manual also states the lifecycle fact that the canonical
+human-readable Chatend text is retained for read-write history ingress when the
+conversation ends, where learned information can be integrated into the Kmap.
 
 After the selected mode manual, the composer adds a short dynamic runtime
 section stating the exact configured model and thinking mode. These values come
@@ -288,7 +326,8 @@ Text-protocol arguments:
 
 Execution:
 
-1. Reject the call if the session's LoadNode call budget is exhausted.
+1. Consume one call from the shared LoadNode/ResetContext context-loading
+   budget and reject the call if that budget is exhausted.
 2. Reject the call if ten nodes are already directly loaded.
 3. Resolve the short identifier.
 4. Call `GET /api/v1/nodes/{durable_id}/context`.
@@ -298,9 +337,11 @@ Execution:
 8. Convert the payload to in-context node shapes and return it as the tool
    result.
 
-Every model-requested LoadNode invocation consumes one call from the session or
-turn budget, including failed calls. Loads performed internally while starting
-or resetting a context do not consume that budget.
+Every model-requested LoadNode or ResetContext invocation consumes one call from
+the shared session or turn budget, including failed calls after basic argument
+validation. Loads performed internally while starting or resetting a context
+do not consume additional calls. Conversation turns receive 20 shared calls;
+history-ingress sessions receive 50.
 
 ### 8.2 `ResetContext`
 
@@ -308,7 +349,8 @@ Text-protocol arguments:
 
 ```json
 {
-  "identifiers": [3, 8]
+  "identifiers": [3, 8],
+  "selfMessage": "Ideas I need after this reset."
 }
 ```
 
@@ -317,8 +359,18 @@ both roots followed by the supplied nodes in their given order. Neither root
 may appear in the argument list, and the resulting direct-load set must not
 exceed ten nodes; therefore the argument list contains at most eight IDs.
 
-Reset preserves the current LoadNode counter. Its tool result contains the
-complete newly loaded Kweb context.
+`selfMessage` is optional. When present, it must be a non-empty string of at
+most 400,000 Unicode characters. A successful reset adds it to retained session
+content as an assistant-role note to self. The rebuilt order is prior retained
+history (including prior reset notes), compact ResetContext history, the latest
+note, the mandatory roots, the explicitly requested nodes, and then any
+active-connection expansions.
+
+Reset consumes one call from and preserves the current shared context-loading
+counter. A successful reset records the supplied nodes' names, the counter
+position, and limit. The Chatend keeps every successful entry and groups
+identical name sets irrespective of argument order. Its tool
+result contains the complete newly loaded Kweb context.
 
 ### 8.3 `ConnectNodes`
 
@@ -502,15 +554,16 @@ explorer remains usable.
 3. Checkpoint the pending query and recovery snapshot through the conversation
    history API with `user_activity: true`. If this fails, do not contact the
    LLM. The backend may atomically time out other eligible idle conversations.
-4. Submit newly appended messages, the previous response ID when available, a
-   stable session-type cache key, and the configured model to the intelligence
-   backend. The first request sends the complete chatend.
+4. Submit the canonical plaintext for newly appended messages, the previous
+   response ID when available, a stable session-type cache key, and the
+   configured model to the intelligence backend. The first request sends the
+   complete formatted Chatend.
 5. If Kennedy emits a tool envelope, append the visible assistant text, execute
    every call sequentially in array order, append readable result messages, and
    continue from the returned response ID. State changes from one call are
    visible to the next call in the same response.
    After every complete response-sized tool round, checkpoint the updated full
-   Chatend archive before requesting another model response.
+   recovery archive before requesting another model response.
 6. Continue until Kennedy returns final text.
 7. Append final text to the clean transcript and chatend and checkpoint the
    completed turn before accepting another query.
@@ -535,7 +588,7 @@ user explicitly ends the selected conversation:
    history record from `active` to `ingress_pending`,
 2. remove it from the set of continuable sessions and select another live
    conversation, or create one if none remains,
-3. serialize the complete versioned Chatend archive, including structured
+3. serialize the complete versioned recovery archive, including structured
    system, memory, tool, and media-capable message content,
 4. let the serialized ingress worker create or retrieve Kweb provenance using
    source `conversation`, the
@@ -547,9 +600,15 @@ user explicitly ends the selected conversation:
 7. only after success transition the history record to `complete`, then claim
    the next queued record.
 
-Any failure leaves the queued record retryable and does not disable live
-conversation submission. A same-origin browser lock and the backend's unique
-in-progress invariant prevent concurrent tabs from running two ingress workers.
+An ingress attempt failure is recorded through the conversation-history
+backend with its stage, normalized code/message, round count, and measured
+context occupancy. The outer worker retries the same logical session at most
+four times. The fifth total failure transitions the record to
+`ingress_failed`, excludes it from queue selection, releases the serialized
+worker for the next record, and leaves its complete diagnostic log visible on
+the conversation. These failures do not disable live conversation submission.
+A same-origin browser lock and the backend's unique in-progress invariant
+prevent concurrent tabs from running two ingress workers.
 
 An active conversation also moves to `ingress_pending` when it has been idle
 for more than 24 hours and the user successfully sends a message in a different
@@ -563,7 +622,10 @@ conversation's Kweb tool history.
 
 1. Fetch `GET /api/v1/provenance/{provenance_id}` from the Kweb backend.
 2. Compose history-ingress instructions.
-3. place the provenance data into the retained session content,
+3. parse the provenance's durable recovery archive and place the canonically
+   formatted `messages` text into retained session content under `Archived
+   Chatend`; do not place the serialized archive or its non-message fields into
+   model context,
 4. load the user and Kennedy roots,
 5. set the session LoadNode counter to zero,
 6. generate with the ingress manual describing the memory navigation and
@@ -579,8 +641,17 @@ and provider-reported reasoning effort. The combined attribution format is
 derived ephemerally by the frontend and sent only to the Kweb mutation API; it
 is not Chatend state and is never exposed as a model-controlled tool argument.
 
-At most 50 model-requested LoadNode calls are allowed across the whole ingress
-session. Zero CreateNode or UpdateNode calls is valid.
+At most 50 model-requested LoadNode/ResetContext calls are allowed across the
+whole ingress session. The agent loop also permits at most 100 model rounds
+across the whole logical ingress session. The current round count is
+checkpointed before each call and restored after retry; ResetContext starts a
+fresh Codex thread but does not reset either session-wide limit. Zero
+CreateNode or UpdateNode calls is valid.
+
+Provider, checkpoint, provenance, and completion errors count toward the same
+five-attempt outer-session failure allowance. Each retry restores the last
+durable ingress archive; reaching the fifth failure aborts instead of scheduling
+the record again.
 
 ## 11. User Interface
 
@@ -625,7 +696,10 @@ attempts do not increment the totals.
 
 ### 11.2 Context Inspector
 
-The right panel has four views of Kennedy's current chatend:
+The right panel has four views of Kennedy's current chatend. The Full view uses
+the exact same canonical formatter and current messages as generation; it is
+not a rendering of the recovery JSON and does not hide application prompt
+content:
 
 - **Full view** shows system context, conversation, transparent JSON tool
   envelopes, readable tool results, and loaded Kmap context.
@@ -639,15 +713,21 @@ The right panel has four views of Kennedy's current chatend:
   in through active connections, task connections, and fanout references whose
   summaries alone are visible.
 
-Provider response IDs and credentials are omitted. Copy View copies exactly
-the text representation of the selected view.
+While the selected record is actively undergoing history ingress, the Full
+inspector switches to that ingress Chatend so its final context-progress line
+matches the text being sent to Kennedy.
+
+Provider response IDs and credentials are omitted because they are not part of
+the application Chatend. Copy View copies exactly the text representation of
+the selected view.
 
 The right side of the Chatend header reports current logical context occupancy,
 the model context-window size, exact remaining tokens, and the percentage of
 input tokens served by prompt-cache reads. Hover details include cumulative
 input/output tokens, cache-read tokens, and cache-write tokens. Values come
 from provider usage rather than client-side token estimates; before the first
-provider response the configured model limit supplies the empty-window size.
+provider response occupancy is explicitly unmeasured while the advertised
+effective limit remains visible.
 
 ### 11.3 Memory Explorer
 
@@ -736,12 +816,21 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - stable short-ID assignment and reset,
 - two-root initialization and reset survival,
 - ten-direct-load enforcement,
-- conversation and ingress LoadNode budgets,
+- conversation and ingress shared LoadNode/ResetContext budgets,
 - parsing and sequential execution of multiple text tool calls from one round,
-- continuation requests sending only newly appended messages,
+- canonical plaintext identity between generation requests and the Full
+  inspector, including archived Chatend ingress without recovery JSON,
+- continuation requests sending only canonically formatted newly appended
+  messages,
 - cache read/write and context-window telemetry aggregation,
 - short-to-durable translation for every tool,
 - chatend rebuilding after ResetContext,
+- optional ResetContext note retention, ordering, and 400,000-character cap,
+- compact, complete, restorable ResetContext history with duplicate grouping,
+- non-resetting 100-round history-ingress safety across checkpoints and retries,
+- model-visible final context progress using exact previous-response usage and
+  fresh-thread stale-usage clearing,
+- durable five-attempt ingress failure logs and terminal queue advancement,
 - clean-transcript serialization,
 - checkpoint-before-generation ordering and pending-query recovery,
 - lossless full-Chatend persistence, including structured media content,

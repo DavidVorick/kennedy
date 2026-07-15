@@ -1,20 +1,15 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, TelegramRelayAPI } from "./api.js?v=20260715.2";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, TelegramRelayAPI } from "./api.js?v=20260715.8";
 import { loadPromptManuals } from "./prompt_composer.js?v=20260714.7";
-import { ConversationSession } from "./conversation.js?v=20260715.2";
-import { runHistoryIngress } from "./history_ingress.js?v=20260715.1";
+import { ConversationSession } from "./conversation.js?v=20260715.9";
+import { runHistoryIngress } from "./history_ingress.js?v=20260715.9";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260715.3";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260715.9";
 
 const CONFIG = {
   kwebBase: window.location.origin,
   intelligenceBase: "http://127.0.0.1:4322",
   conversationHistoryBase: "http://127.0.0.1:4323",
   telegramRelayBase: "http://127.0.0.1:4324",
-};
-
-const MODEL_LIMITS = {
-  "gpt-5.6": { contextWindowTokens: 1050000, maxInputTokens: 922000 },
-  "gpt-5.6-sol": { contextWindowTokens: 1050000, maxInputTokens: 922000 },
 };
 
 const ui = Object.fromEntries([
@@ -58,6 +53,7 @@ let attachmentDrafts = new Map();
 let extractingAttachments = new Set();
 let telegramBridgeRunning = false;
 let telegramInFlight = new Set();
+const INGRESS_FAILURE_LIMIT = 5;
 
 function sessionTypeOf(record) {
   return record?.state?.sessionType || record?.state?.archive?.sessionType || "conversation";
@@ -79,6 +75,18 @@ function selectedSession() {
 function diagnostic() {
   const record = selectedRecord();
   const session = selectedSession();
+  if (record?.id === activeIngressRecord?.id && ingressDiagnostic) {
+    return {
+      mode: "history ingress", provider, model,
+      chatend: ingressDiagnostic.chatend?.messages || [],
+      context: ingressDiagnostic.context?.diagnostics?.() || {},
+      loadCalls: ingressDiagnostic.executor?.loadCalls || 0,
+      loadLimit: ingressDiagnostic.executor?.loadLimit || 50,
+      toolLog: ingressDiagnostic.executor?.toolLog || [],
+      usage: ingressDiagnostic.usage?.snapshot?.() || null,
+      memory: ingressDiagnostic.context?.snapshot?.() || { directlyLoadedIdentifiers: [], nodes: [] },
+    };
+  }
   if (record && record.phase !== "active") {
     const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
     const archive = record.state?.archive?.format === "kennedy-chatend" ? record.state.archive : null;
@@ -752,65 +760,122 @@ function startTelegramBridge() {
   Promise.resolve(work).catch(error => console.error("Telegram bridge stopped", error));
 }
 
+function ingressFailureMetrics(record) {
+  const live = activeIngressRecord?.id === record.id ? ingressDiagnostic : null;
+  const archived = record.state?.historyIngress;
+  const usage = live?.usage?.snapshot?.() || archived?.usage || null;
+  const roundCandidates = [live?.roundsUsed, archived?.roundsUsed].filter(Number.isInteger);
+  return {
+    rounds_used: roundCandidates.length ? Math.max(...roundCandidates) : null,
+    context_tokens: Number.isFinite(usage?.contextTokens) ? usage.contextTokens : null,
+    context_window_tokens: Number.isFinite(usage?.contextWindowTokens) ? usage.contextWindowTokens : null,
+  };
+}
+
+async function recordIngressAttemptFailure(record, error, stage) {
+  const latest = await conversationHistory.get(record.id);
+  if (!["ingress_pending", "ingress_in_progress"].includes(latest.phase)) return latest;
+  return conversationHistory.ingressFailure(latest.id, {
+    expected_version: latest.version,
+    stage,
+    code: typeof error?.code === "string" ? error.code : "ingress_error",
+    message: typeof error?.message === "string" ? error.message : "History ingress failed without an error message.",
+    ...ingressFailureMetrics(latest),
+  });
+}
+
 async function processIngressQueue() {
   while (true) {
     let record = (await conversationHistory.nextIngress()).conversation;
     if (!record) return;
+    let stage = "prepare";
     activeIngressRecord = record;
     ingressDiagnostic = null;
     upsertHistory(record);
     update();
-    if (record.phase === "ingress_pending") {
-      const archive = record.state?.archive;
-      if (archive?.format !== "kennedy-chatend") throw new Error("The queued conversation is missing its durable Chatend archive.");
-      const provenance = await kweb.createProvenance({
-        data: JSON.stringify(archive, null, 2),
-        source: archive.sessionType === "telegram" ? "telegram" : "conversation",
-        source_created_at: record.started_at,
-        idempotency_key: `${archive.sessionType === "telegram" ? "telegram" : "conversation"}:${record.id}`,
-      });
-      try {
-        record = await conversationHistory.ingressStarted(record.id, { expected_version: record.version, provenance_id: provenance.id });
-      } catch (error) {
-        if (error.code === "state_conflict") {
-          await refreshHistory();
-          continue;
-        }
-        throw error;
-      }
-      activeIngressRecord = record;
-      upsertHistory(record);
-      update();
-    }
-    if (record.phase === "ingress_in_progress") {
-      if (!record.provenance_id) throw new Error("The queued conversation is missing its history provenance.");
-      const persistIngress = async archive => {
-        const state = { ...record.state, historyIngress: archive };
+    try {
+      if (record.phase === "ingress_pending") {
+        const archive = record.state?.archive;
+        if (archive?.format !== "kennedy-chatend") throw new Error("The queued conversation is missing its durable Chatend archive.");
+        stage = "provenance";
+        const provenance = await kweb.createProvenance({
+          data: JSON.stringify(archive, null, 2),
+          source: archive.sessionType === "telegram" ? "telegram" : "conversation",
+          source_created_at: record.started_at,
+          idempotency_key: `${archive.sessionType === "telegram" ? "telegram" : "conversation"}:${record.id}`,
+        });
+        stage = "claim";
         try {
-          record = await conversationHistory.ingressCheckpoint(record.id, { expected_version: record.version, state });
+          record = await conversationHistory.ingressStarted(record.id, { expected_version: record.version, provenance_id: provenance.id });
         } catch (error) {
-          if (error.code !== "state_conflict") throw error;
-          const latest = await conversationHistory.get(record.id);
-          if (latest.phase !== "ingress_in_progress" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
-          record = latest;
+          if (error.code === "state_conflict") {
+            await refreshHistory();
+            continue;
+          }
+          throw error;
         }
         activeIngressRecord = record;
         upsertHistory(record);
         update();
-      };
-      await runHistoryIngress({
-        kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
-        provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
-        sourceSessionType: record.state?.archive?.sessionType || "conversation",
-        restoredArchive: record.state?.historyIngress,
-        checkpoint: persistIngress,
-        onUpdate: value => { ingressDiagnostic = value; update(); },
+      }
+      if (record.phase === "ingress_in_progress") {
+        stage = "model_loop";
+        if (!record.provenance_id) throw new Error("The queued conversation is missing its history provenance.");
+        const persistIngress = async archive => {
+          const state = { ...record.state, historyIngress: archive };
+          try {
+            record = await conversationHistory.ingressCheckpoint(record.id, { expected_version: record.version, state });
+          } catch (error) {
+            if (error.code !== "state_conflict") throw error;
+            const latest = await conversationHistory.get(record.id);
+            if (latest.phase !== "ingress_in_progress" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
+            record = latest;
+          }
+          activeIngressRecord = record;
+          upsertHistory(record);
+          update();
+        };
+        await runHistoryIngress({
+          kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
+          provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+          sourceSessionType: record.state?.archive?.sessionType || "conversation",
+          restoredArchive: record.state?.historyIngress,
+          checkpoint: persistIngress,
+          onUpdate: value => { ingressDiagnostic = value; update(); },
+        });
+        ingressDiagnostic = null;
+        stage = "completion";
+        record = await conversationHistory.ingressCompleted(record.id, { expected_version: record.version });
+        upsertHistory(record);
+        activeIngressRecord = null;
+        await refreshHistory();
+      }
+    } catch (error) {
+      const failedRecord = await recordIngressAttemptFailure(record, error, stage);
+      upsertHistory(failedRecord);
+      console.error("History ingress attempt failed", {
+        conversationId: record.id,
+        stage,
+        attempt: failedRecord.ingress_failure_count,
+        limit: INGRESS_FAILURE_LIMIT,
+        terminal: failedRecord.phase === "ingress_failed",
+        error,
       });
-      ingressDiagnostic = null;
-      record = await conversationHistory.ingressCompleted(record.id, { expected_version: record.version });
-      upsertHistory(record);
-      activeIngressRecord = null;
-      await refreshHistory();
+      if (failedRecord.phase === "ingress_failed") {
+        ingressDiagnostic = null;
+        activeIngressRecord = null;
+        ui.service_status.textContent = "Memory ingestion failed";
+        showError(ui.error_banner, `History ingress stopped after ${failedRecord.ingress_failure_count} failed attempts. Select the conversation to inspect its failure log.`);
+        await refreshHistory();
+        continue;
+      }
+      if (!["ingress_pending", "ingress_in_progress"].includes(failedRecord.phase)) {
+        activeIngressRecord = null;
+        await refreshHistory();
+        continue;
+      }
+      const failureMessage = failedRecord.ingress_failures?.at?.(-1)?.message || "No error detail was recorded.";
+      throw new Error(`History ingress attempt ${failedRecord.ingress_failure_count}/${INGRESS_FAILURE_LIMIT} failed during ${stage}: ${failureMessage}`);
     }
   }
 }
@@ -879,12 +944,13 @@ async function initialize() {
     const selected = providers.providers.find(item => item.name === provider);
     model = selected.default_model;
     reasoningEffort = selected.reasoning_effort;
-    inputModalities = selected.model_capabilities?.[model]?.input_modalities || selected.input_modalities || ["text"];
+    const modelCapabilities = selected.model_capabilities?.[model] || {};
+    inputModalities = modelCapabilities.input_modalities || selected.input_modalities || ["text"];
     transcriptionAvailable = Boolean(selected.transcription_available);
     if (typeof reasoningEffort !== "string" || !reasoningEffort) throw new Error("The intelligence service did not provide the model thinking mode.");
-    const fallbackLimits = MODEL_LIMITS[model] || {};
-    contextWindowTokens = selected.context_window_tokens || fallbackLimits.contextWindowTokens || 0;
-    maxInputTokens = selected.max_input_tokens || fallbackLimits.maxInputTokens || 0;
+    contextWindowTokens = Number(modelCapabilities.context_window_tokens ?? selected.context_window_tokens) || 0;
+    maxInputTokens = Number(modelCapabilities.max_input_tokens ?? selected.max_input_tokens) || 0;
+    if (contextWindowTokens <= 0 || maxInputTokens <= 0) throw new Error("The intelligence service did not provide the model's advertised effective context window.");
     historyRecords = (await conversationHistory.list()).conversations || [];
     const activeRecords = historyRecords.filter(record => record.phase === "active");
     for (const record of activeRecords) await buildConversation(record);

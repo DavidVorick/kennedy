@@ -8,7 +8,7 @@ browser-native frontend:
 - `kennedy-intelligence` is a local Codex bridge with thread continuation,
   token/cache telemetry, web research, and safe public page extraction.
 - `kennedy-conversation-history` checkpoints active conversations and durably
-  stores complete conversation and history-ingress Chatend archives, with
+  stores complete conversation and history-ingress recovery archives, with
   multiple live conversations and a serialized history-ingress queue.
 - `kennedy-telegram-relay` uses `teloxide` to queue authorized Telegram text,
   voice, document, and reset events while the browser remains the visible Chatend owner.
@@ -39,6 +39,23 @@ a terminal. Kennedy logs one duration for the complete LLM call and fails
 prompt forwarding after 30 seconds rather than hanging silently. Tool calls and
 complete user turns have their own concise duration logs and matching Chatend
 latency entries.
+
+The UI's Full Chatend inspector and generation path share one plaintext
+formatter: what the Full inspector shows is the application prompt supplied to
+Kennedy, not a formatted JSON archive. Versioned JSON archives exist only for
+recovery and provenance storage. History ingress parses an archive and sends
+its human-readable message text under `Archived Chatend`; it does not send the
+archive envelope, media blobs, counters, or diagnostics.
+
+The launcher must also forward `codex-safe debug models`. Kennedy discovers the
+configured model's advertised effective context window at startup and refuses
+to invent a fallback. All Codex turns set the auto-compaction threshold beyond
+any reachable window so Kmap context is not silently compacted.
+Each model-facing Chatend ends with the terse line
+`context window usage: {used-or-unknown} / {advertised-effective-limit}`.
+History ingress
+records up to five concise failure diagnostics, then marks the conversation's
+memory update failed and advances the queue instead of retrying indefinitely.
 
 Kennedy has no runtime configuration file. Stable provider, model, search,
 audio, and safety defaults are compiled into the codebase. Deployment-specific
@@ -100,8 +117,8 @@ disabled and the rest of Kennedy remains usable.
 The compiled defaults use `gpt-5.6-sol` with `xhigh` reasoning effort and
 execute each turn through `codex-safe`, which invokes non-interactive
 `codex exec` inside Podman. If the deployment needs another compatible model,
-change the provider constants and model limits in
-`IntelligenceBackend/src/defaults.rs` together.
+change the provider model constants in `IntelligenceBackend/src/defaults.rs`;
+the usable context window is always read from Codex's advertised metadata.
 
 ## Editing Kennedy
 

@@ -6,9 +6,12 @@ canonical documents; this file is not an append-only log.
 
 ## Chatend and Inspector
 
-- The chatend is the complete, human-readable logical context Kennedy forms for
-  the LLM. The main UI's right-hand inspector visualizes this mental context,
-  rather than provider payloads or transport diagnostics.
+- The Chatend is the canonical human-readable text supplied to Kennedy. The
+  Full inspector and the intelligence request use the same formatter, so the
+  Full view shows the application prompt text Kennedy receives rather than an
+  approximation, a JSON serialization, or transport diagnostics. A durable
+  "Chatend archive" is a separate versioned recovery object; it is never sent
+  to Kennedy as JSON.
 - Show readable system and conversation text, memory context, Kennedy's
   ordinary-text JSON tool requests, and readable tool results. Hide provider
   response IDs, credentials, and non-context bookkeeping.
@@ -61,6 +64,11 @@ canonical documents; this file is not an append-only log.
 - Reuse Codex threads and report cache reads where Codex exposes them. Do not
   automatically compact or reset context; resets remain under user or Kennedy
   control.
+- Discover each configured model's effective context window from Codex's
+  advertised model metadata at startup and fail closed when it is unavailable.
+  Do not substitute a locally invented window. Set Codex's documented
+  auto-compaction threshold beyond any reachable context for every Kennedy
+  generation so a provider thread cannot silently compact Kmap material.
 - Return actionable, sanitized provider errors, including request IDs when
   useful, without exposing credentials or other sensitive provider data.
 - Keep operational logs concise and action-oriented. Emit one timed log line
@@ -89,6 +97,12 @@ canonical documents; this file is not an append-only log.
   future serializable media blocks or attachment references. Use a versioned
   lossless JSON archive, restore it exactly, and store that complete archive as
   conversation provenance for history ingress.
+- In history ingress, parse that durable recovery archive and place only its
+  canonical human-readable `messages` text under `Archived Chatend`. Never
+  expose the archive's JSON envelope, media data URLs, counters, diagnostics,
+  or other recovery bookkeeping to Kennedy. ResetContext rebuilds this text as
+  well as the Full inspector, so removed Kmap nodes and tool results disappear
+  from both.
 - Kennedy has three logically separate backends: Kweb, intelligence, and
   conversation history. They are independent services with separate APIs,
   listeners, state, and databases and must not call or access one another. They
@@ -182,10 +196,29 @@ canonical documents; this file is not an append-only log.
   Active-connection expansions do not count as direct loads, and existing
   per-turn/session LoadNode request budgets remain enforced.
 - Tell Kennedy in the conversation-mode manual that completing a conversation
-  passes its entire archived Chatend to the separate read-write history-ingress
-  mode, which can integrate anything learned during that conversation.
+  retains the human-readable Full-inspector Chatend text for the separate
+  read-write history-ingress mode, which can integrate anything learned during
+  that conversation. The durability archive around it is not model input.
 - Expose both the user root and Kennedy root as direct navigation options in the
   frontend memory explorer.
+- Let Kennedy optionally pass `selfMessage` to `ResetContext`, capped at 400,000
+  characters. Preserve successful reset notes as assistant-role conversation
+  messages across later resets, ordered after earlier history and before the
+  mandatory roots and explicitly retained nodes. Count each ResetContext as one
+  call against the same 20-call conversation-turn or 50-call ingress-session
+  budget as LoadNode. Keep a compact Chatend history of every successful reset,
+  grouping duplicate retained-node name sets so Kennedy can
+  recognize loops despite short-ID reassignment.
+- Keep the 100-model-round history-ingress safety limit cumulative across
+  checkpoints and retries. A reset starts a fresh provider thread but does not
+  reset that session-wide guard.
+- Give the outer history-ingress worker five failed attempts for one logical
+  session. Persist every concise failure diagnostic and, on the fifth, move the
+  record to a terminal failed state that is excluded from the retry queue.
+- End every model-facing Chatend request with one terse line:
+  `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
+  The Full inspector uses the same line. Do not add percentages, remaining-token
+  prose, or explanatory wording to this recurring clue.
 
 ## Automatic Model Attribution
 

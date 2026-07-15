@@ -1,29 +1,25 @@
-import { Chatend } from "./chatend.js?v=20260715.1";
+import { Chatend } from "./chatend.js?v=20260715.7";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
-import { ToolExecutor } from "./tools.js?v=20260715.1";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.1";
+import { ToolExecutor } from "./tools.js?v=20260715.7";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.9";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
+import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
 function modelReadableProvenance(data) {
+  let archive;
   try {
-    const archive = JSON.parse(data);
-    if (Array.isArray(archive?.media)) {
-      archive.media = archive.media.map(item => {
-        if (!item || typeof item !== "object" || typeof item.dataUrl !== "string") return item;
-        const { dataUrl: _archivedBytes, ...metadata } = item;
-        const mediaKind = item.kind === "document" ? "document" : "audio";
-        return { ...metadata, archivedOriginal: `Original ${mediaKind} retained in provenance; binary data omitted from model context.` };
-      });
-    }
-    return JSON.stringify(archive, null, 2);
+    archive = JSON.parse(data);
   } catch {
-    return data;
+    if (typeof data === "string" && data.trim()) return data.trim();
+    throw new Error("Conversation provenance does not contain a valid archived Chatend.");
   }
+  if (!Array.isArray(archive?.messages)) throw new Error("Conversation provenance does not contain a valid archived Chatend.");
+  return formatChatend(archive.messages, archive.usage || null);
 }
 
 export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
@@ -36,7 +32,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     `Source: ${provenance.source}`,
     `Created: ${provenance.source_created_at}`,
     "",
-    "Archived Chatend (JSON)",
+    "Archived Chatend",
     "",
     modelReadableProvenance(provenance.data),
   ].join("\n") }];
@@ -58,8 +54,10 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   const continuation = new ContinuationState(createCacheKey("ingress"));
   const usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
   usage.restore(archive?.usage);
+  if (archive && !archive.completed) usage.resetThread();
   let completed = Boolean(archive?.completed);
-  const snapshot = () => ({ chatend, context, executor, continuation, usage, completed });
+  let roundsUsed = Number.isInteger(archive?.roundsUsed) ? archive.roundsUsed : Number(archive?.usage?.requests) || 0;
+  const snapshot = () => ({ chatend, context, executor, continuation, usage, completed, roundsUsed });
   const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, modelAttribution, provenanceId, loadLimit: 50, sessionType: "history-ingress", onUpdate: () => onUpdate(snapshot()) });
   if (archive?.tools) {
     executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
@@ -88,6 +86,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
       log: jsonCopy(executor.toolLog),
     },
     usage: jsonCopy(usage.snapshot()),
+    roundsUsed,
     media: [],
   });
   onUpdate(snapshot());
@@ -99,6 +98,12 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
         intelligence, provider, model, chatend, executor, continuation, usage, timing,
         onUpdate: () => onUpdate(snapshot()),
         checkpoint: () => checkpoint(archiveSnapshot()),
+        roundOffset: roundsUsed,
+        onRoundStart: async currentRound => {
+          roundsUsed = currentRound;
+          onUpdate(snapshot());
+          await checkpoint(archiveSnapshot());
+        },
       });
       completed = true;
       onUpdate(snapshot());

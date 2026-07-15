@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
-import { ToolExecutor, parseToolCalls } from "../public/js/tools.js";
+import { MAX_RESET_SELF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText } from "../public/js/render.js";
@@ -13,6 +13,7 @@ import { formatKmapContext } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
+import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -88,6 +89,29 @@ test("conversation history client permanently discards unstarted records", async
   assert.equal(request.options.method, "DELETE");
 });
 
+test("conversation history client records ingress failures durably", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ phase: "ingress_failed", ingress_failure_count: 5 }),
+    };
+  };
+  try {
+    await ConversationHistoryAPI("http://history").ingressFailure("conversation", {
+      expected_version: 9, stage: "model_loop", code: "provider_error", message: "Context exhausted.",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(request.url, "http://history/api/v1/conversations/conversation/ingress-failure");
+  assert.equal(request.options.method, "POST");
+  assert.match(request.options.body, /"stage":"model_loop"/);
+});
+
 test("Kmap snapshot distinguishes direct loads from active expansions", async () => {
   const context = new KwebContext(new MockKweb([node(1, [2]), node(2)]), id(1));
   await context.initialize();
@@ -137,8 +161,45 @@ test("LoadNode attempts consume the tool budget, including failures", async () =
   const first = await executor.execute({ id: "a", name: "LoadNode", arguments: { identifier: 999 } });
   assert.match(first.message.content, /Unknown memory identifier 999/);
   const second = await executor.execute({ id: "b", name: "LoadNode", arguments: { identifier: 2 } });
-  assert.match(second.message.content, /LoadNode budget of 1 is exhausted/);
+  assert.match(second.message.content, /Context-loading budget of 1 is exhausted/);
   assert.equal(executor.loadCalls, 2);
+});
+
+test("ResetContext and LoadNode share one context-loading budget", async () => {
+  const api = new MockKweb([node(1)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 2 });
+  const reset = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [] } });
+  assert.equal(reset.reset, true);
+  assert.deepEqual(reset.resetHistoryEntry, { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 2 });
+  const failedLoad = await executor.execute({ id: "load", name: "LoadNode", arguments: { identifier: 999 } });
+  assert.match(failedLoad.message.content, /Unknown memory identifier 999/);
+  const exhausted = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [] } });
+  assert.equal(exhausted.reset, false);
+  assert.match(exhausted.message.content, /Context-loading budget of 2 is exhausted/);
+  assert.equal(executor.loadCalls, 3);
+});
+
+test("ResetContext accepts an optional bounded self-message", async () => {
+  const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
+  const executor = new ToolExecutor({ mode: "conversation", context, api: context.api, loadLimit: 20 });
+  const selfMessage = ` ${"x".repeat(MAX_RESET_SELF_MESSAGE_CHARACTERS - 2)} `;
+  const accepted = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [], selfMessage } });
+  assert.equal(accepted.reset, true);
+  assert.equal(accepted.selfMessage, selfMessage);
+  assert.deepEqual(accepted.resetHistoryEntry, { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 20 });
+
+  const omitted = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [] } });
+  assert.equal(omitted.reset, true);
+  assert.equal(omitted.selfMessage, null);
+
+  const tooLong = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [], selfMessage: `${selfMessage}x` } });
+  assert.equal(tooLong.reset, false);
+  assert.match(tooLong.message.content, /selfMessage must contain between 1 and 400000 characters/);
+  const tooLongAfterTrimming = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [], selfMessage: `${selfMessage} ` } });
+  assert.equal(tooLongAfterTrimming.reset, false);
+  const empty = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [], selfMessage: "   " } });
+  assert.equal(empty.reset, false);
 });
 
 test("ConnectNodes translates short IDs to durable IDs", async () => {
@@ -267,16 +328,57 @@ test("web tools reject extra retrieval knobs and remain unavailable during ingre
   assert.match(unavailable.message.content, /only available during a live conversation/);
 });
 
-test("chatend reset retains clean session messages and drops old tool activity", async () => {
-  const api = new MockKweb([node(1)]); const context = new KwebContext(api, id(1)); await context.initialize();
+test("chatend reset orders retained self-messages before roots and requested nodes", async () => {
+  const api = new MockKweb([node(1, [3]), node(2), node(3), node(4)]); const context = new KwebContext(api, [id(1), id(2)]); await context.initialize();
+  await context.reset([id(4), id(3)]);
   const chatend = new Chatend("instructions", context, [{ role: "user", content: "hello" }]);
   chatend.append({ role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' });
-  const resetCall = { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}' };
+  const resetCall = { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[4,3],"selfMessage":"latest ideas"}}]}' };
   const resetResult = { role: "user", display_role: "Memory tool result", content: "Memory context reset completed." };
-  chatend.rebuildAfterReset(resetCall, resetResult);
+  chatend.rebuildAfterReset("earlier ideas", { retainedNodeNames: ["Node 4", "Node 3"], budgetUsed: 1, budgetLimit: 20 }, resetCall, resetResult);
+  chatend.append({ role: "assistant", content: "discard this tool activity" });
+  chatend.rebuildAfterReset("latest ideas", { retainedNodeNames: ["Node 3", "Node 4"], budgetUsed: 2, budgetLimit: 20 }, resetCall, resetResult);
   assert.equal(chatend.messages.some(message => message.content?.includes('"LoadNode"')), false);
-  assert.equal(chatend.messages.some(message => message.content === "hello"), true);
+  assert.deepEqual(chatend.messages.slice(1, 6).map(message => message.display_role || message.content), [
+    "hello",
+    "Kennedy note to self",
+    "ResetContext history",
+    "Kennedy note to self",
+    "Kmap context",
+  ]);
+  assert.deepEqual(chatend.messages.filter(message => message.context_kind === "reset-note").map(message => message.content), ["earlier ideas", "latest ideas"]);
+  const resetHistory = chatend.messages.find(message => message.context_kind === "reset-history");
+  assert.match(resetHistory.content, /2 successful calls · shared context-load budget at latest reset: 2\/20/);
+  assert.match(resetHistory.content, /2× Node 3 \| Node 4/);
+  assert.equal(resetHistory.reset_history_entries.length, 2);
+  const memory = chatend.messages.find(message => message.context_kind === "memory").content;
+  assert.ok(memory.indexOf("Node 1:") < memory.indexOf("Node 2:"));
+  assert.ok(memory.indexOf("Node 2:") < memory.indexOf("Node 4:"));
+  assert.ok(memory.indexOf("Node 4:") < memory.indexOf("Node 3:"));
+  assert.equal(chatend.messages.some(message => message.content === "discard this tool activity"), false);
   assert.equal(chatend.messages.at(-1).display_role, "Memory tool result");
+});
+
+test("compact ResetContext history survives restoration without truncation", async () => {
+  const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
+  const resetCall = { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}' };
+  const resetResult = { role: "user", content: "Reset completed." };
+  const chatend = new Chatend("instructions", context, [{ role: "user", content: "work" }]);
+  for (let call = 1; call <= 21; call++) {
+    chatend.rebuildAfterReset(null, { retainedNodeNames: ["Area B", "Area A"], budgetUsed: ((call - 1) % 20) + 1, budgetLimit: 20 }, resetCall, resetResult);
+  }
+  let history = chatend.messages.find(message => message.context_kind === "reset-history");
+  assert.equal(history.reset_history_entries.length, 21);
+  assert.match(history.content, /21 successful calls/);
+  assert.match(history.content, /21× Area A \| Area B/);
+
+  const restored = new Chatend("instructions", context, JSON.parse(JSON.stringify(chatend.retained)));
+  restored.rebuildAfterReset(null, { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 20 }, resetCall, resetResult);
+  history = restored.messages.find(message => message.context_kind === "reset-history");
+  assert.equal(history.reset_history_entries.length, 22);
+  assert.match(history.content, /22 successful calls/);
+  assert.match(history.content, /21× Area A \| Area B/);
+  assert.match(history.content, /1× roots only/);
 });
 
 test("transparent tool protocol parses multiple calls from one model response", () => {
@@ -313,9 +415,9 @@ test("agent loop executes multiple text tool calls before the next generation", 
     if (requests.length === 1) return {
       status: "complete", response_id: "resp_1",
       message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"First","arguments":{}},{"name":"Second","arguments":{}}]}' },
-      usage: { input_tokens: 100, output_tokens: 10, cached_tokens: 80, cache_write_tokens: 20, reasoning_tokens: 4 },
+      usage: { input_tokens: 100, output_tokens: 10, cached_tokens: 80, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true },
     };
-    return { status: "complete", response_id: "resp_2", message: { role: "assistant", content: "Finished." }, usage: { input_tokens: 130, output_tokens: 5, cached_tokens: 100, cache_write_tokens: 0, reasoning_tokens: 0 } };
+    return { status: "complete", response_id: "resp_2", message: { role: "assistant", content: "Finished." }, usage: { input_tokens: 230, output_tokens: 15, cached_tokens: 180, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true } };
   } };
   const executed = [];
   const executor = {
@@ -325,7 +427,8 @@ test("agent loop executes multiple text tool calls before the next generation", 
   const continuation = new ContinuationState("kennedy-test");
   const usage = new UsageTracker({ contextWindowTokens: 1000, maxInputTokens: 900 });
   const checkpoints = [];
-  assert.equal(usage.snapshot().contextRemaining, 1000);
+  assert.equal(usage.snapshot().contextKnown, false);
+  assert.equal(usage.snapshot().contextRemaining, null);
   const answer = await runAgentLoop({
     intelligence, provider: "p", model: "m", chatend, executor, continuation, usage,
     checkpoint: async () => checkpoints.push(chatend.messages.map(message => message.content)),
@@ -334,10 +437,12 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.deepEqual(executed, ["First", "Second"]);
   assert.equal(requests.length, 2);
   assert.equal(requests[1].previous_response_id, "resp_1");
-  assert.deepEqual(requests[1].messages.map(message => message.display_role || message.content), ["Latency", "Memory tool result", "Memory tool result"]);
-  assert.equal(requests[1].messages[1].content, "First completed.");
-  assert.equal(requests[1].messages[2].content, "Second completed.");
-  assert.match(requests[1].messages[0].content, /^Latency: LLM call \d+ ms$/);
+  assert.match(requests[1].chatend, /^Latency\n\nLatency: LLM call \d+ ms/);
+  assert.match(requests[1].chatend, /Memory tool result\n\nFirst completed\./);
+  assert.match(requests[1].chatend, /Memory tool result\n\nSecond completed\./);
+  assert.match(requests[0].chatend, /context window usage: unknown \/ 1,000$/);
+  assert.match(requests[1].chatend, /context window usage: 110 \/ 1,000$/);
+  assert.equal("messages" in requests[1], false);
   assert.equal("tools" in requests[0], false);
   assert.equal(usage.snapshot().totalCachedTokens, 180);
   assert.equal(usage.snapshot().contextTokens, 135);
@@ -348,24 +453,88 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.equal(checkpoints[0].includes("Second completed."), true);
 });
 
+test("concise context usage is model-visible and stale thread usage is cleared on reset", () => {
+  const usage = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
+  assert.equal(
+    formatContextWindowProgress(usage.snapshot()),
+    "context window usage: unknown / 258,400",
+  );
+  usage.record({
+    input_tokens: 200000, output_tokens: 1000, cached_tokens: 150000,
+    cache_write_tokens: 0, reasoning_tokens: 500, cumulative: true,
+  });
+  assert.equal(
+    formatContextWindowProgress(usage.snapshot()),
+    "context window usage: 201,000 / 258,400",
+  );
+  usage.resetThread();
+  assert.equal(usage.snapshot().contextKnown, false);
+  assert.equal(formatContextWindowProgress(usage.snapshot()), "context window usage: unknown / 258,400");
+  assert.equal(usage.snapshot().totalInputTokens, 200000);
+});
+
 test("ResetContext abandons continuation and resends the rebuilt full chatend", async () => {
   const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
   const chatend = new Chatend("instructions", context, [{ role: "user", content: "reset it" }]);
   const requests = [];
   const intelligence = { generate: async request => {
     requests.push(request);
-    if (requests.length === 1) return { status: "complete", response_id: "resp_old", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}' }, usage: null };
+    if (requests.length === 1) return { status: "complete", response_id: "resp_old", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[],"selfMessage":"carry this forward"}}]}' }, usage: null };
     return { status: "complete", response_id: "resp_new", message: { role: "assistant", content: "Fresh context." }, usage: null };
   } };
   const executor = {
-    execute: async () => ({ reset: true, message: { role: "user", display_role: "Memory tool result", content: "Memory context reset completed." } }),
+    execute: async () => ({
+      reset: true,
+      selfMessage: "carry this forward",
+      resetHistoryEntry: { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 20 },
+      message: { role: "user", display_role: "Memory tool result", content: "Memory context reset completed." },
+    }),
     failure: () => { throw new Error("unexpected failure"); },
   };
   await runAgentLoop({ intelligence, provider: "p", model: "m", chatend, executor, continuation: new ContinuationState("kennedy-test"), usage: new UsageTracker() });
   assert.equal(requests[0].previous_response_id, null);
   assert.equal(requests[1].previous_response_id, null);
-  assert.equal(requests[1].messages[0].role, "system");
-  assert.equal(requests[1].messages.some(message => message.content === "Memory context reset completed."), true);
+  assert.match(requests[1].chatend, /^Agent manuals\n\ninstructions/);
+  assert.match(requests[1].chatend, /1× roots only/);
+  assert.match(requests[1].chatend, /Kennedy note to self\n\ncarry this forward/);
+  assert.match(requests[1].chatend, /Memory tool result\n\nMemory context reset completed\./);
+  assert.match(requests[1].chatend, /context window usage: unknown$/);
+  assert.ok(requests[1].chatend.indexOf("1× roots only") < requests[1].chatend.indexOf("carry this forward"));
+  assert.ok(requests[1].chatend.indexOf("carry this forward") < requests[1].chatend.indexOf("Kmap context"));
+  assert.doesNotMatch(requests[1].chatend, /\"role\":\"system\"/);
+});
+
+test("a repeated ResetContext loop cannot successfully reset more than the shared budget", async () => {
+  const api = new MockKweb([node(1)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  const chatend = new Chatend("instructions", context, [{ role: "user", content: "work across memory" }]);
+  let requests = 0;
+  const intelligence = { generate: async () => {
+    requests += 1;
+    return {
+      status: "complete",
+      response_id: `resp_${requests}`,
+      message: {
+        role: "assistant",
+        content: requests <= 22
+          ? 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}'
+          : "Stopped resetting.",
+      },
+      usage: null,
+    };
+  } };
+  const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
+  const answer = await runAgentLoop({
+    intelligence, provider: "p", model: "m", chatend, executor,
+    continuation: new ContinuationState("kennedy-test"), usage: new UsageTracker(),
+  });
+  assert.equal(answer, "Stopped resetting.");
+  assert.equal(executor.loadCalls, 22);
+  assert.equal(executor.toolLog.filter(entry => entry.name === "ResetContext" && entry.ok).length, 20);
+  assert.equal(executor.toolLog.filter(entry => entry.name === "ResetContext" && !entry.ok && entry.code === "load_budget_exhausted").length, 2);
+  const history = chatend.messages.find(message => message.context_kind === "reset-history");
+  assert.equal(history.reset_history_entries.length, 20);
+  assert.match(history.content, /20× roots only/);
 });
 
 test("conversation provenance preserves the complete structured Chatend", async () => {
@@ -422,13 +591,22 @@ test("a structured Chatend archive retains activity while refreshing current man
   assert.equal(restored.usage.snapshot().totalInputTokens, 12);
 });
 
-test("history ingress checkpoints its whole Chatend and completed archives resume without regeneration", async () => {
+test("history ingress sends the archived Chatend as inspector-identical plaintext and resumes completed archives", async () => {
   const kweb = new MockKweb([node(1)]);
-  kweb.provenance = async () => ({ source: "conversation", source_created_at: "2026-07-13T00:00:00Z", data: '{"format":"kennedy-chatend","media":[{"kind":"voice","dataUrl":"data:audio/ogg;base64,AAAA"}]}' });
+  const archivedMessages = [
+    { role: "system", display_role: "Agent manuals", content: "Archived instructions" },
+    { role: "user", content: "Archived words." },
+  ];
+  kweb.provenance = async () => ({
+    source: "conversation", source_created_at: "2026-07-13T00:00:00Z",
+    data: JSON.stringify({ format: "kennedy-chatend", messages: archivedMessages, media: [{ kind: "voice", dataUrl: "data:audio/ogg;base64,AAAA" }] }),
+  });
   let generations = 0;
+  const requests = [];
   const timings = [];
-  const intelligence = { generate: async () => {
+  const intelligence = { generate: async request => {
     generations += 1;
+    requests.push(request);
     return { status: "complete", response_id: "ingress-response", message: { role: "assistant", content: "Memory review complete." }, usage: null };
   }, recordTiming: timing => timings.push(timing) };
   const checkpoints = [];
@@ -442,9 +620,13 @@ test("history ingress checkpoints its whole Chatend and completed archives resum
   assert.equal(checkpoints.at(-1).completed, true);
   assert.equal("modelAttribution" in checkpoints.at(-1), false);
   assert.match(checkpoints.at(-1).systemPrompt, /Ingress/);
-  assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend \(JSON\)/);
-  assert.match(checkpoints.at(-1).retained[0].content, /Original audio retained in provenance/);
+  assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend\n\nAgent manuals\n\nArchived instructions/);
+  assert.match(checkpoints.at(-1).retained[0].content, /David\n\nArchived words\./);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /base64,AAAA/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /"format":"kennedy-chatend"/);
+  assert.equal(requests[0].chatend, formatChatend(checkpoints[0].messages, checkpoints[0].usage));
+  assert.equal(requests[0].chatend, inspectorText({ chatend: checkpoints[0].messages, usage: checkpoints[0].usage }));
+  assert.equal("messages" in requests[0], false);
   assert.equal(checkpoints.at(-1).messages.some(message => message.content === "Memory review complete."), true);
   assert.match(checkpoints.at(-1).messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
   assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
@@ -464,6 +646,18 @@ test("history ingress checkpoints its whole Chatend and completed archives resum
   assert.equal(resumed[0].completed, true);
   assert.equal(resumed[0].messages.some(message => message.content === "Memory review complete."), true);
   assert.match(resumed[0].messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
+  assert.equal(resumed[0].roundsUsed, 1);
+
+  const exhausted = structuredClone(checkpoints.at(-1));
+  exhausted.completed = false;
+  exhausted.roundsUsed = 100;
+  await assert.rejects(() => runHistoryIngress({
+    kweb,
+    intelligence: { generate: async () => { throw new Error("round limit must prevent generation"); } },
+    manuals: { shared: "Changed", ingress: "Changed" }, rootNodeId: id(1),
+    provenanceId: "provenance", provider: "p", model: "m",
+    restoredArchive: exhausted, checkpoint: async () => {}, onUpdate: () => {},
+  }), /100-round tool-loop safety limit/);
 });
 
 test("conversation history titles use the first durable user message", () => {
@@ -479,6 +673,7 @@ test("conversation sidebar distinguishes continuable and closed records", async 
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
   assert.match(render, /active: "Live · Continue"/);
   assert.match(render, /ingress_pending: "Closed · Memory queued"/);
+  assert.match(render, /ingress_failed: "Closed · Memory failed"/);
   assert.match(render, /complete: "Saved · Read only"/);
 });
 
@@ -566,7 +761,24 @@ test("history ingress activity belongs only to its selected conversation", () =>
   const live = conversationIngressActivity({ record: { ...record, phase: "ingress_in_progress" }, liveRecordId: "old", liveDiagnostic });
   assert.equal(live.active, true);
   assert.equal(live.diagnostic, liveDiagnostic);
+  const failed = conversationIngressActivity({ record: {
+    ...record,
+    phase: "ingress_failed",
+    ingress_failure_count: 5,
+    ingress_failures: [{ attempt: 5, stage: "model_loop", code: "provider_error", message: "Context exhausted." }],
+  } });
+  assert.equal(failed.active, false);
+  assert.equal(failed.failed, true);
+  assert.equal(failed.failures[0].message, "Context exhausted.");
   assert.equal(conversationIngressActivity({ record, dismissedId: "old" }), null);
+});
+
+test("history ingress worker records five failures before abandoning a poisoned session", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /const INGRESS_FAILURE_LIMIT = 5/);
+  assert.match(app, /conversationHistory\.ingressFailure/);
+  assert.match(app, /failedRecord\.phase === "ingress_failed"/);
+  assert.match(app, /History ingress stopped after \$\{failedRecord\.ingress_failure_count\} failed attempts/);
 });
 
 test("history ingress summary counts only successful memory mutations", () => {
@@ -739,7 +951,7 @@ test("a structured pending Chatend resumes from cold start without duplicating i
   await restored.resumePendingTurn();
   assert.equal(requests.length, 1);
   assert.equal(requests[0].previous_response_id, null);
-  assert.equal(requests[0].messages.filter(message => message.content === "Cold-start query").length, 1);
+  assert.equal(requests[0].chatend.match(/Cold-start query/g)?.length, 1);
   assert.deepEqual(restored.transcript.map(item => item.content), ["Cold-start query", "Recovered once."]);
 });
 
@@ -874,12 +1086,14 @@ test("mode manuals expose technical contracts without embedding Kmap strategy", 
   assert.doesNotMatch(conversation, /ConsolidateFanout\n  Call:/);
   assert.doesNotMatch(conversation, /AssignTask\n  Call:/);
   assert.match(conversation, /Kmap is read-only in this mode/);
-  assert.match(conversation, /entire archived Chatend is passed to a separate read-write history-ingress mode/);
+  assert.match(conversation, /human-readable Chatend text shown in the Full inspector/);
+  assert.match(conversation, /recovery archive's JSON envelope are not included/);
   assert.match(conversation, /At most ten nodes may be directly loaded at once, including both roots/);
   const ingress = await readFile(new URL("../SystemPrompts/HistoryIngress.txt", import.meta.url), "utf8");
   assert.match(ingress, /ConsolidateFanout\n  Call:/);
   assert.match(ingress, /AssignTask\n  Call:/);
   assert.match(ingress, /Use the string "blank" as childIdentifier/);
+  assert.match(ingress, /Limits: 100 model rounds and five failed attempts per ingress session; ResetContext and recovery renew neither\./);
   for (const manual of [conversation, ingress]) {
     assert.doesNotMatch(manual, /knowledge-hungry|use a promising|navigate enough|prefer to|consider assigning/i);
   }
@@ -896,7 +1110,7 @@ test("history ingress is an inline continuation with no independent scroller", a
   const styles = await readFile(new URL("../public/css/styles.css", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(render, /renderTranscript\(container, transcript, ingressActivity = null\)/);
-  assert.match(render, /renderIngressActivity\(container, ingressActivity\.diagnostic, ingressActivity\.active\)[\s\S]*?container\.scrollTop = wasAtBottom \? container\.scrollHeight : previousTop/);
+  assert.match(render, /renderIngressActivity\(container, ingressActivity\.diagnostic, ingressActivity\.active, ingressActivity\.failed, ingressActivity\.failures\)[\s\S]*?container\.scrollTop = wasAtBottom \? container\.scrollHeight : previousTop/);
   assert.match(styles, /\.ingress-continuation\s*\{/);
   assert.equal(styles.includes(".ingress-panel"), false);
   assert.equal(styles.includes(".ingress-log"), false);
