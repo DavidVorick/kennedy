@@ -4,82 +4,22 @@ use std::path::{Path, PathBuf};
 
 use age::secrecy::{ExposeSecret, SecretString};
 use clap::{Parser, Subcommand};
-use credentials::{CredentialVault, resolve_vault_path};
-use serde::Deserialize;
+use credentials::CredentialVault;
 use zeroize::Zeroize;
 
-#[derive(Deserialize, Default)]
-struct SharedConfig {
-    #[serde(default)]
-    credentials: CredentialsConfig,
-    #[serde(default)]
-    audio: AudioSecretConfig,
-    #[serde(default)]
-    telegram: TelegramConfig,
-}
-
-#[derive(Deserialize)]
-struct CredentialsConfig {
-    #[serde(default = "default_vault_path")]
-    vault_path: PathBuf,
-}
-
-impl Default for CredentialsConfig {
-    fn default() -> Self {
-        Self {
-            vault_path: default_vault_path(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct AudioSecretConfig {
-    #[serde(default = "default_openai_secret_name")]
-    api_key_secret: String,
-}
-
-impl Default for AudioSecretConfig {
-    fn default() -> Self {
-        Self {
-            api_key_secret: default_openai_secret_name(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct TelegramConfig {
-    #[serde(default = "default_telegram_secret_name")]
-    bot_token_secret: String,
-}
-
-impl Default for TelegramConfig {
-    fn default() -> Self {
-        Self {
-            bot_token_secret: default_telegram_secret_name(),
-        }
-    }
-}
-
-fn default_vault_path() -> PathBuf {
-    PathBuf::from("./kennedy-secrets.age")
-}
-
-fn default_openai_secret_name() -> String {
-    "openai-api-key".into()
-}
-
-fn default_telegram_secret_name() -> String {
-    "telegram-bot-token".into()
-}
+const OPENAI_API_KEY_SECRET: &str = "openai-api-key";
+const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, global = true, default_value = "./config.yaml")]
-    config: PathBuf,
+    #[arg(long, global = true, default_value = "./kennedy-secrets.age")]
+    vault_path: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
     #[arg(long, default_value = "127.0.0.1:4321")]
     kweb_bind: String,
+    #[arg(long, default_value = "127.0.0.1:4322")]
+    intelligence_bind: String,
     #[arg(long, default_value = "127.0.0.1:4323")]
     conversation_history_bind: String,
     #[arg(long, default_value = "127.0.0.1:4324")]
@@ -140,19 +80,14 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("installing TLS crypto provider"))?;
     let args = Args::parse();
-    let shared_config = load_shared_config(&args.config).await?;
-    let vault_path = resolve_vault_path(&args.config, &shared_config.credentials.vault_path);
+    let vault_path = args.vault_path.clone();
     if let Some(Command::Secrets { command }) = args.command {
         return manage_secrets(command, &vault_path);
     }
-    run_server(args, shared_config, vault_path).await
+    run_server(args, vault_path).await
 }
 
-async fn run_server(
-    args: Args,
-    shared_config: SharedConfig,
-    vault_path: PathBuf,
-) -> anyhow::Result<()> {
+async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let vault = if vault_path.exists() {
         let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
         CredentialVault::unlock(&vault_path, passphrase)?
@@ -160,16 +95,10 @@ async fn run_server(
         tracing::warn!(path=%vault_path.display(), "Kennedy credential vault does not exist; configured secret-backed features are disabled");
         CredentialVault::empty()
     };
-    let transcription_api_key = resolve_optional_secret(
-        &vault,
-        &shared_config.audio.api_key_secret,
-        "OpenAI transcription",
-    )?;
-    let telegram_bot_token = resolve_optional_secret(
-        &vault,
-        &shared_config.telegram.bot_token_secret,
-        "Telegram relay",
-    )?;
+    let transcription_api_key =
+        resolve_optional_secret(&vault, OPENAI_API_KEY_SECRET, "OpenAI transcription")?;
+    let telegram_bot_token =
+        resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?;
     let kweb = kennedy_kweb::Config {
         bind: args.kweb_bind,
         database: args.kweb_database,
@@ -184,6 +113,10 @@ async fn run_server(
         allowed_origins: vec![args.frontend_origin.clone()],
         max_request_bytes: 128 * 1024 * 1024,
     };
+    let intelligence = kennedy_intelligence::ServeOptions {
+        bind: args.intelligence_bind,
+        allowed_origins: vec![args.frontend_origin.clone()],
+    };
     let telegram = kennedy_telegram_relay::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
@@ -192,10 +125,9 @@ async fn run_server(
         bootstrap_usernames: vec![args.telegram_bootstrap_username],
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
-    let config_path = args.config;
     tokio::try_join!(
         kennedy_kweb::serve(kweb),
-        kennedy_intelligence::serve(config_path, transcription_api_key),
+        kennedy_intelligence::serve(intelligence, transcription_api_key),
         kennedy_conversation_history::serve(history),
         kennedy_telegram_relay::serve(telegram),
     )?;
@@ -317,27 +249,14 @@ fn prompt_confirmed_value(prompt: &str) -> anyhow::Result<String> {
     Ok(first)
 }
 
-async fn load_shared_config(path: &Path) -> anyhow::Result<SharedConfig> {
-    let raw = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
-    serde_yaml::from_str(&raw)
-        .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tracked_config_uses_generic_vault_secret_references() {
-        let config: SharedConfig = serde_yaml::from_str(include_str!("../../config.yaml")).unwrap();
-        assert_eq!(
-            config.credentials.vault_path,
-            PathBuf::from("./kennedy-secrets.age")
-        );
-        assert_eq!(config.audio.api_key_secret, "openai-api-key");
-        assert_eq!(config.telegram.bot_token_secret, "telegram-bot-token");
+    fn secret_names_are_stable_code_defaults() {
+        assert_eq!(OPENAI_API_KEY_SECRET, "openai-api-key");
+        assert_eq!(TELEGRAM_BOT_TOKEN_SECRET, "telegram-bot-token");
     }
 
     #[test]

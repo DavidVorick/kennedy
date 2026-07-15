@@ -64,6 +64,7 @@ function integer(value, name) { if (!Number.isInteger(value) || value < 1) throw
 function integerArray(value, name, minimum = 0) { if (!Array.isArray(value) || value.length < minimum) throw Object.assign(new Error(`${name} must contain at least ${minimum} identifiers.`), { code: "invalid_arguments" }); value.forEach((v, i) => integer(v, `${name}[${i}]`)); if (new Set(value).size !== value.length) throw Object.assign(new Error(`${name} must not contain duplicates.`), { code: "invalid_arguments" }); return value; }
 function string(value, name) { if (typeof value !== "string") throw Object.assign(new Error(`${name} must be a string.`), { code: "invalid_arguments" }); return value; }
 function nonemptyString(value, name, maximum) { string(value, name); const trimmed = value.trim(); if (!trimmed || [...trimmed].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return trimmed; }
+function choice(value, name, choices) { string(value, name); if (!choices.includes(value)) throw Object.assign(new Error(`${name} must be one of: ${choices.join(", ")}.`), { code: "invalid_arguments" }); return value; }
 
 export class ToolExecutor {
   constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, onUpdate = () => {} }) {
@@ -180,9 +181,10 @@ export class ToolExecutor {
   assertConversationWeb() { if (this.mode !== "conversation" || !this.intelligence) throw Object.assign(new Error("This web tool is only available during a live conversation."), { code: "tool_unavailable" }); }
 
   async webSearch(args) {
-    this.assertConversationWeb(); validateObject(args, ["question"]);
+    this.assertConversationWeb(); validateObject(args, ["question", "mode"]);
     const question = nonemptyString(args.question, "question", 4000);
-    return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question }) };
+    const mode = choice(args.mode, "mode", ["fast", "quality"]);
+    return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question, mode }) };
   }
 
   async webFetch(args) {

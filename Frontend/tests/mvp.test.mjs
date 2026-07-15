@@ -212,10 +212,10 @@ test("WebSearch and WebFetch expose only minimal model-facing arguments", async 
     webFetch: async body => { calls.push(["fetch", body]); return { url: body.url, title: "Guide", retrieved_at: "2026-07-12T00:00:00Z", content_type: "text/html", content: "Page evidence.", truncated: false }; },
   };
   const executor = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, provider: "primary", model: "model", loadLimit: 20 });
-  const search = await executor.execute({ id: "search", name: "WebSearch", arguments: { question: "best brunch in El Salvador" } });
+  const search = await executor.execute({ id: "search", name: "WebSearch", arguments: { question: "best brunch in El Salvador", mode: "fast" } });
   const fetch = await executor.execute({ id: "fetch", name: "WebFetch", arguments: { url: "https://example.com/guide" } });
   assert.deepEqual(calls, [
-    ["search", { provider: "primary", model: "model", question: "best brunch in El Salvador" }],
+    ["search", { provider: "primary", model: "model", question: "best brunch in El Salvador", mode: "fast" }],
     ["fetch", { url: "https://example.com/guide" }],
   ]);
   assert.equal(search.message.display_role, "Web tool result");
@@ -243,10 +243,12 @@ test("live conversations cannot mutate the Kmap", async () => {
 test("web tools reject extra retrieval knobs and remain unavailable during ingress", async () => {
   const intelligence = { webSearch: async () => { throw new Error("must not run"); } };
   const conversation = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, loadLimit: 20 });
-  const extra = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", maxResults: 10 } });
-  assert.match(extra.message.content, /Expected exactly: question/);
+  const extra = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "fast", maxResults: 10 } });
+  assert.match(extra.message.content, /Expected exactly: question, mode/);
+  const invalidMode = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "balanced" } });
+  assert.match(invalidMode.message.content, /mode must be one of: fast, quality/);
   const ingress = new ToolExecutor({ mode: "ingress", context: {}, api: {}, intelligence, provenanceId: "p", loadLimit: 50 });
-  const unavailable = await ingress.execute({ id: "search", name: "WebSearch", arguments: { question: "topic" } });
+  const unavailable = await ingress.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "fast" } });
   assert.match(unavailable.message.content, /only available during a live conversation/);
 });
 
@@ -271,7 +273,7 @@ test("transparent tool protocol parses multiple calls from one model response", 
 });
 
 test("tool protocol rejects narration before or after an otherwise valid envelope", () => {
-  const envelope = 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"Compare {official} sources and escape \\\"quoted\\\" names."}}]}';
+  const envelope = 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"Compare {official} sources and escape \\\"quoted\\\" names.","mode":"quality"}}]}';
   assert.equal(parseToolCalls(`${envelope}\n  `)[0].name, "WebSearch");
   assert.throws(
     () => parseToolCalls(`${envelope}\nI’m looking this up now.`),
@@ -816,7 +818,7 @@ test("chatend inspector exposes text tool requests and readable results", () => 
     { role: "user", content: "Hello." },
     { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' },
     { role: "user", display_role: "Memory tool result", content: "Memory load completed.\n\nNode 2: Project" },
-    { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"current evidence"}}]}' },
+    { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"current evidence","mode":"fast"}}]}' },
     { role: "user", display_role: "Web tool result", content: "Kennedy tool result\nTool: WebSearch\n\nWeb research completed." },
     { role: "assistant", content: "Here is what I found." },
   ];

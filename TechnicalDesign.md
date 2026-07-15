@@ -32,11 +32,13 @@ backend crate depends on another backend crate; all coordination happens in the
 frontend through their public HTTP APIs.
 
 `kennedy-server` also owns a generic named credential vault stored as the
-passphrase-encrypted `kennedy-secrets.age` file. The tracked top-level
-`config.yaml` contains only vault names. At startup the server unlocks the vault
-and passes the configured OpenAI and Telegram values directly to their trusted
-connectors. The vault has terminal-only set/remove/list/passphrase commands and
-no HTTP, browser, Kennedy-tool, Codex, or reveal surface.
+passphrase-encrypted `kennedy-secrets.age` file. At startup the server unlocks
+the vault and passes the conventionally named OpenAI and Telegram values
+directly to their trusted connectors. The vault has terminal-only
+set/remove/list/passphrase commands and no HTTP, browser, Kennedy-tool, Codex,
+or reveal surface. Stable runtime policy is compiled into code; only
+deployment-specific listeners, paths, limits, and the vault location are CLI
+options.
 
 System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
 Every session composes `KennedyIdentity.txt` with exactly one technical mode
@@ -98,8 +100,8 @@ default.
 
 The encrypted vault is portable rather than machine-bound. Copying it with the
 three databases preserves configured credentials on a new machine, where the
-same passphrase unlocks it. The vault is excluded from Git; `config.yaml` is
-tracked because it contains no credential values.
+same passphrase unlocks it. The vault is excluded from Git. Kennedy has no
+tracked runtime configuration file.
 
 ## 4. Ownership Boundaries
 

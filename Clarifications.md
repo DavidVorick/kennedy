@@ -39,11 +39,17 @@ canonical documents; this file is not an append-only log.
   first, exactly one JSON envelope follows, and its closing brace is the last
   non-whitespace character. Never mix narration or status text with a tool
   request; return specific protocol feedback for leading or trailing prose.
-- Give live-conversation Kennedy `WebSearch(question)` for delegated hosted
-  research and `WebFetch(url)` for inspecting one public page. Search language,
-  geography, freshness, domains, result counts, and research depth are not tool
-  arguments; Kennedy states relevant constraints naturally and the intelligence
-  layer manages retrieval policy and budgets.
+- Give live-conversation Kennedy `WebSearch(question, mode)` for delegated
+  hosted research and `WebFetch(url)` for inspecting one public page. Kennedy
+  chooses `fast` by default for ordinary latency-sensitive lookups and
+  `quality` for difficult, high-stakes, cross-source, or conflict-resolution
+  research. Search language, geography, freshness, and domains remain natural
+  language in the question; the intelligence layer maps the mode to concrete
+  reasoning, search context, deadline, and retrieval budgets.
+- Eliminate the tracked runtime configuration file. Stable provider, model,
+  audio, web, secret-name, and safety defaults belong in code. Keep only
+  genuinely deployment-specific values such as listeners, data/source paths,
+  and the encrypted vault path as `kennedy-server` CLI options.
 - Continue append-only conversation and history-ingress rounds using Codex
   thread IDs. `ResetContext` starts a fresh Codex thread with Kennedy's rebuilt
   logical context.

@@ -39,9 +39,11 @@ a terminal. Kennedy logs separate launcher-started, prompt-forwarded, and
 Codex-completed stages, and fails prompt forwarding after 30 seconds rather
 than hanging silently.
 
-Kennedy's non-secret runtime settings live in the tracked top-level
-`config.yaml`. It contains only generic vault names for credentials, so it is
-safe to commit and copy with the source tree.
+Kennedy has no runtime configuration file. Stable provider, model, search,
+audio, and safety defaults are compiled into the codebase. Deployment-specific
+listener addresses, database paths, frontend paths, and the encrypted vault
+path remain ordinary `kennedy-server` CLI options; run with `--help` to inspect
+or override them.
 
 No API key is required for ordinary Kennedy generation. Startup rejects
 API-key-only Codex authentication so a
@@ -58,7 +60,7 @@ cargo run -p kennedy-server -- secrets set openai-api-key
 The first `secrets set` command creates `kennedy-secrets.age`, asks for a vault
 passphrase twice, and then asks for the secret value twice without echoing
 either input. To enable the optional Telegram relay, create a bot with
-BotFather and store its token under the name referenced by `config.yaml`:
+BotFather and store its token under Kennedy's conventional secret name:
 
 ```sh
 cargo run -p kennedy-server -- secrets set telegram-bot-token
@@ -87,12 +89,11 @@ as `kennedy.sqlite3`, `kennedy-conversations.sqlite3`, and
 4321 through 4324. Without a Telegram token, port 4324 reports the relay as
 disabled and the rest of Kennedy remains usable.
 
-The example configuration uses `gpt-5.6-sol` with `xhigh` reasoning effort and
-executes each turn through `codex-safe`, which invokes non-interactive
-`codex exec` inside Podman.
-Change `default_model` and the `models` allowlist together if your account uses
-another compatible model, and configure its context limits when they are not
-known to the bridge.
+The compiled defaults use `gpt-5.6-sol` with `xhigh` reasoning effort and
+execute each turn through `codex-safe`, which invokes non-interactive
+`codex exec` inside Podman. If the deployment needs another compatible model,
+change the provider constants and model limits in
+`IntelligenceBackend/src/defaults.rs` together.
 
 ## Editing Kennedy
 
@@ -111,8 +112,10 @@ starts with both the user's root and Kennedy's root loaded.
 Kennedy's local tools use a text protocol documented in the session manuals,
 so tool requests and results are visible in the chatend. Live conversations can
 read Kmap memory and use WebSearch/WebFetch but cannot mutate the Kmap; the
-serialized, offline history-ingress worker owns memory mutation. Search policy
-and retrieval limits stay in the intelligence backend. The UI also reports
+serialized, offline history-ingress worker owns memory mutation. Kennedy
+chooses `fast` or `quality` for each WebSearch call; the concrete reasoning,
+context, deadline, and retrieval bounds for those modes stay in the
+intelligence backend. The UI also reports
 provider token usage, context-window headroom, and prompt-cache reads and
 writes in the Chatend header, and shows history ingress as it runs. The
 Chatend inspector can display the complete context, just the system prompts,

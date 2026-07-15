@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use age::secrecy::SecretString;
@@ -182,18 +182,6 @@ fn write_private_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     result
 }
 
-pub(crate) fn resolve_vault_path(config_path: &Path, configured: &Path) -> PathBuf {
-    if configured.is_absolute() {
-        configured.to_owned()
-    } else {
-        config_path
-            .parent()
-            .filter(|value| !value.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .join(configured)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,16 +248,5 @@ mod tests {
             .unwrap();
         assert!(error.to_string().contains("unlocking credential vault"));
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn vault_path_is_relative_to_the_tracked_config() {
-        assert_eq!(
-            resolve_vault_path(
-                Path::new("/srv/kennedy/config.yaml"),
-                Path::new("kennedy-secrets.age")
-            ),
-            PathBuf::from("/srv/kennedy/kennedy-secrets.age")
-        );
     }
 }

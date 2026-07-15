@@ -7,7 +7,7 @@ host launcher for the Podman-sandboxed Codex CLI, OpenAI's paid transcription
 API, and public web pages. Model generation and web
 research use the user's ChatGPT-authenticated Codex subscription. Audio
 transcription is the deliberately separate billed path and reads
-the generic vault name in `audio.api_key_secret`; `kennedy-server` resolves and
+the conventional vault name `openai-api-key`; `kennedy-server` resolves and
 passes that credential directly to the trusted transcription connector.
 Ordinary generation never receives that key and does not call the Responses
 HTTP API.
@@ -20,9 +20,10 @@ backends.
 
 ## 2. Responsibilities
 
-- Load the Codex sandbox launcher, working directory, allowed models, reasoning effort,
-  timeouts, and model-context limits from `config.yaml`.
-- Require the configured launcher's successful `login status` response to
+- Apply compiled defaults for the Codex sandbox launcher, working directory,
+  allowed models, reasoning effort, timeouts, model-context limits, audio, and
+  web safety bounds.
+- Require the launcher's successful `login status` response to
   identify ChatGPT login inside the sandbox.
 - Remove API-key environment variables from spawned Codex processes so
   generation cannot silently switch to direct API billing.
@@ -42,75 +43,46 @@ Kennedy's Kmap and web tools remain ordinary visible text in the Chatend. The
 normal generation path gives Codex no shell, file-mutation, app, multi-agent,
 or internet tools. Only `/api/v1/web/search` enables Codex web search.
 
-## 3. Configuration
+## 3. Compiled Defaults and Deployment Options
 
-```yaml
-credentials:
-  vault_path: ./kennedy-secrets.age
+The backend has no runtime configuration file. Stable defaults live in
+`IntelligenceBackend/src/defaults.rs`: provider `primary`, launcher
+`codex-safe`, temporary working directory, model `gpt-5.6-sol`, ordinary
+generation at `xhigh`, a 600-second generation deadline, known model context
+limits, bounded public-page fetches, and paid `gpt-4o-transcribe` behavior.
+Changing these policies is a code change reviewed and tested with the rest of
+the adapter.
 
-server:
-  bind: 127.0.0.1:4322
-  max_request_bytes: 27262976
-  allowed_origins:
-    - http://127.0.0.1:4321
+The two WebSearch modes are also compiled policy:
 
-web:
-  search_context_size: high
-  search_reasoning_effort: xhigh
-  max_search_sources: 12
-  search_timeout_seconds: 600
-  fetch_timeout_seconds: 30
-  max_fetch_bytes: 2000000
-  max_fetch_characters: 50000
-  max_redirects: 5
+| Mode | Reasoning | Search context | Deadline | Returned source cap |
+| --- | --- | --- | --- | --- |
+| `fast` | `low` | `low` | 90 seconds | 6 |
+| `quality` | `xhigh` | `high` | 600 seconds | 12 |
 
-audio:
-  api_base: https://api.openai.com/v1/
-  api_key_secret: openai-api-key
-  transcription_model: gpt-4o-transcribe
-  transcription_prompt: "Transcribe faithfully, including discernible relevant non-speech audio."
-  timeout_seconds: 120
-  max_upload_bytes: 26214400
+`fast` is the request default for compatibility and Kennedy's recommended
+ordinary choice. `quality` deliberately retains the former thorough-search
+behavior for hard research.
 
-telegram:
-  bot_token_secret: telegram-bot-token
+The host supplies only the intelligence listener and allowed frontend origins
+when starting the library. `kennedy-server` exposes listener addresses, source
+and data paths, and the encrypted vault path as deployment CLI options. The
+request-body limit and connector safety bounds remain compiled invariants.
 
-default_provider: primary
-
-providers:
-  primary:
-    kind: codex
-    executable: codex-safe
-    working_directory: /tmp
-    default_model: gpt-5.6-sol
-    models: [gpt-5.6-sol]
-    reasoning_effort: xhigh
-    context_window_tokens: 1050000
-    max_input_tokens: 922000
-    native_audio_input_models: []
-    timeout_seconds: 600
-```
-
-This tracked top-level `config.yaml` contains secret names, not credential
-values. `kennedy-server` unlocks the separate encrypted vault before starting
-the backends. `codex-safe` is a host executable on Kennedy's `PATH` that forwards all
+`codex-safe` is a host executable on Kennedy's `PATH` that forwards all
 arguments and piped stdin/stdout to Codex inside a persistent Podman sandbox.
-The host does not need a directly installed `codex` binary. The launcher must
-runs. For noninteractive Kennedy calls it must use `podman run -i`, not require
-a TTY, and preserve stdout for Codex JSONL; it may add `-t` only for an
-interactive terminal invocation. The launcher must mount its Codex state
-directory so login and thread resumes survive container
-runs. `working_directory` must exist. It should contain no project instructions or
-user data; `/tmp` is the default. `context_window_tokens` and
-`max_input_tokens` are optional overrides. Legacy Responses polling fields are
-accepted only for configuration compatibility and are ignored by the active
-Codex runtime.
+The host does not need a directly installed `codex` binary. For noninteractive
+Kennedy calls the launcher must use `podman run -i`, not require a TTY, and
+preserve stdout for Codex JSONL; it may add `-t` only for an interactive
+terminal invocation. It must mount its Codex state directory so login and
+thread resumes survive runs. The temporary working directory must contain no
+project instructions or user data.
 
-`native_audio_input_models` is empty for the configured `gpt-5.6-sol` Codex
-transport. A model belongs in that list only when its active Kennedy transport
-can actually forward native audio. The transcription API rejects rather than
-transcribes requests for a listed model, ensuring that paid transcription is a
-fallback and not an accidental downgrade.
+The native-audio model list is empty for the `gpt-5.6-sol` Codex transport. A
+model belongs in that list only when its active Kennedy transport can actually
+forward native audio. The transcription API rejects rather than transcribes
+requests for a listed model, ensuring that paid transcription is a fallback
+and not an accidental downgrade.
 
 ## 4. Codex Execution
 
@@ -136,8 +108,10 @@ reasoning tokens. Cache-write tokens are reported as zero because Codex JSONL
 does not expose that measurement.
 
 Web search starts a new ephemeral thread with `--search`, retains the same
-read-only/no-shell restrictions, and asks Codex for a concise evidence-focused
-answer with direct links. It never joins Kennedy's conversation thread.
+read-only/no-shell restrictions, and asks Codex for an answer with direct
+links. Each request's mode selects the compiled reasoning effort, Codex web
+search context size, deadline, source cap, and focused or thorough research
+prompt. It never joins Kennedy's conversation thread.
 
 ## 5. API
 
@@ -208,10 +182,13 @@ Kennedy text-tool request.
 
 ### 5.4 Web Search
 
-`POST /api/v1/web/search` accepts provider/model plus a natural-language
-`question` of 1–4000 characters. It returns `answer`, deduplicated `sources`,
-provider/model, and optional usage. A valid answer may have no public source
-URL for a live-data lookup; ordinary cited research should include links.
+`POST /api/v1/web/search` accepts provider/model, a natural-language `question`
+of 1–4000 characters, and `mode: "fast" | "quality"`. An omitted mode defaults
+to `fast` for direct-client compatibility, while Kennedy's frontend tool
+contract requires her to choose explicitly. It returns `answer`, deduplicated
+`sources`, provider/model, selected mode, and optional usage. A valid answer
+may have no public source URL for a live-data lookup; ordinary cited research
+should include links.
 
 ### 5.5 Web Fetch
 
@@ -230,15 +207,16 @@ Invalid inputs return `400 invalid_request`. Unknown providers/models return
 5xx errors; deadlines use `504 provider_timeout`. Errors may include a local
 request UUID but never credentials or full prompts.
 
-The service binds to loopback by default, accepts JSON plus bounded multipart
-audio, exposes explicit GET and POST routes, permits only configured frontend origins, and applies a
+The service binds to the address supplied by `kennedy-server` (loopback by
+default), accepts JSON plus bounded multipart audio, exposes explicit GET and
+POST routes, permits only the supplied frontend origins, and applies a
 request-body limit before deserialization.
 
 ## 7. Verification
 
 Tests cover request and thread-ID validation, Codex JSONL event normalization,
-last-message selection, usage mapping, source extraction/deduplication, config
-defaults, model modality metadata, paid-transcription configuration, safe audio
+last-message selection, usage mapping, source extraction/deduplication,
+compiled defaults, fast/quality search profiles, model modality metadata, paid-transcription behavior, safe audio
 filenames, public-URL safety, and readable-content bounds. A smoke test should
 confirm fresh generation, thread resume, and web search with the machine's
 actual ChatGPT login.
