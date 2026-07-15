@@ -82,13 +82,21 @@ Kennedy calls the launcher must use `podman run -i`, not require a TTY, and
 preserve stdout for Codex JSONL; it may add `-t` only for an interactive
 terminal invocation. It must mount its Codex state directory so login and
 thread resumes survive runs. The temporary working directory must contain no
-project instructions or user data.
+project instructions or user data. It must also bind the backend-created
+`${TMPDIR:-/tmp}/kennedy-codex-catalogs` directory into the container at the
+same absolute path, read-only. A persistent container must be recreated when
+adding this mount. The backend creates the host directory before its first
+launcher call.
 
 At startup the backend runs `codex-safe debug models`, reads each model's
 `context_window` and `effective_context_window_percent`, and exposes their
 product as the usable context and input window. The selected model must be
 present with valid advertised values or startup fails. There is no hardcoded
-fallback window.
+fallback window. The backend also writes a derived catalog that removes only
+`tool_mode`, `multi_agent_version`, and `apply_patch_tool_type`, then probes it
+through `codex-safe debug models`. It uses that catalog only if the probe works
+and every model's effective context limit exactly matches the original live
+catalog; otherwise it removes the file, warns, and uses the stock catalog.
 
 The native-audio model list is empty for the `gpt-5.6-sol` Codex transport. A
 model belongs in that list only when its active Kennedy transport can actually
@@ -103,13 +111,29 @@ Generation asks the `codex-safe` launcher to run `codex exec --json` with:
 - the selected model and configured reasoning effort (`gpt-5.6-sol`, `xhigh`);
 - saved CLI authentication but ignored user/project configuration and rules;
 - approval policy `never` and a read-only sandbox;
-- multi-agent, apps, shell, unified-exec, and web search disabled;
+- a terse inline instruction to follow the supplied Chatend without using
+  Codex tools, with personality, project documents, skills, permission, app,
+  collaboration, and environment instruction blocks suppressed;
+- optional multi-agent, app, shell, unified-exec, code-mode, goal, hook, plugin,
+  browser/computer, image-generation, elicitation, and related tool scaffolding
+  disabled, including the separately configured experimental
+  `request_user_input` tool, along with web search on ordinary Kennedy turns;
+- the verified slim live model catalog when the launcher can read it, reducing
+  model-selected agent tools without altering advertised context limits;
 - the canonical plaintext Chatend passed unchanged through stdin rather than
   command-line arguments or a JSON prompt envelope;
 - `model_auto_compact_token_limit` set to the largest signed 64-bit value,
   beyond every reachable advertised context window, so Codex does not
   automatically compact Kennedy's Chatend;
 - a bounded total deadline and child termination on timeout.
+
+These settings minimize every exposed Codex layer the deployment can control.
+The canonical Chatend is the exact application-controlled plaintext sent to
+Codex; forced CLI/provider system content or structured metadata may still be
+added downstream and is not falsely represented in the Full inspector. Stock
+Codex 0.144.1 still registers its unconditional `update_plan` schema and the
+`view_image` schema for environment-backed turns; no supported configuration
+removes those final core schemas, and the inline instruction forbids their use.
 
 The first call starts a persisted Codex thread. Later calls use
 `codex exec resume <thread-id>` and contain only newly appended normalized
@@ -125,10 +149,10 @@ rounds. Cache-write tokens are reported as zero because Codex JSONL does not
 expose that measurement.
 
 `quality` and `balanced` web search start a new ephemeral Codex thread with
-`--search`, retain the same read-only/no-shell restrictions, and ask Codex for
-an answer with direct links. The mode selects the fixed model, reasoning
-effort, Codex web-search context size, deadline, source cap, and focused or
-thorough research prompt.
+`--search`, retain the same read-only/no-shell restrictions, use a distinct
+terse research instruction, and retain the required hosted search capability.
+The mode selects the fixed model, reasoning effort, Codex web-search context
+size, deadline, source cap, and focused or thorough research prompt.
 
 `fast` sends a stateless request to Gemini's Interactions API with model
 `gemini-3.1-flash-lite`, the built-in `google_search` tool, `low` thinking,

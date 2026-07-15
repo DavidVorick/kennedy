@@ -26,9 +26,12 @@ has no persistent state, and relies on APIs to various backend services to get
 persistence between sessions.
 
 'Chatend' refers to the canonical human-readable application text that is
-passed to LLMs. The Full inspector displays that text using the same formatter;
-it is not a pretty-printed recovery object or a second approximation of what
-Kennedy sees. It includes one concise latency line per LLM/tool call and one final line with
+passed to Codex for Kennedy. The Full inspector displays every
+application-controlled plaintext byte using the same formatter; it is not a
+pretty-printed recovery object or a second approximation. Forced Codex or
+upstream-provider system/tool scaffolding can exist outside this inspectable
+boundary. Kennedy minimizes all exposed layers the environment permits without
+claiming to reveal inaccessible provider prompts. It includes one concise latency line per LLM/tool call and one final line with
 total and combined call time so Kennedy can reason about response latency
 without a repeated step list. Every request also ends with the terse line
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
@@ -467,7 +470,12 @@ LLM turns run through the host's `codex-safe` launcher, which keeps the Codex
 CLI and its persistent ChatGPT login inside a Podman sandbox while using the
 user's subscription limits. The configured model is `gpt-5.6-sol` with
 `xhigh` reasoning. Conversation and tool loops resume their Codex thread;
-ResetContext starts a fresh one.
+ResetContext starts a fresh one. Kennedy supplies terse inline Codex
+instructions, disables exposed optional instruction/tool/plugin scaffolding,
+and uses a verified slim catalog derived from Codex's live model metadata when
+the sandbox can read it. The catalog reduction preserves every advertised
+effective context limit and safely falls back when the launcher boundary does
+not expose the generated file.
 
 ## UI
 

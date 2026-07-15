@@ -40,17 +40,38 @@ prompt forwarding after 30 seconds rather than hanging silently. Tool calls and
 complete user turns have their own concise duration logs and matching Chatend
 latency entries.
 
+The launcher must also make the backend-created
+`${TMPDIR:-/tmp}/kennedy-codex-catalogs` directory visible inside the Codex
+container at the same absolute path, read-only. For example, set
+`catalog_dir="${TMPDIR:-/tmp}/kennedy-codex-catalogs"` and add
+`--mount type=bind,src="$catalog_dir",dst="$catalog_dir",ro` to the container's
+`podman run` or `podman create` arguments. If the launcher uses a persistent
+container, recreate that container with the bind mount. Kennedy creates the
+source directory before its first launcher call, probes the generated catalog
+through `codex-safe` before using it, and warns while falling back to the stock
+catalog when the mount is unavailable.
+
 The UI's Full Chatend inspector and generation path share one plaintext
-formatter: what the Full inspector shows is the application prompt supplied to
-Kennedy, not a formatted JSON archive. Versioned JSON archives exist only for
-recovery and provenance storage. History ingress parses an archive and sends
-its human-readable message text under `Archived Chatend`; it does not send the
-archive envelope, media blobs, counters, or diagnostics.
+formatter: what the Full inspector shows is every application-controlled byte
+of the prompt supplied to Codex for Kennedy, not a formatted JSON archive.
+Codex or its upstream provider can still add forced system/tool scaffolding
+outside the application's observable boundary. Versioned JSON archives exist
+only for recovery and provenance storage. History ingress parses an archive
+and sends its human-readable message text under `Archived Chatend`; it does not
+send the archive envelope, media blobs, counters, or diagnostics.
 
 The launcher must also forward `codex-safe debug models`. Kennedy discovers the
 configured model's advertised effective context window at startup and refuses
-to invent a fallback. All Codex turns set the auto-compaction threshold beyond
-any reachable window so Kmap context is not silently compacted.
+to invent a fallback. It derives a slim catalog from that live result, removes
+only Codex's agent-tool selectors, verifies that all advertised effective
+limits are unchanged, and uses the catalog only when a launcher probe succeeds.
+Every turn also uses minimal inline Codex instructions and suppresses exposed
+optional instruction/tool/plugin scaffolding, including Codex's separately
+configured `request_user_input` tool. Stock Codex still registers its core
+`update_plan` and environment-backed `view_image` schemas; there is no supported
+0.144.1 setting to remove them, so the inline instruction forbids their use.
+All Codex turns set the auto-compaction threshold beyond any reachable window
+so Kmap context is not silently compacted.
 Each model-facing Chatend ends with the terse line
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
 History ingress

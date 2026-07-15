@@ -6,10 +6,14 @@ canonical documents; this file is not an append-only log.
 
 ## Chatend and Inspector
 
-- The Chatend is the canonical human-readable text supplied to Kennedy. The
-  Full inspector and the intelligence request use the same formatter, so the
-  Full view shows the application prompt text Kennedy receives rather than an
-  approximation, a JSON serialization, or transport diagnostics. A durable
+- The Chatend is the canonical human-readable application text supplied to
+  Codex for Kennedy. The Full inspector and the intelligence request use the
+  same formatter, so the Full view shows every application-controlled
+  plaintext byte rather than an approximation, a JSON serialization, or
+  transport diagnostics. Codex and its upstream provider may still add forced
+  system content or structured tool metadata outside the application's
+  inspectable boundary. Reveal and minimize everything the deployment exposes,
+  but do not claim visibility into hidden provider/runtime prompts. A durable
   "Chatend archive" is a separate versioned recovery object; it is never sent
   to Kennedy as JSON.
 - Show readable system and conversation text, memory context, Kennedy's
@@ -61,6 +65,30 @@ canonical documents; this file is not an append-only log.
 - Run ordinary Kennedy generations through `codex-safe` and non-interactive
   `codex exec` under a bounded deadline, read-only sandbox, no approval prompts,
   and no shell/file tools. Give only the dedicated WebSearch run internet access.
+- Minimize exposed Codex scaffolding on every call: use a terse inline base
+  instruction, disable personality and project instructions, omit skill,
+  permission, app, collaboration, and environment instruction blocks, and
+  disable optional tools, plugins, goals, browser/computer features, hooks,
+  shell snapshots, and elicitation features. Ordinary generation disables web
+  search; a dedicated hosted-research turn retains only its required search
+  capability. Do not disable bundled skills through a setting that mutates
+  shared Codex state.
+- Explicitly disable Codex's experimental `request_user_input` registration.
+  After the slim catalog is applied, stock Codex still registers
+  `update_plan` and `view_image` for environment-backed turns; current Codex
+  exposes no supported setting to remove those final core schemas. They remain
+  downstream runtime scaffolding and are forbidden by Kennedy's terse base
+  instruction.
+- Derive a slim model catalog from the live `codex-safe debug models` result by
+  removing only Codex's agent-tool selectors (`tool_mode`,
+  `multi_agent_version`, and `apply_patch_tool_type`). Verify that every
+  model's advertised effective context limit is identical before using it.
+  Probe the filtered catalog through the launcher and fall back to prompt-only
+  reduction with a warning if the sandbox cannot read it.
+- The `codex-safe` container boundary must expose the host temporary directory's
+  `kennedy-codex-catalogs` subdirectory at the same absolute path, read-only.
+  This lets the backend pass the verified live catalog without copying mutable
+  provider state into the application.
 - Reuse Codex threads and report cache reads where Codex exposes them. Do not
   automatically compact or reset context; resets remain under user or Kennedy
   control.

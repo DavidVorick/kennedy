@@ -126,8 +126,11 @@ The frontend owns:
 The context inspector renders the canonical human-readable Chatend, including
 Kennedy's text tool requests and readable tool results. Its Full view and the
 generation path share one formatter over the current messages, so the Full
-view is the application prompt text sent to Kennedy, not a representation of a
-JSON recovery archive. It provides full-context,
+view is every byte of application-controlled plaintext sent to Codex for
+Kennedy, not a representation of a JSON recovery archive. Forced Codex or
+upstream-provider system/tool scaffolding may be added outside the
+application's observable boundary; the application minimizes exposed
+scaffolding and does not pretend invisible layers are inspectable. It provides full-context,
 system-prompt-only, and expandable Kmap-memory views. The memory view derives
 node provenance from the Kweb context snapshot so direct loads, task edges,
 active-edge expansions, and summary-only fanout references remain visually distinct.
@@ -175,6 +178,10 @@ The intelligence backend owns:
 - validating the canonical plaintext generation request,
 - passing canonical plaintext and continuation controls into bounded,
   read-only non-interactive Codex turns,
+- minimizing exposed Codex overhead through terse inline instructions,
+  suppressed optional instruction/tool/plugin features, and a probed slim
+  catalog derived from live model metadata without changing advertised model
+  limits,
 - suppressing Codex auto-compaction beyond every reachable context so Kmap
   material is never silently summarized,
 - translating Codex text, thread IDs, errors, and detailed token usage
@@ -186,12 +193,15 @@ The intelligence backend owns:
   native audio.
 
 It stores no local LLM session and never parses Kennedy's tool envelopes. The
-normal generation path has no provider tools. The frontend recognizes
-WebSearch and WebFetch text calls, invokes the corresponding intelligence API,
-then appends their readable results to the main conversation chain. Quality
-and balanced search runs are fresh ephemeral Codex threads; fast search is a
-stateless Gemini 3.1 Flash-Lite interaction with Google Search grounding. None
-can alter the conversation continuation chain.
+normal generation path has no enabled shell, file-mutation, app, multi-agent,
+or internet capability. Stock Codex still emits its irreducible `update_plan`
+and environment-backed `view_image` schemas, which the inline instruction
+forbids Kennedy from using. The frontend recognizes WebSearch and WebFetch text
+calls, invokes the corresponding intelligence API, then appends their readable
+results to the main conversation chain. Quality and balanced search runs are
+fresh ephemeral Codex threads; fast search is a stateless Gemini 3.1 Flash-Lite
+interaction with Google Search grounding. None can alter the conversation
+continuation chain.
 
 ### 4.4 Conversation History Backend
 

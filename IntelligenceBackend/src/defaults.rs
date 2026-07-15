@@ -7,6 +7,10 @@ pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const GENERATION_REASONING_EFFORT: &str = "xhigh";
 pub(crate) const GENERATION_TIMEOUT_SECONDS: u64 = 600;
 pub(crate) const DISABLED_AUTO_COMPACT_TOKEN_LIMIT: i64 = i64::MAX;
+pub(crate) const MINIMAL_CODEX_INSTRUCTIONS: &str =
+    "Follow the supplied Chatend. Do not use Codex tools.";
+pub(crate) const MINIMAL_CODEX_SEARCH_INSTRUCTIONS: &str =
+    "Follow the supplied research prompt. Use only web search.";
 
 pub(crate) const QUALITY_SEARCH_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const QUALITY_SEARCH_REASONING_EFFORT: &str = "xhigh";

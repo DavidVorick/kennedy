@@ -121,7 +121,11 @@ Kennedy. The Full inspector and generation path call the same formatter over
 the same current message list. Consequently the Full view shows the text sent
 for a fresh Codex thread exactly—role labels, separators, and content included;
 there is no hidden application-side JSON envelope or differently formatted
-prompt. Provider thread IDs and runtime protocol data are not Chatend content.
+prompt. This exactness is scoped to application-controlled plaintext. Codex or
+its upstream provider may add forced system content or structured tool metadata
+downstream; the application minimizes everything its environment exposes and
+does not claim those inaccessible layers appear in the inspector. Provider
+thread IDs and runtime protocol data are not Chatend content.
 It contains:
 
 - the composed system prompt,
@@ -699,7 +703,9 @@ attempts do not increment the totals.
 The right panel has four views of Kennedy's current chatend. The Full view uses
 the exact same canonical formatter and current messages as generation; it is
 not a rendering of the recovery JSON and does not hide application prompt
-content:
+content. It displays the entire application-controlled plaintext boundary, not
+unobservable system/tool scaffolding that Codex or its provider may inject
+afterward:
 
 - **Full view** shows system context, conversation, transparent JSON tool
   envelopes, readable tool results, and loaded Kmap context.

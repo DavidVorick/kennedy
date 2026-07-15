@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -124,6 +124,7 @@ impl Default for ProviderConfig {
 struct ProviderRuntime {
     config: ProviderConfig,
     model_limits: HashMap<String, ModelLimits>,
+    slim_model_catalog: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -508,6 +509,7 @@ fn initialize_providers(
             ProviderRuntime {
                 config: provider.clone(),
                 model_limits: HashMap::new(),
+                slim_model_catalog: None,
             },
         );
     }
@@ -550,9 +552,84 @@ fn parse_codex_model_limits(output: &[u8]) -> anyhow::Result<HashMap<String, Mod
     Ok(limits)
 }
 
+fn slim_codex_model_catalog(output: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut catalog: Value =
+        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .context("Codex model catalog has no models array")?;
+    for model in models {
+        let model = model
+            .as_object_mut()
+            .context("Codex model catalog contains a non-object model")?;
+        model.remove("tool_mode");
+        model.remove("multi_agent_version");
+        model.remove("apply_patch_tool_type");
+    }
+    serde_json::to_vec(&catalog).context("serializing the slim Codex model catalog")
+}
+
+fn model_catalog_config(path: &Path) -> String {
+    format!(
+        "model_catalog_json={}",
+        serde_json::to_string(path.to_string_lossy().as_ref())
+            .expect("serializing a path string cannot fail")
+    )
+}
+
+fn slim_codex_catalog_directory() -> PathBuf {
+    std::env::temp_dir().join("kennedy-codex-catalogs")
+}
+
+async fn prepare_slim_codex_model_catalog(
+    executable: &str,
+    source: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let catalog = slim_codex_model_catalog(source)?;
+    let directory = slim_codex_catalog_directory();
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .context("creating the slim Codex model catalog directory")?;
+    let path = directory.join(format!("models-{}.json", Uuid::new_v4()));
+    tokio::fs::write(&path, catalog)
+        .await
+        .context("writing the slim Codex model catalog")?;
+    let config = model_catalog_config(&path);
+    let probe = Command::new(executable)
+        .arg("-c")
+        .arg(config)
+        .args(["debug", "models"])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .output()
+        .await
+        .with_context(|| format!("probing slim model catalog through '{executable}'"))?;
+    let verification = (|| -> anyhow::Result<()> {
+        if !probe.status.success() {
+            anyhow::bail!(
+                "{executable} cannot read {} inside its sandbox",
+                path.display()
+            );
+        }
+        if parse_codex_model_limits(&probe.stdout)? != parse_codex_model_limits(source)? {
+            anyhow::bail!("slim Codex catalog changed advertised model context limits");
+        }
+        Ok(())
+    })();
+    if let Err(error) = verification {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error);
+    }
+    Ok(path)
+}
+
 async fn discover_codex_model_limits(
     providers: &mut HashMap<String, ProviderRuntime>,
 ) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(slim_codex_catalog_directory())
+        .await
+        .context("creating the shared Codex model catalog directory")?;
     let executables = providers
         .values()
         .map(|provider| provider.config.executable.clone())
@@ -569,10 +646,31 @@ async fn discover_codex_model_limits(
         if !output.status.success() {
             anyhow::bail!("Codex model discovery failed through {executable}");
         }
-        catalogs.insert(executable, parse_codex_model_limits(&output.stdout)?);
+        let limits = parse_codex_model_limits(&output.stdout)?;
+        let slim_model_catalog = match prepare_slim_codex_model_catalog(&executable, &output.stdout)
+            .await
+        {
+            Ok(path) => {
+                tracing::info!(
+                    executable,
+                    path = %path.display(),
+                    "Codex agent-tool model metadata removed"
+                );
+                Some(path)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    executable,
+                    error = %error,
+                    "Codex model catalog slimming unavailable; using prompt-only overhead reduction"
+                );
+                None
+            }
+        };
+        catalogs.insert(executable, (limits, slim_model_catalog));
     }
     for (name, provider) in providers {
-        let catalog = catalogs
+        let (catalog, slim_model_catalog) = catalogs
             .get(&provider.config.executable)
             .context("missing discovered Codex model catalog")?;
         for model in &provider.config.models {
@@ -581,6 +679,7 @@ async fn discover_codex_model_limits(
             })?;
             provider.model_limits.insert(model.clone(), limits);
         }
+        provider.slim_model_catalog.clone_from(slim_model_catalog);
     }
     Ok(())
 }
@@ -910,31 +1009,106 @@ fn add_codex_config(
     command: &mut Command,
     reasoning_effort: &str,
     web_search_context_size: Option<&str>,
+    slim_model_catalog: Option<&Path>,
 ) {
+    let instructions = if web_search_context_size.is_some() {
+        MINIMAL_CODEX_SEARCH_INSTRUCTIONS
+    } else {
+        MINIMAL_CODEX_INSTRUCTIONS
+    };
     command
         .arg("-c")
         .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
+        .arg("-c")
+        .arg(format!("instructions=\"{instructions}\""))
+        .arg("-c")
+        .arg("personality=\"none\"")
+        .arg("-c")
+        .arg("project_doc_max_bytes=0")
         .arg("-c")
         .arg("approval_policy=\"never\"")
         .arg("-c")
         .arg("sandbox_mode=\"read-only\"")
         .arg("-c")
+        .arg("include_permissions_instructions=false")
+        .arg("-c")
+        .arg("include_apps_instructions=false")
+        .arg("-c")
+        .arg("include_collaboration_mode_instructions=false")
+        .arg("-c")
+        .arg("include_environment_context=false")
+        .arg("-c")
+        .arg("skills.include_instructions=false")
+        .arg("-c")
         .arg("features.multi_agent=false")
+        .arg("-c")
+        .arg("features.multi_agent_v2=false")
         .arg("-c")
         .arg("features.apps=false")
         .arg("-c")
         .arg("features.shell_tool=false")
         .arg("-c")
-        .arg("features.unified_exec=false");
+        .arg("features.unified_exec=false")
+        .arg("-c")
+        .arg("features.code_mode=false")
+        .arg("-c")
+        .arg("features.code_mode_host=false")
+        .arg("-c")
+        .arg("features.goals=false")
+        .arg("-c")
+        .arg("features.hooks=false")
+        .arg("-c")
+        .arg("features.plugins=false")
+        .arg("-c")
+        .arg("features.remote_plugin=false")
+        .arg("-c")
+        .arg("features.plugin_sharing=false")
+        .arg("-c")
+        .arg("features.personality=false")
+        .arg("-c")
+        .arg("features.browser_use=false")
+        .arg("-c")
+        .arg("features.browser_use_external=false")
+        .arg("-c")
+        .arg("features.browser_use_full_cdp_access=false")
+        .arg("-c")
+        .arg("features.computer_use=false")
+        .arg("-c")
+        .arg("features.in_app_browser=false")
+        .arg("-c")
+        .arg("features.image_generation=false")
+        .arg("-c")
+        .arg("features.tool_suggest=false")
+        .arg("-c")
+        .arg("features.workspace_dependencies=false")
+        .arg("-c")
+        .arg("features.shell_snapshot=false")
+        .arg("-c")
+        .arg("features.skill_mcp_dependency_install=false")
+        .arg("-c")
+        .arg("features.guardian_approval=false")
+        .arg("-c")
+        .arg("features.auth_elicitation=false")
+        .arg("-c")
+        .arg("features.tool_call_mcp_elicitation=false")
+        .arg("-c")
+        .arg("tools.experimental_request_user_input.enabled=false")
+        .arg("-c")
+        .arg("features.default_mode_request_user_input=false")
+        .arg("-c")
+        .arg("features.remote_compaction_v2=false");
     command.arg("-c").arg(format!(
         "model_auto_compact_token_limit={DISABLED_AUTO_COMPACT_TOKEN_LIMIT}"
     ));
+    if let Some(path) = slim_model_catalog {
+        command.arg("-c").arg(model_catalog_config(path));
+    }
     if let Some(context_size) = web_search_context_size {
         command
             .arg("-c")
             .arg(format!("tools.web_search.context_size=\"{context_size}\""));
     } else {
-        command.arg("-c").arg("tools.web_search=false");
+        command.arg("-c").arg("web_search=\"disabled\"");
     }
 }
 
@@ -1113,7 +1287,12 @@ async fn run_codex_turn(
             .arg("--sandbox")
             .arg("read-only");
     }
-    add_codex_config(&mut command, reasoning_effort, web_search_context_size);
+    add_codex_config(
+        &mut command,
+        reasoning_effort,
+        web_search_context_size,
+        provider.slim_model_catalog.as_deref(),
+    );
     if let Some(thread_id) = previous_thread_id {
         command.arg(thread_id);
     }
@@ -2584,17 +2763,101 @@ mod tests {
     }
 
     #[test]
-    fn codex_turns_set_auto_compaction_beyond_any_reachable_context() {
+    fn slim_codex_catalog_preserves_advertised_limits_and_removes_agent_tools() {
+        let source = br#"{
+            "models":[{
+                "slug":"gpt-5.6-sol",
+                "context_window":272000,
+                "effective_context_window_percent":95,
+                "base_instructions":"provider instructions",
+                "tool_mode":"code_mode_only",
+                "multi_agent_version":"v2",
+                "apply_patch_tool_type":"freeform",
+                "unrelated":"preserved"
+            }]
+        }"#;
+        let slim = slim_codex_model_catalog(source).unwrap();
+        assert_eq!(
+            parse_codex_model_limits(&slim).unwrap(),
+            parse_codex_model_limits(source).unwrap()
+        );
+        let catalog: Value = serde_json::from_slice(&slim).unwrap();
+        let model = catalog["models"][0].as_object().unwrap();
+        for removed in ["tool_mode", "multi_agent_version", "apply_patch_tool_type"] {
+            assert!(!model.contains_key(removed));
+        }
+        assert_eq!(model["base_instructions"], "provider instructions");
+        assert_eq!(model["unrelated"], "preserved");
+    }
+
+    #[test]
+    fn codex_turns_minimize_codex_scaffolding_and_disable_compaction() {
         let mut command = Command::new("codex-safe");
-        add_codex_config(&mut command, "xhigh", None);
+        let catalog = Path::new("/tmp/kennedy-codex-catalogs/models.json");
+        add_codex_config(&mut command, "xhigh", None, Some(catalog));
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for expected in [
+            format!("instructions=\"{MINIMAL_CODEX_INSTRUCTIONS}\""),
+            "personality=\"none\"".into(),
+            "project_doc_max_bytes=0".into(),
+            "include_permissions_instructions=false".into(),
+            "include_apps_instructions=false".into(),
+            "include_collaboration_mode_instructions=false".into(),
+            "include_environment_context=false".into(),
+            "skills.include_instructions=false".into(),
+            "features.multi_agent=false".into(),
+            "features.apps=false".into(),
+            "features.shell_tool=false".into(),
+            "features.unified_exec=false".into(),
+            "features.code_mode=false".into(),
+            "features.code_mode_host=false".into(),
+            "features.goals=false".into(),
+            "features.hooks=false".into(),
+            "features.plugins=false".into(),
+            "features.personality=false".into(),
+            "features.browser_use=false".into(),
+            "features.computer_use=false".into(),
+            "features.image_generation=false".into(),
+            "features.tool_suggest=false".into(),
+            "features.workspace_dependencies=false".into(),
+            "features.shell_snapshot=false".into(),
+            "features.skill_mcp_dependency_install=false".into(),
+            "features.guardian_approval=false".into(),
+            "features.remote_compaction_v2=false".into(),
+            "tools.experimental_request_user_input.enabled=false".into(),
+            "web_search=\"disabled\"".into(),
+            model_catalog_config(catalog),
+        ] {
+            assert!(
+                arguments.contains(&expected),
+                "missing Codex config: {expected}"
+            );
+        }
+        assert!(arguments.contains(&format!(
+            "model_auto_compact_token_limit={DISABLED_AUTO_COMPACT_TOKEN_LIMIT}"
+        )));
+        assert!(!arguments.contains(&"skills.bundled.enabled=false".into()));
+        assert!(!arguments.contains(&"tools.web_search=false".into()));
+    }
+
+    #[test]
+    fn codex_web_search_keeps_only_the_search_capability() {
+        let mut command = Command::new("codex-safe");
+        add_codex_config(&mut command, "low", Some("high"), None);
         let arguments = command
             .as_std()
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(arguments.contains(&format!(
-            "model_auto_compact_token_limit={DISABLED_AUTO_COMPACT_TOKEN_LIMIT}"
+            "instructions=\"{MINIMAL_CODEX_SEARCH_INSTRUCTIONS}\""
         )));
+        assert!(arguments.contains(&"tools.web_search.context_size=\"high\"".into()));
+        assert!(!arguments.contains(&"web_search=\"disabled\"".into()));
     }
 
     #[test]
