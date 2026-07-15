@@ -1,8 +1,8 @@
-import { Chatend } from "./chatend.js?v=20260715.7";
+import { Chatend } from "./chatend.js?v=20260715.8";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
-import { ToolExecutor } from "./tools.js?v=20260715.7";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.9";
+import { ToolExecutor } from "./tools.js?v=20260715.9";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.10";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
@@ -51,6 +51,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   if (Array.isArray(archive?.messages)) {
     chatend.restoreMessages(jsonCopy(archive.messages), Array.isArray(archive.retained) ? jsonCopy(archive.retained) : retained);
   }
+  chatend.restoreFullHistory(archive?.fullHistory?.segments);
   const continuation = new ContinuationState(createCacheKey("ingress"));
   const usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
   usage.restore(archive?.usage);
@@ -75,6 +76,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     systemPrompt: chatend.systemPrompt,
     retained: jsonCopy(chatend.retained),
     messages: jsonCopy(chatend.messages),
+    fullHistory: chatend.fullHistorySnapshot(),
     context: {
       snapshot: jsonCopy(context.snapshot()),
       diagnostics: jsonCopy(context.diagnostics()),

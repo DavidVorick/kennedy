@@ -2,12 +2,16 @@ import { formatKmapContext } from "./human_format.js?v=20260715.7";
 
 const RESET_HISTORY_KIND = "reset-history";
 
+function jsonCopy(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
 function compactNodeName(value) {
   return String(value || "Unnamed memory").replace(/\s+/g, " ").trim() || "Unnamed memory";
 }
 
 export class Chatend {
-  constructor(systemPrompt, context, retained = []) { this.systemPrompt = systemPrompt; this.context = context; this.retained = retained; this.messages = []; this.restoreResetHistory(); this.rebuild(); }
+  constructor(systemPrompt, context, retained = []) { this.systemPrompt = systemPrompt; this.context = context; this.retained = retained; this.messages = []; this.historySegments = []; this.restoreResetHistory(); this.rebuild(); }
 
   contextMessage() { return { role: "system", display_role: "Kmap context", context_kind: "memory", content: formatKmapContext(this.context.snapshot()) }; }
 
@@ -36,6 +40,14 @@ export class Chatend {
       : [];
   }
 
+  restoreFullHistory(segments) {
+    this.historySegments = Array.isArray(segments)
+      ? segments.filter(segment => Array.isArray(segment?.messages)).map(segment => jsonCopy(segment))
+      : [];
+  }
+
+  fullHistorySnapshot() { return { segments: jsonCopy(this.historySegments) }; }
+
   resetHistoryMessage() {
     const groups = new Map();
     for (const entry of this.resetHistory) {
@@ -58,6 +70,14 @@ export class Chatend {
   }
 
   rebuildAfterReset(selfMessage, resetHistoryEntry, assistantMessage, ...followingMessages) {
+    const boundaryIndex = followingMessages.findIndex(message => message?.full_history_boundary === true);
+    const boundary = boundaryIndex >= 0 ? followingMessages.splice(boundaryIndex, 1)[0] : {};
+    this.historySegments.push({
+      reason: "ResetContext",
+      messages: jsonCopy(this.messages),
+      memory: jsonCopy(boundary.memory || null),
+      usage: jsonCopy(boundary.usage || null),
+    });
     this.resetHistory.push({
       retainedNodeNames: (resetHistoryEntry?.retainedNodeNames || []).map(compactNodeName),
       budgetUsed: resetHistoryEntry?.budgetUsed || 0,

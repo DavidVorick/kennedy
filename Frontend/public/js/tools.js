@@ -97,6 +97,8 @@ export class ToolExecutor {
     return {
       role: "user",
       display_role: displayRole,
+      tool_name: call.name,
+      tool_result: content,
       content: [`Kennedy tool result · ${call.name} · ${formatDuration(durationMs)}`, "", formatToolResult(call.name, content)].join("\n"),
     };
   }
@@ -140,7 +142,7 @@ export class ToolExecutor {
       const durationMs = elapsedMs(started);
       const message = this.resultMessage(call, { ok: true, result: outcome.result }, durationMs);
       this.record({ name: call.name, arguments: call.arguments, ok: true, durationMs });
-      return { message, reset: Boolean(outcome.reset), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, durationMs };
+      return { message, reset: Boolean(outcome.reset), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, previousContext: outcome.previousContext ?? null, durationMs };
     } catch (error) {
       const code = error.code || "tool_failed";
       const message = error.message || "Tool execution failed.";
@@ -165,9 +167,11 @@ export class ToolExecutor {
     this.consumeContextLoadBudget();
     const durable = args.identifiers.map(id => this.context.resolve(id));
     const retainedNodeNames = durable.map(id => this.context.nodesById.get(id)?.short_name || "Unnamed memory");
+    const previousContext = this.context.snapshot();
     return {
       result: await this.context.reset(durable),
       reset: true,
+      previousContext,
       selfMessage,
       resetHistoryEntry: { retainedNodeNames, budgetUsed: this.loadCalls, budgetLimit: this.loadLimit },
     };

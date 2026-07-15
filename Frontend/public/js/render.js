@@ -1,6 +1,8 @@
 import { formatKmapContext } from "./human_format.js?v=20260715.7";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
+const RESPONSE_PREVIEW_CHARACTERS = 500;
+
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -158,7 +160,15 @@ export function ingressEntryPresentation(message) {
   return { collapsed: false, label: message?.display_role || "Kennedy" };
 }
 
-export function renderInspector(container, diagnostic, view = "full") {
+export function renderInspector(container, diagnostic, view = "main") {
+  if (view === "history") {
+    renderFullHistory(container, diagnostic);
+    return;
+  }
+  if (view === "main") {
+    renderMainView(container, diagnostic);
+    return;
+  }
   container.replaceChildren();
   if (view === "memory") {
     renderMemoryTree(container, diagnostic.memory);
@@ -167,7 +177,177 @@ export function renderInspector(container, diagnostic, view = "full") {
   container.append(element("pre", "inspector-text", inspectorText(diagnostic, view)));
 }
 
+function parseToolRequest(content) {
+  if (typeof content !== "string") return [];
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("KENNEDY_TOOL_CALLS\n")) return [];
+  try {
+    const envelope = JSON.parse(trimmed.slice("KENNEDY_TOOL_CALLS".length).trim());
+    return Array.isArray(envelope?.calls) ? envelope.calls.filter(call => call && typeof call.name === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function isToolResult(message) {
+  return message?.display_role === "Memory tool result" ||
+    message?.display_role === "Web tool result" ||
+    message?.display_role === "Tool protocol error" ||
+    (typeof message?.content === "string" && message.content.startsWith("Kennedy tool result"));
+}
+
+function readableMessageContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(block => {
+      if (typeof block === "string") return block;
+      if (typeof block?.text === "string") return block.text;
+      if (block?.image_url || block?.type?.includes?.("image")) return "[Image content]";
+      try { return JSON.stringify(block, null, 2); } catch { return "[Structured content]"; }
+    }).join("\n\n");
+  }
+  if (content === null || content === undefined) return "";
+  try { return JSON.stringify(content, null, 2); } catch { return String(content); }
+}
+
+function loadedNodesForResult(message, call, memory) {
+  if ((message?.tool_name || call?.name) !== "LoadNode" || message?.tool_result?.ok === false) return [];
+  const result = message?.tool_result?.result;
+  if (result?.requestedNode) return [{ node: result.requestedNode, relation: "direct" }];
+  const requested = (memory?.nodes || []).find(node => node.identifier === call?.arguments?.identifier);
+  if (!requested) return [];
+  return [{ node: requested, relation: "direct" }];
+}
+
+function responsePreview(content) {
+  const characters = [...content];
+  return characters.length > RESPONSE_PREVIEW_CHARACTERS
+    ? characters.slice(0, RESPONSE_PREVIEW_CHARACTERS).join("")
+    : null;
+}
+
+function addEntryTiming(entry, timing) {
+  if (!entry || typeof timing !== "string" || !timing.trim()) return;
+  if (!Array.isArray(entry.timing)) entry.timing = [];
+  entry.timing.push(timing.trim());
+}
+
+function toolResultPresentation(message) {
+  const content = readableMessageContent(message?.content);
+  const [firstLine = "", ...followingLines] = content.split("\n");
+  const match = firstLine.match(/^Kennedy tool result · (.+?) · (.+)$/);
+  if (!match) return { content, timing: null };
+  return {
+    content: followingLines.join("\n").replace(/^\s+/, ""),
+    timing: `${match[1]} ${match[2]}`,
+  };
+}
+
+export function mainViewEntries(diagnostic) {
+  const messages = Array.isArray(diagnostic?.chatend) ? diagnostic.chatend : [];
+  const memory = diagnostic?.memory || { directlyLoadedIdentifiers: [], nodes: [] };
+  const entries = [];
+  const instructions = messages.filter(message => message?.context_kind === "instructions");
+  const fallbackInstructions = instructions.length ? [] : messages.filter((message, index) => message?.role === "system" && index === 0);
+  for (const message of [...instructions, ...fallbackInstructions]) {
+    entries.push({ kind: "context", label: "System prompt", content: readableMessageContent(message.content) });
+  }
+  entries.push({ kind: "memory", memory });
+
+  const pendingCalls = [];
+  let pendingToolTiming = [];
+  let lastVisibleEntry = null;
+  for (const [messageIndex, message] of messages.entries()) {
+    if (instructions.includes(message) || fallbackInstructions.includes(message) || message?.context_kind === "memory") continue;
+    if (message?.context_kind === "timing") {
+      const timing = readableMessageContent(message.content);
+      if (pendingCalls.length || lastVisibleEntry?.kind === "tool-call") pendingToolTiming.push(timing);
+      else addEntryTiming(lastVisibleEntry, timing);
+      continue;
+    }
+    const calls = message?.role === "assistant" ? parseToolRequest(message.content) : [];
+    if (calls.length) {
+      for (const [callIndex, call] of calls.entries()) {
+        const entry = {
+          kind: "tool-call",
+          label: `Tool call · ${call.name}`,
+          content: JSON.stringify(call.arguments || {}, null, 2),
+          key: `tool-call:${messageIndex}:${callIndex}`,
+        };
+        entries.push(entry);
+        lastVisibleEntry = entry;
+        pendingCalls.push(call);
+      }
+      continue;
+    }
+    if (message?.role === "assistant" && typeof message.content === "string" && message.content.trim().startsWith("KENNEDY_TOOL_CALLS")) {
+      const entry = { kind: "tool-call", label: "Malformed tool call", content: message.content, key: `tool-call:${messageIndex}:malformed` };
+      entries.push(entry);
+      lastVisibleEntry = entry;
+      continue;
+    }
+    if (isToolResult(message)) {
+      const call = pendingCalls.shift() || (message.tool_name ? { name: message.tool_name, arguments: {} } : null);
+      const loadedNodes = loadedNodesForResult(message, call, memory);
+      const presentation = toolResultPresentation(message);
+      if (loadedNodes.length) {
+        let lastLoadedEntry = null;
+        for (const [nodeIndex, loaded] of loadedNodes.entries()) {
+          lastLoadedEntry = {
+            kind: "loaded-node",
+            label: `${loaded.relation === "active" ? "Active connection loaded" : "Node loaded"} · ${loaded.node.identifier}: ${loaded.node.shortName}`,
+            node: loaded.node,
+            relation: loaded.relation,
+            key: `tool-result:${messageIndex}:node:${nodeIndex}`,
+          };
+          entries.push(lastLoadedEntry);
+        }
+        for (const timing of [...pendingToolTiming, presentation.timing]) addEntryTiming(lastLoadedEntry, timing);
+        lastVisibleEntry = lastLoadedEntry;
+      } else {
+        const failed = message?.tool_result?.ok === false;
+        const name = message?.tool_name || call?.name || message.display_role || "Tool";
+        const entry = {
+          kind: "tool-result",
+          label: `${failed ? "Tool failed" : "Tool result"} · ${name}`,
+          content: presentation.content,
+          key: `tool-result:${messageIndex}`,
+        };
+        for (const timing of [...pendingToolTiming, presentation.timing]) addEntryTiming(entry, timing);
+        entries.push(entry);
+        lastVisibleEntry = entry;
+      }
+      pendingToolTiming = [];
+      continue;
+    }
+    if ((message?.role === "user" || message?.role === "assistant") && !message?.context_kind) {
+      const content = readableMessageContent(message.content);
+      const entry = {
+        kind: "conversation",
+        role: message.role,
+        label: message.display_role || (message.role === "assistant" ? "Kennedy" : "David"),
+        content,
+        preview: message.role === "assistant" ? responsePreview(content) : null,
+        key: `conversation:${messageIndex}`,
+      };
+      entries.push(entry);
+      lastVisibleEntry = entry;
+      continue;
+    }
+    const entry = {
+      kind: "context",
+      label: message?.display_role || (message?.role === "assistant" ? "Kennedy context" : "System context"),
+      content: readableMessageContent(message?.content),
+      key: `context:${messageIndex}`,
+    };
+    entries.push(entry);
+    lastVisibleEntry = entry;
+  }
+  return entries;
+}
+
 export function inspectorText(diagnostic, view = "full") {
+  if (view === "history") return fullHistoryText(diagnostic);
   if (view === "memory") return formatKmapContext(diagnostic.memory || { directlyLoadedIdentifiers: [], nodes: [] });
   let messages = diagnostic.chatend || [];
   if (view === "system") {
@@ -187,7 +367,7 @@ export function inspectorText(diagnostic, view = "full") {
     });
     if (!messages.length) return "No tool calls are currently in the Chatend.";
   }
-  return formatChatend(messages, view === "full" ? diagnostic.usage : null);
+  return formatChatend(messages, view === "full" || view === "main" ? diagnostic.usage : null);
 }
 
 function tokenCount(value) {
@@ -252,7 +432,7 @@ function connectionLeaf(connection, kind, nodeByIdentifier, directlyLoaded) {
   return row;
 }
 
-function connectionGroup(title, connections, kind, nodeByIdentifier, directlyLoaded, path, depth) {
+function connectionGroup(title, connections, kind, nodeByIdentifier, directlyLoaded, path, depth, openKeys = new Set(), keyPrefix = "memory") {
   const group = element("div", `memory-branch ${kind}`);
   const heading = element("div", "memory-branch-title");
   heading.append(element("span", "memory-branch-line"), element("strong", "", title), badge(String(connections.length), "count"));
@@ -263,9 +443,9 @@ function connectionGroup(title, connections, kind, nodeByIdentifier, directlyLoa
   }
   for (const connection of connections) {
     const target = nodeByIdentifier.get(connection.identifier);
-    const canExpand = kind === "active" && target && !path.has(connection.identifier) && depth < 2;
+    const canExpand = kind === "active" && target && !path.has(connection.identifier) && depth < 1;
     if (canExpand) {
-      group.append(memoryNode(target, "expanded", nodeByIdentifier, directlyLoaded, new Set([...path, connection.identifier]), depth + 1));
+      group.append(memoryNode(target, "expanded", nodeByIdentifier, directlyLoaded, new Set([...path, connection.identifier]), depth + 1, openKeys, `${keyPrefix}:active:${connection.identifier}`));
     } else {
       group.append(connectionLeaf(connection, kind, nodeByIdentifier, directlyLoaded));
     }
@@ -273,9 +453,10 @@ function connectionGroup(title, connections, kind, nodeByIdentifier, directlyLoa
   return group;
 }
 
-function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, depth = 0) {
+function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, depth = 0, openKeys = new Set(), key = `memory-node:${node.identifier}:${depth}`) {
   const details = element("details", `memory-node ${relation}`);
-  if (relation === "direct") details.open = true;
+  details.dataset.mainKey = key;
+  details.open = openKeys.has(key);
   const summary = element("summary", "memory-node-summary");
   const sourceLabel = relation === "direct"
     ? "directly loaded"
@@ -292,12 +473,205 @@ function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, dept
   body.append(element("p", "memory-node-attribution", `Last modified by: ${node.lastModifiedBy || "legacy-unknown"}`));
   body.append(element("p", "memory-node-long", node.longDescription || "No detailed description."));
   body.append(
-    connectionGroup("Task connections", node.taskConnections || [], "task", nodeByIdentifier, directlyLoaded, path, depth),
-    connectionGroup("Active connections", node.activeConnections || [], "active", nodeByIdentifier, directlyLoaded, path, depth),
-    connectionGroup("Fanout references", node.fanoutConnections || [], "fanout", nodeByIdentifier, directlyLoaded, path, depth),
+    connectionGroup("Task connections", node.taskConnections || [], "task", nodeByIdentifier, directlyLoaded, path, depth, openKeys, key),
+    connectionGroup("Active connections", node.activeConnections || [], "active", nodeByIdentifier, directlyLoaded, path, depth, openKeys, key),
+    connectionGroup("Fanout references", node.fanoutConnections || [], "fanout", nodeByIdentifier, directlyLoaded, path, depth, openKeys, key),
   );
   details.append(body);
   return details;
+}
+
+function keyedDetails(className, key, openKeys) {
+  const details = element("details", className);
+  details.dataset.mainKey = key;
+  details.open = openKeys.has(key);
+  return details;
+}
+
+function disclosureSummary(label, kind = "context") {
+  const summary = element("summary", "main-entry-summary");
+  summary.append(badge(kind, kind), element("strong", "main-entry-label", label), element("span", "main-entry-toggle"));
+  return summary;
+}
+
+function mainMemorySet(entry, openKeys) {
+  const memory = entry.memory || { directlyLoadedIdentifiers: [], nodes: [] };
+  const directlyLoaded = new Set(memory.directlyLoadedIdentifiers || []);
+  const nodeByIdentifier = new Map((memory.nodes || []).map(node => [node.identifier, node]));
+  const activeExpanded = [...nodeByIdentifier.values()].filter(node => !directlyLoaded.has(node.identifier) && node.contextSources?.includes("active")).length;
+  const details = keyedDetails("main-entry main-memory-set", "memory-set", openKeys);
+  const summary = element("summary", "main-entry-summary");
+  summary.append(
+    badge("memory", "memory"),
+    element("strong", "main-entry-label", "Loaded nodes"),
+    badge(`${directlyLoaded.size} direct`, "direct"),
+    badge(`${activeExpanded} active`, "expanded"),
+    element("span", "main-entry-toggle"),
+  );
+  details.append(summary);
+  const body = element("div", "main-memory-body");
+  const directNodes = [...directlyLoaded].map(identifier => nodeByIdentifier.get(identifier)).filter(Boolean);
+  if (!directNodes.length) {
+    body.append(element("p", "memory-tree-empty", "No memory nodes are currently loaded."));
+  } else {
+    for (const node of directNodes) body.append(memoryNode(node, "direct", nodeByIdentifier, directlyLoaded, new Set([node.identifier]), 0, openKeys, `memory-set:node:${node.identifier}`));
+  }
+  const other = [...nodeByIdentifier.values()].filter(node =>
+    !directlyLoaded.has(node.identifier) && !node.contextSources?.includes("active")
+  );
+  if (other.length) {
+    const section = element("section", "memory-other");
+    section.append(element("h3", "", "Other full-context nodes"));
+    for (const node of other) section.append(memoryNode(node, "expanded", nodeByIdentifier, directlyLoaded, new Set([node.identifier]), 1, openKeys, `memory-set:other:${node.identifier}`));
+    body.append(section);
+  }
+  details.append(body);
+  return details;
+}
+
+function mainCollapsedEntry(entry, openKeys, index) {
+  const key = entry.key || `${entry.kind}:${index}`;
+  const details = keyedDetails(`main-entry main-${entry.kind}`, key, openKeys);
+  details.append(disclosureSummary(entry.label, entry.kind === "tool-call" ? "call" : entry.kind === "tool-result" ? "result" : "context"));
+  details.append(element("pre", "main-entry-body", entry.content));
+  if (entry.timing?.length) details.append(element("p", "main-entry-timing", entry.timing.join(" · ")));
+  return details;
+}
+
+function mainLoadedNode(entry, memory, openKeys, index) {
+  const directlyLoaded = new Set(memory?.directlyLoadedIdentifiers || []);
+  const nodes = [...(memory?.nodes || [])];
+  if (!nodes.some(node => node.identifier === entry.node.identifier)) nodes.push(entry.node);
+  const nodeByIdentifier = new Map(nodes.map(node => [node.identifier, node]));
+  const relation = entry.relation === "active" ? "expanded" : "direct";
+  const key = entry.key || `loaded-node:${index}`;
+  const details = memoryNode(entry.node, relation, nodeByIdentifier, directlyLoaded, new Set([entry.node.identifier]), entry.relation === "active" ? 1 : 0, openKeys, key);
+  details.classList.add("main-entry", "main-loaded-node");
+  if (entry.timing?.length) details.querySelector(".memory-node-body")?.append(element("p", "main-entry-timing", entry.timing.join(" · ")));
+  return details;
+}
+
+function mainConversationEntry(entry, openKeys, index) {
+  const article = element("article", `main-conversation-message ${entry.role === "assistant" ? "assistant" : "user"}`);
+  const heading = element("div", "main-conversation-heading");
+  heading.append(element("span", "role", entry.label));
+  if (entry.timing?.length) heading.append(element("span", "main-conversation-timing", entry.timing.join(" · ")));
+  article.append(heading);
+  const body = element("div", "body");
+  appendLinkedText(body, entry.content);
+  if (entry.preview === null || entry.preview === undefined) {
+    article.append(body);
+    return article;
+  }
+  const key = entry.key || `conversation:${index}`;
+  const disclosure = keyedDetails("main-response-disclosure", key, openKeys);
+  const summary = element("summary", "main-response-summary");
+  summary.append(
+    element("span", "main-response-preview", entry.preview),
+    element("span", "main-response-expand", " [...]"),
+    element("span", "main-response-collapse", "Show less"),
+  );
+  disclosure.append(summary, body);
+  article.append(disclosure);
+  return article;
+}
+
+function renderMainView(container, diagnostic) {
+  const openKeys = new Set([...container.querySelectorAll("details[open][data-main-key]")].map(details => details.dataset.mainKey));
+  container.replaceChildren();
+  const stream = element("div", "main-inspector-stream");
+  const entries = mainViewEntries(diagnostic);
+  for (const [index, entry] of entries.entries()) {
+    if (entry.kind === "memory") stream.append(mainMemorySet(entry, openKeys));
+    else if (entry.kind === "conversation") stream.append(mainConversationEntry(entry, openKeys, index));
+    else if (entry.kind === "loaded-node") stream.append(mainLoadedNode(entry, diagnostic?.memory, openKeys, index));
+    else stream.append(mainCollapsedEntry(entry, openKeys, index));
+  }
+  container.append(stream);
+}
+
+function fullHistoryPhases(diagnostic) {
+  const phases = diagnostic?.fullHistory?.phases;
+  if (Array.isArray(phases) && phases.length) return phases;
+  return [{
+    label: diagnostic?.mode === "history ingress" ? "History ingress" : "Conversation",
+    status: diagnostic?.ingressStatus || "current",
+    segments: diagnostic?.historySegments || [],
+    current: { messages: diagnostic?.chatend || [], memory: diagnostic?.memory || null, usage: diagnostic?.usage || null },
+  }];
+}
+
+function historyContext(segment) {
+  return {
+    chatend: segment?.messages || [],
+    memory: segment?.memory || { directlyLoadedIdentifiers: [], nodes: [] },
+    usage: segment?.usage || null,
+  };
+}
+
+function historyBarrier(label, kind = "reset") {
+  const barrier = element("div", `full-history-barrier ${kind}`);
+  barrier.setAttribute("role", "separator");
+  barrier.append(element("span", "full-history-line"), element("strong", "", label), element("span", "full-history-line"));
+  return barrier;
+}
+
+function renderHistoryContext(segment, namespace, openKeys) {
+  const holder = element("section", "full-history-context");
+  holder.append(element("span", "full-history-context-label", namespace.split(":").at(-1)));
+  const content = element("div", "full-history-main");
+  renderMainView(content, historyContext(segment));
+  for (const details of content.querySelectorAll("details[data-main-key]")) {
+    const key = `${namespace}:${details.dataset.mainKey}`;
+    details.dataset.mainKey = key;
+    details.open = openKeys.has(key);
+  }
+  holder.append(content);
+  return holder;
+}
+
+function renderFullHistory(container, diagnostic) {
+  const openKeys = new Set([...container.querySelectorAll("details[open][data-main-key]")].map(details => details.dataset.mainKey));
+  container.replaceChildren();
+  const history = element("div", "full-history");
+  const phases = fullHistoryPhases(diagnostic);
+  for (const [phaseIndex, phase] of phases.entries()) {
+    if (phaseIndex) history.append(historyBarrier(`${phase.label} began`, "phase"));
+    const heading = element("header", "full-history-phase-heading");
+    heading.append(element("strong", "", phase.label), badge(phase.status || "saved", phase.status === "failed" ? "summary" : "expanded"));
+    history.append(heading);
+    const contexts = [...(phase.segments || []), ...(phase.current ? [{ ...phase.current, reason: null }] : [])];
+    if (!contexts.length) {
+      history.append(element("p", "full-history-empty", `${phase.label} is ${phase.status || "not started"}. No Chatend has been checkpointed yet.`));
+      continue;
+    }
+    for (const [contextIndex, context] of contexts.entries()) {
+      history.append(renderHistoryContext(context, `history:${phaseIndex}:Context ${contextIndex + 1}`, openKeys));
+      if (contextIndex < contexts.length - 1) {
+        history.append(historyBarrier(`${context.reason || "ResetContext"} · context reset`));
+      }
+    }
+  }
+  container.append(history);
+}
+
+function fullHistoryText(diagnostic) {
+  const output = [];
+  const phases = fullHistoryPhases(diagnostic);
+  for (const [phaseIndex, phase] of phases.entries()) {
+    if (phaseIndex) output.push(`════════ ${phase.label} began ════════`);
+    output.push(`${phase.label} · ${phase.status || "saved"}`);
+    const contexts = [...(phase.segments || []), ...(phase.current ? [{ ...phase.current, reason: null }] : [])];
+    if (!contexts.length) {
+      output.push(`No ${phase.label.toLowerCase()} Chatend has been checkpointed yet.`);
+      continue;
+    }
+    for (const [contextIndex, context] of contexts.entries()) {
+      output.push(`Context ${contextIndex + 1}`, formatChatend(context.messages || [], context.usage || null));
+      if (contextIndex < contexts.length - 1) output.push(`════════ ${context.reason || "ResetContext"} · context reset ════════`);
+    }
+  }
+  return output.join("\n\n");
 }
 
 function renderMemoryTree(container, snapshot) {

@@ -147,9 +147,11 @@ canonical documents; this file is not an append-only log.
   successful `ConnectNodes` calls. Do not count failed tool attempts.
 - Show durable conversation history in a sidebar and allow completed
   transcripts to be reopened read-only.
-- When a conversation ends, select another live conversation or create one,
-  and run required history ingress sequentially in the background without
-  disabling live chat.
+- When a conversation ends, keep that closed conversation selected while its
+  history ingress unfolds. Never select or create a replacement conversation
+  automatically; the user can select another existing chat or press `New`
+  when ready. Continue to run required history ingress sequentially in the
+  background without disabling other live chats.
 - Serve the local frontend without reusable browser caching and version its
   entry assets so HTML and JavaScript revisions cannot be mixed.
 - Surface startup exceptions as visible failures instead of leaving the UI
@@ -307,3 +309,52 @@ canonical documents; this file is not an append-only log.
   collapsed until the user expands them.
 - A failed Telegram document extraction must receive an error reply and finish
   that relay event so one document cannot block all later messages for the user.
+
+## Main Chatend View
+
+- Keep Full view as the exact, uninterrupted application Chatend passthrough.
+- Make a new Main view the default inspector: ordinary user/Kennedy conversation
+  stays visible while system context, the loaded-node set, each node, tool calls,
+  tool results, node-load events, and other under-the-hood activity are collapsed
+  by default and expandable inline.
+- A directly loaded node may expose the full node returned for each active
+  connection. Connections of that active-connection node remain summary-only,
+  matching the one-hop context-loading boundary.
+- Replace the separate System prompts, Tool calls, and Memory tree inspector
+  tabs with Main view; retain the independent durable Memory explorer.
+
+## Full History Inspector
+
+- Add Full History alongside Main and Full. Main and Full continue to represent
+  only the current post-reset Chatend; Full remains the exact generation
+  passthrough.
+- Full History durably retains each outgoing Main-view context when
+  `ResetContext` succeeds and places a visible reset barrier before the next
+  context. Multiple resets create multiple ordered segments and barriers.
+- Keep Full History data inspector-only: old segments must not re-enter
+  Kennedy's generation context or history-ingress provenance prompt.
+- During history ingress, Main and Full must follow the current live or saved
+  ingress Chatend through completion. Full History follows as well, preserving
+  both conversation and ingress reset segments so the entire process can be
+  traced in the UI.
+
+## Main-View Timing Presentation
+
+- Do not render latency messages as independent rows in Main or in the
+  Main-style segments of Full History.
+- Merge LLM and tool timing into a compact footer at the bottom of the related
+  tool result. For an ordinary expanded conversation response, show timing as
+  small secondary text beside the message heading.
+- Keep Full view unchanged so it continues to expose timing messages at their
+  exact positions in the canonical Chatend.
+
+## Main-View Density
+
+- A `LoadNode` result should render one collapsed event row for the directly
+  requested node. Do not automatically add its full active-connection nodes as
+  sibling rows; expose them only inside the requested node's expansion tree.
+- In Main and the Main-style segments of Full History, truncate Kennedy
+  responses only when they exceed 500 Unicode characters. Show the first 500
+  followed by an expandable `[...]` control that reveals the full response.
+  Keep user messages, responses of 500 characters or fewer, and Full view
+  unchanged.

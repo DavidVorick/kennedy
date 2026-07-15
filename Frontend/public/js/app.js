@@ -1,9 +1,9 @@
 import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, TelegramRelayAPI } from "./api.js?v=20260715.8";
 import { loadPromptManuals } from "./prompt_composer.js?v=20260714.7";
-import { ConversationSession } from "./conversation.js?v=20260715.9";
-import { runHistoryIngress } from "./history_ingress.js?v=20260715.9";
+import { ConversationSession } from "./conversation.js?v=20260715.11";
+import { runHistoryIngress } from "./history_ingress.js?v=20260715.11";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260715.9";
+import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260715.13";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -13,10 +13,10 @@ const CONFIG = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
+  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
-const INSPECTOR_MODES = ["full", "system", "tools", "memory"];
+const INSPECTOR_MODES = ["main", "full", "history"];
 const kweb = KwebAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
@@ -44,7 +44,7 @@ let creatingConversation = false;
 let ingressWorkerRunning = false;
 let activeIngressRecord = null;
 let ingressDiagnostic = null;
-let inspectorMode = "full";
+let inspectorMode = "main";
 let recorder = null;
 let recorderChunks = [];
 let recordingStream = null;
@@ -72,9 +72,43 @@ function selectedSession() {
   return liveSessions.get(selectedConversationId) || null;
 }
 
-function diagnostic() {
-  const record = selectedRecord();
-  const session = selectedSession();
+const EMPTY_MEMORY = { directlyLoadedIdentifiers: [], nodes: [] };
+
+function archivedDiagnostic(archive, mode, transcript = []) {
+  return {
+    mode, provider, model,
+    chatend: archive?.messages || transcript.map(item => ({ role: item.role === "kennedy" ? "assistant" : "user", content: item.content })),
+    context: archive?.context?.diagnostics || {},
+    loadCalls: archive?.tools?.loadCalls || 0,
+    loadLimit: archive?.tools?.loadLimit || 0,
+    toolLog: archive?.tools?.log || [],
+    usage: archive?.usage || null,
+    memory: archive?.context?.snapshot || EMPTY_MEMORY,
+    historySegments: archive?.fullHistory?.segments || [],
+  };
+}
+
+function conversationDiagnostic(record, session) {
+  if (session) {
+    return {
+      mode: "conversation", provider, model,
+      chatend: session.chatend?.messages || [],
+      context: session.context?.diagnostics() || {},
+      loadCalls: session.executor?.loadCalls || 0,
+      loadLimit: session.executor?.loadLimit || 20,
+      toolLog: session.executor?.toolLog || [],
+      usage: session.usage?.snapshot() || null,
+      memory: session.context?.snapshot() || EMPTY_MEMORY,
+      historySegments: session.chatend?.historySegments || [],
+    };
+  }
+  if (!record) return null;
+  const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
+  const archive = record.state?.archive?.format === "kennedy-chatend" ? record.state.archive : null;
+  return archivedDiagnostic(archive, "saved conversation", transcript);
+}
+
+function historyIngressDiagnostic(record) {
   if (record?.id === activeIngressRecord?.id && ingressDiagnostic) {
     return {
       mode: "history ingress", provider, model,
@@ -84,34 +118,46 @@ function diagnostic() {
       loadLimit: ingressDiagnostic.executor?.loadLimit || 50,
       toolLog: ingressDiagnostic.executor?.toolLog || [],
       usage: ingressDiagnostic.usage?.snapshot?.() || null,
-      memory: ingressDiagnostic.context?.snapshot?.() || { directlyLoadedIdentifiers: [], nodes: [] },
+      memory: ingressDiagnostic.context?.snapshot?.() || EMPTY_MEMORY,
+      historySegments: ingressDiagnostic.chatend?.historySegments || [],
     };
   }
-  if (record && record.phase !== "active") {
-    const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
-    const archive = record.state?.archive?.format === "kennedy-chatend" ? record.state.archive : null;
-    return {
-      mode: "saved conversation", provider, model,
-      chatend: archive?.messages || transcript.map(item => ({ role: item.role === "kennedy" ? "assistant" : "user", content: item.content })),
-      context: archive?.context?.diagnostics || {},
-      loadCalls: archive?.tools?.loadCalls || 0,
-      loadLimit: archive?.tools?.loadLimit || 0,
-      toolLog: archive?.tools?.log || [],
-      usage: archive?.usage || null,
-      memory: archive?.context?.snapshot || { directlyLoadedIdentifiers: [], nodes: [] },
-    };
-  }
-  if (!session) return { mode: "offline", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 0, toolLog: [], usage: null, memory: { directlyLoadedIdentifiers: [], nodes: [] } };
+  const archive = record?.state?.historyIngress;
+  return archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
+    ? archivedDiagnostic(archive, "history ingress")
+    : null;
+}
+
+function ingressStatus(record, ingress) {
+  if (record?.phase === "ingress_pending") return "queued";
+  if (record?.phase === "ingress_failed") return "failed";
+  if (record?.phase === "ingress_in_progress") return ingress?.usage?.requests ? "in progress" : "starting";
+  if (ingress) return "complete";
+  return null;
+}
+
+function historyPhase(label, status, source) {
   return {
-    mode: "conversation", provider, model,
-    chatend: session.chatend?.messages || [],
-    context: session.context?.diagnostics() || {},
-    loadCalls: session.executor?.loadCalls || 0,
-    loadLimit: session.executor?.loadLimit || 20,
-    toolLog: session.executor?.toolLog || [],
-    usage: session.usage?.snapshot() || null,
-    memory: session.context?.snapshot() || { directlyLoadedIdentifiers: [], nodes: [] },
+    label,
+    status,
+    segments: source?.historySegments || [],
+    current: source ? { messages: source.chatend, memory: source.memory, usage: source.usage } : null,
   };
+}
+
+function diagnostic() {
+  const record = selectedRecord();
+  const conversation = conversationDiagnostic(record, selectedSession());
+  const ingress = historyIngressDiagnostic(record);
+  const status = ingressStatus(record, ingress);
+  const current = ingress || conversation || {
+    mode: "offline", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 0,
+    toolLog: [], usage: null, memory: EMPTY_MEMORY, historySegments: [],
+  };
+  const phases = [];
+  if (conversation) phases.push(historyPhase("Conversation", record?.phase === "active" ? "live" : "closed", conversation));
+  if (status) phases.push(historyPhase("History ingress", status, ingress));
+  return { ...current, ingressStatus: status, fullHistory: { phases } };
 }
 
 function visibleIngressActivity() {
@@ -175,7 +221,11 @@ function update() {
   ui.clear_attachments.disabled = controls.sendDisabled || extractingAttachment;
   ui.history_eyebrow.textContent = telegramView ? "TELEGRAM SESSIONS" : "YOUR CONVERSATIONS";
   ui.history_title.textContent = telegramView ? "Bot chats" : "History";
-  ui.chatend_title.textContent = telegramView ? "Telegram Chatend" : "Chatend";
+  ui.chatend_title.textContent = currentDiagnostic.mode === "history ingress"
+    ? `History ingress · ${currentDiagnostic.ingressStatus || "in progress"}`
+    : telegramView ? "Telegram Chatend" : currentDiagnostic.ingressStatus
+      ? `Chatend · ingress ${currentDiagnostic.ingressStatus}`
+      : "Chatend";
   ui.end_button.textContent = session?.pendingTurn ? "Retry saved query" : "End conversation";
   ui.activity.textContent = telegramView
     ? session?.busy ? "Kennedy is answering this Telegram message" : "Messages are delivered automatically"
@@ -525,13 +575,11 @@ async function endConversation() {
     liveSessions.delete(id);
     drafts.delete(id);
     attachmentDrafts.delete(id);
-    selectedConversationId = historyRecords.find(item => item.phase === "active"
-      && sessionTypeOf(item) === "conversation"
-      && liveSessions.has(item.id))?.id || id;
+    selectedConversationId = id;
+    selectedByView.conversation = id;
     restoreDraft();
     update();
     kickHistoryIngress();
-    if (!selectedSession()) await createNewConversation();
   } catch (error) {
     showError(ui.error_banner, error.message);
   } finally {

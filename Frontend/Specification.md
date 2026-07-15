@@ -108,6 +108,14 @@ thread. Legacy
 transcript-only snapshots remain readable and recover through the old rebuild
 path.
 
+The recovery archive also contains an inspector-only Full History. Immediately
+before every successful `ResetContext` rebuild, the frontend snapshots the
+outgoing structured messages, Kmap snapshot, and usage state as one completed
+context segment. These segments are durable UI history only: they are never
+restored into the active Chatend, formatted into generation input, or included
+when history ingress extracts the archived conversation's model-readable final
+Chatend.
+
 It loads all durable records for the conversation-history sidebar and keeps a
 `ConversationSession` plus an independent in-memory composer draft for every
 active record. The user may switch freely among active sessions or create a
@@ -590,8 +598,9 @@ user explicitly ends the selected conversation:
 
 1. atomically checkpoint its final state and transition the
    history record from `active` to `ingress_pending`,
-2. remove it from the set of continuable sessions and select another live
-   conversation, or create one if none remains,
+2. remove it from the set of continuable sessions but keep the closed record
+   selected so its queued, running, and completed ingress state remains visible;
+   do not select or create a replacement conversation automatically,
 3. serialize the complete versioned recovery archive, including structured
    system, memory, tool, and media-capable message content,
 4. let the serialized ingress worker create or retrieve Kweb provenance using
@@ -700,32 +709,56 @@ attempts do not increment the totals.
 
 ### 11.2 Context Inspector
 
-The right panel has four views of Kennedy's current chatend. The Full view uses
+The right panel has three views of Kennedy's current chatend. The Main view is
+selected by default and combines the ordinary conversation with progressively
+disclosed application context and activity. The Full view uses
 the exact same canonical formatter and current messages as generation; it is
 not a rendering of the recovery JSON and does not hide application prompt
 content. It displays the entire application-controlled plaintext boundary, not
 unobservable system/tool scaffolding that Codex or its provider may inject
 afterward:
 
+- **Main view** leaves David and Kennedy's ordinary conversation responses
+  visible. Kennedy responses longer than 500 Unicode characters show only the
+  first 500 followed by an expandable `[...]`; user messages and responses of
+  exactly 500 characters or fewer remain fully visible. The system prompt, current loaded-node set, individual directly
+  loaded nodes, tool calls, tool results, context notes, and loaded-node events
+  are closed disclosure rows by default. Timing messages never become separate
+  Main-view rows: LLM and tool durations appear as a compact footer on the
+  corresponding tool result, while direct conversation responses show their
+  LLM and turn timing as small secondary metadata beside the message role.
+  Expanding the loaded-node set
+  reveals closed rows for directly loaded nodes. A node reveals its details and
+  connection summaries; a full active-connection node can be expanded one level
+  further, while that node's outgoing connections remain summary-only because
+  more distant nodes were not fetched by that load. A successful `LoadNode`
+  result adds one closed event row for the requested node only; full active
+  connections remain reachable inside that row and are not repeated as sibling
+  event rows.
 - **Full view** shows system context, conversation, transparent JSON tool
   envelopes, readable tool results, and loaded Kmap context.
-- **System prompts** shows only the agent manuals and other system
-  instructions.
-- **Tool calls** shows every transparent tool-request envelope and its readable
-  memory or web result currently present in the Chatend, in chronological
-  order, while filtering out ordinary conversation and system context.
-- **Memory tree** shows the Kmap material currently visible to Kennedy as an
-  expandable tree. It distinguishes directly loaded nodes, full nodes pulled
-  in through active connections, task connections, and fanout references whose
-  summaries alone are visible.
+- **Full History** renders every completed pre-reset context and the current
+  context using Main-view disclosure rules. A prominent `ResetContext` barrier
+  separates adjacent context segments. It also separates the closed
+  conversation phase from its history-ingress phase, retains reset segments
+  from both phases, and follows live ingress checkpoints through their final
+  completed or failed state.
+
+Full view continues to show timing messages in their exact Chatend positions;
+the timing consolidation is presentation-only in Main and Full History.
 
 While the selected record is actively undergoing history ingress, the Full
-inspector switches to that ingress Chatend so its final context-progress line
-matches the text being sent to Kennedy.
+and Main inspectors switch to that ingress Chatend so the Full view's final
+context-progress line matches the text being sent to Kennedy. The saved ingress
+Chatend remains selected after completion or terminal failure rather than
+reverting to the source conversation. Before the first ingress checkpoint, the
+inspector title reports queued or starting status while the source conversation
+remains the latest available Chatend. Full History shows both phases and their
+current statuses.
 
 Provider response IDs and credentials are omitted because they are not part of
-the application Chatend. Copy View copies exactly the text representation of
-the selected view.
+the application Chatend. Copy View copies the selected view's complete expanded
+plaintext content; collapsed rows do not omit their contents from the copy.
 
 The right side of the Chatend header reports current logical context occupancy,
 the model context-window size, exact remaining tokens, and the percentage of
@@ -831,6 +864,8 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - cache read/write and context-window telemetry aggregation,
 - short-to-durable translation for every tool,
 - chatend rebuilding after ResetContext,
+- durable inspector-only pre-reset Chatend, Kmap, and usage segments with
+  ordered Full History barriers across conversation and history ingress,
 - optional ResetContext note retention, ordering, and 400,000-character cap,
 - compact, complete, restorable ResetContext history with duplicate grouping,
 - non-resetting 100-round history-ingress safety across checkpoints and retries,
@@ -842,6 +877,8 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - lossless full-Chatend persistence, including structured media content,
 - response-sized tool-round checkpoints and exact Chatend recovery,
 - unrestricted new-conversation creation while other sessions remain live,
+- explicit `New`-only conversation creation after ending a selected chat, with
+  that closed record retained as the live history-ingress selection,
 - refresh-time deletion of conversations that never received a user message,
 - editable next-request drafting during Kennedy work and background ingress,
 - conversation-history titles and read-only transcript selection,

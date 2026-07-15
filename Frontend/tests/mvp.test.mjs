@@ -6,7 +6,7 @@ import { Chatend } from "../public/js/chatend.js";
 import { MAX_RESET_SELF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
-import { conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText } from "../public/js/render.js";
+import { conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
@@ -283,6 +283,8 @@ test("WebSearch and WebFetch expose only minimal model-facing arguments", async 
     ["fetch", { url: "https://example.com/guide" }],
   ]);
   assert.equal(search.message.display_role, "Web tool result");
+  assert.equal(search.message.tool_name, "WebSearch");
+  assert.equal(search.message.tool_result.ok, true);
   assert.match(search.message.content, /^Kennedy tool result · WebSearch · \d+ ms/);
   assert.match(search.message.content, /Web research completed/);
   assert.match(search.message.content, /https:\/\/example.com\/guide/);
@@ -476,6 +478,7 @@ test("concise context usage is model-visible and stale thread usage is cleared o
 test("ResetContext abandons continuation and resends the rebuilt full chatend", async () => {
   const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
   const chatend = new Chatend("instructions", context, [{ role: "user", content: "reset it" }]);
+  chatend.append({ role: "assistant", content: "Old pre-reset activity." });
   const requests = [];
   const intelligence = { generate: async request => {
     requests.push(request);
@@ -487,6 +490,7 @@ test("ResetContext abandons continuation and resends the rebuilt full chatend", 
       reset: true,
       selfMessage: "carry this forward",
       resetHistoryEntry: { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 20 },
+      previousContext: context.snapshot(),
       message: { role: "user", display_role: "Memory tool result", content: "Memory context reset completed." },
     }),
     failure: () => { throw new Error("unexpected failure"); },
@@ -502,6 +506,11 @@ test("ResetContext abandons continuation and resends the rebuilt full chatend", 
   assert.ok(requests[1].chatend.indexOf("1× roots only") < requests[1].chatend.indexOf("carry this forward"));
   assert.ok(requests[1].chatend.indexOf("carry this forward") < requests[1].chatend.indexOf("Kmap context"));
   assert.doesNotMatch(requests[1].chatend, /\"role\":\"system\"/);
+  assert.equal(chatend.historySegments.length, 1);
+  assert.equal(chatend.historySegments[0].reason, "ResetContext");
+  assert.equal(chatend.historySegments[0].messages.some(message => message.content === "Old pre-reset activity."), true);
+  assert.equal(chatend.messages.some(message => message.content === "Old pre-reset activity."), false);
+  assert.equal(chatend.historySegments[0].memory.nodes[0].longDescription, "Details 1");
 });
 
 test("a repeated ResetContext loop cannot successfully reset more than the shared budget", async () => {
@@ -551,6 +560,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
     role: "user",
     content: [{ type: "input_text", text: "Look at this" }, { type: "input_image", image_url: "data:image/png;base64,AAAA" }],
   });
+  session.chatend.historySegments.push({ reason: "ResetContext", messages: [{ role: "assistant", content: "Earlier context." }], memory: session.context.snapshot(), usage: null });
   const archive = JSON.parse(session.serialize());
   assert.equal(archive.format, "kennedy-chatend");
   assert.equal(archive.version, 2);
@@ -560,6 +570,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
   assert.match(archive.messages.find(message => typeof message.content === "string" && message.content.includes("KENNEDY_TOOL_CALLS")).content, /LoadNode/);
   assert.match(archive.messages.find(message => message.display_role === "Memory tool result").content, /Loaded/);
   assert.equal(archive.messages.at(-1).content[1].image_url, "data:image/png;base64,AAAA");
+  assert.equal(archive.fullHistory.segments[0].messages[0].content, "Earlier context.");
 });
 
 test("a structured Chatend archive retains activity while refreshing current manuals and context", async () => {
@@ -572,6 +583,7 @@ test("a structured Chatend archive retains activity while refreshing current man
   await source.context.loadDurable(id(2));
   source.chatend.append({ role: "assistant", content: "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":2}}]}" });
   source.chatend.append({ role: "user", display_role: "Memory tool result", content: "Kennedy tool result\nTool: LoadNode\n\nLoaded." });
+  source.chatend.historySegments.push({ reason: "ResetContext", messages: [{ role: "assistant", content: "Pre-reset archived activity." }], memory: source.context.snapshot(), usage: null });
   source.executor.loadCalls = 3;
   source.executor.toolLog.push({ name: "LoadNode", ok: true });
   source.usage.record({ input_tokens: 12, output_tokens: 3, cached_tokens: 4, cache_write_tokens: 0, reasoning_tokens: 1 });
@@ -589,6 +601,7 @@ test("a structured Chatend archive retains activity while refreshing current man
   assert.equal(restored.executor.loadCalls, 3);
   assert.deepEqual(restored.executor.toolLog, [{ name: "LoadNode", ok: true }]);
   assert.equal(restored.usage.snapshot().totalInputTokens, 12);
+  assert.deepEqual(restored.chatend.historySegments, source.chatend.historySegments);
 });
 
 test("history ingress sends the archived Chatend as inspector-identical plaintext and resumes completed archives", async () => {
@@ -599,7 +612,11 @@ test("history ingress sends the archived Chatend as inspector-identical plaintex
   ];
   kweb.provenance = async () => ({
     source: "conversation", source_created_at: "2026-07-13T00:00:00Z",
-    data: JSON.stringify({ format: "kennedy-chatend", messages: archivedMessages, media: [{ kind: "voice", dataUrl: "data:audio/ogg;base64,AAAA" }] }),
+    data: JSON.stringify({
+      format: "kennedy-chatend", messages: archivedMessages,
+      fullHistory: { segments: [{ messages: [{ role: "assistant", content: "INSPECTOR ONLY PRE-RESET SECRET" }] }] },
+      media: [{ kind: "voice", dataUrl: "data:audio/ogg;base64,AAAA" }],
+    }),
   });
   let generations = 0;
   const requests = [];
@@ -624,12 +641,14 @@ test("history ingress sends the archived Chatend as inspector-identical plaintex
   assert.match(checkpoints.at(-1).retained[0].content, /David\n\nArchived words\./);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /base64,AAAA/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /"format":"kennedy-chatend"/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /INSPECTOR ONLY PRE-RESET SECRET/);
   assert.equal(requests[0].chatend, formatChatend(checkpoints[0].messages, checkpoints[0].usage));
   assert.equal(requests[0].chatend, inspectorText({ chatend: checkpoints[0].messages, usage: checkpoints[0].usage }));
   assert.equal("messages" in requests[0], false);
   assert.equal(checkpoints.at(-1).messages.some(message => message.content === "Memory review complete."), true);
   assert.match(checkpoints.at(-1).messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
   assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
+  assert.deepEqual(checkpoints.at(-1).fullHistory.segments, []);
   assert.deepEqual(timings.map(timing => [timing.action, timing.status, timing.sessionType]), [
     ["turn", "ok", "history-ingress"],
   ]);
@@ -658,6 +677,34 @@ test("history ingress sends the archived Chatend as inspector-identical plaintex
     provenanceId: "provenance", provider: "p", model: "m",
     restoredArchive: exhausted, checkpoint: async () => {}, onUpdate: () => {},
   }), /100-round tool-loop safety limit/);
+});
+
+test("history ingress durably checkpoints pre-reset Full History segments", async () => {
+  const kweb = new MockKweb([node(1)]);
+  kweb.provenance = async () => ({
+    source: "conversation", source_created_at: "2026-07-13T00:00:00Z",
+    data: JSON.stringify({ format: "kennedy-chatend", messages: [{ role: "user", content: "Archived conversation." }] }),
+  });
+  let requests = 0;
+  const intelligence = { generate: async () => {
+    requests += 1;
+    return requests === 1
+      ? { status: "complete", response_id: "before-reset", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}' }, usage: null }
+      : { status: "complete", response_id: "after-reset", message: { role: "assistant", content: "Ingress complete after reset." }, usage: null };
+  } };
+  const checkpoints = [];
+  await runHistoryIngress({
+    kweb, intelligence, manuals: { shared: "Shared", ingress: "Ingress" },
+    rootNodeId: id(1), provenanceId: "provenance", provider: "p", model: "m",
+    checkpoint: async archive => checkpoints.push(structuredClone(archive)), onUpdate: () => {},
+  });
+  const final = checkpoints.at(-1);
+  assert.equal(final.completed, true);
+  assert.equal(final.fullHistory.segments.length, 1);
+  assert.equal(final.fullHistory.segments[0].reason, "ResetContext");
+  assert.equal(final.fullHistory.segments[0].messages.some(message => message.content?.includes?.("ResetContext")), true);
+  assert.equal(final.fullHistory.segments[0].memory.nodes[0].longDescription, "Details 1");
+  assert.equal(final.messages.some(message => message.content === "Ingress complete after reset."), true);
 });
 
 test("conversation history titles use the first durable user message", () => {
@@ -923,6 +970,17 @@ test("cold start leaves saved conversation retries under explicit user control",
   assert.match(app, /end_button\.addEventListener\("click", \(\) => selectedSession\(\)\?\.pendingTurn \? resumeSavedQuery\(\) : endConversation\(\)\)/);
 });
 
+test("ending a conversation keeps its ingress record selected until New is explicit", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  const endConversation = app.match(/async function endConversation\(\) \{[\s\S]*?\n\}\n\nasync function createTelegramConversation/)?.[0];
+  assert.ok(endConversation);
+  assert.match(endConversation, /selectedConversationId = id;/);
+  assert.match(endConversation, /selectedByView\.conversation = id;/);
+  assert.match(endConversation, /kickHistoryIngress\(\);/);
+  assert.doesNotMatch(endConversation, /historyRecords\.find\(item => item\.phase === "active"/);
+  assert.doesNotMatch(endConversation, /createNewConversation\(\)/);
+});
+
 test("a structured pending Chatend resumes from cold start without duplicating its user query", async () => {
   const kweb = new MockKweb([node(1)]);
   let saved;
@@ -1152,6 +1210,97 @@ test("chatend inspector exposes text tool requests and readable results", () => 
   assert.equal(inspectorText({ chatend: [{ role: "user", content: "No tools yet." }] }, "tools"), "No tool calls are currently in the Chatend.");
 });
 
+test("main inspector keeps conversation visible and turns context activity into disclosure entries", () => {
+  const direct = {
+    identifier: 3, shortName: "Project", shortDescription: "Project summary", longDescription: "Project details", lastModifiedBy: "model-thinking",
+    taskConnections: [], activeConnections: [{ identifier: 4, shortName: "Related", shortDescription: "Related summary" }], fanoutConnections: [],
+  };
+  const active = {
+    identifier: 4, shortName: "Related", shortDescription: "Related summary", longDescription: "Related details", lastModifiedBy: "model-thinking",
+    taskConnections: [], activeConnections: [{ identifier: 5, shortName: "Distant", shortDescription: "Summary only" }], fanoutConnections: [],
+  };
+  const diagnostic = {
+    chatend: [
+      { role: "system", context_kind: "instructions", content: "Agent manuals." },
+      { role: "system", context_kind: "memory", content: "Formatted Kmap." },
+      { role: "user", content: "What changed?" },
+      { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":3}}]}' },
+      { role: "system", display_role: "Latency", context_kind: "timing", content: "Latency: LLM call 120 ms" },
+      {
+        role: "user", display_role: "Memory tool result", tool_name: "LoadNode",
+        tool_result: { ok: true, result: { requestedNode: direct, activeConnectionNodes: [active] } },
+        content: "Kennedy tool result · LoadNode · 8 ms\n\nMemory load completed.",
+      },
+      { role: "assistant", content: "Here is the answer." },
+      { role: "system", display_role: "Latency", context_kind: "timing", content: "Latency: LLM call 90 ms" },
+      { role: "system", display_role: "Latency summary", context_kind: "timing", content: "Turn latency: 240 ms total · 218 ms in LLM/tools" },
+    ],
+    memory: { directlyLoadedIdentifiers: [3], nodes: [{ ...direct, contextSources: ["direct"] }, { ...active, contextSources: ["active"] }] },
+  };
+  const entries = mainViewEntries(diagnostic);
+  assert.deepEqual(entries.map(entry => entry.kind), ["context", "memory", "conversation", "tool-call", "loaded-node", "conversation"]);
+  assert.equal(entries[0].label, "System prompt");
+  assert.equal(entries[2].content, "What changed?");
+  assert.equal(entries[3].label, "Tool call · LoadNode");
+  assert.deepEqual(entries.filter(entry => entry.kind === "loaded-node").map(entry => [entry.relation, entry.node.shortName]), [["direct", "Project"]]);
+  assert.equal(entries.find(entry => entry.kind === "loaded-node").node.activeConnections[0].shortName, "Related");
+  assert.deepEqual(entries.find(entry => entry.kind === "loaded-node").timing, ["Latency: LLM call 120 ms", "LoadNode 8 ms"]);
+  assert.equal(entries.at(-1).content, "Here is the answer.");
+  assert.deepEqual(entries.at(-1).timing, ["Latency: LLM call 90 ms", "Turn latency: 240 ms total · 218 ms in LLM/tools"]);
+  assert.equal(entries.some(entry => entry.label === "Latency" || entry.label === "Latency summary"), false);
+  assert.equal(inspectorText(diagnostic, "main"), inspectorText(diagnostic, "full"));
+});
+
+test("main inspector truncates only Kennedy responses longer than 500 characters", () => {
+  const long = `${"x".repeat(500)}YZ`;
+  const entries = mainViewEntries({ chatend: [
+    { role: "user", content: long },
+    { role: "assistant", content: "y".repeat(500) },
+    { role: "assistant", content: long },
+  ] });
+  const conversations = entries.filter(entry => entry.kind === "conversation");
+  assert.equal(conversations[0].preview, null);
+  assert.equal(conversations[1].preview, null);
+  assert.equal([...conversations[2].preview].length, 500);
+  assert.equal(conversations[2].preview, "x".repeat(500));
+  assert.equal(conversations[2].content, long);
+});
+
+test("main inspector moves tool latency from the result header to result footer metadata", () => {
+  const entries = mainViewEntries({ chatend: [
+    { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"test","mode":"fast"}}]}' },
+    { role: "system", display_role: "Latency", context_kind: "timing", content: "Latency: LLM call 1.200 s" },
+    { role: "user", display_role: "Web tool result", tool_name: "WebSearch", tool_result: { ok: true }, content: "Kennedy tool result · WebSearch · 2.500 s\n\nWeb research completed." },
+  ] });
+  assert.deepEqual(entries.map(entry => entry.kind), ["memory", "tool-call", "tool-result"]);
+  assert.equal(entries.at(-1).content, "Web research completed.");
+  assert.deepEqual(entries.at(-1).timing, ["Latency: LLM call 1.200 s", "WebSearch 2.500 s"]);
+});
+
+test("full history preserves context segments and reset barriers in order", () => {
+  const diagnostic = {
+    mode: "history ingress",
+    fullHistory: { phases: [
+      {
+        label: "Conversation", status: "closed",
+        segments: [{ reason: "ResetContext", messages: [{ role: "assistant", content: "Before conversation reset." }], memory: { directlyLoadedIdentifiers: [], nodes: [] }, usage: null }],
+        current: { messages: [{ role: "assistant", content: "Final conversation context." }], memory: { directlyLoadedIdentifiers: [], nodes: [] }, usage: null },
+      },
+      {
+        label: "History ingress", status: "complete",
+        segments: [{ reason: "ResetContext", messages: [{ role: "assistant", content: "Before ingress reset." }], memory: { directlyLoadedIdentifiers: [], nodes: [] }, usage: null }],
+        current: { messages: [{ role: "assistant", content: "Final ingress context." }], memory: { directlyLoadedIdentifiers: [], nodes: [] }, usage: null },
+      },
+    ] },
+  };
+  const text = inspectorText(diagnostic, "history");
+  for (const value of ["Before conversation reset.", "Final conversation context.", "History ingress began", "Before ingress reset.", "Final ingress context."]) assert.match(text, new RegExp(value));
+  assert.equal((text.match(/ResetContext · context reset/g) || []).length, 2);
+  assert.ok(text.indexOf("Before conversation reset.") < text.indexOf("Final conversation context."));
+  assert.ok(text.indexOf("Final conversation context.") < text.indexOf("History ingress began"));
+  assert.ok(text.indexOf("Before ingress reset.") < text.indexOf("Final ingress context."));
+});
+
 test("production frontend never uses HTML string insertion", async () => {
   const files = ["render.js", "memory_explorer.js", "app.js"];
   for (const file of files) {
@@ -1160,12 +1309,17 @@ test("production frontend never uses HTML string insertion", async () => {
   }
 });
 
-test("frontend exposes full, system, tools, memory inspector, and both Kmap root controls", async () => {
+test("frontend defaults to main with full and full-history inspectors and retains both Kmap root controls", async () => {
   const [html, app] = await Promise.all([
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
   ]);
-  for (const id of ["usage-metrics", "inspector-full", "inspector-system", "inspector-tools", "inspector-memory", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "tg-tab", "voice-button"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "tg-tab", "voice-button"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["inspector-system", "inspector-tools", "inspector-memory"]) assert.doesNotMatch(html, new RegExp(`id="${id}"`));
+  assert.match(app, /const INSPECTOR_MODES = \["main", "full", "history"\]/);
+  assert.match(app, /let inspectorMode = "main"/);
+  assert.match(app, /record\?\.state\?\.historyIngress/);
+  assert.match(app, /mode: "history ingress"/);
   assert.match(app, /new MemoryExplorer\(\{ api: kweb, rootNodeIds,/);
   assert.match(app, /memory_kennedy_home\.addEventListener\("click", \(\) => explorer\?\.kennedyHome\(\)\)/);
   assert.ok(app.indexOf("await conversationHistory.discardUnstarted()") < app.indexOf("historyRecords = (await conversationHistory.list())"));

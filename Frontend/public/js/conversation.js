@@ -1,8 +1,8 @@
-import { Chatend } from "./chatend.js?v=20260715.7";
+import { Chatend } from "./chatend.js?v=20260715.8";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
-import { ToolExecutor } from "./tools.js?v=20260715.7";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.9";
+import { ToolExecutor } from "./tools.js?v=20260715.9";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.10";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 
 function jsonCopy(value) {
@@ -60,6 +60,7 @@ export class ConversationSession {
         Array.isArray(archive.retained) ? jsonCopy(archive.retained) : this.retainedTranscript(),
       );
     }
+    this.chatend.restoreFullHistory(archive?.fullHistory?.segments);
     this.executor = new ToolExecutor({ mode: "conversation", context: this.context, api: this.kweb, intelligence: this.intelligence, provider: this.provider, model: this.model, modelAttribution: this.modelAttribution, loadLimit: 20, sessionType: this.sessionType, onUpdate: this.onUpdate });
     if (archive?.tools) {
       this.executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
@@ -102,6 +103,7 @@ export class ConversationSession {
       retained: jsonCopy(this.chatend?.retained || []),
       transcript: jsonCopy(this.transcript),
       messages: jsonCopy(this.chatend?.messages || []),
+      fullHistory: this.chatend?.fullHistorySnapshot() || { segments: [] },
       context: {
         snapshot: jsonCopy(this.context?.snapshot() || { directlyLoadedIdentifiers: [], nodes: [] }),
         diagnostics: jsonCopy(this.context?.diagnostics() || {}),
@@ -135,6 +137,7 @@ export class ConversationSession {
     this.media = jsonCopy(state.media || archive.media || []);
     this.pendingCheckpointed = this.pendingTurn;
     this.chatend.restoreMessages(jsonCopy(archive.messages), jsonCopy(archive.retained || this.retainedTranscript()));
+    this.chatend.restoreFullHistory(archive.fullHistory?.segments);
     this.context.restore(archive.context.state);
     this.executor.loadCalls = Number.isInteger(archive.tools?.loadCalls) ? archive.tools.loadCalls : 0;
     this.executor.toolLog = jsonCopy(archive.tools?.log || []);

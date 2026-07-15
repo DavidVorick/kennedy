@@ -1,4 +1,4 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260715.7";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260715.9";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
@@ -173,7 +173,14 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
         Number.isInteger(execution.durationMs) ? execution.durationMs : elapsedMs(toolStarted),
       );
       if (execution.reset) {
-        chatend.rebuildAfterReset(execution.selfMessage, execution.resetHistoryEntry, response.message, llmTimingMessage, execution.message);
+        chatend.rebuildAfterReset(
+          execution.selfMessage,
+          execution.resetHistoryEntry,
+          response.message,
+          llmTimingMessage,
+          execution.message,
+          { full_history_boundary: true, memory: execution.previousContext, usage: usage.snapshot() },
+        );
         continuation.reset();
         usage.resetThread();
       } else {
