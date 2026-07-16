@@ -123,6 +123,12 @@ struct VersionedTransition {
 }
 
 #[derive(Deserialize)]
+struct RetryIngress {
+    expected_version: i64,
+    state: Value,
+}
+
+#[derive(Deserialize)]
 struct StartIngress {
     expected_version: i64,
     provenance_id: String,
@@ -209,6 +215,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/v1/conversations/{conversation_id}/ingress-failure",
             post(ingress_failure),
+        )
+        .route(
+            "/api/v1/conversations/{conversation_id}/retry-ingress",
+            post(retry_ingress),
         )
         .layer(DefaultBodyLimit::max(config.max_request_bytes))
         .layer(cors)
@@ -656,6 +666,9 @@ fn record_ingress_failure(
         "context_tokens": input.context_tokens,
         "context_window_tokens": input.context_window_tokens,
     }));
+    if failures.len() > INGRESS_FAILURE_LIMIT as usize {
+        failures.drain(..failures.len() - INGRESS_FAILURE_LIMIT as usize);
+    }
     let failures_json = serde_json::to_string(&failures).map_err(ApiError::internal)?;
     let next_phase = if terminal {
         "ingress_failed"
@@ -698,6 +711,44 @@ async fn ingress_failure(
 ) -> Result<Json<ConversationRecord>, ApiError> {
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     Ok(Json(record_ingress_failure(&mut db, &id, &input)?))
+}
+
+fn retry_failed_ingress(
+    db: &mut Connection,
+    id: &str,
+    input: &RetryIngress,
+) -> Result<ConversationRecord, ApiError> {
+    validate_version(input.expected_version)?;
+    let existing = fetch_record(db, id)?;
+    if existing.phase != "ingress_failed" || existing.version != input.expected_version {
+        return Err(ApiError::conflict(
+            "Conversation is not in the expected failed history-ingress state.",
+        ));
+    }
+    let state_json = serde_json::to_string(&input.state).map_err(ApiError::internal)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE conversations SET phase='ingress_pending',state_json=?1,updated_at=?2,ingress_failure_count=0,version=version+1 WHERE id=?3 AND phase='ingress_failed' AND version=?4",
+            params![state_json, Utc::now().to_rfc3339(), id, input.expected_version],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "Conversation history ingress changed before it could be retried.",
+        ));
+    }
+    tx.commit().map_err(ApiError::internal)?;
+    fetch_record(db, id)
+}
+
+async fn retry_ingress(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<RetryIngress>,
+) -> Result<Json<ConversationRecord>, ApiError> {
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    Ok(Json(retry_failed_ingress(&mut db, &id, &input)?))
 }
 
 async fn ingress_completed(
@@ -936,5 +987,33 @@ mod tests {
             "Attempt 5 failed with details"
         );
         assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
+    }
+
+    #[test]
+    fn terminal_ingress_can_be_requeued_with_a_fresh_frontend_checkpoint() {
+        let mut db = database();
+        db.execute(
+            "INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,ingress_failure_count,ingress_failures_json) VALUES('failed','ingress_failed','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1,3,5,?2)",
+            params![
+                r#"{"archive":{"format":"kennedy-chatend"},"historyIngress":{"completed":false}}"#,
+                r#"[{"attempt":5,"message":"context exhausted"}]"#,
+            ],
+        )
+        .unwrap();
+
+        let retried = retry_failed_ingress(
+            &mut db,
+            "failed",
+            &RetryIngress {
+                expected_version: 3,
+                state: json!({"archive":{"format":"kennedy-chatend"}}),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(retried.phase, "ingress_pending");
+        assert_eq!(retried.ingress_failure_count, 0);
+        assert_eq!(retried.state.get("historyIngress"), None);
+        assert_eq!(retried.ingress_failures[0]["message"], "context exhausted");
     }
 }

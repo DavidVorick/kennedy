@@ -1,10 +1,52 @@
 #!/usr/bin/env bash
 
-VNOTE_DIR="/home/user/media/vnotes"
-AUDIO_API="http://127.0.0.1:4325/api/v1/audio-ingress"
+set -u
+set -o pipefail
+
+VNOTE_DIR="${KENNEDY_VNOTE_DIR:-/home/user/media/vnotes}"
+AUDIO_API="${KENNEDY_AUDIO_API:-http://127.0.0.1:4325/api/v1/audio-ingress}"
+AUDIO_API="${AUDIO_API%/}"
+STABILITY_SECONDS=2
+
+file_signature() {
+    stat --format='%s:%y' -- "$1"
+}
+
+wav_is_finalized() {
+    local vnote="$1"
+    local size riff_size
+    local -a header
+
+    size="$(stat --format='%s' -- "$vnote")" || return 1
+    (( size >= 12 )) || return 1
+    read -r -a header < <(od -An -tu1 -N12 -- "$vnote") || return 1
+    (( ${#header[@]} == 12 )) || return 1
+    (( header[0] == 82 && header[1] == 73 && header[2] == 70 && header[3] == 70 )) ||
+        return 1
+    (( header[8] == 87 && header[9] == 65 && header[10] == 86 && header[11] == 69 )) ||
+        return 1
+    riff_size=$((header[4] + 256 * header[5] + 65536 * header[6] + 16777216 * header[7]))
+    (( riff_size + 8 <= size ))
+}
+
+vnote_is_ready() {
+    local vnote="$1"
+    local before="${initial_signatures[$vnote]-}"
+    local after
+
+    [[ -n "$before" ]] || return 1
+    after="$(file_signature "$vnote")" || return 1
+    [[ "$before" == "$after" ]] || return 1
+    wav_is_finalized "$vnote" || return 1
+    READY_SIGNATURE="$after"
+}
+
+for dependency in curl sha256sum date head ls od pkill sleep stat; do
+    command -v "$dependency" >/dev/null 2>&1 || exit 1
+done
 
 sleep 1
-pkill -x arecord
+pkill -x arecord 2>/dev/null || true
 sleep 1
 
 # Look only at the five most recently modified vnotes.
@@ -12,8 +54,26 @@ mapfile -t recent_vnotes < <(
     ls -1t "$VNOTE_DIR"/*-vnote.wav 2>/dev/null | head -n 5
 )
 
+declare -A initial_signatures=()
 for vnote in "${recent_vnotes[@]}"; do
-    sha256="$(sha256sum "$vnote" | cut -d' ' -f1)"
+    initial_signatures["$vnote"]="$(file_signature "$vnote")" || exit 1
+done
+if (( ${#recent_vnotes[@]} > 0 )); then
+    sleep "$STABILITY_SECONDS"
+fi
+
+for vnote in "${recent_vnotes[@]}"; do
+    READY_SIGNATURE=""
+    if ! vnote_is_ready "$vnote"; then
+        continue
+    fi
+
+    sha256="$(sha256sum -- "$vnote")" || exit 1
+    sha256="${sha256%% *}"
+    if [[ "$(file_signature "$vnote")" != "$READY_SIGNATURE" ]]; then
+        continue
+    fi
+
     status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
         "$AUDIO_API/by-sha256/$sha256")"
 
@@ -29,7 +89,7 @@ for vnote in "${recent_vnotes[@]}"; do
     filename="$(basename "$vnote")"
     recorded_epoch="${filename%-vnote.wav}"
     recorded_epoch="${recorded_epoch##*-}"
-    recorded_at="$(date --iso-8601=seconds --date="@$recorded_epoch")"
+    recorded_at="$(date --iso-8601=seconds --date="@$recorded_epoch")" || exit 1
 
     curl --silent --show-error --fail \
         --form "recorded_at=$recorded_at" \

@@ -241,6 +241,14 @@ Successful responses contain:
 The bridge does not interpret whether assistant text is a final answer or a
 Kennedy text-tool request.
 
+Generation, web-search, and web-fetch requests may include a UUID
+`operation_id`. While such a request is active,
+`POST /api/v1/operations/{operation_id}/cancel` cancels it. Cancelling a Codex
+generation or Codex-backed search drops and kills the child process; cancelling
+a remote search or page fetch drops its network future. A cancelled request
+returns `409 operation_cancelled`. The cancellation endpoint is idempotent from
+the caller's perspective and reports whether the operation was still active.
+
 ### 5.4 Web Search
 
 `POST /api/v1/web/search` accepts provider/model, a natural-language `question`

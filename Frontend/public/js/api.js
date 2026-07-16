@@ -10,6 +10,7 @@ export async function requestJSON(base, path, options = {}) {
       headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     });
   } catch (error) {
+    if (error?.name === "AbortError") throw error;
     throw new ApiError(`Could not reach ${base}.`, 0, "network_error");
   }
   const isJSON = (response.headers.get("content-type") || "").includes("application/json");
@@ -56,9 +57,22 @@ export const KwebAPI = (base) => ({
 export const IntelligenceAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   providers: () => requestJSON(base, "/api/v1/providers"),
-  generate: (body) => requestJSON(base, "/api/v1/generate", { method: "POST", body: JSON.stringify(body) }),
-  webSearch: (body) => requestJSON(base, "/api/v1/web/search", { method: "POST", body: JSON.stringify(body) }),
-  webFetch: (body) => requestJSON(base, "/api/v1/web/fetch", { method: "POST", body: JSON.stringify(body) }),
+  generate: (body, { signal = null, operationId = null } = {}) => requestJSON(base, "/api/v1/generate", {
+    method: "POST",
+    body: JSON.stringify(operationId ? { ...body, operation_id: operationId } : body),
+    signal,
+  }),
+  webSearch: (body, { signal = null, operationId = null } = {}) => requestJSON(base, "/api/v1/web/search", {
+    method: "POST",
+    body: JSON.stringify(operationId ? { ...body, operation_id: operationId } : body),
+    signal,
+  }),
+  webFetch: (body, { signal = null, operationId = null } = {}) => requestJSON(base, "/api/v1/web/fetch", {
+    method: "POST",
+    body: JSON.stringify(operationId ? { ...body, operation_id: operationId } : body),
+    signal,
+  }),
+  cancelOperation: (operationId) => requestJSON(base, `/api/v1/operations/${encodeURIComponent(operationId)}/cancel`, { method: "POST" }),
   recordTiming: (body) => requestJSON(base, "/api/v1/timings", { method: "POST", body: JSON.stringify(body) }),
   extractDocument: ({ file, fileName = "document" }) => {
     const form = new FormData();
@@ -88,6 +102,7 @@ export const ConversationHistoryAPI = (base) => ({
   ingressCheckpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
   ingressCompleted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-completed`, { method: "POST", body: JSON.stringify(body) }),
   ingressFailure: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-failure`, { method: "POST", body: JSON.stringify(body) }),
+  retryIngress: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/retry-ingress`, { method: "POST", body: JSON.stringify(body) }),
 });
 
 export const AudioIngressAPI = (base) => ({

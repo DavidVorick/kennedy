@@ -10,6 +10,67 @@ function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
+function nodeSummary(node) {
+  const rawName = node?.shortName ?? node?.short_name;
+  const rawDescription = node?.shortDescription ?? node?.short_description;
+  const shortName = typeof rawName === "string" ? rawName.trim() : "";
+  const shortDescription = typeof rawDescription === "string" ? rawDescription.trim() : "";
+  if (!shortName && !shortDescription) return null;
+  return {
+    shortName: shortName || "Unnamed memory",
+    shortDescription: shortDescription || "(no short description)",
+  };
+}
+
+function collectNodeSummaries(archive) {
+  const summaries = new Map();
+  const add = node => {
+    const summary = nodeSummary(node);
+    if (!summary) return;
+    summaries.set(`${summary.shortName}\u0000${summary.shortDescription}`, summary);
+  };
+  const addSnapshot = snapshot => {
+    for (const node of snapshot?.nodes || []) add(node);
+  };
+  const addToolResult = result => {
+    add(result?.requestedNode);
+    for (const node of result?.activeConnectionNodes || []) add(node);
+    for (const node of result?.nodes || []) add(node);
+    add(result?.node);
+    addSnapshot(result?.context);
+  };
+  addSnapshot(archive?.context?.snapshot);
+  for (const entry of archive?.context?.state?.nodesById || []) add(entry?.[1]);
+  for (const segment of archive?.fullHistory?.segments || []) addSnapshot(segment?.memory);
+  for (const message of archive?.messages || []) addToolResult(message?.tool_result?.result);
+  return [...summaries.values()].sort((left, right) =>
+    left.shortName.localeCompare(right.shortName) ||
+    left.shortDescription.localeCompare(right.shortDescription)
+  );
+}
+
+function compactArchivedMessages(archive, summaries) {
+  if (!summaries.length) return archive.messages;
+  const isMemoryToolRequest = message => {
+    if (message?.role !== "assistant" || typeof message.content !== "string") return false;
+    const content = message.content.trim();
+    if (!content.startsWith("KENNEDY_TOOL_CALLS\n")) return false;
+    try {
+      const envelope = JSON.parse(content.slice("KENNEDY_TOOL_CALLS".length).trim());
+      const calls = Array.isArray(envelope?.calls) ? envelope.calls : [];
+      return calls.length > 0 && calls.every(call => ["LoadNode", "ResetContext"].includes(call?.name));
+    } catch {
+      return false;
+    }
+  };
+  return archive.messages.filter(message =>
+    message?.context_kind !== "memory" &&
+    message?.context_kind !== "timing" &&
+    message?.display_role !== "Memory tool result" &&
+    !isMemoryToolRequest(message)
+  );
+}
+
 function modelReadableProvenance(data) {
   let archive;
   try {
@@ -19,7 +80,19 @@ function modelReadableProvenance(data) {
     throw new Error("Ingress provenance does not contain readable source data.");
   }
   if (!Array.isArray(archive?.messages)) throw new Error("Ingress provenance does not contain readable source data.");
-  return formatChatend(archive.messages, archive.usage || null);
+  const summaries = collectNodeSummaries(archive);
+  const chatend = formatChatend(compactArchivedMessages(archive, summaries), archive.usage || null);
+  const loadedNodes = summaries.length
+    ? [
+      "Loaded Kmap node summaries from the archived session",
+      "",
+      ...summaries.flatMap(summary => [
+        `- ${summary.shortName}`,
+        `  ${summary.shortDescription}`,
+      ]),
+    ].join("\n")
+    : "";
+  return [chatend, loadedNodes].filter(Boolean).join("\n\n────────────────────────\n\n");
 }
 
 export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
@@ -27,7 +100,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   rootNodeIds = rootNodeIds || [rootNodeId];
   const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
   const audioSource = sourceSessionType === "audio";
-  const retained = [{ role: "user", content: [
+  const retained = [{ role: "user", display_role: audioSource ? "Audio transcript provenance" : "Conversation provenance", context_kind: "provenance", content: [
     audioSource ? "Audio transcript provenance" : "Conversation provenance",
     "",
     `Source: ${provenance.source}`,

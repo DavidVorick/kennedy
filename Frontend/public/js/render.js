@@ -3,6 +3,15 @@ import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
 
+function characterCount(value) {
+  return [...String(value ?? "")].length;
+}
+
+function characterLabel(value) {
+  const count = typeof value === "number" ? value : characterCount(value);
+  return `${new Intl.NumberFormat("en-US").format(count)} character${count === 1 ? "" : "s"}`;
+}
+
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -78,7 +87,24 @@ function appendLinkedText(container, text) {
   container.append(document.createTextNode(text.slice(cursor)));
 }
 
-export function renderTranscript(container, transcript, ingressActivity = null, viewKey = "transcript") {
+function ingressRetryNotice(retrying, onRetry) {
+  const notice = element("section", "ingress-retry-notice");
+  notice.setAttribute("aria-label", "Retry failed history ingress");
+  const copy = element("div");
+  copy.append(
+    element("span", "eyebrow", "ACTION REQUIRED"),
+    element("strong", "", "History ingress failed"),
+    element("p", "", "The conversation is preserved. Restart Kennedy’s memory update with a fresh model context."),
+  );
+  const retry = element("button", "primary", retrying ? "Scheduling retry…" : "Retry history ingress");
+  retry.type = "button";
+  retry.disabled = retrying;
+  retry.addEventListener("click", onRetry);
+  notice.append(copy, retry);
+  return notice;
+}
+
+export function renderTranscript(container, transcript, ingressActivity = null, viewKey = "transcript", retryAction = null) {
   const viewState = captureViewState(container, viewKey);
   container.replaceChildren();
   if (!transcript.length && !ingressActivity?.diagnostic) {
@@ -87,6 +113,9 @@ export function renderTranscript(container, transcript, ingressActivity = null, 
     container.append(empty);
     restoreViewState(container, viewKey, viewState);
     return;
+  }
+  if (ingressActivity?.failed && typeof retryAction?.onRetry === "function") {
+    container.append(ingressRetryNotice(Boolean(retryAction.retrying), retryAction.onRetry));
   }
   for (const item of transcript) {
     const message = element("article", `message ${item.role === "kennedy" ? "assistant" : "user"}`);
@@ -124,6 +153,21 @@ export function conversationTitle(record, limit = 54) {
   return normalized.length > limit ? `${normalized.slice(0, limit - 1).trimEnd()}…` : normalized;
 }
 
+function conversationPhaseRank(phase) {
+  if (phase === "active") return 0;
+  if (phase === "complete") return 2;
+  return 1;
+}
+
+export function sortConversationHistory(records) {
+  return [...(records || [])].sort((left, right) =>
+    conversationPhaseRank(left?.phase) - conversationPhaseRank(right?.phase) ||
+    String(right?.updated_at || "").localeCompare(String(left?.updated_at || "")) ||
+    String(right?.started_at || "").localeCompare(String(left?.started_at || "")) ||
+    String(left?.id || "").localeCompare(String(right?.id || ""))
+  );
+}
+
 function historyDate(value) {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.valueOf())) return "Saved";
@@ -133,6 +177,8 @@ function historyDate(value) {
 export function renderConversationHistory(container, records, {
   selectedId = null,
   onSelect = () => {},
+  retryingIds = new Set(),
+  onRetryIngress = () => {},
   viewKey = "conversation-history",
 } = {}) {
   const viewState = captureViewState(container, viewKey);
@@ -143,6 +189,7 @@ export function renderConversationHistory(container, records, {
     return;
   }
   for (const record of records) {
+    const row = element("div", `history-item-row${record.id === selectedId ? " selected" : ""}`);
     const button = element("button", `history-item${record.id === selectedId ? " selected" : ""}`);
     button.type = "button";
     button.dataset.focusKey = `${viewKey}:record:${record.id}`;
@@ -161,7 +208,16 @@ export function renderConversationHistory(container, records, {
     meta.append(status, element("time", "", historyDate(record.started_at)));
     button.append(element("span", "history-item-title", conversationTitle(record)), meta);
     button.addEventListener("click", () => onSelect(record.id));
-    container.append(button);
+    row.append(button);
+    if (record.phase === "ingress_failed") {
+      const retry = element("button", "quiet history-item-retry", retryingIds.has(record.id) ? "Retrying…" : "Retry");
+      retry.type = "button";
+      retry.disabled = retryingIds.has(record.id);
+      retry.setAttribute("aria-label", `Retry history ingress for ${conversationTitle(record, 100)}`);
+      retry.addEventListener("click", () => onRetryIngress(record));
+      row.append(retry);
+    }
+    container.append(row);
   }
   restoreViewState(container, viewKey, viewState);
 }
@@ -186,6 +242,8 @@ export function audioRecordingTitle(record, limit = 54) {
 export function renderAudioHistory(container, records, {
   selectedId = null,
   onSelect = () => {},
+  retryingIds = new Set(),
+  onRetryIngress = () => {},
   viewKey = "audio-history",
 } = {}) {
   const viewState = captureViewState(container, viewKey);
@@ -197,6 +255,7 @@ export function renderAudioHistory(container, records, {
   }
   for (const record of records) {
     const selected = record.id === selectedId;
+    const row = element("div", `history-item-row${selected ? " selected" : ""}`);
     const button = element("button", `history-item${selected ? " selected" : ""}`);
     button.type = "button";
     button.dataset.focusKey = `${viewKey}:record:${record.id}`;
@@ -209,7 +268,16 @@ export function renderAudioHistory(container, records, {
     meta.append(status, element("time", "", historyDate(record.source_created_at)));
     button.append(element("span", "history-item-title", audioRecordingTitle(record)), meta);
     button.addEventListener("click", () => onSelect(record.id));
-    container.append(button);
+    row.append(button);
+    if (record.status === "ingress_failed") {
+      const retry = element("button", "quiet history-item-retry", retryingIds.has(record.id) ? "Retrying…" : "Retry");
+      retry.type = "button";
+      retry.disabled = retryingIds.has(record.id);
+      retry.setAttribute("aria-label", `Retry failed memory ingress for ${audioRecordingTitle(record, 100)}`);
+      retry.addEventListener("click", () => onRetryIngress(record));
+      row.append(retry);
+    }
+    container.append(row);
   }
   restoreViewState(container, viewKey, viewState);
 }
@@ -238,8 +306,12 @@ function audioDisclosure(label, content, key, open = false) {
   const disclosure = element("details", "audio-disclosure");
   disclosure.dataset.viewKey = key;
   disclosure.open = open;
-  const summary = element("summary", "", label);
+  const summary = element("summary", "audio-disclosure-summary");
   summary.dataset.focusKey = `${key}:summary`;
+  summary.append(
+    element("span", "audio-disclosure-label", label),
+    element("span", "audio-disclosure-size", characterLabel(content)),
+  );
   const body = element("pre", "audio-disclosure-body", content);
   body.dataset.scrollKey = `${key}:body`;
   disclosure.append(summary, body);
@@ -407,6 +479,7 @@ export function conversationControlState({ hasSession, sessionBusy, transitionBu
     inputDisabled: viewingHistory || !hasSession,
     sendDisabled: sessionBusy || transitionBusy || pendingTurn || viewingHistory || !hasSession,
     endDisabled: sessionBusy || transitionBusy || viewingHistory || !hasSession || (!pendingTurn && !transcriptLength),
+    stopHidden: !sessionBusy || viewingHistory || !hasSession,
     newDisabled: transitionBusy,
   };
 }
@@ -529,6 +602,15 @@ function responsePreview(content) {
     : null;
 }
 
+function ingressProvenanceLabel(message, content) {
+  if (message?.context_kind === "provenance") {
+    return message.display_role || "Conversation provenance";
+  }
+  if (content.startsWith("Conversation provenance\n")) return "Conversation provenance";
+  if (content.startsWith("Audio transcript provenance\n")) return "Audio transcript provenance";
+  return null;
+}
+
 function addEntryTiming(entry, timing) {
   if (!entry || typeof timing !== "string" || !timing.trim()) return;
   if (!Array.isArray(entry.timing)) entry.timing = [];
@@ -623,14 +705,28 @@ export function mainViewEntries(diagnostic) {
       pendingToolTiming = [];
       continue;
     }
+    const provenanceLabel = ingressProvenanceLabel(message, readableMessageContent(message?.content));
+    if (provenanceLabel) {
+      const entry = {
+        kind: "provenance",
+        label: provenanceLabel,
+        content: readableMessageContent(message.content),
+        key: `provenance:${messageIndex}`,
+      };
+      entries.push(entry);
+      lastVisibleEntry = entry;
+      continue;
+    }
     if ((message?.role === "user" || message?.role === "assistant") && !message?.context_kind) {
       const content = readableMessageContent(message.content);
+      const preview = message.role === "assistant" ? responsePreview(content) : null;
       const entry = {
         kind: "conversation",
         role: message.role,
         label: message.display_role || (message.role === "assistant" ? "Kennedy" : "David"),
         content,
-        preview: message.role === "assistant" ? responsePreview(content) : null,
+        preview,
+        hiddenCharacters: preview === null ? 0 : characterCount(content) - characterCount(preview),
         key: `conversation:${messageIndex}`,
       };
       entries.push(entry);
@@ -769,6 +865,7 @@ function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, dept
     badge(String(node.identifier), "identifier"),
     element("strong", "memory-node-name", node.shortName),
     badge(sourceLabel, relation),
+    badge(characterLabel(nodeContentCharacters(node)), "summary"),
   );
   if (relation !== "direct" && directlyLoaded.has(node.identifier)) summary.append(badge("also directly loaded", "direct"));
   details.append(summary);
@@ -792,9 +889,22 @@ function keyedDetails(className, key, openKeys) {
   return details;
 }
 
-function disclosureSummary(label, kind = "context") {
+function nodeContentCharacters(node) {
+  return characterCount([
+    node?.shortName,
+    node?.shortDescription,
+    node?.longDescription,
+    ...(node?.taskConnections || []).flatMap(connection => [connection.shortName, connection.shortDescription]),
+    ...(node?.activeConnections || []).flatMap(connection => [connection.shortName, connection.shortDescription]),
+    ...(node?.fanoutConnections || []).flatMap(connection => [connection.shortName, connection.shortDescription]),
+  ].filter(Boolean).join("\n"));
+}
+
+function disclosureSummary(label, kind = "context", characters = null) {
   const summary = element("summary", "main-entry-summary");
-  summary.append(badge(kind, kind), element("strong", "main-entry-label", label), element("span", "main-entry-toggle"));
+  summary.append(badge(kind, kind), element("strong", "main-entry-label", label));
+  if (characters !== null) summary.append(badge(characterLabel(characters), "summary"));
+  summary.append(element("span", "main-entry-toggle"));
   return summary;
 }
 
@@ -811,6 +921,7 @@ function mainMemorySet(entry, openKeys) {
     element("strong", "main-entry-label", "Loaded nodes"),
     badge(`${directlyLoaded.size} direct`, "direct"),
     badge(`${activeExpanded} active`, "expanded"),
+    badge(characterLabel([...nodeByIdentifier.values()].reduce((total, node) => total + nodeContentCharacters(node), 0)), "summary"),
     element("span", "main-entry-toggle"),
   );
   details.append(summary);
@@ -837,7 +948,11 @@ function mainMemorySet(entry, openKeys) {
 function mainCollapsedEntry(entry, openKeys, index) {
   const key = entry.key || `${entry.kind}:${index}`;
   const details = keyedDetails(`main-entry main-${entry.kind}`, key, openKeys);
-  const summary = disclosureSummary(entry.label, entry.kind === "tool-call" ? "call" : entry.kind === "tool-result" ? "result" : "context");
+  const summary = disclosureSummary(
+    entry.label,
+    entry.kind === "tool-call" ? "call" : entry.kind === "tool-result" ? "result" : "context",
+    characterCount(entry.content),
+  );
   summary.dataset.focusKey = `${key}:summary`;
   details.append(summary);
   const body = element("pre", "main-entry-body", entry.content);
@@ -878,7 +993,7 @@ function mainConversationEntry(entry, openKeys, index) {
   summary.dataset.focusKey = `${key}:summary`;
   summary.append(
     element("span", "main-response-preview", entry.preview),
-    element("span", "main-response-expand", " [...]"),
+    element("span", "main-response-expand", ` [Show ${characterLabel(entry.hiddenCharacters)} more]`),
     element("span", "main-response-collapse", "Show less"),
   );
   disclosure.append(summary, body);
@@ -1102,7 +1217,11 @@ export function renderIngressActivity(
       item.dataset.viewKey = key;
       const summary = element("summary", "ingress-entry-summary");
       summary.dataset.focusKey = `${key}:summary`;
-      summary.append(element("span", "role", presentation.label), element("span", "ingress-entry-toggle"));
+      summary.append(
+        element("span", "role", presentation.label),
+        element("span", "ingress-entry-size", characterLabel(message.content)),
+        element("span", "ingress-entry-toggle"),
+      );
       item.append(summary);
     } else {
       item.append(element("span", "role", presentation.label));

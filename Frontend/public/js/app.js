@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260716.3";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260716.5";
 import { loadPromptManuals } from "./prompt_composer.js?v=20260716.2";
-import { ConversationSession } from "./conversation.js?v=20260715.11";
-import { runHistoryIngress } from "./history_ingress.js?v=20260716.1";
+import { ConversationSession } from "./conversation.js?v=20260716.12";
+import { runHistoryIngress } from "./history_ingress.js?v=20260716.2";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260716.5";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260716.7";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -14,7 +14,7 @@ const CONFIG = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
+  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "stop-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["main", "full", "history"];
@@ -43,6 +43,8 @@ let audioDetails = new Map();
 let audioDetailLoading = new Set();
 let audioDetailErrors = new Map();
 let retryingAudioPieces = new Set();
+let retryingAudioRecordings = new Set();
+let retryingConversationIds = new Set();
 let activeView = "conversation";
 let liveSessions = new Map();
 let drafts = new Map();
@@ -96,7 +98,7 @@ function sessionTypeOf(record) {
 
 function recordsForView(view = activeView) {
   const type = view === "telegram" ? "telegram" : "conversation";
-  return historyRecords.filter(record => sessionTypeOf(record) === type);
+  return sortConversationHistory(historyRecords.filter(record => sessionTypeOf(record) === type));
 }
 
 function selectedRecord() {
@@ -109,6 +111,12 @@ function selectedSession() {
 
 function selectedAudioDetail() {
   return audioDetails.get(selectedAudioId) || null;
+}
+
+function freshIngressState(state) {
+  const fresh = { ...(state || {}) };
+  delete fresh.historyIngress;
+  return fresh;
 }
 
 const EMPTY_MEMORY = { directlyLoadedIdentifiers: [], nodes: [] };
@@ -302,6 +310,8 @@ function update() {
     renderAudioHistory(ui.conversation_history, audioRecords, {
       selectedId: selectedAudioId,
       onSelect: id => selectAudioRecording(id),
+      retryingIds: retryingAudioRecordings,
+      onRetryIngress: retryAudioIngressRecording,
       viewKey: "sidebar:audio",
     });
     const currentDiagnostic = diagnostic();
@@ -335,6 +345,9 @@ function update() {
     viewingHistory ? (record?.state?.transcript || []) : (session?.transcript || []),
     ingressActivity,
     `${activeView}:${selectedConversationId || "none"}`,
+    record?.phase === "ingress_failed"
+      ? { retrying: retryingConversationIds.has(record.id), onRetry: () => retryConversationIngress(record) }
+      : null,
   );
   if (telegramView && !(viewingHistory ? record?.state?.transcript : session?.transcript)?.length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Keep this page open: the relay queues messages while it is closed, and this visible UI owns Kennedy's Chatend and tool loop."));
@@ -342,6 +355,8 @@ function update() {
   renderConversationHistory(ui.conversation_history, recordsForView(), {
     selectedId: selectedConversationId,
     onSelect: id => selectConversation(id).catch(error => showError(ui.error_banner, error.message)),
+    retryingIds: retryingConversationIds,
+    onRetryIngress: retryConversationIngress,
     viewKey: `sidebar:${activeView}`,
   });
   const currentDiagnostic = diagnostic();
@@ -371,6 +386,9 @@ function update() {
   ui.message_input.disabled = controls.inputDisabled;
   ui.send_button.disabled = controls.sendDisabled || extractingAttachment;
   ui.end_button.disabled = controls.endDisabled;
+  ui.stop_button.classList.toggle("hidden", controls.stopHidden || !session?.canStop);
+  ui.stop_button.disabled = Boolean(session?.stopping);
+  ui.stop_button.textContent = session?.stopping ? "Stopping…" : "Stop Kennedy";
   ui.new_conversation.disabled = controls.newDisabled || !chatRuntimeReady();
   ui.new_conversation.classList.toggle("hidden", telegramView);
   ui.voice_button.disabled = controls.sendDisabled || !transcriptionAvailable
@@ -394,6 +412,8 @@ function update() {
     ? session?.busy ? "Kennedy is answering this Telegram message" : "Messages are delivered automatically"
     : viewingHistory
     ? record?.phase === "active" ? "Chat is unavailable; this saved conversation is read only" : "This conversation is closed and read only"
+    : session?.stopping
+      ? "Stopping Kennedy — the saved query will remain retryable"
     : session?.busy
       ? "Kennedy is working — you can draft your next message"
       : session?.pendingTurn
@@ -403,8 +423,7 @@ function update() {
 
 function upsertHistory(record) {
   if (!record) return;
-  historyRecords = [record, ...historyRecords.filter(item => item.id !== record.id)]
-    .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  historyRecords = sortConversationHistory([record, ...historyRecords.filter(item => item.id !== record.id)]);
 }
 
 function saveDraft() {
@@ -588,7 +607,7 @@ async function toggleVoiceRecording() {
 }
 
 function reconcileLiveSessions(records) {
-  historyRecords = [...records].sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  historyRecords = sortConversationHistory(records);
   const activeIds = new Set(historyRecords.filter(record => record.phase === "active").map(record => record.id));
   for (const id of liveSessions.keys()) {
     if (!activeIds.has(id)) liveSessions.delete(id);
@@ -643,13 +662,70 @@ async function retryAudioIngressPiece(piece) {
   retryingAudioPieces.add(piece.id);
   update();
   try {
-    await audioIngress.retryIngress(piece.id, { expected_version: piece.version });
+    await audioIngress.retryIngress(piece.id, {
+      expected_version: piece.version,
+      state: freshIngressState(piece.state),
+    });
     await refreshAudioHistory(true);
     kickHistoryIngress();
   } catch (error) {
     showError(ui.error_banner, `Audio memory ingress could not be retried: ${error.message}`);
   } finally {
     retryingAudioPieces.delete(piece.id);
+    update();
+  }
+}
+
+async function retryAudioIngressRecording(record) {
+  if (!record?.id || retryingAudioRecordings.has(record.id)) return;
+  retryingAudioRecordings.add(record.id);
+  update();
+  const scheduled = [];
+  try {
+    const detail = await audioIngress.history(record.id);
+    const failedPieces = (detail.pieces || []).filter(piece =>
+      piece.phase === "ingress_failed" && !retryingAudioPieces.has(piece.id)
+    );
+    if (!failedPieces.length) throw new Error("No failed transcript pieces are available to retry.");
+    for (const piece of failedPieces) {
+      retryingAudioPieces.add(piece.id);
+      scheduled.push(piece.id);
+    }
+    update();
+    await Promise.all(failedPieces.map(piece => audioIngress.retryIngress(piece.id, {
+      expected_version: piece.version,
+      state: freshIngressState(piece.state),
+    })));
+    kickHistoryIngress();
+  } catch (error) {
+    showError(ui.error_banner, `Audio memory ingress could not be retried: ${error.message}`);
+  } finally {
+    retryingAudioRecordings.delete(record.id);
+    for (const pieceId of scheduled) retryingAudioPieces.delete(pieceId);
+    try {
+      await refreshAudioHistory(activeView === "audio" && selectedAudioId === record.id);
+    } catch (error) {
+      showError(ui.error_banner, `Audio history could not be refreshed after retry: ${error.message}`);
+    }
+    update();
+  }
+}
+
+async function retryConversationIngress(record) {
+  if (!record?.id || record.phase !== "ingress_failed" || retryingConversationIds.has(record.id)) return;
+  retryingConversationIds.add(record.id);
+  update();
+  try {
+    const retried = await conversationHistory.retryIngress(record.id, {
+      expected_version: record.version,
+      state: freshIngressState(record.state),
+    });
+    upsertHistory(retried);
+    kickHistoryIngress();
+  } catch (error) {
+    showError(ui.error_banner, `History ingress could not be retried: ${error.message}`);
+  } finally {
+    retryingConversationIds.delete(record.id);
     update();
   }
 }
@@ -750,6 +826,11 @@ async function submitMessage(event) {
   try {
     await session.send(text, metadata);
   } catch (error) {
+    if (error?.code === "turn_stopped") {
+      conversationErrors.delete(id);
+      update();
+      return;
+    }
     const message = error.message || "Kennedy could not answer the saved query.";
     conversationErrors.set(id, message);
     if (selectedConversationId === id) showError(ui.error_banner, message);
@@ -764,9 +845,27 @@ async function resumeSavedQuery(id = selectedConversationId) {
   try {
     await session.resumePendingTurn();
   } catch (error) {
+    if (error?.code === "turn_stopped") {
+      conversationErrors.delete(id);
+      update();
+      return;
+    }
     const message = `The saved query could not be resumed: ${error.message}`;
     conversationErrors.set(id, message);
     if (selectedConversationId === id) showError(ui.error_banner, message);
+  }
+  update();
+}
+
+async function stopConversationTurn() {
+  const id = selectedConversationId;
+  const session = selectedSession();
+  if (!session?.canStop) return;
+  conversationErrors.delete(id);
+  try {
+    await session.stopPendingTurn();
+  } catch (error) {
+    showError(ui.error_banner, `Kennedy could not be stopped cleanly: ${error.message}`);
   }
   update();
 }
@@ -1358,7 +1457,7 @@ async function initialize() {
   try {
     await conversationHistory.health();
     await conversationHistory.discardUnstarted();
-    historyRecords = (await conversationHistory.list()).conversations || [];
+    historyRecords = sortConversationHistory((await conversationHistory.list()).conversations || []);
     conversationHistoryReady = true;
   } catch (error) {
     showError(ui.error_banner, `Conversation history is unavailable: ${error.message}`);
@@ -1502,6 +1601,7 @@ ui.message_resize_handle.addEventListener("keydown", event => {
 const messageInputResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(syncComposerResizeValue) : null;
 messageInputResizeObserver?.observe(ui.message_input);
 ui.end_button.addEventListener("click", () => selectedSession()?.pendingTurn ? resumeSavedQuery() : endConversation());
+ui.stop_button.addEventListener("click", () => stopConversationTurn());
 ui.new_conversation.addEventListener("click", () => createNewConversation().catch(error => showError(ui.error_banner, error.message)));
 ui.clear_log.addEventListener("click", () => clearError(ui.error_banner));
 for (const mode of INSPECTOR_MODES) ui[`inspector_${mode}`].addEventListener("click", () => { inspectorMode = mode; update(); });

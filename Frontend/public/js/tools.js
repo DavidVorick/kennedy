@@ -123,9 +123,10 @@ export class ToolExecutor {
     return { message: result, reset: false, durationMs };
   }
 
-  async execute(call) {
+  async execute(call, { signal = null, operationId = null } = {}) {
     const started = performance.now();
     try {
+      if (signal?.aborted) throw Object.assign(new Error("Kennedy's response was stopped."), { code: "turn_stopped" });
       let outcome;
       switch (call.name) {
         case "LoadNode": outcome = await this.loadNode(call.arguments); break;
@@ -135,8 +136,8 @@ export class ToolExecutor {
         case "AssignTask": outcome = await this.assignTask(call.arguments); break;
         case "CreateNode": outcome = await this.createNode(call.arguments); break;
         case "UpdateNode": outcome = await this.updateNode(call.arguments); break;
-        case "WebSearch": outcome = await this.webSearch(call.arguments); break;
-        case "WebFetch": outcome = await this.webFetch(call.arguments); break;
+        case "WebSearch": outcome = await this.webSearch(call.arguments, { signal, operationId }); break;
+        case "WebFetch": outcome = await this.webFetch(call.arguments, { signal, operationId }); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
       }
       const durationMs = elapsedMs(started);
@@ -144,6 +145,7 @@ export class ToolExecutor {
       this.record({ name: call.name, arguments: call.arguments, ok: true, durationMs });
       return { message, reset: Boolean(outcome.reset), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, previousContext: outcome.previousContext ?? null, durationMs };
     } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError" || ["operation_cancelled", "turn_stopped"].includes(error?.code)) throw error;
       const code = error.code || "tool_failed";
       const message = error.message || "Tool execution failed.";
       const durationMs = elapsedMs(started);
@@ -218,17 +220,17 @@ export class ToolExecutor {
   assertIngress() { if (this.mode !== "ingress" || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" }); }
   assertConversationWeb() { if (this.mode !== "conversation" || !this.intelligence) throw Object.assign(new Error("This web tool is only available during a live conversation."), { code: "tool_unavailable" }); }
 
-  async webSearch(args) {
+  async webSearch(args, { signal = null, operationId = null } = {}) {
     this.assertConversationWeb(); validateObject(args, ["question", "mode"]);
     const question = nonemptyString(args.question, "question", 4000);
     const mode = choice(args.mode, "mode", ["quality", "balanced", "fast"]);
-    return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question, mode }) };
+    return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question, mode }, { signal, operationId }) };
   }
 
-  async webFetch(args) {
+  async webFetch(args, { signal = null, operationId = null } = {}) {
     this.assertConversationWeb(); validateObject(args, ["url"]);
     const url = nonemptyString(args.url, "url", 4096);
-    return { result: await this.intelligence.webFetch({ url }) };
+    return { result: await this.intelligence.webFetch({ url }, { signal, operationId }) };
   }
 
   async createNode(args) {

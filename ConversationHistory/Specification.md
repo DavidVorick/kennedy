@@ -48,6 +48,8 @@ null.
 active -> ingress_pending -> ingress_in_progress -> complete
              |               |
              +---------------+-> ingress_failed (fifth failure)
+                                      |
+                                      +-> ingress_pending (explicit retry)
 ```
 
 - Checkpoints may update only an `active` conversation.
@@ -69,6 +71,10 @@ active -> ingress_pending -> ingress_in_progress -> complete
   the record from future queue selection. Failed records remain queryable with
   their diagnostic logs.
 - New and existing active conversations are independent of this queue.
+- A terminal failed record can be explicitly retried. The frontend supplies a
+  fresh opaque state with the failed history-ingress checkpoint removed, the
+  backend resets the consecutive-attempt count, preserves the diagnostic log
+  and provenance ID, and returns the record to `ingress_pending`.
 - On frontend startup, records that have neither recorded user activity nor a
   user message in their stored conversation transcript are permanently
   discarded, regardless of phase. This also removes an untouched placeholder
@@ -96,6 +102,7 @@ index serializes memory updates even when several conversations close together.
 - `PUT /api/v1/conversations/{id}/ingress-checkpoint`
 - `POST /api/v1/conversations/{id}/ingress-completed`
 - `POST /api/v1/conversations/{id}/ingress-failure`
+- `POST /api/v1/conversations/{id}/retry-ingress`
 
 Create accepts `started_at` plus opaque `state`. Checkpoint accepts
 `expected_version`, `state`, and optional `user_activity`. The ingress queue
@@ -105,6 +112,7 @@ idempotent and returns the count and IDs of discarded records.
 The failure endpoint accepts `expected_version`, stage, optional error code,
 message, round count, and optional context usage. It normalizes and bounds
 diagnostic text before atomically incrementing the attempt count.
+Retry accepts `expected_version` plus replacement opaque `state`.
 
 ## 5. Deployment and Isolation
 

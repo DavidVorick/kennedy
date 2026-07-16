@@ -706,6 +706,7 @@ The left panel contains only:
 - user and Kennedy messages,
 - multiline input,
 - Send and End Conversation controls,
+- a Stop Kennedy control while a response is in flight,
 - a Retry Saved Query state when a durable user turn needs to resume,
 - per-conversation busy status,
 - inline history-ingress activity after a closed conversation,
@@ -719,9 +720,20 @@ or closed indicator. Selecting a live entry restores its draft and continuable
 session; selecting a closed entry opens its clean transcript read-only. New
 always creates and selects another durable live conversation.
 
+Conversation and Telegram sidebars group records automatically: live sessions
+first, records whose memory ingress is queued, running, or failed second, and
+fully completed records last. Within each group, the most recently updated
+record appears first.
+
 The message composer is not rendered while a closed record is selected. Its
 textarea, Send control, and End Conversation control return only after the user
 selects or creates a live conversation.
+
+While Kennedy is working, Stop Kennedy remains available even though Send and
+End Conversation are disabled. It aborts the active generation or web request,
+prevents another tool-loop round from starting, restores the latest durable
+turn checkpoint, and exposes Retry Saved Query. A user-requested stop is normal
+control flow and does not add a red activity-log failure.
 
 In a live conversation, the textarea has a visible larger/compact toggle for
 long messages and remains vertically resizable using either its top-edge grip
@@ -754,7 +766,11 @@ afterward:
   first 500 followed by an expandable `[...]`; user messages and responses of
   exactly 500 characters or fewer remain fully visible. The system prompt, current loaded-node set, individual directly
   loaded nodes, tool calls, tool results, context notes, and loaded-node events
-  are closed disclosure rows by default. Timing messages never become separate
+  are closed disclosure rows by default. Conversation/audio provenance is also
+  a closed disclosure row, including in Full History, rather than appearing as
+  a potentially enormous user message. Every closed text disclosure reports
+  its Unicode-character size; a truncated Kennedy response reports the exact
+  number of additional characters expansion will reveal. Timing messages never become separate
   Main-view rows: LLM and tool durations appear as a compact footer on the
   corresponding tool result, while direct conversation responses show their
   LLM and turn timing as small secondary metadata beside the message role.
@@ -906,8 +922,22 @@ while extracted text enters the Chatend once and is not duplicated in media.
 
 In the inline history-ingress review, verbose Kennedy tool requests, memory
 tool results, and tool-protocol errors use closed disclosure controls by
-default. The user can expand and collapse each entry; Kennedy's ordinary final
+default and report their character size. The user can expand and collapse each entry; Kennedy's ordinary final
 review remains visible.
+
+History ingress does not replay full Kmap node bodies from the archived source
+Chatend. It removes the archived Kmap-context and memory-tool-result bodies and
+their matching memory-only tool requests, drops source-session timing noise,
+and supplies a deduplicated list containing only each encountered node's title
+and short description. Kennedy's live ingress Kmap context and tools remain
+unchanged, so she can navigate and load relevant nodes herself.
+
+A terminal conversation-history ingress exposes Retry beside its failed status
+in the history column and in an action panel at the top of the central view.
+Audio recordings expose the equivalent history-column action in addition to
+their per-piece central retry controls. Retry preserves provenance and failure
+diagnostics, removes the exhausted history-ingress checkpoint, and returns the
+work to the durable queue with a fresh model context.
 
 ## 14. Verification
 

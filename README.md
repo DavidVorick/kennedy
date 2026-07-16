@@ -150,7 +150,10 @@ port 4324 reports the relay as disabled and the rest of Kennedy remains usable.
 for i3 hotkeys. Start records directly into `/home/user/media/vnotes`, using the
 recording-start Unix timestamp in the filename. Stop ends `arecord`, examines
 the five newest vnotes, asks Kennedy which SHA-256 hashes she already has, and
-uploads only the missing files. The local WAV files are never deleted.
+uploads only finalized, stable files that are missing. Both upload scripts take
+one two-second directory snapshot and verify the finalized RIFF/WAVE length,
+so a recording that is still changing or has not had its header closed is
+ignored. The local WAV files are never deleted.
 
 For example, use absolute paths in i3:
 
@@ -159,22 +162,42 @@ bindsym $mod+Shift+v exec --no-startup-id /path/to/kennedy/scripts/vnote-start
 bindsym $mod+Shift+b exec --no-startup-id /path/to/kennedy/scripts/vnote-stop
 ```
 
-The two paths are plain variables at the top of the scripts if this fixed
-loopback setup changes later. The stop hotkey waits only for each upload HTTP
-response; it never waits for transcription, reconciliation, or Kmap ingress.
+The two paths are plain defaults at the top of the scripts if this fixed
+loopback setup changes later; `KENNEDY_VNOTE_DIR` and `KENNEDY_AUDIO_API`
+override them. The stop hotkey waits only for file stability and each upload
+HTTP response; it never waits for transcription, reconciliation, or Kmap
+ingress.
+
+For importing a backlog or a reorganized backup, copy
+[`scripts/vnote-ingress`](scripts/vnote-ingress) into a directory containing
+vnotes and run it directly:
+
+```sh
+./vnote-ingress
+```
+
+It scans every `*-vnote.wav` in its own directory from newest recording to
+oldest, checks each content hash against Kennedy, and uploads the first five
+finalized, stable recordings that Kennedy does not already know. It continues
+past files that are still changing or have unfinished WAV headers. It uses the
+recording-start epoch embedded by `vnote-start`; for other matching filenames
+it falls back to the file's modification time. Set `KENNEDY_AUDIO_API` to
+override the default loopback API URL.
 
 After acceptance, the server hashes and stores the original WAV, creates equal
 four-minute-or-shorter windows with fifteen seconds of neighboring overlap,
-and transcribes those windows in strict chronological order with
-`gemini-3.1-pro-preview`. `gpt-5.6-sol` with `xhigh` reasoning reconciles
-speakers, removes repeated overlap, preserves annotations and translations,
-and produces the canonical final transcript. If needed, Sol inserts sensible
-boundaries so each Kennedy ingress piece remains at or below an estimated
-50,000 tokens. Every piece repeats the recording timestamp and shares the
-recording SHA-256 identity. Processing stages, transcripts, retries, and
-Kennedy ingress checkpoints are SQLite-backed and resume after server or
-browser restarts. Kmap mutation runs when Kennedy's browser worker is open and
-remains serialized with ordinary conversation-history ingress.
+and transcribes up to four windows concurrently with
+`gemini-3.1-pro-preview`. Successful chunk results are stored immediately and
+retries send only unfinished chunks. `gpt-5.6-sol` with `xhigh` reasoning
+receives the stored transcripts in chronological order, reconciles speakers,
+removes repeated overlap, preserves annotations and translations, and produces
+the canonical final transcript. If needed, Sol inserts sensible boundaries so
+each Kennedy ingress piece remains at or below an estimated 50,000 tokens.
+Every piece repeats the recording timestamp and shares the recording SHA-256
+identity. Processing stages, transcripts, retries, and Kennedy ingress
+checkpoints are SQLite-backed and resume after server or browser restarts. Kmap
+mutation runs when Kennedy's browser worker is open and remains serialized with
+ordinary conversation-history ingress.
 
 Recordings are idempotent by content hash. Check one with
 `GET /api/v1/audio-ingress/by-sha256/{sha256}` or inspect the entire durable

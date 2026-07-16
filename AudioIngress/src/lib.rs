@@ -15,6 +15,7 @@ use axum::{
     routing::{get, post, put},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures::{StreamExt, stream};
 use hound::{SampleFormat, WavReader, WavWriter};
 use reqwest::{Client, header};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -42,6 +43,7 @@ const MAX_CHUNK_MILLISECONDS: u64 = 4 * 60 * 1_000;
 const CHUNK_OVERLAP_MILLISECONDS: u64 = 15 * 1_000;
 const MAX_INGRESS_TOKENS: u64 = 50_000;
 const ESTIMATED_CHARACTERS_PER_TOKEN: u64 = 4;
+const MAX_CONCURRENT_GEMINI_CHUNKS: usize = 4;
 const INGRESS_BREAK: &str = "<!-- KENNEDY_INGRESS_BREAK -->";
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 
@@ -224,6 +226,13 @@ struct CheckpointIngress {
 #[derive(Deserialize)]
 struct VersionedTransition {
     expected_version: i64,
+}
+
+#[derive(Deserialize)]
+struct RetryIngress {
+    expected_version: i64,
+    #[serde(default)]
+    state: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -792,7 +801,7 @@ async fn process_next_recording(state: &AppState) -> anyhow::Result<bool> {
     let stage = recording.status.clone();
     let result = match recording.status.as_str() {
         "uploaded" | "chunking" => prepare_recording_chunks(state, &recording).await,
-        "transcribing" => transcribe_next_chunk(state, &recording).await,
+        "transcribing" => transcribe_pending_chunks(state, &recording).await,
         "reconciling" => reconcile_recording(state, &recording).await,
         _ => Ok(()),
     };
@@ -1016,19 +1025,32 @@ fn copy_wav_interval(
     Ok(())
 }
 
-async fn transcribe_next_chunk(state: &AppState, recording: &WorkRecording) -> anyhow::Result<()> {
-    let chunk = {
+async fn transcribe_pending_chunks(
+    state: &AppState,
+    recording: &WorkRecording,
+) -> anyhow::Result<()> {
+    let chunks = {
         let db = state
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
-        db.query_row(
-            "SELECT chunk_index,audio_start_ms,audio_end_ms,relative_path,transcript_json FROM audio_chunks WHERE recording_id=?1 AND transcript_json IS NULL ORDER BY chunk_index LIMIT 1",
-            [&recording.id],
-            |row| Ok(ChunkRecord { index:row.get(0)?,audio_start_ms:row.get(1)?,audio_end_ms:row.get(2)?,relative_path:row.get(3)?,transcript_json:row.get(4)? }),
-        ).optional()?
+        let mut statement = db.prepare(
+            "SELECT chunk_index,audio_start_ms,audio_end_ms,relative_path,transcript_json \
+             FROM audio_chunks WHERE recording_id=?1 AND transcript_json IS NULL ORDER BY chunk_index",
+        )?;
+        statement
+            .query_map([&recording.id], |row| {
+                Ok(ChunkRecord {
+                    index: row.get(0)?,
+                    audio_start_ms: row.get(1)?,
+                    audio_end_ms: row.get(2)?,
+                    relative_path: row.get(3)?,
+                    transcript_json: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
     };
-    let Some(chunk) = chunk else {
+    if chunks.is_empty() {
         let db = state
             .db
             .lock()
@@ -1038,25 +1060,75 @@ async fn transcribe_next_chunk(state: &AppState, recording: &WorkRecording) -> a
             params![Utc::now().to_rfc3339(),recording.id],
         )?;
         return Ok(());
-    };
+    }
     let api_key = state.config.gemini_api_key.as_deref().context(
         "Gemini audio transcription is not configured; store gemini-api-key in Kennedy's vault",
     )?;
-    let path = state.config.media_directory.join(&chunk.relative_path);
-    let transcript = transcribe_chunk(&state.client, api_key, &path, recording, &chunk).await?;
+    tracing::info!(
+        recording_id = %recording.id,
+        chunks = chunks.len(),
+        concurrency = MAX_CONCURRENT_GEMINI_CHUNKS.min(chunks.len()),
+        model = GEMINI_MODEL,
+        "Transcribing audio chunks concurrently"
+    );
+    let mut transcriptions = stream::iter(chunks.into_iter().map(|chunk| {
+        let path = state.config.media_directory.join(&chunk.relative_path);
+        async move {
+            let index = chunk.index;
+            let result = transcribe_chunk(&state.client, api_key, &path, recording, &chunk).await;
+            (index, result)
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_GEMINI_CHUNKS);
+    let mut failures = Vec::new();
+    while let Some((chunk_index, result)) = transcriptions.next().await {
+        match result {
+            Ok(transcript) => {
+                let db = state
+                    .db
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
+                let changed = db.execute(
+                    "UPDATE audio_chunks SET transcript_json=?1 WHERE recording_id=?2 AND chunk_index=?3 AND transcript_json IS NULL",
+                    params![transcript,recording.id,chunk_index],
+                )?;
+                ensure!(
+                    changed == 1,
+                    "audio chunk {chunk_index} changed before its transcript could be saved"
+                );
+                db.execute(
+                    "UPDATE audio_recordings SET attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
+                    params![Utc::now().to_rfc3339(),recording.id],
+                )?;
+                tracing::info!(recording_id=%recording.id, chunk=chunk_index, model=GEMINI_MODEL, "Transcribed audio chunk");
+            }
+            Err(error) => failures.push((
+                chunk_index,
+                concise_text(
+                    &error.to_string(),
+                    800,
+                    "Gemini transcription failed without detail",
+                ),
+            )),
+        }
+    }
+    if !failures.is_empty() {
+        failures.sort_by_key(|(chunk_index, _)| *chunk_index);
+        let detail = failures
+            .into_iter()
+            .map(|(chunk_index, error)| format!("chunk {chunk_index}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("one or more concurrent Gemini transcriptions failed: {detail}");
+    }
     let db = state
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
     db.execute(
-        "UPDATE audio_chunks SET transcript_json=?1 WHERE recording_id=?2 AND chunk_index=?3 AND transcript_json IS NULL",
-        params![transcript,recording.id,chunk.index],
-    )?;
-    db.execute(
-        "UPDATE audio_recordings SET attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
+        "UPDATE audio_recordings SET status='reconciling',attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
         params![Utc::now().to_rfc3339(),recording.id],
     )?;
-    tracing::info!(recording_id=%recording.id, chunk=chunk.index, model=GEMINI_MODEL, "Transcribed audio chunk");
     Ok(())
 }
 
@@ -1748,7 +1820,7 @@ fn ingress_retry_delay_seconds(consecutive_attempt: i64) -> i64 {
 async fn retry_ingress(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
-    Json(input): Json<VersionedTransition>,
+    Json(input): Json<RetryIngress>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
     validate_version(input.expected_version)?;
     let mut db = state.db.lock().map_err(ApiError::internal)?;
@@ -1756,6 +1828,7 @@ async fn retry_ingress(
         &mut db,
         &id,
         input.expected_version,
+        input.state.as_ref(),
     )?))
 }
 
@@ -1763,6 +1836,7 @@ fn retry_failed_ingress(
     db: &mut Connection,
     id: &str,
     expected_version: i64,
+    replacement_state: Option<&Value>,
 ) -> Result<IngressPieceRecord, ApiError> {
     let existing = fetch_piece(db, id)?;
     if existing.phase != "ingress_failed" || existing.version != expected_version {
@@ -1772,10 +1846,12 @@ fn retry_failed_ingress(
     }
     let tx = db.transaction().map_err(ApiError::internal)?;
     let now = Utc::now().to_rfc3339();
+    let state_json = serde_json::to_string(replacement_state.unwrap_or(&existing.state))
+        .map_err(ApiError::internal)?;
     let changed = tx
         .execute(
-            "UPDATE audio_ingress_pieces SET phase='ingress_pending',ingress_failure_count=0,updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_failed' AND version=?3",
-            params![now, id, expected_version],
+            "UPDATE audio_ingress_pieces SET phase='ingress_pending',state_json=?1,ingress_failure_count=0,updated_at=?2,version=version+1 WHERE id=?3 AND phase='ingress_failed' AND version=?4",
+            params![state_json, now, id, expected_version],
         )
         .map_err(ApiError::internal)?;
     if changed == 0 {
@@ -1935,9 +2011,11 @@ mod tests {
         db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,version,ingress_failure_count,ingress_failures_json,created_at,updated_at) VALUES('p','r',0,'text',1,'ingress_failed',3,5,?1,?2,?2)",params![r#"[{"attempt":1,"message":"provider failed"}]"#,now]).unwrap();
 
         assert!(fetch_next_ingress_piece(&db).unwrap().is_none());
-        let retried = retry_failed_ingress(&mut db, "p", 3).unwrap();
+        let retried =
+            retry_failed_ingress(&mut db, "p", 3, Some(&json!({"retry":"fresh"}))).unwrap();
         assert_eq!(retried.phase, "ingress_pending");
         assert_eq!(retried.ingress_failure_count, 0);
+        assert_eq!(retried.state["retry"], "fresh");
         assert_eq!(retried.ingress_failures[0]["message"], "provider failed");
         assert_eq!(retried.version, 4);
         assert_eq!(

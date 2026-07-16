@@ -6,14 +6,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, State},
+    extract::{DefaultBodyLimit, Multipart, Path as RoutePath, State},
     http::{HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -24,7 +24,7 @@ use quick_xml::{Reader as XmlReader, events::Event as XmlEvent};
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{io::AsyncWriteExt, process::Command, sync::watch};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -153,6 +153,84 @@ struct AppState {
     transcription_api_key: Option<Arc<str>>,
     gemini_client: Client,
     gemini_api_key: Option<Arc<str>>,
+    active_operations: ActiveOperations,
+}
+
+#[derive(Clone, Default)]
+struct ActiveOperations {
+    senders: Arc<Mutex<HashMap<Uuid, watch::Sender<bool>>>>,
+}
+
+struct ActiveOperation {
+    id: Uuid,
+    operations: ActiveOperations,
+    cancellation: watch::Receiver<bool>,
+}
+
+impl ActiveOperations {
+    fn register(&self, id: Uuid) -> Result<ActiveOperation, ApiError> {
+        let (sender, cancellation) = watch::channel(false);
+        let mut senders = self.senders.lock().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "operation_registry_unavailable",
+                "The intelligence operation registry is unavailable.",
+            )
+        })?;
+        if senders.contains_key(&id) {
+            return Err(ApiError::conflict(
+                "operation_in_progress",
+                "An intelligence operation with this identifier is already running.",
+            ));
+        }
+        senders.insert(id, sender);
+        Ok(ActiveOperation {
+            id,
+            operations: self.clone(),
+            cancellation,
+        })
+    }
+
+    fn cancel(&self, id: Uuid) -> Result<bool, ApiError> {
+        let sender = self
+            .senders
+            .lock()
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "operation_registry_unavailable",
+                    "The intelligence operation registry is unavailable.",
+                )
+            })?
+            .get(&id)
+            .cloned();
+        Ok(sender.is_some_and(|sender| sender.send(true).is_ok()))
+    }
+
+    fn remove(&self, id: Uuid) {
+        if let Ok(mut senders) = self.senders.lock() {
+            senders.remove(&id);
+        }
+    }
+}
+
+impl ActiveOperation {
+    async fn cancelled(&mut self) {
+        if *self.cancellation.borrow() {
+            return;
+        }
+        while self.cancellation.changed().await.is_ok() {
+            if *self.cancellation.borrow() {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for ActiveOperation {
+    fn drop(&mut self) {
+        self.operations.remove(self.id);
+    }
 }
 
 #[derive(Debug)]
@@ -185,6 +263,14 @@ impl ApiError {
     fn conflict(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, code, message)
     }
+    fn cancelled(request_id: Uuid) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "operation_cancelled",
+            "The intelligence operation was stopped by the user.",
+        )
+        .with_request_id(request_id)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -209,6 +295,8 @@ struct GenerateRequest {
     model: Option<String>,
     chatend: String,
     #[serde(default)]
+    operation_id: Option<Uuid>,
+    #[serde(default)]
     previous_response_id: Option<String>,
     #[serde(default)]
     prompt_cache_key: Option<String>,
@@ -219,6 +307,8 @@ struct WebSearchRequest {
     provider: Option<String>,
     model: Option<String>,
     question: String,
+    #[serde(default)]
+    operation_id: Option<Uuid>,
     #[serde(default)]
     mode: WebSearchMode,
 }
@@ -297,6 +387,13 @@ struct WebSource {
 #[derive(Deserialize)]
 struct WebFetchRequest {
     url: String,
+    #[serde(default)]
+    operation_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct OperationCancellationResponse {
+    cancelled: bool,
 }
 
 #[derive(Serialize)]
@@ -413,6 +510,7 @@ pub async fn serve(
         transcription_api_key,
         gemini_client,
         gemini_api_key,
+        active_operations: ActiveOperations::default(),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -422,6 +520,10 @@ pub async fn serve(
         .route("/api/v1/documents/extract", post(extract_document))
         .route("/api/v1/web/search", post(web_search))
         .route("/api/v1/web/fetch", post(web_fetch))
+        .route(
+            "/api/v1/operations/{operation_id}/cancel",
+            post(cancel_operation),
+        )
         .route("/api/v1/timings", post(record_timing))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(cors)
@@ -872,6 +974,15 @@ async fn record_timing(Json(timing): Json<ActionTiming>) -> Result<StatusCode, A
         _ => return Err(ApiError::invalid("action must be tool, turn, or delivery.")),
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cancel_operation(
+    State(state): State<AppState>,
+    RoutePath(operation_id): RoutePath<Uuid>,
+) -> Result<Json<OperationCancellationResponse>, ApiError> {
+    Ok(Json(OperationCancellationResponse {
+        cancelled: state.active_operations.cancel(operation_id)?,
+    }))
 }
 
 fn model_input_modalities(provider: &ProviderConfig, model: &str) -> Vec<&'static str> {
@@ -2255,20 +2366,23 @@ async fn generate(
         request.provider.as_deref(),
         request.model.as_deref(),
     )?;
-    let request_id = Uuid::new_v4();
+    let request_id = request.operation_id.unwrap_or_else(Uuid::new_v4);
+    let mut operation = state.active_operations.register(request_id)?;
     let started = Instant::now();
-    let turn = run_codex_turn(
-        provider,
-        model,
-        &provider.config.reasoning_effort,
-        &request.chatend,
-        request.previous_response_id.as_deref(),
-        None,
-        false,
-        provider.config.timeout_seconds,
-        request_id,
-    )
-    .await
+    let turn = tokio::select! {
+        _ = operation.cancelled() => Err(ApiError::cancelled(request_id)),
+        result = run_codex_turn(
+            provider,
+            model,
+            &provider.config.reasoning_effort,
+            &request.chatend,
+            request.previous_response_id.as_deref(),
+            None,
+            false,
+            provider.config.timeout_seconds,
+            request_id,
+        ) => result,
+    }
     .inspect_err(|error| {
         tracing::warn!(%request_id, action="generate", provider=%provider_name, %model, code=%error.code, duration_ms=started.elapsed().as_millis(), "LLM call failed");
     })?;
@@ -2311,11 +2425,12 @@ async fn web_search(
         request.provider.as_deref(),
         request.model.as_deref(),
     )?;
-    let request_id = Uuid::new_v4();
+    let request_id = request.operation_id.unwrap_or_else(Uuid::new_v4);
+    let mut operation = state.active_operations.register(request_id)?;
     let started = Instant::now();
     let mode = request.mode;
     let profile = mode.profile();
-    let result: Result<(String, SearchTurn), ApiError> = async {
+    let search = async {
         Ok(match profile.backend {
             SearchBackend::Codex => {
                 let prompt = codex_search_prompt(question, mode);
@@ -2364,8 +2479,11 @@ async fn web_search(
                 ("gemini".into(), turn)
             }
         })
-    }
-    .await;
+    };
+    let result: Result<(String, SearchTurn), ApiError> = tokio::select! {
+        _ = operation.cancelled() => Err(ApiError::cancelled(request_id)),
+        result = search => result,
+    };
     let (execution_provider, turn) = result.inspect_err(|error| {
         tracing::warn!(%request_id, action="web_search", provider=%provider_name, model=%profile.model, ?mode, code=%error.code, duration_ms=started.elapsed().as_millis(), "LLM call failed");
     })?;
@@ -2385,10 +2503,13 @@ async fn web_fetch(
     Json(request): Json<WebFetchRequest>,
 ) -> Result<Json<WebFetchResponse>, ApiError> {
     let requested = parse_public_web_url(request.url.trim())?;
-    let request_id = Uuid::new_v4();
-    let fetched = fetch_readable_page(&requested, &state.config.web)
-        .await
-        .map_err(|error| error.with_request_id(request_id))?;
+    let request_id = request.operation_id.unwrap_or_else(Uuid::new_v4);
+    let mut operation = state.active_operations.register(request_id)?;
+    let fetched = tokio::select! {
+        _ = operation.cancelled() => Err(ApiError::cancelled(request_id)),
+        result = fetch_readable_page(&requested, &state.config.web) => result,
+    }
+    .map_err(|error| error.with_request_id(request_id))?;
     let content_type = fetched.content_type.clone();
     let raw = String::from_utf8_lossy(&fetched.body);
     let title = is_html_content(&content_type)
@@ -2698,9 +2819,22 @@ mod tests {
             provider: None,
             model: None,
             chatend: chatend.into(),
+            operation_id: None,
             previous_response_id: None,
             prompt_cache_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn active_intelligence_operations_can_be_cancelled_by_identifier() {
+        let operations = ActiveOperations::default();
+        let operation_id = Uuid::new_v4();
+        let mut operation = operations.register(operation_id).unwrap();
+        assert!(operations.register(operation_id).is_err());
+        assert!(operations.cancel(operation_id).unwrap());
+        operation.cancelled().await;
+        drop(operation);
+        assert!(!operations.cancel(operation_id).unwrap());
     }
 
     fn pdf_with_content_stream(content: &str) -> Vec<u8> {
@@ -2940,6 +3074,7 @@ mod tests {
             transcription_api_key: None,
             gemini_client: Client::new(),
             gemini_api_key: None,
+            active_operations: ActiveOperations::default(),
         }))
         .await;
         assert_eq!(response.0["providers"][0]["reasoning_effort"], "xhigh");

@@ -1,8 +1,8 @@
 import { Chatend } from "./chatend.js?v=20260715.8";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260716.1";
-import { ToolExecutor } from "./tools.js?v=20260715.9";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.10";
+import { ToolExecutor } from "./tools.js?v=20260716.10";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260716.11";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 
 function jsonCopy(value) {
@@ -11,6 +11,13 @@ function jsonCopy(value) {
 
 function transcriptEndsWithUnansweredUser(transcript) {
   return Array.isArray(transcript) && transcript.at(-1)?.role === "user";
+}
+
+function turnStoppedError() {
+  return Object.assign(
+    new Error("Kennedy's response was stopped. The saved query is ready to retry."),
+    { code: "turn_stopped" },
+  );
 }
 
 export class ConversationSession {
@@ -23,7 +30,7 @@ export class ConversationSession {
     this.sessionType = sessionType;
     this.channel = channel ? jsonCopy(channel) : null;
     this.persist = persist; this.onUpdate = onUpdate;
-    this.transcript = []; this.media = []; this.startedAt = new Date().toISOString(); this.pendingTurn = false; this.pendingCheckpointed = false; this.pendingExternalEventId = null; this.lastContextWarningBand = 0; this.busy = false;
+    this.transcript = []; this.media = []; this.startedAt = new Date().toISOString(); this.pendingTurn = false; this.pendingCheckpointed = false; this.pendingExternalEventId = null; this.lastContextWarningBand = 0; this.busy = false; this.stopping = false; this.activeTurn = null;
     this.continuation = new ContinuationState(createCacheKey("conversation"));
     this.usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
   }
@@ -159,7 +166,42 @@ export class ConversationSession {
     Promise.resolve(report).catch(() => {});
   }
 
-  async runPendingTurn(timing = createTurnTiming(this.sessionType)) {
+  beginTurn() {
+    const turn = {
+      controller: new AbortController(),
+      operationId: crypto.randomUUID(),
+      cancellable: true,
+    };
+    this.activeTurn = turn;
+    this.stopping = false;
+    this.busy = true;
+    this.onUpdate();
+    return turn;
+  }
+
+  finishTurn(turn) {
+    if (this.activeTurn === turn) this.activeTurn = null;
+    this.stopping = false;
+    this.busy = false;
+    this.onUpdate();
+  }
+
+  get canStop() {
+    return Boolean(this.busy && this.activeTurn?.cancellable);
+  }
+
+  async stopPendingTurn() {
+    const turn = this.activeTurn;
+    if (!this.busy || !turn?.cancellable || this.stopping) return false;
+    this.stopping = true;
+    this.onUpdate();
+    const cancellation = Promise.resolve(this.intelligence?.cancelOperation?.(turn.operationId)).catch(() => null);
+    turn.controller.abort();
+    await cancellation;
+    return true;
+  }
+
+  async runPendingTurn(timing = createTurnTiming(this.sessionType), turn = this.activeTurn) {
     if (!this.pendingTurn) return null;
     try {
       const answer = await runAgentLoop({
@@ -167,7 +209,12 @@ export class ConversationSession {
         chatend: this.chatend, executor: this.executor, continuation: this.continuation,
         usage: this.usage, timing, onUpdate: this.onUpdate,
         checkpoint: () => this.persistSnapshot(),
+        signal: turn?.controller.signal,
+        operationId: turn?.operationId,
       });
+      if (turn?.controller.signal.aborted) throw turnStoppedError();
+      turn.cancellable = false;
+      this.onUpdate();
       const response = { role: "kennedy", content: answer };
       if (this.pendingExternalEventId) response.externalEventId = this.pendingExternalEventId;
       const usage = this.usage.snapshot();
@@ -191,11 +238,14 @@ export class ConversationSession {
       this.onUpdate();
       return answer;
     } catch (error) {
+      const stopped = turn?.controller.signal.aborted
+        || error?.name === "AbortError"
+        || ["operation_cancelled", "turn_stopped"].includes(error?.code);
       this.restoreDurableState();
       this.continuation.reset();
       updateTimingSummary(timing);
       this.reportTurnTiming(timing, "error");
-      throw error;
+      throw stopped ? turnStoppedError() : error;
     }
   }
 
@@ -255,7 +305,8 @@ export class ConversationSession {
       ].join("\n");
     }
     const timing = createTurnTiming(this.sessionType);
-    this.busy = true; this.transcript.push(transcriptItem);
+    const turn = this.beginTurn();
+    this.transcript.push(transcriptItem);
     this.pendingTurn = true; this.pendingCheckpointed = false;
     this.pendingExternalEventId = externalEventId;
     this.chatend.retained.push({ role: "user", content: chatendContent });
@@ -266,14 +317,15 @@ export class ConversationSession {
       await this.persistSnapshot(this.snapshot(), { userActivity: true });
       addTimingStep(timing, "checkpoint", "Pending turn save", elapsedMs(pendingSaveStarted));
       this.pendingCheckpointed = true;
-      return await this.runPendingTurn(timing);
+      if (turn.controller.signal.aborted) throw turnStoppedError();
+      return await this.runPendingTurn(timing, turn);
     } catch (error) {
       if (!timing.reported) {
         updateTimingSummary(timing);
         this.reportTurnTiming(timing, "error");
       }
       throw error;
-    } finally { this.busy = false; this.onUpdate(); }
+    } finally { this.finishTurn(turn); }
   }
 
   answerForExternalEvent(id) {
@@ -283,7 +335,7 @@ export class ConversationSession {
   async resumePendingTurn() {
     if (!this.pendingTurn || this.busy) return null;
     const timing = createTurnTiming(this.sessionType);
-    this.busy = true; this.onUpdate();
+    const turn = this.beginTurn();
     try {
       if (!this.pendingCheckpointed) {
         const pendingSaveStarted = performance.now();
@@ -291,7 +343,8 @@ export class ConversationSession {
         addTimingStep(timing, "checkpoint", "Pending turn save", elapsedMs(pendingSaveStarted));
         this.pendingCheckpointed = true;
       }
-      return await this.runPendingTurn(timing);
+      if (turn.controller.signal.aborted) throw turnStoppedError();
+      return await this.runPendingTurn(timing, turn);
     }
     catch (error) {
       if (!timing.reported) {
@@ -300,7 +353,7 @@ export class ConversationSession {
       }
       throw error;
     }
-    finally { this.busy = false; this.onUpdate(); }
+    finally { this.finishTurn(turn); }
   }
 
   serialize() { return JSON.stringify(this.archive(), null, 2); }

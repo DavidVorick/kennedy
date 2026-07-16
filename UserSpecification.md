@@ -384,6 +384,11 @@ Kennedy may call LoadNode up to 20 times per turn to find relevant context.
 The frontend checkpoints the pending user query with the conversation history
 backend before the first LLM request. Kennedy's answer and the completed-turn
 state are checkpointed again before another query is accepted.
+While Kennedy is responding, the live conversation exposes an explicit stop
+control. Stopping aborts the current model or web request, prevents any further
+tool-loop rounds, rolls the visible session back to its latest durable
+checkpoint, and leaves the unanswered user query available for deliberate
+retry.
 
 While the conversation session is ongoing, Kennedy may only call LoadNode,
 ResetContext, WebSearch, and WebFetch. Conversation sessions cannot mutate the
@@ -439,11 +444,13 @@ historical repository can query or resubmit files without ingressing renamed or
 recopied audio twice.
 
 The server divides a recording into equalized audio windows no longer than four
-minutes, with fifteen seconds of overlap between neighbors. It sends the
-windows to Gemini 3.1 Pro Preview in strict chronological order for structured
+minutes, with fifteen seconds of overlap between neighbors. It sends up to four
+independent windows concurrently to Gemini 3.1 Pro Preview for structured
 speaker-aware transcription, preserving original-language utterances, per-line
 English translation when needed, timestamps, annotations, and uncertainty.
-Gemini's longer advertised duration is deliberately not used because observed
+Each result is stored under its original window index so reconciliation remains
+strictly chronological, and retries send only unfinished windows. Gemini's
+longer advertised duration is deliberately not used because observed
 transcription fidelity degrades sharply beyond roughly five minutes.
 
 One `gpt-5.6-sol` `xhigh` pass receives the complete ordered set, removes only
@@ -568,6 +575,10 @@ scrolled completely to its bottom.
 
 Closed conversations do not show a message textarea or conversation controls;
 the composer exists only for a selected live conversation.
+While a live response is in flight, the composer shows Stop Kennedy. Activating
+it cancels the intelligence backend operation as well as the browser agent
+loop, then returns the conversation to Retry Saved Query without logging the
+user-requested stop as an operational failure.
 
 The live composer can be vertically resized up to most of the viewport from
 either a top-edge grip or the browser's lower-right corner. It also has a

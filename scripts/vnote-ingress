@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+AUDIO_API="${KENNEDY_AUDIO_API:-http://127.0.0.1:4325/api/v1/audio-ingress}"
+AUDIO_API="${AUDIO_API%/}"
+VNOTE_LIMIT=5
+VNOTE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+STABILITY_SECONDS=2
+
+die() {
+    printf 'vnote-ingress: %s\n' "$*" >&2
+    exit 1
+}
+
+recorded_epoch() {
+    local vnote="$1"
+    local filename
+
+    filename="$(basename -- "$vnote")"
+    if [[ "$filename" =~ -([0-9]{10,})-vnote\.wav$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        stat --format='%Y' -- "$vnote"
+    fi
+}
+
+file_signature() {
+    stat --format='%s:%y' -- "$1"
+}
+
+wav_is_finalized() {
+    local vnote="$1"
+    local size riff_size
+    local -a header
+
+    size="$(stat --format='%s' -- "$vnote")" || return 1
+    (( size >= 12 )) || return 1
+    read -r -a header < <(od -An -tu1 -N12 -- "$vnote") || return 1
+    (( ${#header[@]} == 12 )) || return 1
+    (( header[0] == 82 && header[1] == 73 && header[2] == 70 && header[3] == 70 )) ||
+        return 1
+    (( header[8] == 87 && header[9] == 65 && header[10] == 86 && header[11] == 69 )) ||
+        return 1
+    riff_size=$((header[4] + 256 * header[5] + 65536 * header[6] + 16777216 * header[7]))
+    (( riff_size + 8 <= size ))
+}
+
+vnote_is_ready() {
+    local vnote="$1"
+    local before="${initial_signatures[$vnote]-}"
+    local after
+
+    [[ -n "$before" ]] || return 1
+    after="$(file_signature "$vnote")" || return 1
+    [[ "$before" == "$after" ]] || return 1
+    wav_is_finalized "$vnote" || return 1
+    READY_SIGNATURE="$after"
+}
+
+for dependency in curl sha256sum date find od sort stat; do
+    command -v "$dependency" >/dev/null 2>&1 ||
+        die "required command not found: $dependency"
+done
+
+candidate_count=0
+ready_count=0
+uploaded_count=0
+response_file=""
+trap '[[ -z "$response_file" ]] || rm -f -- "$response_file"' EXIT
+
+declare -A initial_signatures=()
+while IFS= read -r -d '' vnote; do
+    initial_signatures["$vnote"]="$(file_signature "$vnote")" ||
+        die "could not inspect $vnote"
+done < <(
+    find "$VNOTE_DIR" -maxdepth 1 -type f -name '*-vnote.wav' -print0
+)
+if (( ${#initial_signatures[@]} > 0 )); then
+    sleep "$STABILITY_SECONDS"
+fi
+
+while IFS=$'\t' read -r -d '' epoch vnote; do
+    candidate_count=$((candidate_count + 1))
+
+    READY_SIGNATURE=""
+    if ! vnote_is_ready "$vnote"; then
+        printf 'Not finalized or still changing: %s\n' "$(basename -- "$vnote")"
+        continue
+    fi
+    ready_count=$((ready_count + 1))
+
+    sha256="$(sha256sum -- "$vnote")" ||
+        die "could not hash $vnote"
+    sha256="${sha256%% *}"
+    if [[ "$(file_signature "$vnote")" != "$READY_SIGNATURE" ]]; then
+        ready_count=$((ready_count - 1))
+        printf 'Changed while hashing; skipped: %s\n' "$(basename -- "$vnote")"
+        continue
+    fi
+
+    if ! status="$(
+        curl --silent --show-error \
+            --connect-timeout 5 \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            "$AUDIO_API/by-sha256/$sha256"
+    )"; then
+        die "could not reach Kennedy at $AUDIO_API"
+    fi
+
+    case "$status" in
+        200)
+            printf 'Already known: %s\n' "$(basename -- "$vnote")"
+            continue
+            ;;
+        404)
+            ;;
+        *)
+            die "Kennedy returned HTTP $status while checking $(basename -- "$vnote")"
+            ;;
+    esac
+
+    if ! recorded_at="$(date --utc --iso-8601=seconds --date="@$epoch")"; then
+        die "could not determine the recording time for $vnote"
+    fi
+
+    response_file="$(mktemp)" ||
+        die "could not create a temporary response file"
+    if ! upload_status="$(
+        curl --silent --show-error \
+            --connect-timeout 5 \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --form-string "recorded_at=$recorded_at" \
+            --form "file=@$vnote;type=audio/wav" \
+            "$AUDIO_API"
+    )"; then
+        die "upload failed for $vnote"
+    fi
+
+    case "$upload_status" in
+        200|202)
+            rm -f -- "$response_file"
+            response_file=""
+            uploaded_count=$((uploaded_count + 1))
+            printf 'Queued: %s (%s)\n' "$(basename -- "$vnote")" "$recorded_at"
+            ;;
+        *)
+            printf 'vnote-ingress: Kennedy returned HTTP %s while uploading %s\n' \
+                "$upload_status" "$(basename -- "$vnote")" >&2
+            if [[ -s "$response_file" ]]; then
+                printf 'vnote-ingress: response: ' >&2
+                tr '\n' ' ' <"$response_file" >&2
+                printf '\n' >&2
+            fi
+            exit 1
+            ;;
+    esac
+
+    if (( uploaded_count == VNOTE_LIMIT )); then
+        break
+    fi
+done < <(
+    while IFS= read -r -d '' vnote; do
+        epoch="$(recorded_epoch "$vnote")" || exit 1
+        printf '%s\t%s\0' "$epoch" "$vnote"
+    done < <(
+        find "$VNOTE_DIR" -maxdepth 1 -type f -name '*-vnote.wav' -print0
+    ) |
+        sort --zero-terminated --field-separator=$'\t' \
+            --key=1,1nr --key=2,2
+)
+
+if (( candidate_count == 0 )); then
+    printf 'No *-vnote.wav files found in %s\n' "$VNOTE_DIR"
+elif (( uploaded_count == 0 )); then
+    if (( ready_count == 0 )); then
+        printf 'Nothing to upload; no finalized, stable vnotes were found in %s\n' "$VNOTE_DIR"
+    else
+        printf 'Nothing to upload; Kennedy already knows every finalized vnote in %s\n' "$VNOTE_DIR"
+    fi
+else
+    printf 'Queued %d vnote%s for Kennedy ingress.\n' \
+        "$uploaded_count" "$([[ "$uploaded_count" == 1 ]] && printf '' || printf 's')"
+fi

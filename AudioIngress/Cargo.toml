@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+futures.workspace = true
 hound.workspace = true
 http.workspace = true
 reqwest.workspace = true

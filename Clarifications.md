@@ -370,6 +370,10 @@ canonical documents; this file is not an append-only log.
   collapsed until the user expands them.
 - A failed Telegram document extraction must receive an error reply and finish
   that relay event so one document cannot block all later messages for the user.
+- A live conversation must expose a kill control while Kennedy is responding.
+  It must stop the current model or web operation and prevent further agent-loop
+  retries; the already-checkpointed user query remains preserved for an
+  explicit retry.
 
 ## Main Chatend View
 

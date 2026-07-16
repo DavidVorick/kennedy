@@ -45,12 +45,14 @@ is a durable WAV under `chunks/{recording_id}/` and has an ordered database row
 with recording-relative bounds. Gemini Files API media is deleted after each
 interaction; the local original and results remain.
 
-`gemini-3.1-pro-preview` receives one window at a time and returns structured
-utterances with relative timestamps, chunk-local speakers, language, original
-text, English translation, annotations, and confidence. `gpt-5.6-sol` with
-`xhigh` reasoning receives all resulting JSON in database order. It produces
-the canonical complete Markdown transcript, removes the known overlap, and
-reconciles speaker labels without inventing unsupported real identities.
+`gemini-3.1-pro-preview` receives up to four independent windows concurrently
+and returns structured utterances with relative timestamps, chunk-local
+speakers, language, original text, English translation, annotations, and
+confidence. Each successful result is committed immediately; a retry sends
+only unfinished windows. `gpt-5.6-sol` with `xhigh` reasoning receives all
+resulting JSON in database order. It produces the canonical complete Markdown
+transcript, removes the known overlap, and reconciles speaker labels without
+inventing unsupported real identities.
 
 The estimate is `ceil(Unicode characters / 4)`. Sol inserts
 `<!-- KENNEDY_INGRESS_BREAK -->` only at sensible boundaries when a transcript
@@ -91,3 +93,7 @@ Completing the final piece atomically marks the recording complete.
 - `POST /api/v1/audio-ingress/pieces/{piece_id}/ingress-completed`
 - `POST /api/v1/audio-ingress/pieces/{piece_id}/ingress-failure`
 - `POST /api/v1/audio-ingress/pieces/{piece_id}/retry-ingress`
+
+Terminal retry preserves the transcript, provenance, and diagnostic log. The
+caller may replace the opaque frontend state so an exhausted model checkpoint
+can be discarded before the piece returns to the durable ingress queue.

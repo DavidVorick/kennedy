@@ -1,8 +1,13 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260715.9";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260716.10";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 export const AGENT_LOOP_ROUND_LIMIT = 100;
+
+function throwIfCancelled(signal) {
+  if (!signal?.aborted) return;
+  throw Object.assign(new Error("Kennedy's response was stopped."), { code: "turn_stopped" });
+}
 
 export function createCacheKey(mode) {
   return `kennedy-${mode}-prompt-v3`;
@@ -114,25 +119,31 @@ function protocolFailureMessage(error) {
   };
 }
 
-export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {} }) {
+export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {}, signal = null, operationId = null }) {
   for (let round = roundOffset; round < AGENT_LOOP_ROUND_LIMIT; round++) {
+    throwIfCancelled(signal);
     await onRoundStart(round + 1);
+    throwIfCancelled(signal);
     const messages = continuation.requestMessages(chatend);
     if (messages.length === 0) throw new Error("Kennedy has no new context to continue from.");
     const llmStarted = performance.now();
     let response;
     const continued = Boolean(continuation.previousResponseId);
     try {
-      response = await intelligence.generate({
-        provider,
-        model,
-        chatend: formatChatend(messages, usage.snapshot()),
-        previous_response_id: continuation.previousResponseId,
-        prompt_cache_key: continuation.cacheKey,
-      });
+      response = await intelligence.generate(
+        {
+          provider,
+          model,
+          chatend: formatChatend(messages, usage.snapshot()),
+          previous_response_id: continuation.previousResponseId,
+          prompt_cache_key: continuation.cacheKey,
+        },
+        { signal, operationId },
+      );
     } finally {
       addTimingStep(timing, "llm", "LLM call", elapsedMs(llmStarted));
     }
+    throwIfCancelled(signal);
     usage.record(response.usage, { continued });
     const content = response.message?.content;
     if (response.status !== "complete" || typeof content !== "string") throw new Error("The intelligence service returned an invalid text generation.");
@@ -162,10 +173,12 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     calls = calls.map((call, index) => ({ ...call, id: `text_call_${round + 1}_${index + 1}` }));
     const resetIsMixed = calls.length > 1 && calls.some(call => call.name === "ResetContext");
     for (const call of calls) {
+      throwIfCancelled(signal);
       const toolStarted = performance.now();
       const execution = resetIsMixed && call.name === "ResetContext"
         ? executor.failure(call, "mixed_reset_call", "ResetContext must be requested by itself so the chatend can be rebuilt safely.")
-        : await executor.execute(call);
+        : await executor.execute(call, { signal, operationId });
+      throwIfCancelled(signal);
       const durationMs = addTimingStep(
         timing,
         "tool",

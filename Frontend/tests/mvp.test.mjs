@@ -6,7 +6,7 @@ import { Chatend } from "../public/js/chatend.js";
 import { MAX_RESET_SELF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
-import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries } from "../public/js/render.js";
+import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, sortConversationHistory } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
@@ -110,6 +110,61 @@ test("conversation history client records ingress failures durably", async () =>
   assert.equal(request.url, "http://history/api/v1/conversations/conversation/ingress-failure");
   assert.equal(request.options.method, "POST");
   assert.match(request.options.body, /"stage":"model_loop"/);
+});
+
+test("conversation history client can explicitly restart terminal ingress", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ phase: "ingress_pending", ingress_failure_count: 0 }),
+    };
+  };
+  try {
+    await ConversationHistoryAPI("http://history").retryIngress("conversation", {
+      expected_version: 10,
+      state: { archive: { format: "kennedy-chatend" } },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(request.url, "http://history/api/v1/conversations/conversation/retry-ingress");
+  assert.equal(request.options.method, "POST");
+  assert.match(request.options.body, /"expected_version":10/);
+  assert.doesNotMatch(request.options.body, /historyIngress/);
+});
+
+test("intelligence client tags cancellable work and exposes an explicit cancel request", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => url.endsWith("/cancel")
+        ? { cancelled: true }
+        : { status: "complete", response_id: "response", message: { role: "assistant", content: "Done." } },
+    };
+  };
+  const controller = new AbortController();
+  try {
+    const api = IntelligenceAPI("http://intelligence");
+    await api.generate({ provider: "p", model: "m", chatend: "David\n\nHi" }, {
+      signal: controller.signal,
+      operationId: "11111111-1111-4111-8111-111111111111",
+    });
+    await api.cancelOperation("11111111-1111-4111-8111-111111111111");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(requests[0].options.signal, controller.signal);
+  assert.match(requests[0].options.body, /"operation_id":"11111111-1111-4111-8111-111111111111"/);
+  assert.equal(requests[1].url, "http://intelligence/api/v1/operations/11111111-1111-4111-8111-111111111111/cancel");
+  assert.equal(requests[1].options.method, "POST");
 });
 
 test("Kmap snapshot distinguishes direct loads from active expansions", async () => {
@@ -604,17 +659,29 @@ test("a structured Chatend archive retains activity while refreshing current man
   assert.deepEqual(restored.chatend.historySegments, source.chatend.historySegments);
 });
 
-test("history ingress sends the archived Chatend as inspector-identical plaintext and resumes completed archives", async () => {
+test("history ingress compacts archived Kmap nodes to titles and short descriptions and resumes completed archives", async () => {
   const kweb = new MockKweb([node(1)]);
   const archivedMessages = [
     { role: "system", display_role: "Agent manuals", content: "Archived instructions" },
     { role: "user", content: "Archived words." },
+    { role: "system", display_role: "Kmap context", context_kind: "memory", content: "FULL NODE DETAILS MUST NOT BE INGRESSED" },
+    { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' },
+    { role: "user", display_role: "Memory tool result", tool_name: "LoadNode", content: "ANOTHER FULL NODE COPY" },
+    { role: "system", display_role: "Latency", context_kind: "timing", content: "SOURCE TIMING NOISE" },
   ];
   kweb.provenance = async () => ({
     source: "conversation", source_created_at: "2026-07-13T00:00:00Z",
     data: JSON.stringify({
       format: "kennedy-chatend", messages: archivedMessages,
-      fullHistory: { segments: [{ messages: [{ role: "assistant", content: "INSPECTOR ONLY PRE-RESET SECRET" }] }] },
+      context: { snapshot: { nodes: [
+        { identifier: 2, shortName: "Roadmap", shortDescription: "Current product direction.", longDescription: "Very large details." },
+      ] } },
+      fullHistory: { segments: [{
+        messages: [{ role: "assistant", content: "INSPECTOR ONLY PRE-RESET SECRET" }],
+        memory: { nodes: [
+          { identifier: 5, shortName: "Launch notes", shortDescription: "Historical launch decisions.", longDescription: "More very large details." },
+        ] },
+      }] },
       media: [{ kind: "voice", dataUrl: "data:audio/ogg;base64,AAAA" }],
     }),
   });
@@ -639,6 +706,14 @@ test("history ingress sends the archived Chatend as inspector-identical plaintex
   assert.match(checkpoints.at(-1).systemPrompt, /Ingress/);
   assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend\n\nAgent manuals\n\nArchived instructions/);
   assert.match(checkpoints.at(-1).retained[0].content, /David\n\nArchived words\./);
+  assert.match(checkpoints.at(-1).retained[0].content, /Loaded Kmap node summaries from the archived session/);
+  assert.match(checkpoints.at(-1).retained[0].content, /Roadmap\n  Current product direction\./);
+  assert.match(checkpoints.at(-1).retained[0].content, /Launch notes\n  Historical launch decisions\./);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /FULL NODE DETAILS MUST NOT BE INGRESSED/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /ANOTHER FULL NODE COPY/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /KENNEDY_TOOL_CALLS/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /SOURCE TIMING NOISE/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /Very large details/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /base64,AAAA/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /"format":"kennedy-chatend"/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /INSPECTOR ONLY PRE-RESET SECRET/);
@@ -646,6 +721,7 @@ test("history ingress sends the archived Chatend as inspector-identical plaintex
   assert.equal(requests[0].chatend, inspectorText({ chatend: checkpoints[0].messages, usage: checkpoints[0].usage }));
   assert.equal("messages" in requests[0], false);
   assert.equal(checkpoints.at(-1).messages.some(message => message.content === "Memory review complete."), true);
+  assert.equal(checkpoints.at(-1).retained[0].context_kind, "provenance");
   assert.match(checkpoints.at(-1).messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
   assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
   assert.deepEqual(checkpoints.at(-1).fullHistory.segments, []);
@@ -729,6 +805,28 @@ test("conversation sidebar distinguishes continuable and closed records", async 
   assert.match(render, /complete: "Saved · Read only"/);
 });
 
+test("conversation history keeps live, finalizing, and finalized records in separate groups", () => {
+  const records = [
+    { id: "complete-new", phase: "complete", updated_at: "2026-07-16T12:00:00Z" },
+    { id: "pending-old", phase: "ingress_pending", updated_at: "2026-07-16T08:00:00Z" },
+    { id: "active-old", phase: "active", updated_at: "2026-07-15T08:00:00Z" },
+    { id: "failed-new", phase: "ingress_failed", updated_at: "2026-07-16T11:00:00Z" },
+    { id: "active-new", phase: "active", updated_at: "2026-07-16T09:00:00Z" },
+    { id: "progress-middle", phase: "ingress_in_progress", updated_at: "2026-07-16T10:00:00Z" },
+    { id: "complete-old", phase: "complete", updated_at: "2026-07-14T12:00:00Z" },
+  ];
+  assert.deepEqual(sortConversationHistory(records).map(record => record.id), [
+    "active-new",
+    "active-old",
+    "failed-new",
+    "progress-middle",
+    "pending-old",
+    "complete-new",
+    "complete-old",
+  ]);
+  assert.equal(records[0].id, "complete-new", "sorting must not mutate backend results");
+});
+
 test("composer stays editable but cannot send during a conversation transition", () => {
   const controls = conversationControlState({
     hasSession: true, sessionBusy: false, transitionBusy: true,
@@ -749,6 +847,7 @@ test("next message stays editable but cannot send while Kennedy is working", () 
   assert.equal(controls.sendDisabled, true);
   assert.equal(controls.endDisabled, true);
   assert.equal(controls.newDisabled, false);
+  assert.equal(controls.stopHidden, false);
 });
 
 test("a saved unanswered query is retryable only when no response is in flight", () => {
@@ -764,6 +863,7 @@ test("a saved unanswered query is retryable only when no response is in flight",
     pendingTurn: true, viewingHistory: false, transcriptLength: 1,
   });
   assert.equal(responding.endDisabled, true);
+  assert.equal(responding.stopHidden, false);
 });
 
 test("closed conversations do not render a message composer", async () => {
@@ -773,6 +873,7 @@ test("closed conversations do not render a message composer", async () => {
   });
   assert.equal(controls.composerHidden, true);
   assert.equal(controls.inputDisabled, true);
+  assert.equal(controls.stopHidden, true);
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
   assert.match(app, /message_form\.classList\.toggle\("hidden", controls\.composerHidden\)/);
 });
@@ -831,6 +932,20 @@ test("history ingress worker records five failures before abandoning a poisoned 
   assert.match(app, /conversationHistory\.ingressFailure/);
   assert.match(app, /failedRecord\.phase === "ingress_failed"/);
   assert.match(app, /History ingress stopped after \$\{failedRecord\.ingress_failure_count\} failed attempts/);
+  assert.match(app, /conversationHistory\.retryIngress\(record\.id/);
+  assert.match(app, /delete fresh\.historyIngress/);
+});
+
+test("failed conversation ingress exposes retry actions in the sidebar and central view", async () => {
+  const [app, render] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(render, /record\.phase === "ingress_failed"[\s\S]*?history-item-retry/);
+  assert.match(render, /function ingressRetryNotice/);
+  assert.match(render, /Retry history ingress/);
+  assert.match(app, /onRetryIngress: retryConversationIngress/);
+  assert.match(app, /record\?\.phase === "ingress_failed"[\s\S]*?onRetry: \(\) => retryConversationIngress\(record\)/);
 });
 
 test("audio ingress client can explicitly requeue a terminal piece", async () => {
@@ -858,6 +973,8 @@ test("audio ingress UI exposes an always-visible terminal retry and durable retr
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
   assert.match(app, /audioIngress\.retryIngress\(piece\.id/);
+  assert.match(app, /onRetryIngress: retryAudioIngressRecording/);
+  assert.match(app, /state: freshIngressState\(piece\.state\)/);
   assert.match(app, /kickHistoryIngress\(\)/);
   assert.match(render, /piece\.phase === "ingress_failed"/);
   assert.match(render, /const retryPanel = element\("section", "audio-retry-panel"\)/);
@@ -910,6 +1027,20 @@ test("history ingress starts Kennedy and memory tool details collapsed", () => {
   }), { collapsed: false, label: "Kennedy" });
 });
 
+test("Full History treats conversation provenance as a collapsed disclosure entry", () => {
+  const entries = mainViewEntries({ chatend: [
+    { role: "user", display_role: "Conversation provenance", context_kind: "provenance", content: "Conversation provenance\n\nLarge archived source." },
+  ] });
+  assert.equal(entries[1].kind, "provenance");
+  assert.equal(entries[1].label, "Conversation provenance");
+  assert.match(entries[1].content, /Large archived source/);
+
+  const legacy = mainViewEntries({ chatend: [
+    { role: "user", content: "Conversation provenance\n\nLegacy archived source." },
+  ] });
+  assert.equal(legacy[1].kind, "provenance");
+});
+
 test("Telegram documents are acknowledged on extraction failure so the queue can advance", async () => {
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
   assert.match(app, /else if \(event\.kind === "document"\)/);
@@ -947,6 +1078,50 @@ test("conversation checkpoints the pending query before any model request", asyn
   const summary = session.chatend.messages.find(message => message.display_role === "Latency summary");
   assert.match(summary.content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
   assert.equal(summary.content.includes("\n"), false);
+});
+
+test("an in-flight conversation can be stopped and remains explicitly retryable", async () => {
+  const kweb = new MockKweb([node(1)]);
+  let generateMode = "wait";
+  let generateStarted;
+  let releaseGenerateStarted;
+  let seenOptions = null;
+  let cancelledOperationId = null;
+  generateStarted = new Promise(resolve => { releaseGenerateStarted = resolve; });
+  const intelligence = {
+    generate: async (_request, options) => {
+      seenOptions = options;
+      if (generateMode === "answer") {
+        return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered." }, usage: null };
+      }
+      releaseGenerateStarted();
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      });
+    },
+    cancelOperation: async operationId => { cancelledOperationId = operationId; return { cancelled: true }; },
+  };
+  const session = new ConversationSession({
+    kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" },
+    rootNodeId: id(1), provider: "p", model: "m", persist: async () => {}, onUpdate: () => {},
+  });
+  await session.initialize();
+  const response = session.send("Stop this loop");
+  await generateStarted;
+  assert.equal(session.busy, true);
+  assert.equal(session.canStop, true);
+  await session.stopPendingTurn();
+  await assert.rejects(response, error => error.code === "turn_stopped");
+  assert.equal(seenOptions.signal.aborted, true);
+  assert.equal(cancelledOperationId, seenOptions.operationId);
+  assert.equal(session.busy, false);
+  assert.equal(session.pendingTurn, true);
+  assert.deepEqual(session.transcript.map(item => item.content), ["Stop this loop"]);
+
+  generateMode = "answer";
+  await session.resumePendingTurn();
+  assert.equal(session.pendingTurn, false);
+  assert.deepEqual(session.transcript.map(item => item.content), ["Stop this loop", "Recovered."]);
 });
 
 test("document attachments become model-readable text without duplicating extraction in media", async () => {
@@ -1242,7 +1417,7 @@ test("history ingress is an inline continuation with no independent scroller", a
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/css/styles.css", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  assert.match(render, /renderTranscript\(container, transcript, ingressActivity = null, viewKey = "transcript"\)/);
+  assert.match(render, /renderTranscript\(container, transcript, ingressActivity = null, viewKey = "transcript", retryAction = null\)/);
   assert.match(render, /renderIngressActivity\([\s\S]*?ingressActivity\.diagnostic,[\s\S]*?\{ namespace: `\$\{viewKey\}:history-ingress` \},[\s\S]*?restoreViewState\(container, viewKey, viewState\)/);
   assert.match(styles, /\.ingress-continuation\s*\{/);
   assert.equal(styles.includes(".ingress-panel"), false);
@@ -1339,6 +1514,19 @@ test("main inspector truncates only Kennedy responses longer than 500 characters
   assert.equal([...conversations[2].preview].length, 500);
   assert.equal(conversations[2].preview, "x".repeat(500));
   assert.equal(conversations[2].content, long);
+  assert.equal(conversations[2].hiddenCharacters, 2);
+});
+
+test("collapsed inspector entries expose exact character-size metadata", async () => {
+  const [render, styles] = await Promise.all([
+    readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/css/styles.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(render, /characterLabel\(entry\.hiddenCharacters\)/);
+  assert.match(render, /disclosureSummary\([\s\S]*?characterCount\(entry\.content\)/);
+  assert.match(render, /"ingress-entry-size", characterLabel\(message\.content\)/);
+  assert.match(render, /"audio-disclosure-size", characterLabel\(content\)/);
+  assert.match(styles, /\.ingress-entry-size \{/);
 });
 
 test("main inspector moves tool latency from the result header to result footer metadata", () => {
@@ -1413,7 +1601,7 @@ test("frontend defaults to main with full and full-history inspectors and retain
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
   ]);
-  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "user-log-section", "clear-log", "tg-tab", "audio-tab", "voice-button"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "user-log-section", "clear-log", "tg-tab", "audio-tab", "voice-button", "stop-button"]) assert.match(html, new RegExp(`id="${id}"`));
   for (const id of ["inspector-system", "inspector-tools", "inspector-memory"]) assert.doesNotMatch(html, new RegExp(`id="${id}"`));
   assert.match(app, /const INSPECTOR_MODES = \["main", "full", "history"\]/);
   assert.match(app, /let inspectorMode = "main"/);
@@ -1427,6 +1615,9 @@ test("frontend defaults to main with full and full-history inspectors and retain
   assert.match(app, /renderAudioHistory\(ui\.conversation_history, audioRecords/);
   assert.match(app, /const detail = selectedAudioDetail\(\)/);
   assert.match(app, /renderAudioRecording\(ui\.transcript, detail/);
+  assert.match(app, /session\.stopPendingTurn\(\)/);
+  assert.match(app, /stop_button\.addEventListener\("click"/);
+  assert.match(html, /id="stop-button"[^>]*>Stop Kennedy<\/button>/);
   assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
 });
