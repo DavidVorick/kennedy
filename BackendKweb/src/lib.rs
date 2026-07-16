@@ -29,12 +29,6 @@ const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const TASK_HIGH_ORDER: i64 = -1;
 const TASK_MEDIUM_ORDER: i64 = -2;
 const TASK_LOW_ORDER: i64 = -3;
-const PROMPT_FILES: [&str; 3] = [
-    "KennedyIdentity.txt",
-    "ConversationManual.txt",
-    "HistoryIngress.txt",
-];
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: String,
@@ -425,12 +419,21 @@ async fn get_prompt(
     State(state): State<AppState>,
     Path(filename): Path<String>,
 ) -> Result<Response, ApiError> {
-    if !PROMPT_FILES.contains(&filename.as_str()) {
+    let safe_name = filename.ends_with(".txt")
+        && !filename.starts_with('.')
+        && filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    if !safe_name {
         return Err(ApiError::not_found("Prompt manual not found."));
     }
-    let body = tokio::fs::read_to_string(state.prompts_dir.join(&filename))
-        .await
-        .map_err(ApiError::internal)?;
+    let body = match tokio::fs::read_to_string(state.prompts_dir.join(&filename)).await {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::not_found("Prompt manual not found."));
+        }
+        Err(error) => return Err(ApiError::internal(error)),
+    };
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
@@ -1191,6 +1194,43 @@ mod tests {
             response.0["user_root_node_id"],
             response.0["kennedy_root_node_id"]
         );
+    }
+
+    #[tokio::test]
+    async fn audio_ingress_prompt_is_served_from_the_prompt_directory() {
+        let directory =
+            std::env::temp_dir().join(format!("kennedy-prompts-{}", hex::encode(new_id())));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("AudioIngress.txt"),
+            "Audio ingress instructions.",
+        )
+        .unwrap();
+        let mut prompt_state = state(db());
+        prompt_state.prompts_dir = directory.clone();
+
+        let response = get_prompt(State(prompt_state), Path("AudioIngress.txt".to_owned()))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(body, "Audio ingress instructions.");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_route_rejects_non_prompt_names_without_a_second_filename_allowlist() {
+        let missing = get_prompt(State(state(db())), Path("FutureMode.txt".to_owned()))
+            .await
+            .unwrap_err();
+        let unsafe_name = get_prompt(State(state(db())), Path("README.md".to_owned()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(unsafe_name.status, StatusCode::NOT_FOUND);
     }
 
     #[test]

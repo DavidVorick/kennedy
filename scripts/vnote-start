@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+VNOTE_DIR="/home/user/media/vnotes"
+
+mkdir -p "$VNOTE_DIR"
+arecord -f cd -t wav -q "$VNOTE_DIR/$(date +%F-%H-%M-%s)-vnote.wav"

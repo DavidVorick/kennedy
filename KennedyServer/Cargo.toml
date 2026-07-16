@@ -11,6 +11,7 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 flate2.workspace = true
+kennedy-audio-ingress = { path = "../AudioIngress" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
 kennedy-intelligence = { path = "../IntelligenceBackend" }
 kennedy-kweb = { path = "../BackendKweb" }

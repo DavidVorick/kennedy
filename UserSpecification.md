@@ -41,11 +41,11 @@ thread's number.
 'Backend' refers to any of the backend services that are providing APIs to the
 frontend.
 
-Kennedy has four backends: Kweb, intelligence, conversation history, and a
-Telegram relay. They
-are architecturally independent services with separate APIs and storage and do
+Kennedy has five backends: Kweb, intelligence, conversation history, a
+Telegram relay, and durable audio ingress. They are architecturally independent
+services with separate APIs and storage and do
 not communicate with or access one another. For operational simplicity they
-are compiled into one Rust binary, which hosts all four APIs on separate local
+are compiled into one Rust binary, which hosts all five APIs on separate local
 listeners. The frontend treats them exactly as though they were unrelated
 processes.
 
@@ -429,6 +429,41 @@ documents. Kennedy receives a bounded local text conversion together with the
 filename and format, and the original remains archived. Searchable PDFs are
 supported; scanned/image-only PDFs report that OCR is required.
 
+### Durable Vnote Ingress
+
+A separate loopback upload endpoint accepts WAV vnotes together with the exact
+RFC 3339 time at which recording began. Once the endpoint returns success, the
+uploader is finished: Kennedy durably owns the content-addressed original file
+and a restartable database job. SHA-256 is the idempotency identity, so a large
+historical repository can query or resubmit files without ingressing renamed or
+recopied audio twice.
+
+The server divides a recording into equalized audio windows no longer than four
+minutes, with fifteen seconds of overlap between neighbors. It sends the
+windows to Gemini 3.1 Pro Preview in strict chronological order for structured
+speaker-aware transcription, preserving original-language utterances, per-line
+English translation when needed, timestamps, annotations, and uncertainty.
+Gemini's longer advertised duration is deliberately not used because observed
+transcription fidelity degrades sharply beyond roughly five minutes.
+
+One `gpt-5.6-sol` `xhigh` pass receives the complete ordered set, removes only
+the repeated overlap, reconciles speakers across independently transcribed
+windows, and produces the canonical final transcript. If the result exceeds an
+estimate of 50,000 tokens, Sol selects sensible conversational or topical
+boundaries so every piece stays at or below that ceiling. Pieces are not forced
+to equal size.
+
+Kennedy ingresses those final pieces individually and chronologically under the
+same global serialization as conversation history. Every provenance node and
+model-facing piece carries the original recording timestamp, never merely the
+upload or ingress time. Kennedy uses that timestamp to distinguish historical,
+superseded, or then-current statements from knowledge independently marked as
+current. The audio-ingress prompt treats transcription and speaker identity as
+fallible, preserves important uncertainty or contradiction, and permits dated
+clarification notes or concrete follow-up tasks when context is materially
+missing. Preparation is server-side and restartable; Kmap mutation resumes from
+durable checkpoints whenever Kennedy's browser worker is available.
+
 ### History Ingress
 
 In a history ingress session, a history provenance node is created as the first
@@ -453,7 +488,11 @@ not create a fresh allowance.
 The outer history-ingress worker permits five failed attempts total. It records
 the stage, error code/message, current round, and measured context usage when
 available. The fifth failure aborts the session, preserves the log for later
-inspection, and allows the queue to advance instead of retrying forever.
+inspection, and allows the queue to advance instead of retrying forever. Audio
+transcript pieces persist increasing delays between attempts so a temporary
+provider failure cannot exhaust the allowance immediately; a terminal audio
+piece can be manually returned to the queue while retaining its old
+diagnostics.
 
 ### Self Action
 
@@ -480,7 +519,7 @@ not expose the generated file.
 ## UI
 
 The UI is a pure html/css/js webapp (no nodejs, no typescript, just pure js)
-that connects to four pure-Rust backend APIs hosted by one binary.
+that connects to five pure-Rust backend APIs hosted by one binary.
 
 The UI itself is a chat interface beween the user and Kennedy. On the left,
 there is the unpolluted conversation between the user and Kennedy. On the right
@@ -492,10 +531,21 @@ The UI also provides a memory explorer, where the user can open up their own
 node, see its contents, and then from there open up other nodes and explore the
 contents of the kweb.
 
-The top navigation has Conversation, TG Bot, and Memory views. TG Bot filters
-the conversation sidebar to Telegram users and reuses the transcript and full
-Chatend inspector, but has no browser composer. The ordinary conversation
-composer includes a microphone control and an editable paid transcription.
+The top navigation has Conversation, TG Bot, Audio Ingress, and Memory views.
+TG Bot filters the conversation sidebar to Telegram users and reuses the
+transcript and full Chatend inspector, but has no browser composer. The
+ordinary conversation composer includes a microphone control and an editable
+paid transcription.
+
+Audio Ingress lists the complete durable recording history. Selecting a vnote
+shows its recording time and hash, processing status, Gemini chunk transcripts,
+Sol's reconciled final transcript, Kennedy-sized pieces, retry failures, and
+the saved Kennedy ingress Chatend for every piece. The full transcript and
+other large artifacts begin collapsed. The large center display appends a
+conversation-style History Ingress section for every transcript piece, while
+the inspector's Full History orders those piece sessions and retains all
+pre-reset contexts. A terminal memory-ingress failure exposes a retry action
+for the preserved piece.
 
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from
@@ -503,6 +553,18 @@ the conversation history backend. Live entries remain continuable and closed
 entries are read-only. Its canonical Chatend is reconstructed from archived
 messages in the inspector, and its complete history-ingress session is appended
 after the transcript as one continuous scrolling history.
+
+Below the sidebar history is a persistent activity log for sanitized
+user-visible operational failures. Entries are timestamped and repeated
+identical failures are collapsed. Errors from Telegram, audio ingress, startup,
+or background memory work never appear inside an unrelated conversation, and
+the log remains until the user clears it.
+
+Background progress never changes the user's reading position or reopens or
+closes a disclosure control. The center display, history sidebar, activity log,
+and inspector retain their scroll and disclosure state while showing the same
+record. A pane follows newly appended content only when the user was already
+scrolled completely to its bottom.
 
 Closed conversations do not show a message textarea or conversation controls;
 the composer exists only for a selected live conversation.

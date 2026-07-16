@@ -1,19 +1,20 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, TelegramRelayAPI } from "./api.js?v=20260715.8";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260714.7";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260716.3";
+import { loadPromptManuals } from "./prompt_composer.js?v=20260716.2";
 import { ConversationSession } from "./conversation.js?v=20260715.11";
-import { runHistoryIngress } from "./history_ingress.js?v=20260715.11";
+import { runHistoryIngress } from "./history_ingress.js?v=20260716.1";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
-import { renderTranscript, renderConversationHistory, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260715.13";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260716.4";
 
 const CONFIG = {
   kwebBase: window.location.origin,
   intelligenceBase: "http://127.0.0.1:4322",
   conversationHistoryBase: "http://127.0.0.1:4323",
   telegramRelayBase: "http://127.0.0.1:4324",
+  audioIngressBase: "http://127.0.0.1:4325",
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "memory-tab", "transcript", "error-banner", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
+  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["main", "full", "history"];
@@ -21,8 +22,9 @@ const kweb = KwebAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
 const telegramRelay = TelegramRelayAPI(CONFIG.telegramRelayBase);
+const audioIngress = AudioIngressAPI(CONFIG.audioIngressBase);
 
-let manuals = null;
+let manuals = {};
 let rootNodeIds = null;
 let provider = null;
 let model = null;
@@ -35,6 +37,12 @@ let explorer = null;
 let historyRecords = [];
 let selectedConversationId = null;
 let selectedByView = { conversation: null, telegram: null };
+let audioRecords = [];
+let selectedAudioId = null;
+let audioDetails = new Map();
+let audioDetailLoading = new Set();
+let audioDetailErrors = new Map();
+let retryingAudioPieces = new Set();
 let activeView = "conversation";
 let liveSessions = new Map();
 let drafts = new Map();
@@ -44,6 +52,7 @@ let creatingConversation = false;
 let ingressWorkerRunning = false;
 let activeIngressRecord = null;
 let ingressDiagnostic = null;
+let activeAudioIngressPiece = null;
 let inspectorMode = "main";
 let recorder = null;
 let recorderChunks = [];
@@ -53,7 +62,33 @@ let attachmentDrafts = new Map();
 let extractingAttachments = new Set();
 let telegramBridgeRunning = false;
 let telegramInFlight = new Set();
+let kwebReady = false;
+let conversationHistoryReady = false;
+let intelligenceReady = false;
+let audioIngressReady = false;
+let telegramRelayReady = false;
 const INGRESS_FAILURE_LIMIT = 5;
+
+function conversationPromptsReady() {
+  return Boolean(manuals.identity && manuals.conversation);
+}
+
+function historyPromptsReady() {
+  return Boolean(manuals.identity && manuals.ingress);
+}
+
+function audioPromptsReady() {
+  return historyPromptsReady() && Boolean(manuals.audioIngress);
+}
+
+function chatRuntimeReady() {
+  return kwebReady && conversationHistoryReady && intelligenceReady && conversationPromptsReady();
+}
+
+function memoryIngressRuntimeReady() {
+  return kwebReady && intelligenceReady && historyPromptsReady()
+    && (conversationHistoryReady || (audioIngressReady && audioPromptsReady()));
+}
 
 function sessionTypeOf(record) {
   return record?.state?.sessionType || record?.state?.archive?.sessionType || "conversation";
@@ -70,6 +105,10 @@ function selectedRecord() {
 
 function selectedSession() {
   return liveSessions.get(selectedConversationId) || null;
+}
+
+function selectedAudioDetail() {
+  return audioDetails.get(selectedAudioId) || null;
 }
 
 const EMPTY_MEMORY = { directlyLoadedIdentifiers: [], nodes: [] };
@@ -146,6 +185,7 @@ function historyPhase(label, status, source) {
 }
 
 function diagnostic() {
+  if (activeView === "audio") return audioRecordingDiagnostic();
   const record = selectedRecord();
   const conversation = conversationDiagnostic(record, selectedSession());
   const ingress = historyIngressDiagnostic(record);
@@ -160,6 +200,83 @@ function diagnostic() {
   return { ...current, ingressStatus: status, fullHistory: { phases } };
 }
 
+function audioPieceDiagnostic(piece) {
+  if (piece?.id === activeAudioIngressPiece?.id && ingressDiagnostic) {
+    return {
+      mode: "audio ingress", provider, model,
+      chatend: ingressDiagnostic.chatend?.messages || [],
+      context: ingressDiagnostic.context?.diagnostics?.() || {},
+      loadCalls: ingressDiagnostic.executor?.loadCalls || 0,
+      loadLimit: ingressDiagnostic.executor?.loadLimit || 50,
+      toolLog: ingressDiagnostic.executor?.toolLog || [],
+      usage: ingressDiagnostic.usage?.snapshot?.() || null,
+      memory: ingressDiagnostic.context?.snapshot?.() || EMPTY_MEMORY,
+      historySegments: ingressDiagnostic.chatend?.historySegments || [],
+    };
+  }
+  const archive = piece?.state?.historyIngress;
+  return archive?.format === "kennedy-chatend"
+    ? archivedDiagnostic(archive, "audio ingress")
+    : null;
+}
+
+function audioPieceIngressActivity(piece) {
+  const currentPiece = piece?.id === activeAudioIngressPiece?.id
+    ? activeAudioIngressPiece
+    : piece;
+  let diagnostic = null;
+  if (currentPiece?.id === activeAudioIngressPiece?.id && ingressDiagnostic) {
+    diagnostic = ingressDiagnostic;
+  } else {
+    const archive = currentPiece?.state?.historyIngress;
+    if (archive?.format === "kennedy-chatend") {
+      diagnostic = {
+        chatend: { messages: archive.messages || [] },
+        usage: { snapshot: () => archive.usage || null },
+        toolLog: archive.tools?.log || [],
+      };
+    }
+  }
+  const failed = currentPiece?.phase === "ingress_failed";
+  const active = currentPiece?.phase === "ingress_pending" || currentPiece?.phase === "ingress_in_progress";
+  if (!diagnostic) {
+    diagnostic = {
+      chatend: { messages: [] },
+      usage: { snapshot: () => null },
+      toolLog: [],
+    };
+  }
+  return {
+    diagnostic,
+    active,
+    failed,
+    failures: Array.isArray(currentPiece?.ingress_failures) ? currentPiece.ingress_failures : [],
+  };
+}
+
+function audioIngressActivities(detail) {
+  return new Map((detail?.pieces || []).map(piece => [piece.id, audioPieceIngressActivity(piece)]));
+}
+
+function audioRecordingDiagnostic() {
+  const detail = selectedAudioDetail();
+  const phases = (detail?.pieces || []).map(piece => {
+    const source = audioPieceDiagnostic(piece);
+    return historyPhase(
+      `Transcript piece ${piece.piece_index + 1}/${piece.piece_count}`,
+      piece.phase.replaceAll("_", " "),
+      source,
+    );
+  });
+  const current = [...(detail?.pieces || [])].reverse()
+    .map(audioPieceDiagnostic)
+    .find(Boolean) || {
+      mode: "audio ingress", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 50,
+      toolLog: [], usage: null, memory: EMPTY_MEMORY, historySegments: [],
+    };
+  return { ...current, fullHistory: { phases } };
+}
+
 function visibleIngressActivity() {
   return conversationIngressActivity({
     record: selectedRecord(),
@@ -169,15 +286,55 @@ function visibleIngressActivity() {
 }
 
 function update() {
+  if (activeView === "audio") {
+    const detail = selectedAudioDetail();
+    const audioViewKey = detail?.recording?.id
+      ? `audio-recording:${detail.recording.id}`
+      : selectedAudioId ? `audio-loading:${selectedAudioId}` : "audio-recording:none";
+    renderAudioRecording(ui.transcript, detail, {
+      loading: audioDetailLoading.has(selectedAudioId) && !detail,
+      error: detail ? null : audioDetailErrors.get(selectedAudioId) || null,
+      retryingPieceIds: retryingAudioPieces,
+      onRetryPiece: retryAudioIngressPiece,
+      ingressActivities: audioIngressActivities(detail),
+      viewKey: audioViewKey,
+    });
+    renderAudioHistory(ui.conversation_history, audioRecords, {
+      selectedId: selectedAudioId,
+      onSelect: id => selectAudioRecording(id),
+      viewKey: "sidebar:audio",
+    });
+    const currentDiagnostic = diagnostic();
+    renderInspector(
+      ui.context_inspector,
+      currentDiagnostic,
+      inspectorMode,
+      `inspector:audio:${selectedAudioId || "none"}:${inspectorMode}`,
+    );
+    renderUsage(ui.usage_metrics, currentDiagnostic);
+    for (const mode of INSPECTOR_MODES) {
+      const button = ui[`inspector_${mode}`];
+      const active = inspectorMode === mode;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+    }
+    ui.message_form.classList.add("hidden");
+    ui.new_conversation.classList.add("hidden");
+    ui.history_eyebrow.textContent = "AUDIO INGRESS";
+    ui.history_title.textContent = "Vnote history";
+    ui.chatend_title.textContent = "Kennedy audio-ingress history";
+    return;
+  }
   const record = selectedRecord();
   const session = selectedSession();
-  const viewingHistory = Boolean(record && record.phase !== "active");
+  const viewingHistory = Boolean(record && (record.phase !== "active" || !session));
   const telegramView = activeView === "telegram";
   const ingressActivity = visibleIngressActivity();
   renderTranscript(
     ui.transcript,
-    viewingHistory ? (record.state?.transcript || []) : (session?.transcript || []),
+    viewingHistory ? (record?.state?.transcript || []) : (session?.transcript || []),
     ingressActivity,
+    `${activeView}:${selectedConversationId || "none"}`,
   );
   if (telegramView && !(viewingHistory ? record?.state?.transcript : session?.transcript)?.length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Keep this page open: the relay queues messages while it is closed, and this visible UI owns Kennedy's Chatend and tool loop."));
@@ -185,9 +342,15 @@ function update() {
   renderConversationHistory(ui.conversation_history, recordsForView(), {
     selectedId: selectedConversationId,
     onSelect: id => selectConversation(id).catch(error => showError(ui.error_banner, error.message)),
+    viewKey: `sidebar:${activeView}`,
   });
   const currentDiagnostic = diagnostic();
-  renderInspector(ui.context_inspector, currentDiagnostic, inspectorMode);
+  renderInspector(
+    ui.context_inspector,
+    currentDiagnostic,
+    inspectorMode,
+    `inspector:${activeView}:${selectedConversationId || "none"}:${inspectorMode}`,
+  );
   renderUsage(ui.usage_metrics, currentDiagnostic);
   for (const mode of INSPECTOR_MODES) {
     const button = ui[`inspector_${mode}`];
@@ -208,7 +371,7 @@ function update() {
   ui.message_input.disabled = controls.inputDisabled;
   ui.send_button.disabled = controls.sendDisabled || extractingAttachment;
   ui.end_button.disabled = controls.endDisabled;
-  ui.new_conversation.disabled = controls.newDisabled;
+  ui.new_conversation.disabled = controls.newDisabled || !chatRuntimeReady();
   ui.new_conversation.classList.toggle("hidden", telegramView);
   ui.voice_button.disabled = controls.sendDisabled || !transcriptionAvailable
     || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function";
@@ -230,7 +393,7 @@ function update() {
   ui.activity.textContent = telegramView
     ? session?.busy ? "Kennedy is answering this Telegram message" : "Messages are delivered automatically"
     : viewingHistory
-    ? "This conversation is closed and read only"
+    ? record?.phase === "active" ? "Chat is unavailable; this saved conversation is read only" : "This conversation is closed and read only"
     : session?.busy
       ? "Kennedy is working — you can draft your next message"
       : session?.pendingTurn
@@ -321,7 +484,6 @@ async function attachSelectedFiles() {
     return;
   }
   extractingAttachments.add(id);
-  clearError(ui.error_banner);
   update();
   ui.activity.textContent = `Reading ${files.length === 1 ? files[0].name : `${files.length} files`}…`;
   try {
@@ -379,7 +541,6 @@ async function finishVoiceRecording() {
   if (!blob.size || selectedConversationId !== id) return;
   ui.activity.textContent = "Transcribing voice note with OpenAI…";
   ui.voice_button.disabled = true;
-  clearError(ui.error_banner);
   try {
     if (inputModalities.includes("audio")) throw new Error("The selected native-audio transport is not enabled in this UI build.");
     const fileName = `voice-note.${audioExtension(mimeType)}`;
@@ -407,7 +568,6 @@ async function toggleVoiceRecording() {
     recorder.stop();
     return;
   }
-  clearError(ui.error_banner);
   try {
     recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     recorderChunks = [];
@@ -439,6 +599,59 @@ async function refreshHistory() {
   const records = (await conversationHistory.list()).conversations || [];
   reconcileLiveSessions(records);
   update();
+}
+
+async function loadAudioRecording(id, force = false) {
+  if (!id || audioDetailLoading.has(id) || (!force && audioDetails.has(id))) return;
+  const hadCachedDetail = audioDetails.has(id);
+  audioDetailLoading.add(id);
+  if (!hadCachedDetail) audioDetailErrors.delete(id);
+  update();
+  try {
+    audioDetails.set(id, await audioIngress.history(id));
+    audioDetailErrors.delete(id);
+  } catch (error) {
+    const message = error.message || "Unknown audio-ingress history error.";
+    if (hadCachedDetail) {
+      showError(ui.error_banner, `Audio history refresh will retry: ${message}`);
+    } else {
+      audioDetailErrors.set(id, message);
+    }
+  } finally {
+    audioDetailLoading.delete(id);
+    update();
+  }
+}
+
+function selectAudioRecording(id) {
+  selectedAudioId = id;
+  update();
+  loadAudioRecording(id).catch(error => showError(ui.error_banner, error.message));
+}
+
+async function refreshAudioHistory(refreshSelected = false) {
+  audioRecords = (await audioIngress.list(50_000)).recordings || [];
+  if (!audioRecords.some(record => record.id === selectedAudioId)) {
+    selectedAudioId = audioRecords[0]?.id || null;
+  }
+  if (refreshSelected && selectedAudioId) await loadAudioRecording(selectedAudioId, true);
+  update();
+}
+
+async function retryAudioIngressPiece(piece) {
+  if (!piece?.id || retryingAudioPieces.has(piece.id)) return;
+  retryingAudioPieces.add(piece.id);
+  update();
+  try {
+    await audioIngress.retryIngress(piece.id, { expected_version: piece.version });
+    await refreshAudioHistory(true);
+    kickHistoryIngress();
+  } catch (error) {
+    showError(ui.error_banner, `Audio memory ingress could not be retried: ${error.message}`);
+  } finally {
+    retryingAudioPieces.delete(piece.id);
+    update();
+  }
 }
 
 async function persistSession(id, state, metadata = {}) {
@@ -476,9 +689,9 @@ async function buildConversation(record) {
 
 async function createNewConversation() {
   if (creatingConversation) return;
+  if (!chatRuntimeReady()) throw new Error("A new conversation cannot start until Kweb, conversation history, intelligence, and the conversation prompts are available.");
   creatingConversation = true;
   saveDraft();
-  clearError(ui.error_banner);
   update();
   try {
     const session = new ConversationSession({
@@ -507,10 +720,9 @@ async function createNewConversation() {
 async function selectConversation(id) {
   if (id === selectedConversationId) return;
   saveDraft();
-  clearError(ui.error_banner);
   const record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
   upsertHistory(record);
-  if (record.phase === "active" && !liveSessions.has(id)) await buildConversation(record);
+  if (record.phase === "active" && !liveSessions.has(id) && chatRuntimeReady()) await buildConversation(record);
   selectedConversationId = id;
   selectedByView[sessionTypeOf(record)] = id;
   restoreDraft();
@@ -535,7 +747,6 @@ async function submitMessage(event) {
   voiceDrafts.delete(id);
   attachmentDrafts.delete(id);
   conversationErrors.delete(id);
-  clearError(ui.error_banner);
   try {
     await session.send(text, metadata);
   } catch (error) {
@@ -550,7 +761,6 @@ async function resumeSavedQuery(id = selectedConversationId) {
   const session = liveSessions.get(id);
   if (!session?.pendingTurn || session.busy) return;
   conversationErrors.delete(id);
-  if (selectedConversationId === id) clearError(ui.error_banner);
   try {
     await session.resumePendingTurn();
   } catch (error) {
@@ -567,7 +777,6 @@ async function endConversation() {
   const record = selectedRecord();
   if (!session || !record || session.busy || session.pendingTurn || endingIds.has(id)) return;
   endingIds.add(id);
-  clearError(ui.error_banner);
   update();
   try {
     const closed = await conversationHistory.requestIngress(id, { expected_version: record.version, state: session.snapshot() });
@@ -776,7 +985,7 @@ async function pollTelegramEvents() {
     } catch (error) {
       console.error("Telegram event processing failed", event.id, error);
       ui.service_status.textContent = "Telegram queue needs attention";
-      if (activeView === "telegram") showError(ui.error_banner, `Telegram delivery will retry: ${error.message}`);
+      showError(ui.error_banner, `Telegram delivery will retry: ${error.message}`);
     } finally {
       telegramInFlight.delete(event.id);
     }
@@ -788,6 +997,7 @@ async function telegramBridgeLoop() {
     await pollTelegramEvents().catch(error => {
       console.error("Telegram relay poll failed", error);
       ui.service_status.textContent = "Telegram relay unavailable";
+      showError(ui.error_banner, `Telegram relay polling will retry: ${error.message}`);
     });
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
@@ -832,10 +1042,152 @@ async function recordIngressAttemptFailure(record, error, stage) {
   });
 }
 
+function archivedIngressMetrics(state, live = null) {
+  const archived = state?.historyIngress;
+  const usage = live?.usage?.snapshot?.() || archived?.usage || null;
+  const roundCandidates = [live?.roundsUsed, archived?.roundsUsed].filter(Number.isInteger);
+  return {
+    rounds_used: roundCandidates.length ? Math.max(...roundCandidates) : null,
+    context_tokens: Number.isFinite(usage?.contextTokens) ? usage.contextTokens : null,
+    context_window_tokens: Number.isFinite(usage?.contextWindowTokens) ? usage.contextWindowTokens : null,
+  };
+}
+
+async function nextMemoryIngress() {
+  const [conversationResult, audioResult] = await Promise.all([
+    conversationHistoryReady
+      ? conversationHistory.nextIngress().catch(error => {
+        showError(ui.error_banner, `Conversation memory queue is temporarily unavailable: ${error.message}`);
+        return { conversation: null };
+      })
+      : { conversation: null },
+    audioIngressReady && audioPromptsReady()
+      ? audioIngress.nextIngress().catch(error => {
+        showError(ui.error_banner, `Audio memory queue is temporarily unavailable: ${error.message}`);
+        return { piece: null };
+      })
+      : { piece: null },
+  ]);
+  const conversation = conversationResult.conversation;
+  const audio = audioResult.piece;
+  if (!conversation && !audio) return null;
+  if (conversation?.phase === "ingress_in_progress") return { kind: "conversation", record: conversation };
+  if (audio?.phase === "ingress_in_progress") return { kind: "audio", record: audio };
+  if (!conversation) return { kind: "audio", record: audio };
+  if (!audio) return { kind: "conversation", record: conversation };
+  return String(audio.source_created_at).localeCompare(String(conversation.started_at)) < 0
+    ? { kind: "audio", record: audio }
+    : { kind: "conversation", record: conversation };
+}
+
+async function processAudioIngressPiece(initialPiece) {
+  let piece = initialPiece;
+  let stage = "prepare";
+  let liveDiagnostic = null;
+  activeAudioIngressPiece = piece;
+  ingressDiagnostic = null;
+  try {
+    if (piece.phase === "ingress_pending") {
+      stage = "provenance";
+      const provenance = await kweb.createProvenance({
+        data: [
+          "Vnote final transcript piece",
+          "",
+          `Recording began: ${piece.source_created_at}`,
+          `Recording SHA-256: ${piece.sha256}`,
+          `Original filename: ${piece.original_filename}`,
+          `Transcript piece: ${piece.piece_index + 1} of ${piece.piece_count}`,
+          "",
+          piece.transcript_text,
+        ].join("\n"),
+        source: "audio-vnote",
+        source_created_at: piece.source_created_at,
+        idempotency_key: `audio:${piece.sha256}:piece:${piece.piece_index}`,
+      });
+      stage = "claim";
+      try {
+        piece = await audioIngress.ingressStarted(piece.id, { expected_version: piece.version, provenance_id: provenance.id });
+        activeAudioIngressPiece = piece;
+      } catch (error) {
+        if (error.code === "state_conflict") {
+          activeAudioIngressPiece = null;
+          return;
+        }
+        throw error;
+      }
+    }
+    if (piece.phase !== "ingress_in_progress") {
+      activeAudioIngressPiece = null;
+      return;
+    }
+    stage = "model_loop";
+    if (!piece.provenance_id) throw new Error("The queued audio transcript is missing its provenance.");
+    const persistIngress = async archive => {
+      const state = { ...piece.state, historyIngress: archive };
+      try {
+        piece = await audioIngress.ingressCheckpoint(piece.id, { expected_version: piece.version, state });
+        activeAudioIngressPiece = piece;
+      } catch (error) {
+        if (error.code !== "state_conflict") throw error;
+        const latest = await audioIngress.getPiece(piece.id);
+        if (latest.phase !== "ingress_in_progress" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
+        piece = latest;
+      }
+    };
+    await runHistoryIngress({
+      kweb, intelligence, manuals, rootNodeIds, provenanceId: piece.provenance_id,
+      provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+      sourceSessionType: "audio",
+      restoredArchive: piece.state?.historyIngress,
+      checkpoint: persistIngress,
+      onUpdate: value => { liveDiagnostic = value; ingressDiagnostic = value; update(); },
+    });
+    ingressDiagnostic = null;
+    stage = "completion";
+    await audioIngress.ingressCompleted(piece.id, { expected_version: piece.version });
+    activeAudioIngressPiece = null;
+    await refreshAudioHistory(activeView === "audio");
+  } catch (error) {
+    const latest = await audioIngress.getPiece(piece.id);
+    if (!["ingress_pending", "ingress_in_progress"].includes(latest.phase)) {
+      activeAudioIngressPiece = null;
+      return;
+    }
+    const failed = await audioIngress.ingressFailure(latest.id, {
+      expected_version: latest.version,
+      stage,
+      code: typeof error?.code === "string" ? error.code : "ingress_error",
+      message: typeof error?.message === "string" ? error.message : "Audio ingress failed without an error message.",
+      ...archivedIngressMetrics(latest.state, liveDiagnostic),
+    });
+    console.error("Audio ingress attempt failed", {
+      recordingId: failed.recording_id, piece: failed.piece_index,
+      stage, attempt: failed.ingress_failure_count, terminal: failed.phase === "ingress_failed", error,
+    });
+    if (failed.phase === "ingress_failed") {
+      ingressDiagnostic = null;
+      activeAudioIngressPiece = null;
+      await refreshAudioHistory(activeView === "audio");
+      ui.service_status.textContent = "Audio memory ingestion failed";
+      showError(ui.error_banner, `Audio transcript ingress stopped after ${failed.ingress_failure_count} failed attempts. Recording ${failed.recording_id} remains preserved for inspection.`);
+      return;
+    }
+    activeAudioIngressPiece = failed;
+    const failureMessage = failed.ingress_failures?.at?.(-1)?.message || "No error detail was recorded.";
+    throw new Error(`Audio ingress attempt ${failed.ingress_failure_count}/${INGRESS_FAILURE_LIMIT} failed during ${stage}: ${failureMessage}`);
+  }
+}
+
 async function processIngressQueue() {
   while (true) {
-    let record = (await conversationHistory.nextIngress()).conversation;
-    if (!record) return;
+    const work = await nextMemoryIngress();
+    if (!work) return;
+    if (work.kind === "audio") {
+      activeIngressRecord = null;
+      await processAudioIngressPiece(work.record);
+      continue;
+    }
+    let record = work.record;
     let stage = "prepare";
     activeIngressRecord = record;
     ingressDiagnostic = null;
@@ -929,7 +1281,7 @@ async function processIngressQueue() {
 }
 
 function kickHistoryIngress() {
-  if (ingressWorkerRunning) return;
+  if (ingressWorkerRunning || !memoryIngressRuntimeReady()) return;
   ingressWorkerRunning = true;
   const run = () => processIngressQueue();
   const work = navigator.locks?.request
@@ -938,17 +1290,18 @@ function kickHistoryIngress() {
   Promise.resolve(work).catch(error => {
     ui.service_status.textContent = "Memory ingestion needs attention";
     showError(ui.error_banner, `History ingress will retry: ${error.message}`);
-    setTimeout(kickHistoryIngress, 5000);
   }).finally(() => {
     ingressWorkerRunning = false;
     activeIngressRecord = null;
+    activeAudioIngressPiece = null;
     update();
+    setTimeout(kickHistoryIngress, 5000);
   });
 }
 
 function showView(view) {
-  if (!["conversation", "telegram", "memory"].includes(view)) return;
-  if (activeView !== "memory") selectedByView[activeView] = selectedConversationId;
+  if (!["conversation", "telegram", "audio", "memory"].includes(view)) return;
+  if (["conversation", "telegram"].includes(activeView)) selectedByView[activeView] = selectedConversationId;
   saveDraft();
   activeView = view;
   const memory = view === "memory";
@@ -956,8 +1309,13 @@ function showView(view) {
   ui.memory_view.classList.toggle("hidden", !memory);
   ui.chat_tab.classList.toggle("active", view === "conversation");
   ui.tg_tab.classList.toggle("active", view === "telegram");
+  ui.audio_tab.classList.toggle("active", view === "audio");
   ui.memory_tab.classList.toggle("active", memory);
-  if (!memory) {
+  if (view === "audio") {
+    if (!audioRecords.some(record => record.id === selectedAudioId)) selectedAudioId = audioRecords[0]?.id || null;
+    update();
+    refreshAudioHistory(true).catch(error => showError(ui.error_banner, error.message));
+  } else if (!memory) {
     const records = recordsForView(view);
     const preferred = selectedByView[view];
     selectedConversationId = records.some(record => record.id === preferred) ? preferred : records[0]?.id || null;
@@ -970,26 +1328,56 @@ function showView(view) {
 
 async function initialize() {
   update();
+
   try {
-    const [health, user, loadedManuals] = await Promise.all([kweb.health(), kweb.user(), loadPromptManuals(CONFIG.kwebBase)]);
+    const [health, user] = await Promise.all([kweb.health(), kweb.user()]);
     rootNodeIds = [user.user_root_node_id || user.root_node_id, user.kennedy_root_node_id];
     if (rootNodeIds.some(id => typeof id !== "string" || !id)) throw new Error("Kweb did not provide both required root nodes.");
-    manuals = loadedManuals;
     explorer = new MemoryExplorer({ api: kweb, rootNodeIds, content: ui.memory_content, backButton: ui.memory_back, forwardButton: ui.memory_forward });
+    kwebReady = true;
     ui.service_status.textContent = `${health.status} · memory ready`;
   } catch (error) {
     ui.service_status.textContent = "Kweb unavailable";
-    showError(ui.error_banner, error.message);
-    update();
-    return;
+    showError(ui.error_banner, `Memory is unavailable: ${error.message}`);
   }
+
+  if (kwebReady) {
+    const loaded = await loadPromptManuals(CONFIG.kwebBase);
+    manuals = loaded.manuals;
+    const promptImpact = {
+      identity: "Conversation and memory-ingress model sessions are unavailable",
+      conversation: "New and restored conversations are unavailable",
+      ingress: "Conversation-history and audio memory ingress are paused",
+      audioIngress: "Audio preparation and history remain available, but audio memory ingress is paused",
+    };
+    for (const [key, message] of Object.entries(loaded.errors)) {
+      showError(ui.error_banner, `${promptImpact[key] || "A model mode is unavailable"}: ${message}`);
+    }
+  }
+
   try {
     await conversationHistory.health();
     await conversationHistory.discardUnstarted();
+    historyRecords = (await conversationHistory.list()).conversations || [];
+    conversationHistoryReady = true;
+  } catch (error) {
+    showError(ui.error_banner, `Conversation history is unavailable: ${error.message}`);
+  }
+
+  try {
+    await audioIngress.health();
+    audioRecords = (await audioIngress.list(50_000)).recordings || [];
+    audioIngressReady = true;
+  } catch (error) {
+    showError(ui.error_banner, `Audio ingress is unavailable: ${error.message}`);
+  }
+
+  try {
     await intelligence.health();
     const providers = await intelligence.providers();
     provider = providers.default_provider;
     const selected = providers.providers.find(item => item.name === provider);
+    if (!selected) throw new Error("The intelligence service did not provide its configured default provider.");
     model = selected.default_model;
     reasoningEffort = selected.reasoning_effort;
     const modelCapabilities = selected.model_capabilities?.[model] || {};
@@ -999,25 +1387,63 @@ async function initialize() {
     contextWindowTokens = Number(modelCapabilities.context_window_tokens ?? selected.context_window_tokens) || 0;
     maxInputTokens = Number(modelCapabilities.max_input_tokens ?? selected.max_input_tokens) || 0;
     if (contextWindowTokens <= 0 || maxInputTokens <= 0) throw new Error("The intelligence service did not provide the model's advertised effective context window.");
-    historyRecords = (await conversationHistory.list()).conversations || [];
+    intelligenceReady = true;
+  } catch (error) {
+    showError(ui.error_banner, `Kennedy's model service is unavailable: ${error.message}`);
+  }
+
+  if (chatRuntimeReady()) {
     const activeRecords = historyRecords.filter(record => record.phase === "active");
-    for (const record of activeRecords) await buildConversation(record);
-    const activeConversations = activeRecords.filter(record => sessionTypeOf(record) === "conversation");
+    for (const record of activeRecords) {
+      try {
+        await buildConversation(record);
+      } catch (error) {
+        showError(ui.error_banner, `Saved ${sessionTypeOf(record)} session ${record.id} could not be restored: ${error.message}`);
+      }
+    }
+    const activeConversations = activeRecords.filter(record =>
+      sessionTypeOf(record) === "conversation" && liveSessions.has(record.id)
+    );
     if (activeConversations.length) {
       selectedConversationId = activeConversations[0].id;
       selectedByView.conversation = selectedConversationId;
       restoreDraft();
-      update();
     } else {
-      await createNewConversation();
+      try {
+        await createNewConversation();
+      } catch (error) {
+        showError(ui.error_banner, `A new conversation could not be started: ${error.message}`);
+      }
     }
-    await telegramRelay.health();
-    startTelegramBridge();
-    kickHistoryIngress();
-    ui.service_status.textContent = `Ready · ${model}`;
-  } catch (error) {
-    ui.service_status.textContent = "Chat offline · memory ready";
-    showError(ui.error_banner, `The memory explorer is available, but chat is offline: ${error.message}`);
+  } else {
+    selectedConversationId = recordsForView("conversation")[0]?.id || null;
+    selectedByView.conversation = selectedConversationId;
+  }
+
+  if (chatRuntimeReady()) {
+    try {
+      await telegramRelay.health();
+      telegramRelayReady = true;
+      startTelegramBridge();
+    } catch (error) {
+      showError(ui.error_banner, `Telegram is unavailable: ${error.message}`);
+    }
+  }
+
+  kickHistoryIngress();
+  const readyFeatures = [
+    chatRuntimeReady() ? "chat" : null,
+    kwebReady ? "memory" : null,
+    audioIngressReady ? "audio" : null,
+    telegramRelayReady ? "Telegram" : null,
+  ].filter(Boolean);
+  ui.service_status.textContent = readyFeatures.length
+    ? `Ready · ${readyFeatures.join(", ")}${model ? ` · ${model}` : ""}`
+    : "Kennedy services unavailable";
+
+  if (!chatRuntimeReady() && !historyRecords.length && audioIngressReady) {
+    showView("audio");
+  } else {
     update();
   }
 }
@@ -1077,9 +1503,11 @@ const messageInputResizeObserver = typeof ResizeObserver === "function" ? new Re
 messageInputResizeObserver?.observe(ui.message_input);
 ui.end_button.addEventListener("click", () => selectedSession()?.pendingTurn ? resumeSavedQuery() : endConversation());
 ui.new_conversation.addEventListener("click", () => createNewConversation().catch(error => showError(ui.error_banner, error.message)));
+ui.clear_log.addEventListener("click", () => clearError(ui.error_banner));
 for (const mode of INSPECTOR_MODES) ui[`inspector_${mode}`].addEventListener("click", () => { inspectorMode = mode; update(); });
 ui.chat_tab.addEventListener("click", () => showView("conversation"));
 ui.tg_tab.addEventListener("click", () => showView("telegram"));
+ui.audio_tab.addEventListener("click", () => showView("audio"));
 ui.memory_tab.addEventListener("click", () => showView("memory"));
 ui.memory_back.addEventListener("click", () => explorer?.goBack());
 ui.memory_forward.addEventListener("click", () => explorer?.goForward());

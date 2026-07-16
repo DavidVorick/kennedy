@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kennedy</title>
-  <link rel="stylesheet" href="/css/styles.css?v=20260715.12">
+  <link rel="stylesheet" href="/css/styles.css?v=20260716.2">
 </head>
 <body>
   <header class="topbar">
@@ -16,6 +16,7 @@
       <span id="service-status" class="status" role="status">Starting…</span>
       <button id="chat-tab" class="tab active" type="button">Conversation</button>
       <button id="tg-tab" class="tab" type="button">TG Bot</button>
+      <button id="audio-tab" class="tab" type="button">Audio Ingress</button>
       <button id="memory-tab" class="tab" type="button">Memory</button>
     </div>
   </header>
@@ -28,6 +29,13 @@
           <button id="new-conversation" class="primary history-new" type="button">New</button>
         </div>
         <nav id="conversation-history" class="conversation-history" aria-label="Saved conversations"></nav>
+        <section id="user-log-section" class="user-log-section hidden" aria-label="Kennedy activity log">
+          <div class="user-log-heading">
+            <div><span class="eyebrow">ACTIVITY</span><h3>Log</h3></div>
+            <button id="clear-log" class="quiet" type="button">Clear</button>
+          </div>
+          <div id="error-banner" class="user-log" role="log" aria-live="polite"></div>
+        </section>
       </aside>
       <section class="panel conversation-panel" aria-label="Conversation">
         <div id="transcript" class="transcript" aria-live="polite">
@@ -36,7 +44,6 @@
             <p>Kennedy can help directly and draw on your local memory when it matters.</p>
           </div>
         </div>
-        <div id="error-banner" class="error-banner hidden" role="alert"></div>
         <form id="message-form" class="composer">
           <div class="composer-heading">
             <label for="message-input">Message Kennedy</label>
@@ -98,6 +105,6 @@
     </section>
   </main>
 
-  <script type="module" src="/js/app.js?v=20260715.14"></script>
+  <script type="module" src="/js/app.js?v=20260716.5"></script>
 </body>
 </html>

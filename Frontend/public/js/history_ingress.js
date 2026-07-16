@@ -1,6 +1,6 @@
 import { Chatend } from "./chatend.js?v=20260715.8";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
-import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260714.7";
+import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260716.1";
 import { ToolExecutor } from "./tools.js?v=20260715.9";
 import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260715.10";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
@@ -16,9 +16,9 @@ function modelReadableProvenance(data) {
     archive = JSON.parse(data);
   } catch {
     if (typeof data === "string" && data.trim()) return data.trim();
-    throw new Error("Conversation provenance does not contain a valid archived Chatend.");
+    throw new Error("Ingress provenance does not contain readable source data.");
   }
-  if (!Array.isArray(archive?.messages)) throw new Error("Conversation provenance does not contain a valid archived Chatend.");
+  if (!Array.isArray(archive?.messages)) throw new Error("Ingress provenance does not contain readable source data.");
   return formatChatend(archive.messages, archive.usage || null);
 }
 
@@ -26,13 +26,17 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   const provenance = await kweb.provenance(provenanceId);
   rootNodeIds = rootNodeIds || [rootNodeId];
   const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
+  const audioSource = sourceSessionType === "audio";
   const retained = [{ role: "user", content: [
-    "Conversation provenance",
+    audioSource ? "Audio transcript provenance" : "Conversation provenance",
     "",
     `Source: ${provenance.source}`,
     `Created: ${provenance.source_created_at}`,
+    ...(audioSource ? [
+      "Recording-time semantics: Created is when this vnote began, not when it was uploaded or ingressed. Use it to judge whether its statements are historical, superseded, or still current.",
+    ] : []),
     "",
-    "Archived Chatend",
+    audioSource ? "Final transcript piece" : "Archived Chatend",
     "",
     modelReadableProvenance(provenance.data),
   ].join("\n") }];

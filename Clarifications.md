@@ -7,7 +7,8 @@ canonical documents; this file is not an append-only log.
 ## Offline Backups
 
 - `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
-  all three SQLite databases and the encrypted credential vault when present.
+  all four SQLite databases, the complete audio-ingress media tree, and the
+  encrypted credential vault when present.
   Each archive is self-describing: its README starts with the creating commit
   hash and records the exact schemas and current data-format semantics.
 - Backups are deliberately offline. Before reading persistent data, the backup
@@ -25,6 +26,37 @@ canonical documents; this file is not an append-only log.
   footprint for current Kmap nodes. It reports both all three node text fields
   and long descriptions alone, while excluding history, provenance,
   connections, and all non-node tables.
+
+## Durable Vnote Audio Ingress
+
+- An i3 hotkey runs `arecord` directly into `/home/user/media/vnotes`. The stop
+  hotkey ends `arecord`, then checks the five newest vnotes by SHA-256 and
+  uploads any Kennedy has not accepted. Once Kennedy has durably accepted the
+  bytes, the script never waits for later processing.
+- Audio jobs and originals survive shutdown and resume gracefully. SHA-256 is
+  the durable identity and lookup key so a large historical recording archive
+  can skip files Kennedy has already accepted or ingressed even when renamed.
+- Split each recording into equalized, ordered windows no longer than four
+  minutes, with fifteen-second overlap. The four-minute limit is a deliberate
+  Gemini fidelity choice despite longer advertised support. Gemini 3.1 Pro
+  Preview produces structured speaker-aware transcripts with original text,
+  per-line English translations for non-English speech, and useful annotations.
+- Give every piecemeal transcript to `gpt-5.6-sol` with `xhigh` reasoning in
+  exact chronological order. Tell it about the overlap and trust it to produce
+  the canonical complete transcript, reconcile speakers, and remove repeated
+  boundary speech. If the final transcript exceeds an estimated 50,000 tokens,
+  Sol chooses sensible, not necessarily equal, boundaries before Kennedy sees it.
+- Kennedy ingresses the resulting transcript pieces individually and in order.
+  Every piece and provenance record must prominently carry the exact vnote
+  recording timestamp, distinct from upload or ingress time, so Kennedy can
+  distinguish historical or superseded claims from current Kmap knowledge.
+- The `Audio Ingress` UI tab lists every retained audio job. Selecting one shows
+  its complete preparation artifacts and all durable Kennedy ingress history.
+- Audio ingress is explicitly fallible: speech, translation, annotations, and
+  speaker identity may be seriously wrong. Kennedy preserves uncertainty and
+  dated contradictions, and may create useful clarification notes or concrete
+  tasks when important context is missing rather than blindly overwriting
+  newer knowledge.
 
 ## Chatend and Inspector
 
@@ -225,6 +257,13 @@ canonical documents; this file is not an append-only log.
 - On transcript rerenders, follow new content only if the reader was already at
   the bottom. Otherwise preserve the exact scroll offset so status/tool updates
   do not interrupt reading.
+- Initialize frontend features independently. A missing service or
+  mode-specific prompt disables only the feature that consumes it. In
+  particular, a missing audio-ingress prompt must not disable chat, memory,
+  ordinary history ingress, audio preparation, or audio history.
+- Put timestamped, deduplicated user-visible operational errors below the
+  history sidebar. Do not inject unrelated failures into the currently selected
+  conversation; retain the log until the user clears it.
 
 ## Web Search Recovery
 

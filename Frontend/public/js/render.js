@@ -10,6 +10,53 @@ function element(tag, className, text) {
   return node;
 }
 
+function captureViewState(container, viewKey) {
+  const sameView = container.dataset.renderKey === viewKey;
+  const focused = sameView ? document.activeElement : null;
+  return {
+    sameView,
+    previousTop: container.scrollTop,
+    wasAtBottom: container.scrollHeight - container.clientHeight - container.scrollTop <= 1,
+    openKeys: sameView
+      ? new Set([...container.querySelectorAll("details[open][data-view-key]")].map(details => details.dataset.viewKey))
+      : new Set(),
+    nestedScroll: sameView
+      ? new Map([...container.querySelectorAll("[data-scroll-key]")].map(node => [
+        node.dataset.scrollKey,
+        {
+          top: node.scrollTop,
+          left: node.scrollLeft,
+          wasAtBottom: node.scrollHeight - node.clientHeight - node.scrollTop <= 1,
+        },
+      ]))
+      : new Map(),
+    focusKey: focused?.dataset?.focusKey || focused?.closest?.("[data-focus-key]")?.dataset?.focusKey || null,
+  };
+}
+
+function restoreViewState(container, viewKey, state) {
+  container.dataset.renderKey = viewKey;
+  if (!state.sameView) {
+    container.scrollTop = 0;
+    return;
+  }
+  for (const details of container.querySelectorAll("details[data-view-key]")) {
+    details.open = state.openKeys.has(details.dataset.viewKey);
+  }
+  for (const node of container.querySelectorAll("[data-scroll-key]")) {
+    const saved = state.nestedScroll.get(node.dataset.scrollKey);
+    if (!saved) continue;
+    node.scrollTop = saved.wasAtBottom ? node.scrollHeight : saved.top;
+    node.scrollLeft = saved.left;
+  }
+  container.scrollTop = state.wasAtBottom ? container.scrollHeight : state.previousTop;
+  if (state.focusKey) {
+    const target = [...container.querySelectorAll("[data-focus-key]")]
+      .find(node => node.dataset.focusKey === state.focusKey);
+    target?.focus?.({ preventScroll: true });
+  }
+}
+
 function appendLinkedText(container, text) {
   const pattern = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<]+)/g;
   let cursor = 0;
@@ -31,15 +78,14 @@ function appendLinkedText(container, text) {
   container.append(document.createTextNode(text.slice(cursor)));
 }
 
-export function renderTranscript(container, transcript, ingressActivity = null) {
-  const previousTop = container.scrollTop;
-  const wasAtBottom = container.scrollHeight - container.clientHeight - container.scrollTop <= 1;
+export function renderTranscript(container, transcript, ingressActivity = null, viewKey = "transcript") {
+  const viewState = captureViewState(container, viewKey);
   container.replaceChildren();
   if (!transcript.length && !ingressActivity?.diagnostic) {
     const empty = element("div", "empty-state");
     empty.append(element("p", "empty-title", "What are we working on?"), element("p", "", "Kennedy can help directly and draw on your local memory when it matters."));
     container.append(empty);
-    container.scrollTop = wasAtBottom ? container.scrollHeight : previousTop;
+    restoreViewState(container, viewKey, viewState);
     return;
   }
   for (const item of transcript) {
@@ -54,9 +100,16 @@ export function renderTranscript(container, transcript, ingressActivity = null) 
     container.append(message);
   }
   if (ingressActivity?.diagnostic) {
-    renderIngressActivity(container, ingressActivity.diagnostic, ingressActivity.active, ingressActivity.failed, ingressActivity.failures);
+    renderIngressActivity(
+      container,
+      ingressActivity.diagnostic,
+      ingressActivity.active,
+      ingressActivity.failed,
+      ingressActivity.failures,
+      { namespace: `${viewKey}:history-ingress` },
+    );
   }
-  container.scrollTop = wasAtBottom ? container.scrollHeight : previousTop;
+  restoreViewState(container, viewKey, viewState);
 }
 
 export function conversationTitle(record, limit = 54) {
@@ -77,15 +130,22 @@ function historyDate(value) {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(parsed);
 }
 
-export function renderConversationHistory(container, records, { selectedId = null, onSelect = () => {} } = {}) {
+export function renderConversationHistory(container, records, {
+  selectedId = null,
+  onSelect = () => {},
+  viewKey = "conversation-history",
+} = {}) {
+  const viewState = captureViewState(container, viewKey);
   container.replaceChildren();
   if (!records.length) {
     container.append(element("p", "history-empty", "Past conversations will appear here after you begin chatting."));
+    restoreViewState(container, viewKey, viewState);
     return;
   }
   for (const record of records) {
     const button = element("button", `history-item${record.id === selectedId ? " selected" : ""}`);
     button.type = "button";
+    button.dataset.focusKey = `${viewKey}:record:${record.id}`;
     button.setAttribute("aria-pressed", String(record.id === selectedId));
     const meta = element("span", "history-item-meta");
     const phases = {
@@ -103,6 +163,218 @@ export function renderConversationHistory(container, records, { selectedId = nul
     button.addEventListener("click", () => onSelect(record.id));
     container.append(button);
   }
+  restoreViewState(container, viewKey, viewState);
+}
+
+const AUDIO_STATUS_LABELS = {
+  uploaded: "Uploaded · queued",
+  chunking: "Preparing audio",
+  transcribing: "Gemini transcription",
+  reconciling: "Reconciling transcript",
+  ready_for_ingress: "Transcript · queued",
+  ingressing: "Updating memory",
+  ingress_failed: "Memory ingress failed",
+  complete: "Complete",
+  failed: "Processing failed",
+};
+
+export function audioRecordingTitle(record, limit = 54) {
+  const title = String(record?.original_filename || "Audio recording").trim() || "Audio recording";
+  return title.length > limit ? `${title.slice(0, limit - 1).trimEnd()}…` : title;
+}
+
+export function renderAudioHistory(container, records, {
+  selectedId = null,
+  onSelect = () => {},
+  viewKey = "audio-history",
+} = {}) {
+  const viewState = captureViewState(container, viewKey);
+  container.replaceChildren();
+  if (!records.length) {
+    container.append(element("p", "history-empty", "Uploaded vnotes will appear here as soon as Kennedy accepts them."));
+    restoreViewState(container, viewKey, viewState);
+    return;
+  }
+  for (const record of records) {
+    const selected = record.id === selectedId;
+    const button = element("button", `history-item${selected ? " selected" : ""}`);
+    button.type = "button";
+    button.dataset.focusKey = `${viewKey}:record:${record.id}`;
+    button.setAttribute("aria-pressed", String(selected));
+    const meta = element("span", "history-item-meta");
+    const label = AUDIO_STATUS_LABELS[record.status] || String(record.status || "unknown").replaceAll("_", " ");
+    const active = !["complete", "failed", "ingress_failed"].includes(record.status);
+    const status = element("span", `history-phase ${active ? "live" : "closed"}`, label);
+    status.setAttribute("aria-label", label);
+    meta.append(status, element("time", "", historyDate(record.source_created_at)));
+    button.append(element("span", "history-item-title", audioRecordingTitle(record)), meta);
+    button.addEventListener("click", () => onSelect(record.id));
+    container.append(button);
+  }
+  restoreViewState(container, viewKey, viewState);
+}
+
+function fullDate(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) return value || "Unavailable";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" }).format(parsed);
+}
+
+function fileSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "Unknown";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MiB`;
+}
+
+function audioDetail(label, value) {
+  const item = element("div", "audio-detail");
+  item.append(element("dt", "", label), element("dd", "", String(value)));
+  return item;
+}
+
+function audioDisclosure(label, content, key, open = false) {
+  const disclosure = element("details", "audio-disclosure");
+  disclosure.dataset.viewKey = key;
+  disclosure.open = open;
+  const summary = element("summary", "", label);
+  summary.dataset.focusKey = `${key}:summary`;
+  const body = element("pre", "audio-disclosure-body", content);
+  body.dataset.scrollKey = `${key}:body`;
+  disclosure.append(summary, body);
+  return disclosure;
+}
+
+export function renderAudioRecording(container, detail, {
+  loading = false,
+  error = null,
+  retryingPieceIds = new Set(),
+  onRetryPiece = () => {},
+  ingressActivities = new Map(),
+  viewKey = "audio-recording",
+} = {}) {
+  const viewState = captureViewState(container, viewKey);
+  container.replaceChildren();
+  if (loading) {
+    container.append(element("div", "audio-empty", "Loading the durable audio-ingress history…"));
+    restoreViewState(container, viewKey, viewState);
+    return;
+  }
+  if (error) {
+    container.append(element("div", "audio-empty", `Could not load this recording: ${error}`));
+    restoreViewState(container, viewKey, viewState);
+    return;
+  }
+  if (!detail?.recording) {
+    container.append(element("div", "audio-empty", "Upload a vnote to see its complete processing and memory-ingress history here."));
+    restoreViewState(container, viewKey, viewState);
+    return;
+  }
+
+  const record = detail.recording;
+  const header = element("header", "audio-recording-header");
+  header.append(
+    element("span", "eyebrow", "DURABLE VNOTE"),
+    element("h2", "", audioRecordingTitle(record, 100)),
+    element("span", `audio-status audio-status-${record.status}`, AUDIO_STATUS_LABELS[record.status] || record.status),
+  );
+  const metadata = element("dl", "audio-metadata");
+  metadata.append(
+    audioDetail("Recorded", fullDate(record.source_created_at)),
+    audioDetail("Kennedy received", fullDate(record.received_at)),
+    audioDetail("File size", fileSize(record.size_bytes)),
+    audioDetail("SHA-256", record.sha256),
+    audioDetail("Gemini model", record.gemini_model),
+    audioDetail("Reconciliation", `${record.reconciliation_model} · ${record.reconciliation_reasoning}`),
+    audioDetail("Kennedy pieces", `${record.completed_piece_count}/${record.transcript_piece_count} complete`),
+  );
+  container.append(header, metadata);
+  if (record.last_error) container.append(element("pre", "audio-error", record.last_error));
+  container.append(element("p", "audio-history-note", "History ingress appears below the transcript pieces as the same continuous memory-update stream used for conversations. The right-hand Full History inspector retains every piece and context reset."));
+
+  const finalTranscript = typeof detail.final_transcript === "string" && detail.final_transcript.trim()
+    ? detail.final_transcript
+    : "The reconciled transcript has not been produced yet.";
+  container.append(audioDisclosure(
+    "Final reconciled transcript",
+    finalTranscript,
+    `${viewKey}:final-transcript`,
+  ));
+
+  const chunks = element("section", "audio-history-section");
+  chunks.append(element("h3", "", `Gemini chunk transcripts (${detail.chunks?.length || 0})`));
+  if (!detail.chunks?.length) {
+    chunks.append(element("p", "audio-section-empty", "Audio chunks have not been created yet."));
+  } else {
+    for (const chunk of detail.chunks) {
+      const start = (Number(chunk.audio_start_ms) / 1000).toFixed(1);
+      const end = (Number(chunk.audio_end_ms) / 1000).toFixed(1);
+      const transcript = chunk.transcript
+        ? JSON.stringify(chunk.transcript, null, 2)
+        : "Gemini has not transcribed this chunk yet.";
+      chunks.append(audioDisclosure(
+        `Chunk ${chunk.chunk_index + 1} · ${start}s–${end}s`,
+        transcript,
+        `${viewKey}:chunk:${chunk.chunk_index}`,
+      ));
+    }
+  }
+  container.append(chunks);
+
+  const pieces = element("section", "audio-history-section");
+  pieces.append(element("h3", "", `Kennedy transcript pieces (${detail.pieces?.length || 0})`));
+  if (!detail.pieces?.length) {
+    pieces.append(element("p", "audio-section-empty", "The final transcript has not been divided for Kennedy yet."));
+  } else {
+    for (const piece of detail.pieces) {
+      const archived = piece.state?.historyIngress?.format === "kennedy-chatend";
+      const label = `Piece ${piece.piece_index + 1}/${piece.piece_count} · ${piece.phase.replaceAll("_", " ")} · ~${Number(piece.estimated_tokens).toLocaleString()} tokens${archived ? " · Kennedy history saved" : ""}`;
+      const disclosure = audioDisclosure(
+        label,
+        piece.transcript_text,
+        `${viewKey}:piece:${piece.id}`,
+      );
+      if (piece.phase === "ingress_failed") {
+        const retry = element(
+          "button",
+          "secondary audio-retry-button",
+          retryingPieceIds.has(piece.id) ? "Scheduling retry…" : "Retry Kennedy ingress",
+        );
+        retry.type = "button";
+        retry.dataset.focusKey = `${viewKey}:piece:${piece.id}:retry`;
+        retry.disabled = retryingPieceIds.has(piece.id);
+        retry.addEventListener("click", () => onRetryPiece(piece));
+        disclosure.append(retry);
+      }
+      pieces.append(disclosure);
+    }
+  }
+  container.append(pieces);
+
+  const ingress = element("section", "audio-history-section audio-memory-history");
+  ingress.append(element("h3", "", `History ingress (${detail.pieces?.length || 0})`));
+  if (!detail.pieces?.length) {
+    ingress.append(element("p", "audio-section-empty", "Kennedy memory ingress has not started because no transcript pieces are ready."));
+  } else {
+    for (const piece of detail.pieces) {
+      const activity = ingressActivities.get(piece.id);
+      if (!activity?.diagnostic) continue;
+      renderIngressActivity(
+        ingress,
+        activity.diagnostic,
+        activity.active,
+        activity.failed,
+        activity.failures,
+        {
+          namespace: `${viewKey}:piece:${piece.id}:history-ingress`,
+          sourceLabel: `Transcript piece ${piece.piece_index + 1}/${piece.piece_count}`,
+        },
+      );
+    }
+  }
+  container.append(ingress);
+  restoreViewState(container, viewKey, viewState);
 }
 
 export function conversationControlState({ hasSession, sessionBusy, transitionBusy, pendingTurn, viewingHistory, transcriptLength }) {
@@ -160,21 +432,28 @@ export function ingressEntryPresentation(message) {
   return { collapsed: false, label: message?.display_role || "Kennedy" };
 }
 
-export function renderInspector(container, diagnostic, view = "main") {
+export function renderInspector(container, diagnostic, view = "main", viewKey = `inspector:${view}`) {
+  const viewState = captureViewState(container, viewKey);
   if (view === "history") {
     renderFullHistory(container, diagnostic);
+    restoreViewState(container, viewKey, viewState);
     return;
   }
   if (view === "main") {
     renderMainView(container, diagnostic);
+    restoreViewState(container, viewKey, viewState);
     return;
   }
   container.replaceChildren();
   if (view === "memory") {
     renderMemoryTree(container, diagnostic.memory);
+    restoreViewState(container, viewKey, viewState);
     return;
   }
-  container.append(element("pre", "inspector-text", inspectorText(diagnostic, view)));
+  const text = element("pre", "inspector-text", inspectorText(diagnostic, view));
+  text.dataset.scrollKey = `${viewKey}:text`;
+  container.append(text);
+  restoreViewState(container, viewKey, viewState);
 }
 
 function parseToolRequest(content) {
@@ -458,6 +737,7 @@ function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, dept
   details.dataset.mainKey = key;
   details.open = openKeys.has(key);
   const summary = element("summary", "memory-node-summary");
+  summary.dataset.focusKey = `${key}:summary`;
   const sourceLabel = relation === "direct"
     ? "directly loaded"
     : node.contextSources?.includes("active") ? "pulled by active connection" : "full context";
@@ -501,6 +781,7 @@ function mainMemorySet(entry, openKeys) {
   const activeExpanded = [...nodeByIdentifier.values()].filter(node => !directlyLoaded.has(node.identifier) && node.contextSources?.includes("active")).length;
   const details = keyedDetails("main-entry main-memory-set", "memory-set", openKeys);
   const summary = element("summary", "main-entry-summary");
+  summary.dataset.focusKey = "memory-set:summary";
   summary.append(
     badge("memory", "memory"),
     element("strong", "main-entry-label", "Loaded nodes"),
@@ -532,8 +813,12 @@ function mainMemorySet(entry, openKeys) {
 function mainCollapsedEntry(entry, openKeys, index) {
   const key = entry.key || `${entry.kind}:${index}`;
   const details = keyedDetails(`main-entry main-${entry.kind}`, key, openKeys);
-  details.append(disclosureSummary(entry.label, entry.kind === "tool-call" ? "call" : entry.kind === "tool-result" ? "result" : "context"));
-  details.append(element("pre", "main-entry-body", entry.content));
+  const summary = disclosureSummary(entry.label, entry.kind === "tool-call" ? "call" : entry.kind === "tool-result" ? "result" : "context");
+  summary.dataset.focusKey = `${key}:summary`;
+  details.append(summary);
+  const body = element("pre", "main-entry-body", entry.content);
+  body.dataset.scrollKey = `${key}:body`;
+  details.append(body);
   if (entry.timing?.length) details.append(element("p", "main-entry-timing", entry.timing.join(" · ")));
   return details;
 }
@@ -566,6 +851,7 @@ function mainConversationEntry(entry, openKeys, index) {
   const key = entry.key || `conversation:${index}`;
   const disclosure = keyedDetails("main-response-disclosure", key, openKeys);
   const summary = element("summary", "main-response-summary");
+  summary.dataset.focusKey = `${key}:summary`;
   summary.append(
     element("span", "main-response-preview", entry.preview),
     element("span", "main-response-expand", " [...]"),
@@ -622,9 +908,15 @@ function renderHistoryContext(segment, namespace, openKeys) {
   const content = element("div", "full-history-main");
   renderMainView(content, historyContext(segment));
   for (const details of content.querySelectorAll("details[data-main-key]")) {
+    const previousKey = details.dataset.mainKey;
     const key = `${namespace}:${details.dataset.mainKey}`;
     details.dataset.mainKey = key;
     details.open = openKeys.has(key);
+    const summary = details.querySelector(":scope > summary");
+    if (summary) summary.dataset.focusKey = `${key}:summary`;
+    for (const scroller of details.querySelectorAll(`[data-scroll-key^="${previousKey}:"]`)) {
+      scroller.dataset.scrollKey = `${namespace}:${scroller.dataset.scrollKey}`;
+    }
   }
   holder.append(content);
   return holder;
@@ -704,14 +996,24 @@ function renderMemoryTree(container, snapshot) {
   }
 }
 
-export function renderIngressActivity(container, diagnostic, active, failed = false, failures = []) {
+export function renderIngressActivity(
+  container,
+  diagnostic,
+  active,
+  failed = false,
+  failures = [],
+  { namespace = "history-ingress", sourceLabel = null } = {},
+) {
   const continuation = element("section", "ingress-continuation");
   continuation.setAttribute("aria-label", failed ? "Failed history ingress" : active ? "History ingress in progress" : "Completed history ingress");
   const heading = element("div", "ingress-heading");
   const headingText = element("div");
   headingText.append(
     element("span", "eyebrow", "MEMORY UPDATE"),
-    element("strong", "", failed ? "History ingress · failed" : active ? "History ingress · live" : "History ingress · complete"),
+    element("strong", "", [
+      sourceLabel,
+      failed ? "History ingress · failed" : active ? "History ingress · live" : "History ingress · complete",
+    ].filter(Boolean).join(" · ")),
   );
   heading.append(headingText);
   continuation.append(heading);
@@ -768,11 +1070,14 @@ export function renderIngressActivity(container, diagnostic, active, failed = fa
     container.append(continuation);
     return;
   }
-  for (const message of visible) {
+  for (const [messageIndex, message] of visible.entries()) {
     const presentation = ingressEntryPresentation(message);
     const item = element(presentation.collapsed ? "details" : "article", `ingress-entry${presentation.collapsed ? " ingress-entry-collapsible" : ""}`);
     if (presentation.collapsed) {
+      const key = `${namespace}:entry:${messageIndex}`;
+      item.dataset.viewKey = key;
       const summary = element("summary", "ingress-entry-summary");
+      summary.dataset.focusKey = `${key}:summary`;
       summary.append(element("span", "role", presentation.label), element("span", "ingress-entry-toggle"));
       item.append(summary);
     } else {
@@ -784,7 +1089,34 @@ export function renderIngressActivity(container, diagnostic, active, failed = fa
   container.append(continuation);
 }
 
-export function showError(banner, message) { banner.textContent = message; banner.classList.remove("hidden"); }
-export function clearError(banner) { banner.textContent = ""; banner.classList.add("hidden"); }
+export function showError(log, message) {
+  if (!log) return;
+  const previousTop = log.scrollTop;
+  const wasAtBottom = log.scrollHeight - log.clientHeight - log.scrollTop <= 1;
+  const text = String(message || "An unknown Kennedy error occurred.").trim();
+  const previous = log.lastElementChild;
+  if (previous?.dataset.message === text) {
+    const count = Number(previous.dataset.count || 1) + 1;
+    previous.dataset.count = String(count);
+    previous.querySelector(".user-log-message").textContent = `${text} · repeated ${count} times`;
+  } else {
+    const entry = element("article", "user-log-entry");
+    entry.dataset.message = text;
+    entry.dataset.count = "1";
+    entry.append(
+      element("time", "", new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(new Date())),
+      element("div", "user-log-message", text),
+    );
+    log.append(entry);
+  }
+  log.parentElement?.classList.remove("hidden");
+  log.scrollTop = wasAtBottom ? log.scrollHeight : previousTop;
+}
+
+export function clearError(log) {
+  if (!log) return;
+  log.replaceChildren();
+  log.parentElement?.classList.add("hidden");
+}
 
 export { element };

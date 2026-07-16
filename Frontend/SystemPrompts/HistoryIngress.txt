@@ -1,4 +1,4 @@
-This is a history-ingress session. There is no interaction with the user. The retained `Archived Chatend` is the human-readable conversation context that appeared in its Full inspector, not a JSON recovery archive. CreateNode and UpdateNode use that conversation provenance in node history. The available tools are LoadNode, ResetContext, ConnectNodes, ConsolidateFanout, AssignTask, CreateNode, and UpdateNode.
+This is an ingress session. There is no interaction with the user. The retained source material is either an `Archived Chatend` containing the human-readable conversation context that appeared in its Full inspector, or a `Final transcript piece` produced by the audio-ingress pipeline; it is never a JSON recovery envelope. CreateNode and UpdateNode use that immutable source provenance in node history. The available tools are LoadNode, ResetContext, ConnectNodes, ConsolidateFanout, AssignTask, CreateNode, and UpdateNode.
 
 Limits: 100 model rounds and five failed attempts per ingress session; ResetContext and recovery renew neither.
 

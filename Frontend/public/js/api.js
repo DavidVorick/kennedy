@@ -90,6 +90,21 @@ export const ConversationHistoryAPI = (base) => ({
   ingressFailure: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-failure`, { method: "POST", body: JSON.stringify(body) }),
 });
 
+export const AudioIngressAPI = (base) => ({
+  health: () => requestJSON(base, "/health"),
+  list: (limit = 100) => requestJSON(base, `/api/v1/audio-ingress?limit=${encodeURIComponent(limit)}`),
+  get: (id) => requestJSON(base, `/api/v1/audio-ingress/${id}`),
+  history: (id) => requestJSON(base, `/api/v1/audio-ingress/${id}/history`),
+  bySha256: (sha256) => requestJSON(base, `/api/v1/audio-ingress/by-sha256/${sha256}`),
+  nextIngress: () => requestJSON(base, "/api/v1/audio-ingress/ingress/next"),
+  getPiece: (id) => requestJSON(base, `/api/v1/audio-ingress/pieces/${id}`),
+  ingressStarted: (id, body) => requestJSON(base, `/api/v1/audio-ingress/pieces/${id}/ingress-started`, { method: "POST", body: JSON.stringify(body) }),
+  ingressCheckpoint: (id, body) => requestJSON(base, `/api/v1/audio-ingress/pieces/${id}/ingress-checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
+  ingressCompleted: (id, body) => requestJSON(base, `/api/v1/audio-ingress/pieces/${id}/ingress-completed`, { method: "POST", body: JSON.stringify(body) }),
+  ingressFailure: (id, body) => requestJSON(base, `/api/v1/audio-ingress/pieces/${id}/ingress-failure`, { method: "POST", body: JSON.stringify(body) }),
+  retryIngress: (id, body) => requestJSON(base, `/api/v1/audio-ingress/pieces/${id}/retry-ingress`, { method: "POST", body: JSON.stringify(body) }),
+});
+
 export const TelegramRelayAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   events: () => requestJSON(base, "/api/v1/events"),

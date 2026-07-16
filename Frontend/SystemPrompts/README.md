@@ -11,6 +11,8 @@ rebuild is needed.
   Kmap mechanics, and the exact tools available there.
 - `HistoryIngress.txt` describes the non-interactive ingress mode, its Kmap
   mechanics, and the exact mutation tools available there.
+- `AudioIngress.txt` adds timestamp, transcript-fallibility, and clarification
+  policy for audio ingress while reusing the history-ingress tool protocol.
 
 The identity is composed first, followed by the mode manual, then a dynamic
 runtime sentence identifying the configured model and thinking mode. Mode

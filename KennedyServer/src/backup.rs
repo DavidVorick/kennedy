@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const BACKUP_FORMAT_VERSION: u32 = 1;
+const BACKUP_FORMAT_VERSION: u32 = 2;
 const ARCHIVE_PREFIX: &str = "kennedy-backup";
 const BACKUP_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -40,6 +40,8 @@ pub(crate) struct BackupOptions {
     pub kmap_database: PathBuf,
     pub conversation_database: PathBuf,
     pub telegram_database: PathBuf,
+    pub audio_database: PathBuf,
+    pub audio_media_directory: PathBuf,
     pub vault: PathBuf,
 }
 
@@ -135,6 +137,12 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
     validate_database_source(&options.kmap_database, "Kmap")?;
     validate_database_source(&options.conversation_database, "conversation history")?;
     validate_database_source(&options.telegram_database, "Telegram relay")?;
+    validate_database_source(&options.audio_database, "audio ingress")?;
+    ensure!(
+        options.audio_media_directory.is_dir(),
+        "audio-ingress media directory {} does not exist or is not a directory; refusing to create an incomplete backup",
+        options.audio_media_directory.display()
+    );
     if options.vault.exists() {
         ensure!(
             options.vault.is_file(),
@@ -181,25 +189,39 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
         // These databases form one quiescent recovery point because the Kweb
         // address is held before this worker starts and a normal server binds
         // that address before opening any persistent state.
-        let mut files = Vec::new();
-        files.push(snapshot_database(
-            &options.telegram_database,
-            &data_directory.join("telegram.sqlite3"),
-            "data/telegram.sqlite3",
-            "Telegram relay database",
-        )?);
-        files.push(snapshot_database(
-            &options.conversation_database,
-            &data_directory.join("conversations.sqlite3"),
-            "data/conversations.sqlite3",
-            "conversation history database",
-        )?);
-        files.push(snapshot_database(
-            &options.kmap_database,
-            &data_directory.join("kmap.sqlite3"),
-            "data/kmap.sqlite3",
-            "Kmap database",
-        )?);
+        let mut files = vec![
+            snapshot_database(
+                &options.audio_database,
+                &data_directory.join("audio-ingress.sqlite3"),
+                "data/audio-ingress.sqlite3",
+                "audio-ingress database",
+            )?,
+            snapshot_database(
+                &options.telegram_database,
+                &data_directory.join("telegram.sqlite3"),
+                "data/telegram.sqlite3",
+                "Telegram relay database",
+            )?,
+            snapshot_database(
+                &options.conversation_database,
+                &data_directory.join("conversations.sqlite3"),
+                "data/conversations.sqlite3",
+                "conversation history database",
+            )?,
+            snapshot_database(
+                &options.kmap_database,
+                &data_directory.join("kmap.sqlite3"),
+                "data/kmap.sqlite3",
+                "Kmap database",
+            )?,
+        ];
+        copy_persistent_directory(
+            &options.audio_media_directory,
+            &data_directory.join("audio-ingress-media"),
+            "data/audio-ingress-media",
+            "durable audio-ingress media",
+            &mut files,
+        )?;
 
         if options.vault.exists() {
             let destination = data_directory.join("kennedy-secrets.age");
@@ -354,6 +376,60 @@ fn snapshot_database(
     Ok(file)
 }
 
+fn copy_persistent_directory(
+    source: &Path,
+    destination: &Path,
+    archive_prefix: &str,
+    role: &'static str,
+    files: &mut Vec<ManifestFile>,
+) -> anyhow::Result<()> {
+    fs::create_dir(destination)
+        .with_context(|| format!("creating backup media directory {}", destination.display()))?;
+    set_directory_private(destination)?;
+    let mut entries = fs::read_dir(source)
+        .with_context(|| format!("reading persistent directory {}", source.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let archive_path = format!("{}/{}", archive_prefix, entry.file_name().to_string_lossy());
+        let metadata = fs::symlink_metadata(&source_path)
+            .with_context(|| format!("inspecting {}", source_path.display()))?;
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "audio-ingress media {} is a symbolic link; refusing an ambiguous backup",
+            source_path.display()
+        );
+        if metadata.is_dir() {
+            copy_persistent_directory(&source_path, &destination_path, &archive_path, role, files)?;
+        } else {
+            ensure!(
+                metadata.is_file(),
+                "audio-ingress media {} is not a regular file",
+                source_path.display()
+            );
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copying persistent audio media {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+            set_file_private(&destination_path)?;
+            sync_file(&destination_path)?;
+            files.push(manifest_file(
+                &destination_path,
+                &archive_path,
+                &source_path,
+                role,
+                None,
+            )?);
+        }
+    }
+    Ok(())
+}
+
 fn verify_integrity(connection: &Connection, path: &Path) -> anyhow::Result<()> {
     let mut integrity = connection
         .prepare("PRAGMA integrity_check")
@@ -459,6 +535,7 @@ fn render_readme(manifest: &Manifest) -> String {
             file.path, file.role, file.source_path, file.size_bytes, file.sha256
         ));
     }
+    readme.push_str("- `data/audio-ingress-media/` contains private original vnote audio and any durable in-progress WAV chunks. Empty directories have no checksum entry in the manifest.\n");
     if !manifest
         .files
         .iter()
@@ -470,7 +547,7 @@ fn render_readme(manifest: &Manifest) -> String {
     readme.push_str(
         r#"
 
-All files are stored beneath one top-level archive directory. The three `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
+All files are stored beneath one top-level archive directory. The four `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
 
 ## Kmap data format
 
@@ -485,6 +562,12 @@ All files are stored beneath one top-level archive directory. The three `.sqlite
 ## Telegram-relay data format
 
 `data/telegram.sqlite3` stores paired identities in `authorized_users` and ordered durable Telegram work in `telegram_events`. Telegram, chat, update, and message identifiers are SQLite integers; Kennedy event and conversation identifiers are text. Event `kind` distinguishes text, voice, document, and reset work. Original voice/document bytes are stored in `voice_bytes`; `mime_type` and `file_name` describe that media. `status` is the pending/processing/complete queue state. Transcription, model, conversation binding, creation time, and completion time are retained alongside the event.
+
+## Audio-ingress data format
+
+`data/audio-ingress.sqlite3` tracks uploaded recordings by SHA-256, making renamed or recopied audio idempotent. `audio_recordings` owns the recording timestamp, original filename, provider-model attribution, durable processing stage, retry state, and final Sol transcript. `audio_chunks` preserves ordered four-minute-or-shorter WAV windows, their recording-relative offsets, and Gemini's structured transcript JSON. Neighboring chunks overlap by fifteen seconds. `audio_ingress_pieces` stores Sol-selected transcript pieces of no more than an estimated 50,000 tokens and their independent Kennedy ingress checkpoints, provenance identifiers, versions, and failure logs.
+
+Paths in the audio database are relative to `data/audio-ingress-media/` after restoration. `originals/` contains content-addressed uploaded WAV files. `chunks/{recording UUID}/` contains derived WAV windows needed by unfinished transcription jobs. Keep the complete directory during recovery.
 
 ## Credential-vault data format
 
@@ -523,8 +606,8 @@ The following DDL was read from each verified snapshot's `sqlite_schema`. It is 
 2. Recompute SHA-256 for every `data/` entry and compare it with `manifest.json`.
 3. Open each database with SQLite and run `PRAGMA integrity_check` and `PRAGMA foreign_key_check` before attempting a migration.
 4. Use the commit at the first line of this README as the primary behavioral reference. If that build was marked dirty or unavailable, use the exact schemas and JSON descriptions above to construct an explicit migration from copies of the files.
-5. Stop Kennedy. Place the three standalone databases and optional encrypted vault at the paths supplied to the target binary. Do not restore old `-wal` or `-shm` files.
-6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify both roots, several Kmap histories/connections, active and completed conversations, pending ingress, Telegram authorization/events, and vault unlock.
+5. Stop Kennedy. Place the four standalone databases, the complete audio-ingress media directory, and optional encrypted vault at the paths supplied to the target binary. Do not restore old `-wal` or `-shm` files.
+6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify both roots, several Kmap histories/connections, active and completed conversations, pending conversation/audio ingress, Telegram authorization/events, audio SHA lookups, and vault unlock.
 
 Tracked frontend assets, system prompts, source migrations, and external Codex/ChatGPT state are not duplicated here; the source commit identifies tracked assets, and the latter is not Kennedy-owned runtime persistence.
 "#,
@@ -668,12 +751,16 @@ mod tests {
     }
 
     fn options(directory: &TestDirectory) -> BackupOptions {
+        let audio_media_directory = directory.path().join("audio-media");
+        fs::create_dir(&audio_media_directory).unwrap();
         BackupOptions {
             bind: "127.0.0.1:4321".to_owned(),
             backup_dir: directory.path().join("backups"),
             kmap_database: directory.path().join("kmap.sqlite3"),
             conversation_database: directory.path().join("conversations.sqlite3"),
             telegram_database: directory.path().join("telegram.sqlite3"),
+            audio_database: directory.path().join("audio.sqlite3"),
+            audio_media_directory,
             vault: directory.path().join("secrets.age"),
         }
     }
@@ -685,6 +772,13 @@ mod tests {
         let kmap = database(&options.kmap_database, "memory in wal");
         let conversations = database(&options.conversation_database, "conversation in wal");
         let telegram = database(&options.telegram_database, "telegram in wal");
+        let audio = database(&options.audio_database, "audio queue in wal");
+        fs::create_dir(options.audio_media_directory.join("originals")).unwrap();
+        fs::write(
+            options.audio_media_directory.join("originals/vnote.wav"),
+            b"private audio",
+        )
+        .unwrap();
         fs::write(&options.vault, b"age-encrypted-test-vault").unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 7, 16, 12, 34, 56).unwrap();
 
@@ -706,9 +800,9 @@ mod tests {
 
         let manifest: Value =
             serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["backup_format_version"], 1);
+        assert_eq!(manifest["backup_format_version"], 2);
         assert_eq!(manifest["snapshot_mode"], "offline-port-guard");
-        assert_eq!(manifest["files"].as_array().unwrap().len(), 4);
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 6);
         for file in manifest["files"].as_array().unwrap() {
             let path = root.join(file["path"].as_str().unwrap());
             assert_eq!(sha256(&path).unwrap(), file["sha256"]);
@@ -719,6 +813,7 @@ mod tests {
             ("kmap.sqlite3", "memory in wal"),
             ("conversations.sqlite3", "conversation in wal"),
             ("telegram.sqlite3", "telegram in wal"),
+            ("audio-ingress.sqlite3", "audio queue in wal"),
         ] {
             let path = root.join("data").join(name);
             let snapshot = Connection::open(&path).unwrap();
@@ -733,8 +828,12 @@ mod tests {
             fs::read(root.join("data/kennedy-secrets.age")).unwrap(),
             b"age-encrypted-test-vault"
         );
+        assert_eq!(
+            fs::read(root.join("data/audio-ingress-media/originals/vnote.wav")).unwrap(),
+            b"private audio"
+        );
 
-        drop((kmap, conversations, telegram));
+        drop((kmap, conversations, telegram, audio));
     }
 
     #[test]
@@ -753,6 +852,7 @@ mod tests {
         drop(database(&options.kmap_database, "kmap"));
         drop(database(&options.conversation_database, "conversations"));
         drop(database(&options.telegram_database, "telegram"));
+        drop(database(&options.audio_database, "audio"));
         let created_at = Utc.with_ymd_and_hms(2026, 7, 16, 12, 34, 56).unwrap();
         fs::create_dir(&options.backup_dir).unwrap();
         let existing = options

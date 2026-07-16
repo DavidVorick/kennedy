@@ -1,7 +1,7 @@
 # Kennedy MVP
 
 Kennedy is a local-first personal assistant with inspectable, provenance-backed
-long-term memory. The MVP has four logically independent backend APIs and a
+long-term memory. The MVP has five logically independent backend APIs and a
 browser-native frontend:
 
 - `kennedy-kweb` owns SQLite, memory/history invariants, and serves the UI.
@@ -12,11 +12,13 @@ browser-native frontend:
   multiple live conversations and a serialized history-ingress queue.
 - `kennedy-telegram-relay` uses `teloxide` to queue authorized Telegram text,
   voice, document, and reset events while the browser remains the visible Chatend owner.
+- `kennedy-audio-ingress` durably owns content-addressed vnotes, restartable
+  Gemini/Sol transcript preparation, and timestamped Kennedy-ingress pieces.
 - `Frontend/public` owns live conversations, context, tool execution, durable
   recovery orchestration, conversation-history browsing, and automatic
   background history ingress.
 
-All four backends are separate library crates with separate listeners, state,
+All five backends are separate library crates with separate listeners, state,
 and databases. One `kennedy-server` binary hosts them without allowing the
 backends to call or access one another.
 
@@ -97,7 +99,9 @@ cargo run -p kennedy-server -- secrets set openai-api-key
 ```
 
 The low-latency `fast` WebSearch tier uses Gemini 3.1 Flash-Lite with Google
-Search grounding. Store its API key under the compiled secret name:
+Search grounding. Durable vnote ingress uses Gemini 3.1 Pro Preview for its
+ordered four-minute transcription chunks. Store the shared Gemini API key
+under the compiled secret name:
 
 ```sh
 cargo run -p kennedy-server -- secrets set gemini-api-key
@@ -128,14 +132,56 @@ cargo run -p kennedy-server
 
 When the encrypted vault exists, startup prompts once for its passphrase and
 keeps the unlocked values only inside `kennedy-server`. Copy
-`kennedy-secrets.age` alongside the three SQLite databases to migrate the same
-credentials to another machine; the same vault passphrase unlocks them there.
+`kennedy-secrets.age` alongside the four SQLite databases and audio-ingress
+media directory to migrate the same credentials to another machine; the same
+vault passphrase unlocks them there.
 
 Open `http://127.0.0.1:4321`. The Kweb and conversation databases are created
-as `kennedy.sqlite3`, `kennedy-conversations.sqlite3`, and
-`kennedy-telegram.sqlite3` on first run. The four APIs bind to loopback ports
-4321 through 4324. Without a Telegram token, port 4324 reports the relay as
-disabled and the rest of Kennedy remains usable.
+as `kennedy.sqlite3`, `kennedy-conversations.sqlite3`,
+`kennedy-telegram.sqlite3`, and `kennedy-audio.sqlite3` on first run. Original
+vnotes and restartable working chunks live under `kennedy-audio-ingress/`. The
+five APIs bind to loopback ports 4321 through 4325. Without a Telegram token,
+port 4324 reports the relay as disabled and the rest of Kennedy remains usable.
+
+## Durable vnote ingress
+
+[`scripts/vnote-start`](scripts/vnote-start) and
+[`scripts/vnote-stop`](scripts/vnote-stop) are non-interactive scripts intended
+for i3 hotkeys. Start records directly into `/home/user/media/vnotes`, using the
+recording-start Unix timestamp in the filename. Stop ends `arecord`, examines
+the five newest vnotes, asks Kennedy which SHA-256 hashes she already has, and
+uploads only the missing files. The local WAV files are never deleted.
+
+For example, use absolute paths in i3:
+
+```text
+bindsym $mod+Shift+v exec --no-startup-id /path/to/kennedy/scripts/vnote-start
+bindsym $mod+Shift+b exec --no-startup-id /path/to/kennedy/scripts/vnote-stop
+```
+
+The two paths are plain variables at the top of the scripts if this fixed
+loopback setup changes later. The stop hotkey waits only for each upload HTTP
+response; it never waits for transcription, reconciliation, or Kmap ingress.
+
+After acceptance, the server hashes and stores the original WAV, creates equal
+four-minute-or-shorter windows with fifteen seconds of neighboring overlap,
+and transcribes those windows in strict chronological order with
+`gemini-3.1-pro-preview`. `gpt-5.6-sol` with `xhigh` reasoning reconciles
+speakers, removes repeated overlap, preserves annotations and translations,
+and produces the canonical final transcript. If needed, Sol inserts sensible
+boundaries so each Kennedy ingress piece remains at or below an estimated
+50,000 tokens. Every piece repeats the recording timestamp and shares the
+recording SHA-256 identity. Processing stages, transcripts, retries, and
+Kennedy ingress checkpoints are SQLite-backed and resume after server or
+browser restarts. Kmap mutation runs when Kennedy's browser worker is open and
+remains serialized with ordinary conversation-history ingress.
+
+Recordings are idempotent by content hash. Check one with
+`GET /api/v1/audio-ingress/by-sha256/{sha256}` or inspect the entire durable
+processing history in the UI's **Audio Ingress** tab. Selecting a recording
+shows its metadata, Gemini chunk transcripts, reconciled final transcript,
+Kennedy-sized pieces, retry records, and the saved Kennedy Chatend for each
+piece.
 
 ## Backups
 
@@ -153,16 +199,18 @@ instance from modifying persistent state during a backup.
 
 The result is a private
 `backups/kennedy-backup-YYYY-MM-DDTHH-MM-SSZ.tar.gz` archive containing
-verified standalone snapshots of all three SQLite databases, the encrypted
-credential vault when present, a machine-readable checksum manifest, and a
-self-contained recovery README. The README begins with the creating source
-commit and includes the exact SQLite DDL and current persisted JSON/vault
-formats. Gzip does not encrypt the databases; move the archive to appropriately
-protected off-machine storage.
+verified standalone snapshots of all four SQLite databases, the complete
+audio-ingress media directory, the encrypted credential vault when present, a
+machine-readable checksum manifest, and a self-contained recovery README. The
+README begins with the creating source commit and includes the exact SQLite DDL
+and current persisted JSON/vault/audio formats. Gzip does not encrypt the
+databases or recordings; move the archive to appropriately protected
+off-machine storage.
 
 Use `--backup-dir PATH` to select another destination. The existing global
 `--kweb-bind`, `--kweb-database`, `--conversation-history-database`,
-`--telegram-database`, and `--vault-path` flags select the lock address and
+`--telegram-database`, `--audio-ingress-database`,
+`--audio-ingress-media`, and `--vault-path` flags select the lock address and
 source files when their deployment values differ from the defaults.
 
 For a quick estimate of the current Kmap's model-context footprint, run:
@@ -192,6 +240,8 @@ Kennedy's live system prompts are deliberately plain-text files in
 - `ConversationManual.txt` — exact live-mode, read-only Kmap, and tool
   mechanics.
 - `HistoryIngress.txt` — exact ingress-mode and Kmap mutation mechanics.
+- `AudioIngress.txt` — timestamp-aware and uncertainty-aware vnote policy layered
+  onto the ingress mechanics.
 
 Kennedy's strategy for using her harness is intentionally learned and stored in
 her own Kmap graph rather than embedded in the mode manuals. Every session

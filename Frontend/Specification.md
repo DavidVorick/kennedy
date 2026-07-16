@@ -20,6 +20,7 @@ Frontend/
     KennedyIdentity.txt
     ConversationManual.txt
     HistoryIngress.txt
+    AudioIngress.txt
   public/
     index.html
     css/
@@ -50,6 +51,7 @@ The frontend defaults to:
 - Intelligence API: `http://127.0.0.1:4322`
 - Conversation history API: `http://127.0.0.1:4323`
 - Telegram relay API: `http://127.0.0.1:4324`
+- Audio ingress API: `http://127.0.0.1:4325`
 
 The values are defined once in `app.js` so alternate local ports do not require
 changes throughout the codebase.
@@ -537,12 +539,15 @@ chatend visualization.
 
 ### 9.1 Start
 
-1. Fetch all system-prompt manuals.
-2. Check all four backend health endpoints.
-3. Fetch `GET /api/v1/providers` from the intelligence backend.
+Startup is feature-isolated rather than one all-or-nothing transaction.
+
+1. Check Kweb and load the two root identifiers. If it succeeds, initialize the
+   memory explorer and fetch every system-prompt manual independently.
+2. Check conversation history and load its sidebar records independently.
+3. Check audio ingress and load its recording history independently.
+4. Check intelligence and fetch `GET /api/v1/providers`.
    Retain the selected provider's configured reasoning effort alongside its
    model.
-4. Fetch `GET /api/v1/user`.
 5. Ask the conversation-history backend to permanently discard every record
    that has never received a user message, then fetch
    `GET /api/v1/conversations` for the sidebar. This resets abandoned “New
@@ -556,8 +561,13 @@ chatend visualization.
 8. Start the sequential history-ingress worker for the queue without blocking
    any active conversation.
 
-If the intelligence backend is unavailable, chat is disabled but the memory
-explorer remains usable.
+Each feature starts when only its own dependencies are ready. A missing
+conversation prompt disables live conversation and Telegram sessions but not
+memory or audio history. A missing common ingress prompt pauses both mutation
+queues without disabling read-only history. A missing `AudioIngress.txt` pauses
+only audio-to-Kmap mutation: ordinary conversation ingress, audio preparation,
+and the complete audio history UI continue. Failure of one ingress queue's
+poll does not prevent the other queue from being checked.
 
 ### 9.2 User Turn
 
@@ -663,8 +673,29 @@ CreateNode or UpdateNode calls is valid.
 
 Provider, checkpoint, provenance, and completion errors count toward the same
 five-attempt outer-session failure allowance. Each retry restores the last
-durable ingress archive; reaching the fifth failure aborts instead of scheduling
-the record again.
+durable ingress archive. Conversation retries are scheduled by the browser
+worker; audio retries additionally use the recording's durable next-attempt
+timestamp so a transient outage cannot consume all five attempts in a few
+minutes.
+
+### 10.1 Audio-ingress pieces
+
+The same browser Web Lock polls both conversation and audio queues. A claimed
+item from either queue completes before the next Kmap-mutating item starts. An
+in-progress item has priority; otherwise the oldest source time wins, and audio
+pieces with the same source time remain ordered by their persisted piece index.
+
+For audio, the frontend creates `audio-vnote` provenance with the recording's
+SHA-256/piece idempotency key and recording-start `source_created_at`. The
+retained content is the Sol-produced final transcript piece, not Gemini JSON or
+audio bytes. Its heading repeats recording time, hash, filename, and piece
+position. Prompt composition adds `AudioIngress.txt` after the common mutation
+manual and explicitly tells Kennedy that `Created` is historical recording
+time. The audio backend stores the same complete ingress Chatend checkpoints,
+versions, and five-consecutive-attempt failure history as conversation ingress.
+Failed attempts become eligible again after one, five, fifteen, and sixty
+minutes. It marks the recording complete only after every chronological piece
+completes.
 
 ## 11. User Interface
 
@@ -768,7 +799,28 @@ from provider usage rather than client-side token estimates; before the first
 provider response occupancy is explicitly unmeasured while the advertised
 effective limit remains visible.
 
-### 11.3 Memory Explorer
+### 11.3 Audio Ingress History
+
+`Audio Ingress` is a top-level tab with no composer. Its sidebar lists all
+durable audio recordings in newest-received order, showing filename,
+recording-start date, and current processing or ingress status. Selecting a
+recording loads one complete history response containing its metadata, ordered
+Gemini chunk transcripts, Sol-produced final transcript, Kennedy transcript
+pieces, durable retry failures, and each piece's checkpointed ingress archive.
+
+The center panel uses disclosure rows for the potentially large final
+transcript, chunk JSON, and transcript-piece text. All are closed by default,
+including the full Sol transcript. Below the transcript pieces, each Kennedy
+piece renders the same inline history-ingress continuation used by conversation
+and Telegram records: status, retry failures, mutation summary, usage, Kennedy
+messages, and collapsible tool traffic. The right inspector also treats each
+piece as an ordered Full History phase, retaining the piece's current Chatend
+and all pre-reset segments. Preparation records remain visible before Kennedy
+ingress begins, and terminal failures remain inspectable. A failed piece has a
+retry action that preserves its old diagnostics, resets its
+consecutive-failure allowance, and returns it to the durable queue.
+
+### 11.4 Memory Explorer
 
 The explorer starts at the user root and provides persistent toolbar actions
 for jumping directly to either the user root or Kennedy root. It also supports:
@@ -789,19 +841,28 @@ The explorer does not edit durable data.
 - Keep the composer editable while generation, a tool loop, or a pending
   restored query is active so the user can draft their next message. Keep Send
   disabled until Kennedy has responded and the current turn is complete.
-- Preserve transcript scroll position across rerenders unless the reader was
-  already at the bottom; only bottom-following readers track new content.
+- Preserve scroll position, disclosure state, and focused controls across
+  background rerenders of the center pane, history sidebar, activity log, and
+  inspector while they still show the same record and view. Never replace a
+  cached audio record with an intermediate loading screen during refresh.
+  Only a reader already at the exact bottom follows newly appended content to
+  the new bottom. Explicit user navigation to another record or inspector mode
+  may establish a new view position.
 - Keep a per-live-conversation draft while switching sessions, and show a clear
   `Live · Continue` versus closed/read-only status in the sidebar.
 - Preserve the diagnostic record of failed calls.
-- Display backend error messages without exposing stack traces.
+- Display backend error messages without exposing stack traces. Append
+  user-visible operational errors to a timestamped, deduplicated activity log
+  below the history sidebar; never insert an unrelated operational error into
+  the selected conversation. The user explicitly clears this log.
 - Use semantic controls and visible keyboard focus.
 - Support `Ctrl+Enter` and `Cmd+Enter` for message submission.
 - Use no remote scripts, fonts, stylesheets, or other CDN assets.
 
 ## 13. Telegram Sessions, Audio, and Documents
 
-The top navigation exposes `TG Bot` beside Conversation and Memory. It reuses
+The top navigation exposes `TG Bot` and `Audio Ingress` beside Conversation and
+Memory. The Telegram view reuses
 the conversation transcript and Chatend inspector but filters the sidebar to
 Telegram records and has no message composer: Telegram itself is the input
 surface. Each Telegram user maps to a separate `sessionType: telegram`

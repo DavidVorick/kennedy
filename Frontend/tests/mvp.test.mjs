@@ -6,12 +6,12 @@ import { Chatend } from "../public/js/chatend.js";
 import { MAX_RESET_SELF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
-import { conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries } from "../public/js/render.js";
+import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
-import { ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
+import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
 import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 
@@ -716,6 +716,11 @@ test("conversation history titles use the first durable user message", () => {
   assert.equal(conversationTitle({ state: { transcript: [] } }), "New conversation");
 });
 
+test("audio history titles use the durable original filename", () => {
+  assert.equal(audioRecordingTitle({ original_filename: "2026-07-16-vnote.wav" }), "2026-07-16-vnote.wav");
+  assert.equal(audioRecordingTitle({ original_filename: "x".repeat(80) }, 20), `${"x".repeat(19)}…`);
+});
+
 test("conversation sidebar distinguishes continuable and closed records", async () => {
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
   assert.match(render, /active: "Live · Continue"/);
@@ -826,6 +831,36 @@ test("history ingress worker records five failures before abandoning a poisoned 
   assert.match(app, /conversationHistory\.ingressFailure/);
   assert.match(app, /failedRecord\.phase === "ingress_failed"/);
   assert.match(app, /History ingress stopped after \$\{failedRecord\.ingress_failure_count\} failed attempts/);
+});
+
+test("audio ingress client can explicitly requeue a terminal piece", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ phase: "ingress_pending", ingress_failure_count: 0 }),
+    };
+  };
+  try {
+    await AudioIngressAPI("http://audio").retryIngress("piece", { expected_version: 8 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(request.url, "http://audio/api/v1/audio-ingress/pieces/piece/retry-ingress");
+  assert.equal(request.options.method, "POST");
+  assert.match(request.options.body, /"expected_version":8/);
+});
+
+test("audio ingress UI exposes terminal retry and durable retry scheduling", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
+  assert.match(app, /audioIngress\.retryIngress\(piece\.id/);
+  assert.match(app, /kickHistoryIngress\(\)/);
+  assert.match(render, /piece\.phase === "ingress_failed"/);
+  assert.match(render, /Retry Kennedy ingress/);
 });
 
 test("history ingress summary counts only successful memory mutations", () => {
@@ -1094,6 +1129,10 @@ test("system prompt composition uses readable sections rather than markup wrappe
   assert.equal(prompt, "Kennedy's identity\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.\n\nCurrent session\n\nThis is a conversation session in Kennedy's browser UI.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
   assert.match(composePrompt({ shared: "Shared.", conversation: "Conversation." }, "conversation", { sessionType: "telegram" }), /This is a telegram session/);
   assert.match(composePrompt({ shared: "Shared.", ingress: "Ingress." }, "ingress", { sourceSessionType: "telegram" }), /ingressing an archived telegram session/);
+  const audio = composePrompt({ shared: "Shared.", ingress: "Ingress mechanics.", audioIngress: "Audio timestamp policy." }, "ingress", { sourceSessionType: "audio" });
+  assert.match(audio, /Audio-ingress session instructions/);
+  assert.match(audio, /Ingress mechanics/);
+  assert.match(audio, /Audio timestamp policy/);
   assert.equal(formatModelAttribution("gpt-5.6-sol", "xhigh"), "gpt-5.6-sol-xhigh");
   assert.equal(prompt.includes("<kennedy_"), false);
 });
@@ -1115,16 +1154,38 @@ test("system prompt loader requests the identity and mode manuals", async () => 
     requested.push(path);
     return { ok: true, text: async () => path };
   };
+  let loaded;
   try {
-    await loadPromptManuals("/base");
+    loaded = await loadPromptManuals("/base");
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(requested.sort(), [
+    "/base/system-prompts/AudioIngress.txt",
     "/base/system-prompts/ConversationManual.txt",
     "/base/system-prompts/HistoryIngress.txt",
     "/base/system-prompts/KennedyIdentity.txt",
   ]);
+  assert.equal(loaded.errors.audioIngress, undefined);
+  assert.equal(loaded.manuals.audioIngress, "/base/system-prompts/AudioIngress.txt");
+});
+
+test("a missing audio prompt disables only audio memory ingress", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async path => ({
+    ok: !String(path).endsWith("/AudioIngress.txt"),
+    text: async () => `Loaded ${path}`,
+  });
+  let loaded;
+  try {
+    loaded = await loadPromptManuals("/base");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.match(loaded.errors.audioIngress, /Could not load system prompt AudioIngress\.txt/);
+  assert.match(loaded.manuals.identity, /KennedyIdentity\.txt/);
+  assert.match(loaded.manuals.conversation, /ConversationManual\.txt/);
+  assert.match(loaded.manuals.ingress, /HistoryIngress\.txt/);
 });
 
 test("session manuals enforce exclusive tool-request responses", async () => {
@@ -1157,18 +1218,25 @@ test("mode manuals expose technical contracts without embedding Kmap strategy", 
   }
 });
 
-test("transcript rerenders follow only readers already at the bottom", async () => {
+test("background rerenders preserve the current view and follow only readers already at the bottom", async () => {
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
-  assert.match(render, /wasAtBottom = container\.scrollHeight - container\.clientHeight - container\.scrollTop <= 1/);
-  assert.match(render, /container\.scrollTop = wasAtBottom \? container\.scrollHeight : previousTop/);
+  assert.match(render, /sameView = container\.dataset\.renderKey === viewKey/);
+  assert.match(render, /wasAtBottom: container\.scrollHeight - container\.clientHeight - container\.scrollTop <= 1/);
+  assert.match(render, /details\[open\]\[data-view-key\]/);
+  assert.match(render, /details\.open = state\.openKeys\.has\(details\.dataset\.viewKey\)/);
+  assert.match(render, /nestedScroll: sameView/);
+  assert.match(render, /node\.scrollTop = saved\.wasAtBottom \? node\.scrollHeight : saved\.top/);
+  assert.match(render, /container\.scrollTop = state\.wasAtBottom \? container\.scrollHeight : state\.previousTop/);
+  assert.match(render, /focus\?\.\(\{ preventScroll: true \}\)/);
+  assert.match(render, /log\.scrollTop = wasAtBottom \? log\.scrollHeight : previousTop/);
 });
 
 test("history ingress is an inline continuation with no independent scroller", async () => {
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/css/styles.css", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  assert.match(render, /renderTranscript\(container, transcript, ingressActivity = null\)/);
-  assert.match(render, /renderIngressActivity\(container, ingressActivity\.diagnostic, ingressActivity\.active, ingressActivity\.failed, ingressActivity\.failures\)[\s\S]*?container\.scrollTop = wasAtBottom \? container\.scrollHeight : previousTop/);
+  assert.match(render, /renderTranscript\(container, transcript, ingressActivity = null, viewKey = "transcript"\)/);
+  assert.match(render, /renderIngressActivity\([\s\S]*?ingressActivity\.diagnostic,[\s\S]*?\{ namespace: `\$\{viewKey\}:history-ingress` \},[\s\S]*?restoreViewState\(container, viewKey, viewState\)/);
   assert.match(styles, /\.ingress-continuation\s*\{/);
   assert.equal(styles.includes(".ingress-panel"), false);
   assert.equal(styles.includes(".ingress-log"), false);
@@ -1309,12 +1377,36 @@ test("production frontend never uses HTML string insertion", async () => {
   }
 });
 
+test("user-visible errors are logged below history instead of inside the chat panel", async () => {
+  const [html, render] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
+  ]);
+  const historyPanel = html.match(/<aside class="panel history-panel"[\s\S]*?<\/aside>/)?.[0];
+  const conversationPanel = html.match(/<section class="panel conversation-panel"[\s\S]*?<\/section>/)?.[0];
+  assert.ok(historyPanel);
+  assert.ok(conversationPanel);
+  assert.match(historyPanel, /id="conversation-history"[\s\S]*id="user-log-section"[\s\S]*id="error-banner"/);
+  assert.doesNotMatch(conversationPanel, /id="error-banner"/);
+  assert.match(render, /log\.append\(entry\)/);
+  assert.match(render, /previous\?\.dataset\.message === text/);
+});
+
+test("frontend initialization and ingress queues degrade by feature", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.doesNotMatch(app, /Promise\.all\(\[kweb\.health\(\), kweb\.user\(\), loadPromptManuals/);
+  assert.match(app, /audioIngressReady && audioPromptsReady\(\)/);
+  assert.match(app, /conversationHistory\.nextIngress\(\)\.catch/);
+  assert.match(app, /audioIngress\.nextIngress\(\)\.catch/);
+  assert.match(app, /Audio preparation and history remain available, but audio memory ingress is paused/);
+});
+
 test("frontend defaults to main with full and full-history inspectors and retains both Kmap root controls", async () => {
   const [html, app] = await Promise.all([
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
   ]);
-  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "tg-tab", "voice-button"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "user-log-section", "clear-log", "tg-tab", "audio-tab", "voice-button"]) assert.match(html, new RegExp(`id="${id}"`));
   for (const id of ["inspector-system", "inspector-tools", "inspector-memory"]) assert.doesNotMatch(html, new RegExp(`id="${id}"`));
   assert.match(app, /const INSPECTOR_MODES = \["main", "full", "history"\]/);
   assert.match(app, /let inspectorMode = "main"/);
@@ -1322,9 +1414,28 @@ test("frontend defaults to main with full and full-history inspectors and retain
   assert.match(app, /mode: "history ingress"/);
   assert.match(app, /new MemoryExplorer\(\{ api: kweb, rootNodeIds,/);
   assert.match(app, /memory_kennedy_home\.addEventListener\("click", \(\) => explorer\?\.kennedyHome\(\)\)/);
-  assert.ok(app.indexOf("await conversationHistory.discardUnstarted()") < app.indexOf("historyRecords = (await conversationHistory.list())"));
+  const initialize = app.match(/async function initialize\(\) \{[\s\S]*?\n\}\n\nui\.message_form/)?.[0];
+  assert.ok(initialize);
+  assert.ok(initialize.indexOf("await conversationHistory.discardUnstarted()") < initialize.indexOf("conversationHistory.list()"));
+  assert.match(app, /renderAudioHistory\(ui\.conversation_history, audioRecords/);
+  assert.match(app, /const detail = selectedAudioDetail\(\)/);
+  assert.match(app, /renderAudioRecording\(ui\.transcript, detail/);
   assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
+});
+
+test("audio recording view starts large artifacts collapsed and includes inline history ingress", async () => {
+  const [render, app] = await Promise.all([
+    readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(render, /audioDisclosure\(\s*"Final reconciled transcript",\s*finalTranscript,\s*`\$\{viewKey\}:final-transcript`,\s*\)/s);
+  assert.doesNotMatch(render, /"Final reconciled transcript",\s*finalTranscript,\s*[^,]+,\s*true/s);
+  assert.match(render, /`History ingress \(\$\{detail\.pieces\?\.length \|\| 0\}\)`/);
+  assert.match(render, /sourceLabel: `Transcript piece \$\{piece\.piece_index \+ 1\}\/\$\{piece\.piece_count\}`/);
+  assert.match(render, /renderIngressActivity\(\s*ingress,/s);
+  assert.match(app, /ingressActivities: audioIngressActivities\(detail\)/);
+  assert.match(app, /loading: audioDetailLoading\.has\(selectedAudioId\) && !detail/);
 });
 
 test("telegram voice sessions archive media, correlate delivery, and emit context notices outside the Chatend", async () => {
@@ -1356,7 +1467,7 @@ test("telegram voice sessions archive media, correlate delivery, and emit contex
   assert.equal(checkpoints.at(-1).pendingExternalEventId, null);
 });
 
-test("audio, document, and Telegram API clients use multipart and durable relay endpoints", async () => {
+test("audio, document, durable vnote, and Telegram API clients use their queue endpoints", async () => {
   const originalFetch = globalThis.fetch;
   const requests = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -1371,6 +1482,9 @@ test("audio, document, and Telegram API clients use multipart and durable relay 
     await IntelligenceAPI("http://intelligence").transcribe({ provider: "p", model: "m", file: new Blob(["audio"], { type: "audio/ogg" }), fileName: "note.ogg" });
     await IntelligenceAPI("http://intelligence").extractDocument({ file: new Blob(["report"], { type: "application/pdf" }), fileName: "report.pdf" });
     await IntelligenceAPI("http://intelligence").recordTiming({ action: "tool", name: "LoadNode", status: "ok", sessionType: "conversation", durationMs: 12 });
+    await AudioIngressAPI("http://audio").nextIngress();
+    await AudioIngressAPI("http://audio").history("recording");
+    await AudioIngressAPI("http://audio").ingressCheckpoint("piece", { expected_version: 2, state: { historyIngress: {} } });
     await TelegramRelayAPI("http://telegram").bind("event", "019f5ca7-020f-7b63-be2f-82785fb68c03");
   } finally {
     globalThis.fetch = originalFetch;
@@ -1382,6 +1496,10 @@ test("audio, document, and Telegram API clients use multipart and durable relay 
   assert.equal(requests[1].options.body instanceof FormData, true);
   assert.equal(requests[2].url, "http://intelligence/api/v1/timings");
   assert.match(requests[2].options.body, /"durationMs":12/);
-  assert.equal(requests[3].url, "http://telegram/api/v1/events/event/bind");
-  assert.match(requests[3].options.body, /conversationId/);
+  assert.equal(requests[3].url, "http://audio/api/v1/audio-ingress/ingress/next");
+  assert.equal(requests[4].url, "http://audio/api/v1/audio-ingress/recording/history");
+  assert.equal(requests[5].url, "http://audio/api/v1/audio-ingress/pieces/piece/ingress-checkpoint");
+  assert.match(requests[5].options.body, /historyIngress/);
+  assert.equal(requests[6].url, "http://telegram/api/v1/events/event/bind");
+  assert.match(requests[6].options.body, /conversationId/);
 });

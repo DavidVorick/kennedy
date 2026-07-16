@@ -29,6 +29,8 @@ struct Args {
     conversation_history_bind: String,
     #[arg(long, default_value = "127.0.0.1:4324")]
     telegram_bind: String,
+    #[arg(long, default_value = "127.0.0.1:4325")]
+    audio_ingress_bind: String,
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     frontend_origin: String,
     #[arg(long, global = true, default_value = "./kennedy.sqlite3")]
@@ -37,6 +39,10 @@ struct Args {
     conversation_history_database: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-telegram.sqlite3")]
     telegram_database: PathBuf,
+    #[arg(long, global = true, default_value = "./kennedy-audio.sqlite3")]
+    audio_ingress_database: PathBuf,
+    #[arg(long, global = true, default_value = "./kennedy-audio-ingress")]
+    audio_ingress_media: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
     frontend_dir: PathBuf,
     #[arg(long, default_value = "./Frontend/SystemPrompts")]
@@ -49,6 +55,8 @@ struct Args {
     telegram_bootstrap_username: String,
     #[arg(long, default_value_t = 20 * 1024 * 1024)]
     telegram_max_voice_bytes: usize,
+    #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
+    audio_ingress_max_upload_bytes: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -113,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
                 kmap_database: args.kweb_database,
                 conversation_database: args.conversation_history_database,
                 telegram_database: args.telegram_database,
+                audio_database: args.audio_ingress_database,
+                audio_media_directory: args.audio_ingress_media,
                 vault: vault_path,
             })
             .await?;
@@ -144,8 +154,11 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     };
     let transcription_api_key =
         resolve_optional_secret(&vault, OPENAI_API_KEY_SECRET, "OpenAI transcription")?;
-    let gemini_api_key =
-        resolve_optional_secret(&vault, GEMINI_API_KEY_SECRET, "Gemini web search")?;
+    let gemini_api_key = resolve_optional_secret(
+        &vault,
+        GEMINI_API_KEY_SECRET,
+        "Gemini search and audio transcription",
+    )?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?;
     let kweb = kennedy_kweb::Config {
@@ -169,16 +182,25 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let telegram = kennedy_telegram_relay::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
-        allowed_origins: vec![args.frontend_origin],
+        allowed_origins: vec![args.frontend_origin.clone()],
         bot_token: telegram_bot_token,
         bootstrap_usernames: vec![args.telegram_bootstrap_username],
         max_voice_bytes: args.telegram_max_voice_bytes,
+    };
+    let audio_ingress = kennedy_audio_ingress::Config {
+        bind: args.audio_ingress_bind,
+        database: args.audio_ingress_database,
+        media_directory: args.audio_ingress_media,
+        allowed_origins: vec![args.frontend_origin],
+        max_upload_bytes: args.audio_ingress_max_upload_bytes,
+        gemini_api_key: gemini_api_key.clone(),
     };
     tokio::try_join!(
         kennedy_kweb::serve_with_listener(kweb, kweb_listener),
         kennedy_intelligence::serve(intelligence, transcription_api_key, gemini_api_key),
         kennedy_conversation_history::serve(history),
         kennedy_telegram_relay::serve(telegram),
+        kennedy_audio_ingress::serve(audio_ingress),
     )?;
     Ok(())
 }
@@ -335,6 +357,8 @@ mod tests {
         let kmap = directory.join("kmap.sqlite3");
         let conversations = directory.join("conversations.sqlite3");
         let telegram = directory.join("telegram.sqlite3");
+        let audio = directory.join("audio.sqlite3");
+        let audio_media = directory.join("audio-media");
         let args = Args {
             vault_path: vault.clone(),
             command: None,
@@ -342,16 +366,20 @@ mod tests {
             intelligence_bind: "127.0.0.1:0".to_owned(),
             conversation_history_bind: "127.0.0.1:0".to_owned(),
             telegram_bind: "127.0.0.1:0".to_owned(),
+            audio_ingress_bind: "127.0.0.1:0".to_owned(),
             frontend_origin: "http://127.0.0.1:4321".to_owned(),
             kweb_database: kmap.clone(),
             conversation_history_database: conversations.clone(),
             telegram_database: telegram.clone(),
+            audio_ingress_database: audio.clone(),
+            audio_ingress_media: audio_media.clone(),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
             active_limit: 12,
             fanout_limit: 60,
             telegram_bootstrap_username: "@test".to_owned(),
             telegram_max_voice_bytes: 1024,
+            audio_ingress_max_upload_bytes: 1024,
         };
 
         let error = run_server(args, vault.clone()).await.unwrap_err();
@@ -360,6 +388,8 @@ mod tests {
         assert!(!kmap.exists());
         assert!(!conversations.exists());
         assert!(!telegram.exists());
+        assert!(!audio.exists());
+        assert!(!audio_media.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
