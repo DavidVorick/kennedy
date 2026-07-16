@@ -246,6 +246,19 @@ function audioDisclosure(label, content, key, open = false) {
   return disclosure;
 }
 
+function audioRetryButton(piece, retryingPieceIds, onRetryPiece, viewKey) {
+  const retry = element(
+    "button",
+    "secondary audio-retry-button",
+    retryingPieceIds.has(piece.id) ? "Scheduling retry…" : "Retry Kennedy ingress",
+  );
+  retry.type = "button";
+  retry.dataset.focusKey = `${viewKey}:piece:${piece.id}:retry`;
+  retry.disabled = retryingPieceIds.has(piece.id);
+  retry.addEventListener("click", () => onRetryPiece(piece));
+  return retry;
+}
+
 export function renderAudioRecording(container, detail, {
   loading = false,
   error = null,
@@ -291,6 +304,29 @@ export function renderAudioRecording(container, detail, {
   );
   container.append(header, metadata);
   if (record.last_error) container.append(element("pre", "audio-error", record.last_error));
+
+  const failedPieces = (detail.pieces || []).filter(piece => piece.phase === "ingress_failed");
+  if (failedPieces.length) {
+    const retryPanel = element("section", "audio-retry-panel");
+    retryPanel.setAttribute("aria-label", "Failed Kennedy audio ingress");
+    retryPanel.append(
+      element("span", "eyebrow", "ACTION REQUIRED"),
+      element("h3", "", failedPieces.length === 1
+        ? "Kennedy memory ingress failed"
+        : `${failedPieces.length} Kennedy memory ingress pieces failed`),
+      element("p", "", "The transcript is preserved. Retry each failed piece when Kennedy is ready to continue updating the Kmap."),
+    );
+    for (const piece of failedPieces) {
+      const action = element("div", "audio-retry-action");
+      action.append(
+        element("span", "", `Transcript piece ${piece.piece_index + 1}/${piece.piece_count}`),
+        audioRetryButton(piece, retryingPieceIds, onRetryPiece, viewKey),
+      );
+      retryPanel.append(action);
+    }
+    container.append(retryPanel);
+  }
+
   container.append(element("p", "audio-history-note", "History ingress appears below the transcript pieces as the same continuous memory-update stream used for conversations. The right-hand Full History inspector retains every piece and context reset."));
 
   const finalTranscript = typeof detail.final_transcript === "string" && detail.final_transcript.trim()
@@ -335,18 +371,6 @@ export function renderAudioRecording(container, detail, {
         piece.transcript_text,
         `${viewKey}:piece:${piece.id}`,
       );
-      if (piece.phase === "ingress_failed") {
-        const retry = element(
-          "button",
-          "secondary audio-retry-button",
-          retryingPieceIds.has(piece.id) ? "Scheduling retry…" : "Retry Kennedy ingress",
-        );
-        retry.type = "button";
-        retry.dataset.focusKey = `${viewKey}:piece:${piece.id}:retry`;
-        retry.disabled = retryingPieceIds.has(piece.id);
-        retry.addEventListener("click", () => onRetryPiece(piece));
-        disclosure.append(retry);
-      }
       pieces.append(disclosure);
     }
   }

@@ -854,13 +854,20 @@ test("audio ingress client can explicitly requeue a terminal piece", async () =>
   assert.match(request.options.body, /"expected_version":8/);
 });
 
-test("audio ingress UI exposes terminal retry and durable retry scheduling", async () => {
+test("audio ingress UI exposes an always-visible terminal retry and durable retry scheduling", async () => {
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
   const render = await readFile(new URL("../public/js/render.js", import.meta.url), "utf8");
   assert.match(app, /audioIngress\.retryIngress\(piece\.id/);
   assert.match(app, /kickHistoryIngress\(\)/);
   assert.match(render, /piece\.phase === "ingress_failed"/);
+  assert.match(render, /const retryPanel = element\("section", "audio-retry-panel"\)/);
+  assert.match(render, /container\.append\(retryPanel\)/);
   assert.match(render, /Retry Kennedy ingress/);
+  assert.ok(
+    render.indexOf("container.append(retryPanel)") < render.indexOf('const pieces = element("section", "audio-history-section")'),
+    "the retry panel should render before the collapsed transcript-piece disclosures",
+  );
+  assert.doesNotMatch(render, /disclosure\.append\(retry\)/);
 });
 
 test("history ingress summary counts only successful memory mutations", () => {

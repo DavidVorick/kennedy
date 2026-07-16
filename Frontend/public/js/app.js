@@ -3,7 +3,7 @@ import { loadPromptManuals } from "./prompt_composer.js?v=20260716.2";
 import { ConversationSession } from "./conversation.js?v=20260715.11";
 import { runHistoryIngress } from "./history_ingress.js?v=20260716.1";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260716.4";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, element } from "./render.js?v=20260716.5";
 
 const CONFIG = {
   kwebBase: window.location.origin,

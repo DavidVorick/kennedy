@@ -544,8 +544,8 @@ the saved Kennedy ingress Chatend for every piece. The full transcript and
 other large artifacts begin collapsed. The large center display appends a
 conversation-style History Ingress section for every transcript piece, while
 the inspector's Full History orders those piece sessions and retains all
-pre-reset contexts. A terminal memory-ingress failure exposes a retry action
-for the preserved piece.
+pre-reset contexts. A terminal memory-ingress failure exposes an always-visible
+retry action above the collapsed transcript sections for the preserved piece.
 
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from

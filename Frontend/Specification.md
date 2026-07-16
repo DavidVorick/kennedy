@@ -816,9 +816,10 @@ and Telegram records: status, retry failures, mutation summary, usage, Kennedy
 messages, and collapsible tool traffic. The right inspector also treats each
 piece as an ordered Full History phase, retaining the piece's current Chatend
 and all pre-reset segments. Preparation records remain visible before Kennedy
-ingress begins, and terminal failures remain inspectable. A failed piece has a
-retry action that preserves its old diagnostics, resets its
-consecutive-failure allowance, and returns it to the durable queue.
+ingress begins, and terminal failures remain inspectable. A failed piece has an
+always-visible retry action above the collapsed transcript disclosures. Retrying
+preserves its old diagnostics, resets its consecutive-failure allowance, and
+returns it to the durable queue.
 
 ### 11.4 Memory Explorer
 

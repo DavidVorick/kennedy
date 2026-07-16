@@ -104,7 +104,12 @@ h3 { margin-bottom: 8px; }
 .audio-disclosure > summary:hover { background: #eee9df; }
 .audio-disclosure-body { max-height: 60vh; padding: 14px; border-top: 1px solid var(--line); background: white; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .audio-error { margin: 0 0 12px; padding: 10px 12px; border: 1px solid #e2aaa5; border-radius: 8px; background: #fff0ee; color: var(--danger); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
-.audio-retry-button { margin: 0 12px 12px; }
+.audio-retry-panel { margin: 0 0 15px; padding: 12px; border: 1px solid #e2aaa5; border-radius: 9px; background: #fff7f5; }
+.audio-retry-panel h3 { margin: 3px 0 5px; color: var(--danger); font-size: 14px; }
+.audio-retry-panel > p { margin: 0 0 10px; color: #70443f; font-size: 12px; line-height: 1.45; }
+.audio-retry-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 9px; border-top: 1px solid #ecc8c3; font-size: 12px; font-weight: 700; }
+.audio-retry-action + .audio-retry-action { margin-top: 9px; }
+.audio-retry-button { flex: 0 0 auto; }
 .error-banner { margin: 14px; padding: 10px 12px; border: 1px solid #e2aaa5; border-radius: 8px; background: #fff0ee; color: var(--danger); }
 .hidden { display: none !important; }
 .inspector-panel { display: flex; flex-direction: column; }
