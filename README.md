@@ -117,6 +117,8 @@ user ID; later authorization no longer depends on the username. The encrypted
 vault is mode `0600`, excluded by `.gitignore`, contains arbitrary named
 secrets, and has no reveal command or HTTP API. Available maintenance commands
 are `secrets list`, `secrets remove NAME`, and `secrets change-passphrase`.
+Stop the running server before using these commands; they acquire the same Kweb
+address used to exclude server startup during an offline backup.
 
 Start Kennedy with one command:
 
@@ -134,6 +136,46 @@ as `kennedy.sqlite3`, `kennedy-conversations.sqlite3`, and
 `kennedy-telegram.sqlite3` on first run. The four APIs bind to loopback ports
 4321 through 4324. Without a Telegram token, port 4324 reports the relay as
 disabled and the rest of Kennedy remains usable.
+
+## Backups
+
+Stop the running Kennedy server, then create an offline backup with:
+
+```sh
+cargo run -p kennedy-server -- backup
+```
+
+The command first binds the configured Kweb address and serves a small
+maintenance page there. It fails before creating backup files if Kennedy or
+another backup already owns that address. Normal Kennedy startup also acquires
+the Kweb address before opening the vault or any database, preventing a second
+instance from modifying persistent state during a backup.
+
+The result is a private
+`backups/kennedy-backup-YYYY-MM-DDTHH-MM-SSZ.tar.gz` archive containing
+verified standalone snapshots of all three SQLite databases, the encrypted
+credential vault when present, a machine-readable checksum manifest, and a
+self-contained recovery README. The README begins with the creating source
+commit and includes the exact SQLite DDL and current persisted JSON/vault
+formats. Gzip does not encrypt the databases; move the archive to appropriately
+protected off-machine storage.
+
+Use `--backup-dir PATH` to select another destination. The existing global
+`--kweb-bind`, `--kweb-database`, `--conversation-history-database`,
+`--telegram-database`, and `--vault-path` flags select the lock address and
+source files when their deployment values differ from the defaults.
+
+For a quick estimate of the current Kmap's model-context footprint, run:
+
+```sh
+cargo run -p kennedy-server -- kmap-size
+```
+
+This read-only command can run while Kennedy is serving. It reports estimated
+tokens for complete node text and for long descriptions alone, using one token
+per four Unicode characters, and also prints the underlying word and character
+counts. Node history, provenance, connections, and every non-node table are
+excluded.
 
 The compiled defaults use `gpt-5.6-sol` with `xhigh` reasoning effort and
 execute each turn through `codex-safe`, which invokes non-interactive

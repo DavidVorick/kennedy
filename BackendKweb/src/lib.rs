@@ -189,6 +189,14 @@ struct AssignTaskInput {
 }
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    serve_with_listener(config, listener).await
+}
+
+pub async fn serve_with_listener(
+    config: Config,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
     if config.active_limit == 0 {
         anyhow::bail!("active_limit must be positive");
     }
@@ -239,7 +247,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(middleware::map_response(prevent_stale_frontend_assets))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(address = %config.bind, "Kweb ready");
     axum::serve(listener, app).await?;
     Ok(())

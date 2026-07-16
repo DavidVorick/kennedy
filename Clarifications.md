@@ -4,6 +4,28 @@ These user-provided decisions supplement the repository specifications and
 technical design. They may be consolidated or removed once represented by the
 canonical documents; this file is not an append-only log.
 
+## Offline Backups
+
+- `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
+  all three SQLite databases and the encrypted credential vault when present.
+  Each archive is self-describing: its README starts with the creating commit
+  hash and records the exact schemas and current data-format semantics.
+- Backups are deliberately offline. Before reading persistent data, the backup
+  command binds the configured Kweb HTTP address and serves a maintenance page
+  for the full operation. Normal server startup acquires that same address
+  before opening any persistent state, so an active or competing instance
+  fails before the databases can be touched.
+- Backup creation verifies standalone SQLite snapshots and publishes the final
+  archive atomically. The user is responsible for moving archives to durable
+  off-machine storage.
+
+## Kmap Size Estimate
+
+- `kennedy-server kmap-size` reports a deliberately approximate total token
+  footprint for current Kmap nodes. It reports both all three node text fields
+  and long descriptions alone, while excluding history, provenance,
+  connections, and all non-node tables.
+
 ## Chatend and Inspector
 
 - The Chatend is the canonical human-readable application text supplied to

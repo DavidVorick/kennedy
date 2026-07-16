@@ -1,8 +1,12 @@
+mod backup;
 mod credentials;
+mod kmap_size;
 
 use std::path::{Path, PathBuf};
 
 use age::secrecy::{ExposeSecret, SecretString};
+use anyhow::Context;
+use backup::BackupOptions;
 use clap::{Parser, Subcommand};
 use credentials::CredentialVault;
 use zeroize::Zeroize;
@@ -17,7 +21,7 @@ struct Args {
     vault_path: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
-    #[arg(long, default_value = "127.0.0.1:4321")]
+    #[arg(long, global = true, default_value = "127.0.0.1:4321")]
     kweb_bind: String,
     #[arg(long, default_value = "127.0.0.1:4322")]
     intelligence_bind: String,
@@ -27,11 +31,11 @@ struct Args {
     telegram_bind: String,
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     frontend_origin: String,
-    #[arg(long, default_value = "./kennedy.sqlite3")]
+    #[arg(long, global = true, default_value = "./kennedy.sqlite3")]
     kweb_database: PathBuf,
-    #[arg(long, default_value = "./kennedy-conversations.sqlite3")]
+    #[arg(long, global = true, default_value = "./kennedy-conversations.sqlite3")]
     conversation_history_database: PathBuf,
-    #[arg(long, default_value = "./kennedy-telegram.sqlite3")]
+    #[arg(long, global = true, default_value = "./kennedy-telegram.sqlite3")]
     telegram_database: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
     frontend_dir: PathBuf,
@@ -54,6 +58,14 @@ enum Command {
         #[command(subcommand)]
         command: SecretsCommand,
     },
+    /// Create a verified offline archive of all Kennedy-owned persistent data.
+    Backup {
+        /// Directory in which to create the timestamped .tar.gz archive.
+        #[arg(long, default_value = "./backups")]
+        backup_dir: PathBuf,
+    },
+    /// Estimate the token footprint of all current Kmap node text.
+    KmapSize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -80,15 +92,49 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("installing TLS crypto provider"))?;
-    let args = Args::parse();
+    let mut args = Args::parse();
     let vault_path = args.vault_path.clone();
-    if let Some(Command::Secrets { command }) = args.command {
-        return manage_secrets(command, &vault_path);
+    match args.command.take() {
+        Some(Command::Secrets { command }) => {
+            let _maintenance_guard = tokio::net::TcpListener::bind(&args.kweb_bind)
+                .await
+                .with_context(|| {
+                    format!(
+                        "binding maintenance lock {}; stop the running Kennedy server before changing its credential vault",
+                        args.kweb_bind
+                    )
+                })?;
+            manage_secrets(command, &vault_path)
+        }
+        Some(Command::Backup { backup_dir }) => {
+            let path = backup::run(BackupOptions {
+                bind: args.kweb_bind,
+                backup_dir,
+                kmap_database: args.kweb_database,
+                conversation_database: args.conversation_history_database,
+                telegram_database: args.telegram_database,
+                vault: vault_path,
+            })
+            .await?;
+            println!("Created Kennedy backup {}", path.display());
+            Ok(())
+        }
+        Some(Command::KmapSize) => {
+            let size = kmap_size::measure(&args.kweb_database)?;
+            println!("{}", kmap_size::render(&size));
+            Ok(())
+        }
+        None => run_server(args, vault_path).await,
     }
-    run_server(args, vault_path).await
 }
 
 async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
+    // Bind the public Kennedy address before opening any persistent state. The
+    // backup command owns this same address for its entire run, making the port
+    // an inter-process offline lock rather than only a late startup check.
+    let kweb_listener = tokio::net::TcpListener::bind(&args.kweb_bind)
+        .await
+        .with_context(|| format!("binding Kweb listener {}", args.kweb_bind))?;
     let vault = if vault_path.exists() {
         let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
         CredentialVault::unlock(&vault_path, passphrase)?
@@ -129,7 +175,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
     tokio::try_join!(
-        kennedy_kweb::serve(kweb),
+        kennedy_kweb::serve_with_listener(kweb, kweb_listener),
         kennedy_intelligence::serve(intelligence, transcription_api_key, gemini_api_key),
         kennedy_conversation_history::serve(history),
         kennedy_telegram_relay::serve(telegram),
@@ -276,5 +322,44 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn occupied_kweb_address_prevents_server_from_opening_persistent_state() {
+        let directory =
+            std::env::temp_dir().join(format!("kennedy-server-lock-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        let vault = directory.join("vault.age");
+        let kmap = directory.join("kmap.sqlite3");
+        let conversations = directory.join("conversations.sqlite3");
+        let telegram = directory.join("telegram.sqlite3");
+        let args = Args {
+            vault_path: vault.clone(),
+            command: None,
+            kweb_bind: bind,
+            intelligence_bind: "127.0.0.1:0".to_owned(),
+            conversation_history_bind: "127.0.0.1:0".to_owned(),
+            telegram_bind: "127.0.0.1:0".to_owned(),
+            frontend_origin: "http://127.0.0.1:4321".to_owned(),
+            kweb_database: kmap.clone(),
+            conversation_history_database: conversations.clone(),
+            telegram_database: telegram.clone(),
+            frontend_dir: directory.join("frontend"),
+            system_prompts_dir: directory.join("prompts"),
+            active_limit: 12,
+            fanout_limit: 60,
+            telegram_bootstrap_username: "@test".to_owned(),
+            telegram_max_voice_bytes: 1024,
+        };
+
+        let error = run_server(args, vault.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("binding Kweb listener"));
+        assert!(!vault.exists());
+        assert!(!kmap.exists());
+        assert!(!conversations.exists());
+        assert!(!telegram.exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

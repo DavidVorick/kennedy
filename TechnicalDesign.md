@@ -105,6 +105,24 @@ three databases preserves configured credentials on a new machine, where the
 same passphrase unlocks it. The vault is excluded from Git. Kennedy has no
 tracked runtime configuration file.
 
+### 3.1 Offline backup boundary
+
+`kennedy-server backup` acquires the configured Kweb listener before inspecting
+any persistent path and holds it while serving a maintenance page. Ordinary
+server startup acquires the same listener before unlocking the vault or opening
+any database. The listener is therefore the inter-process exclusion boundary:
+backup fails while Kennedy is running, and a competing server fails before it
+can mutate a backup source.
+
+While that boundary is held, the command uses SQLite's backup API to create
+standalone snapshots of the Telegram, conversation-history, and Kmap databases,
+copies the still-encrypted credential vault when present, verifies SQLite
+integrity and foreign keys, and atomically publishes a private timestamped
+`.tar.gz`. The archive contains a checksummed JSON manifest and a recovery
+README beginning with the creating commit hash. Exact snapshot DDL and semantic
+descriptions of every persisted format travel with the data so a later version
+can construct an explicit migration without trusting current source docs.
+
 ## 4. Ownership Boundaries
 
 ### 4.1 Frontend
