@@ -581,8 +581,10 @@ canonical documents; this file is not an append-only log.
   abort any remaining intelligence operation two minutes later, with each
   provider request capped to that same hard-stop window.
 - Persist and restore active self-time work through Conversation History,
-  serialize execution across browser tabs, give each run mutation provenance,
-  and send every completed clean-slate session through normal history ingress.
+  serialize execution across browser tabs, and give each run mutation
+  provenance. A completed clean-slate session becomes read-only history
+  directly; do not send it through normal history ingress because self time
+  already performs its own Kmap memory work.
 - Make starting visibly single-flight: disable the control and show a
   `Starting…` state before the first network wait, and have Conversation History
   reject creation while any `free-time` record is already active so separate

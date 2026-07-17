@@ -27,6 +27,8 @@ const MULTIPLE_LIVE_MIGRATION: &str =
 const INGRESS_FAILURES_MIGRATION: &str = include_str!("../migrations/003_ingress_failures.sql");
 const INGRESS_RETRY_SCHEDULE_MIGRATION: &str =
     include_str!("../migrations/004_ingress_retry_schedule.sql");
+const SELF_TIME_COMPLETION_MIGRATION: &str =
+    include_str!("../migrations/005_self_time_completes_directly.sql");
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
 
@@ -212,6 +214,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(request_ingress),
         )
         .route(
+            "/api/v1/conversations/{conversation_id}/complete",
+            post(complete_conversation),
+        )
+        .route(
             "/api/v1/conversations/{conversation_id}/ingress-started",
             post(ingress_started),
         )
@@ -254,6 +260,9 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     }
     if version < 4 {
         connection.execute_batch(INGRESS_RETRY_SCHEDULE_MIGRATION)?;
+    }
+    if version < 5 {
+        connection.execute_batch(SELF_TIME_COMPLETION_MIGRATION)?;
     }
     // An early v2 build re-ran the v1 migration on every launch. That could recreate
     // this legacy singleton index after user_version had already advanced to 2, at
@@ -497,11 +506,19 @@ async fn next_ingress(State(state): State<AppState>) -> Result<Json<Value>, ApiE
 }
 
 fn fetch_next_ingress(db: &Connection) -> Result<Option<ConversationRecord>, ApiError> {
-    db.query_row(
-        &format!("{} WHERE phase IN ('ingress_in_progress','ingress_pending') AND (ingress_next_attempt_at IS NULL OR datetime(ingress_next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END, datetime(COALESCE(last_user_message_at,started_at)), datetime(started_at), id LIMIT 1", conversation_select()),
-        [],
-        row_record,
-    ).optional().map_err(ApiError::internal)
+    let mut statement = db
+        .prepare(&format!("{} WHERE phase IN ('ingress_in_progress','ingress_pending') AND (ingress_next_attempt_at IS NULL OR datetime(ingress_next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END, datetime(COALESCE(last_user_message_at,started_at)), datetime(started_at), id", conversation_select()))
+        .map_err(ApiError::internal)?;
+    let records = statement
+        .query_map([], row_record)
+        .map_err(ApiError::internal)?;
+    for record in records {
+        let record = record.map_err(ApiError::internal)?;
+        if !is_free_time_session(&record.state) {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 async fn get_conversation(
@@ -560,7 +577,7 @@ fn update_active(
     validate_version(expected_version)?;
     let state_json = serde_json::to_string(state).map_err(ApiError::internal)?;
     let now = Utc::now().to_rfc3339();
-    let ended_at = (phase == "ingress_pending").then_some(now.as_str());
+    let ended_at = (phase != "active").then_some(now.as_str());
     let changed = db.execute("UPDATE conversations SET state_json=?1,phase=?2,updated_at=?3,ended_at=COALESCE(?4,ended_at),version=version+1 WHERE id=?5 AND phase='active' AND version=?6", params![state_json,phase,now,ended_at,id,expected_version]).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
@@ -650,12 +667,49 @@ async fn request_ingress(
     Json(input): Json<CheckpointConversation>,
 ) -> Result<Json<ConversationRecord>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
+    if is_free_time_session(&input.state) {
+        return Ok(Json(complete_self_time(
+            &db,
+            &id,
+            input.expected_version,
+            &input.state,
+        )?));
+    }
     Ok(Json(update_active(
         &db,
         &id,
         input.expected_version,
         &input.state,
         "ingress_pending",
+    )?))
+}
+
+fn complete_self_time(
+    db: &Connection,
+    id: &str,
+    expected_version: i64,
+    state: &Value,
+) -> Result<ConversationRecord, ApiError> {
+    let existing = fetch_record(db, id)?;
+    if !is_free_time_session(&existing.state) || !is_free_time_session(state) {
+        return Err(ApiError::bad(
+            "Only self-time records can complete without history ingress.",
+        ));
+    }
+    update_active(db, id, expected_version, state, "complete")
+}
+
+async fn complete_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<CheckpointConversation>,
+) -> Result<Json<ConversationRecord>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    Ok(Json(complete_self_time(
+        &db,
+        &id,
+        input.expected_version,
+        &input.state,
     )?))
 }
 
@@ -670,6 +724,11 @@ async fn ingress_started(
     }
     let db = state.db.lock().map_err(ApiError::internal)?;
     let existing = fetch_record(&db, &id)?;
+    if is_free_time_session(&existing.state) {
+        return Err(ApiError::conflict(
+            "Self-time records complete directly and do not undergo history ingress.",
+        ));
+    }
     if existing.phase == "ingress_in_progress"
         && existing.provenance_id.as_deref() == Some(input.provenance_id.as_str())
     {
@@ -922,9 +981,38 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_in_progress','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
+    }
+
+    #[test]
+    fn migration_removes_existing_self_time_records_from_the_ingress_queue() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(INITIAL_MIGRATION).unwrap();
+        db.execute_batch(MULTIPLE_LIVE_MIGRATION).unwrap();
+        db.execute_batch(INGRESS_FAILURES_MIGRATION).unwrap();
+        db.execute_batch(INGRESS_RETRY_SCHEDULE_MIGRATION).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time-claimed','ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"sessionType\":\"free-time\"}',1)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time-failed','ingress_failed','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{\"archive\":{\"sessionType\":\"free-time\"}}',3)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('conversation','ingress_pending','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z','{}',1)", []).unwrap();
+
+        apply_migrations(&db).unwrap();
+
+        let claimed = fetch_record(&db, "self-time-claimed").unwrap();
+        assert_eq!(claimed.phase, "complete");
+        assert_eq!(claimed.version, 2);
+        assert!(claimed.ended_at.is_some());
+        assert_eq!(
+            fetch_record(&db, "self-time-failed").unwrap().phase,
+            "complete"
+        );
+        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "conversation");
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
     }
 
     #[test]
@@ -946,6 +1034,42 @@ mod tests {
         assert_eq!(record.version, 2);
         assert_eq!(record.state["transcript"], json!([]));
         assert_eq!(record.state, state);
+    }
+
+    #[test]
+    fn self_time_completes_directly_without_entering_the_ingress_queue() {
+        let db = database();
+        let state = json!({
+            "sessionType":"free-time",
+            "archive":{"format":"kennedy-chatend","sessionType":"free-time"}
+        });
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1,1)", [serde_json::to_string(&state).unwrap()]).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('conversation','active','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{\"sessionType\":\"conversation\"}',1)", []).unwrap();
+
+        let completed = complete_self_time(&db, "self-time", 1, &state).unwrap();
+        assert_eq!(completed.phase, "complete");
+        assert_eq!(completed.version, 2);
+        assert!(completed.ended_at.is_some());
+        assert!(fetch_next_ingress(&db).unwrap().is_none());
+
+        let error = complete_self_time(
+            &db,
+            "conversation",
+            1,
+            &json!({"sessionType":"conversation"}),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(fetch_record(&db, "conversation").unwrap().phase, "active");
+    }
+
+    #[test]
+    fn ingress_queue_defensively_skips_self_time_records() {
+        let db = database();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time','ingress_pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"sessionType\":\"free-time\"}',1)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('conversation','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
+
+        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "conversation");
     }
 
     #[test]
@@ -1119,7 +1243,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('new','active','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
     }

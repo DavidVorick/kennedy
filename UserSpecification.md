@@ -593,7 +593,9 @@ requests retain the intelligence provider's profile-specific allowance, so a
 quality search can run longer than 90 seconds, while the remaining hard-stop
 interval is always the upper bound. A same-origin browser lock prevents two
 tabs from running the autonomous loop concurrently. Every completed clean-slate
-session is queued for ordinary history ingress.
+session is retained as read-only conversation history without ordinary history
+ingress, since self time has already performed its own Kmap memory work under
+the run provenance.
 
 ### History Ingress
 

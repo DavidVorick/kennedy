@@ -160,6 +160,30 @@ test("conversation history client records ingress failures durably", async () =>
   assert.match(request.options.body, /"stage":"model_loop"/);
 });
 
+test("conversation history client can complete self time without ingress", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ phase: "complete", state: { sessionType: "free-time" } }),
+    };
+  };
+  try {
+    await ConversationHistoryAPI("http://history").completeWithoutIngress("self-time", {
+      expected_version: 4,
+      state: { sessionType: "free-time" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(request.url, "http://history/api/v1/conversations/self-time/complete");
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.body, '{"expected_version":4,"state":{"sessionType":"free-time"}}');
+});
+
 test("conversation history client can explicitly restart terminal ingress", async () => {
   const originalFetch = globalThis.fetch;
   let request = null;
@@ -1592,6 +1616,14 @@ test("ending a conversation keeps its ingress record selected until New is expli
   assert.match(closeConversation, /kickHistoryIngress\(\);/);
   assert.doesNotMatch(closeConversation, /historyRecords\.find\(item => item\.phase === "active"/);
   assert.doesNotMatch(closeConversation, /createNewConversation\(\)/);
+});
+
+test("ending self time archives it without waking history ingress", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  const closeSelfTime = app.match(/async function closeFreeTimeSession\(id, session\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(closeSelfTime);
+  assert.match(closeSelfTime, /conversationHistory\.completeWithoutIngress\(id,/);
+  assert.doesNotMatch(closeSelfTime, /requestIngress|kickHistoryIngress/);
 });
 
 test("a structured pending Chatend resumes from cold start without duplicating its user query", async () => {

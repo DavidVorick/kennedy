@@ -265,6 +265,8 @@ checkpoints, optimistic record versions, and the conversation phase machine:
 
 ```text
 active -> ingress_pending -> ingress_in_progress -> complete
+   |
+   +---------------------------------------------> complete (self time)
              |               |
              +---------------+-> ingress_failed (fifth failure)
 ```
@@ -420,8 +422,10 @@ user-role handoff, and then consumed so it cannot leak into later slices. Below
 the rollover threshold, yielding ends the run and no message is forwarded.
 
 The controller immediately exposes one pending start promise, owns a cross-tab
-Web Lock, restores pending work after reload, and sends every closed slice
-through normal history ingress. Conversation History atomically refuses a
+Web Lock, and restores pending work after reload. Every closed slice transitions
+directly to read-only Conversation History instead of normal history ingress,
+because the self-time session already writes useful memory to the Kmap under
+its run-level provenance. Conversation History atomically refuses a
 second active `free-time` record, closing the remaining cross-browser race. The
 controller checks the clock before requests and after responses, durably
 injects a warning inside the last three minutes, blocks tools at expiry, and

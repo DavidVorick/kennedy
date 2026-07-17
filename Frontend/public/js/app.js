@@ -1,4 +1,4 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.6";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.7";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
 import { ConversationSession } from "./conversation.js?v=20260717.14";
 import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260717.3";
@@ -1087,7 +1087,7 @@ function freeTimeTimerAt(timestamp, callback) {
 async function closeFreeTimeSession(id, session) {
   let record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
   if (record.phase === "active") {
-    record = await conversationHistory.requestIngress(id, {
+    record = await conversationHistory.completeWithoutIngress(id, {
       expected_version: record.version,
       state: session.snapshot(),
     });
@@ -1098,7 +1098,6 @@ async function closeFreeTimeSession(id, session) {
   voiceDrafts.delete(id);
   attachmentDrafts.delete(id);
   update();
-  kickHistoryIngress();
   return record;
 }
 

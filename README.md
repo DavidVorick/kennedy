@@ -341,10 +341,11 @@ full read/web/Kmap-write tool set and can call `EndSelfTimeSession({})`, or pass
 the next session a note with
 `EndSelfTimeSession({"message":"Continue this investigation."})`, to choose a
 fresh Chatend without giving up any remaining time. Self-time records survive
-a reload and roll through normal history ingress. A notice is injected for the
-last three minutes; the deadline allows one tool-free wrap-up response and a
-hard cancellation follows two minutes later. Start feedback is immediate and
-both the browser and history service prevent overlapping runs. Model and search
+a reload and become read-only history directly; they bypass normal history
+ingress because the live run already performs Kmap memory work. A notice is
+injected for the last three minutes; the deadline allows one tool-free wrap-up
+response and a hard cancellation follows two minutes later. Start feedback is
+immediate and both the browser and history service prevent overlapping runs. Model and search
 requests retain their provider/profile timeout, including long quality
 searches, but can never run past the self-time hard stop.
 

@@ -761,10 +761,12 @@ when no prompt was supplied.
 
 One same-origin `kennedy-free-time` Web Lock owns execution across tabs. A
 normal final response or successful `EndSelfTimeSession` finalizes the current
-record into `ingress_pending`. If at least five minutes remain before the
-persisted deadline, the controller increments the slice index and creates a
-new record with a fresh Chatend, context, continuation, counters, and the
-unchanged run deadline/provenance. An optional end-tool message is durably
+record directly into read-only `complete` history without submitting its
+Chatend to history ingress: the live self-time session already performs Kmap
+memory work with its run-level provenance. If at least five minutes remain
+before the persisted deadline, the controller increments the slice index and
+creates a new record with a fresh Chatend, context, continuation, counters, and
+the unchanged run deadline/provenance. An optional end-tool message is durably
 promoted to that next record and removed before any later rollover. With less
 than five minutes left, the run ends and no message is forwarded. Startup
 restores an active pending slice and reacquires the lock; provider or checkpoint
@@ -780,8 +782,8 @@ provider/profile timeout, including the longer quality-search allowance, but
 the frontend supplies the shorter remaining deadline plus two-minute grace
 when necessary. A browser timer also aborts and cancels the operation at that
 hard stop.
-Finalization clears `pendingTurn` and queues the complete slice archive for the
-normal memory-ingress coordinator.
+Finalization clears `pendingTurn` and checkpoints the complete slice archive
+without waking the normal memory-ingress coordinator.
 
 Conversation History list responses are reconciled with the local cache by
 monotonically increasing record version. A delayed list response therefore
@@ -1195,6 +1197,7 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - editable next-request drafting during Kennedy work and background ingress,
 - conversation-history titles and read-only transcript selection,
 - per-conversation live and archived history-ingress activity,
+- direct self-time archival without duplicate history ingress,
 - HTML escaping,
 - recovery from failed intelligence, Kweb, and conversation-history requests.
 - explicit conversation/Telegram prompt labels and source-aware history ingress,

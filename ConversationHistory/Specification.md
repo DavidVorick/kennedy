@@ -4,7 +4,9 @@
 
 The conversation history backend is a logically independent Rust API that owns
 durable browser and Telegram conversation checkpoints and the queue of conversations that
-must undergo history ingress. It shares a deployment binary with the Kweb and
+must undergo history ingress. Autonomous self-time records are retained here
+but complete without entering that queue because their live sessions already
+write to the Kmap. The backend shares a deployment binary with the Kweb and
 intelligence backends but has its own listener, router, state, SQLite database,
 and crate. It imports neither backend and calls neither backend.
 
@@ -56,6 +58,8 @@ null.
 
 ```text
 active -> ingress_pending -> ingress_in_progress -> complete
+   |
+   +---------------------------------------------> complete (self time)
              |               |
              +---------------+-> ingress_failed (fifth failure)
                                       |
@@ -71,12 +75,17 @@ active -> ingress_pending -> ingress_in_progress -> complete
   exempt.
 - Explicitly ending a conversation checkpoints its final state and changes
   `active` to `ingress_pending` immediately.
+- Completing a `free-time` record checkpoints its final state and changes it
+  directly from `active` to `complete`; both the direct-completion transition
+  and queue selection verify its stored session type. Existing queued or failed
+  self-time records are migrated to `complete`.
 - The oldest eligible queued conversation is selected by last user activity,
   falling back to its start time. An actively claimed `ingress_in_progress`
   record wins; deferred records are skipped until their next-attempt time.
 - The frontend creates or retrieves idempotent Kweb provenance, records its ID,
   and changes the selected record to `ingress_in_progress`.
-- Only successful history ingress changes the record to `complete`.
+- Ordinary conversation records change to `complete` only after successful
+  history ingress.
 - The frontend records a failed ingress attempt atomically. Attempts one
   through four return the record to `ingress_pending`, release the
   single-worker claim, and defer that record for 15 seconds so other eligible
@@ -119,6 +128,7 @@ index serializes memory updates even when several conversations close together.
 - `DELETE /api/v1/conversations/{id}`
 - `PUT /api/v1/conversations/{id}/checkpoint`
 - `POST /api/v1/conversations/{id}/request-ingress`
+- `POST /api/v1/conversations/{id}/complete` (self time only; no ingress)
 - `POST /api/v1/conversations/{id}/ingress-started`
 - `PUT /api/v1/conversations/{id}/ingress-checkpoint`
 - `POST /api/v1/conversations/{id}/ingress-completed`
@@ -130,7 +140,9 @@ Create accepts `started_at` plus opaque `state`. Checkpoint accepts
 endpoint returns `{ "conversation": null }` when empty. Successful
 state-machine mutations return the complete updated record. Purge returns the
 deleted ID. Unstarted cleanup is idempotent and returns the count and IDs of
-discarded records.
+discarded records. Direct completion accepts `expected_version` and the final
+state, verifies that both stored and supplied states identify `free-time`, and
+makes the record read-only without creating a history-ingress obligation.
 The failure endpoint accepts `expected_version`, stage, optional error code,
 message, round count, and optional context usage. It normalizes and bounds
 diagnostic text before atomically incrementing the attempt count.
@@ -154,5 +166,5 @@ repair of a v2 database containing the legacy singleton index, the
 single-ingress-worker invariant, 24-hour expiry plus pending-response and
 Telegram-session protection,
 structured archives, safe unstarted-record cleanup, and phase-restricted ingress
-checkpoints, plus deferred retry claim release, terminal fifth-failure
-behavior, and queue advancement.
+checkpoints, direct self-time completion and legacy queue cleanup, plus deferred
+retry claim release, terminal fifth-failure behavior, and queue advancement.

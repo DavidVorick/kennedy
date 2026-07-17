@@ -103,6 +103,7 @@ export const ConversationHistoryAPI = (base) => ({
   create: (body) => requestJSON(base, "/api/v1/conversations", { method: "POST", body: JSON.stringify(body) }),
   checkpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
   requestIngress: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/request-ingress`, { method: "POST", body: JSON.stringify(body) }),
+  completeWithoutIngress: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/complete`, { method: "POST", body: JSON.stringify(body) }),
   ingressStarted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-started`, { method: "POST", body: JSON.stringify(body) }),
   ingressCheckpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
   ingressCompleted: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/ingress-completed`, { method: "POST", body: JSON.stringify(body) }),
