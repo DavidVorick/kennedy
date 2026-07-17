@@ -25,10 +25,12 @@ CREATE TABLE IF NOT EXISTS telegram_events (
     duration_seconds INTEGER,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'complete')),
     conversation_id TEXT,
+    processing_started_at TEXT,
     transcription TEXT,
     transcription_model TEXT,
     created_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    completion_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS telegram_events_work_queue

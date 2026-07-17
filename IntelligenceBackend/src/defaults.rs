@@ -15,7 +15,7 @@ pub(crate) const QUALITY_SEARCH_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const QUALITY_SEARCH_REASONING_EFFORT: &str = "xhigh";
 pub(crate) const QUALITY_SEARCH_CONTEXT_SIZE: &str = "high";
 pub(crate) const QUALITY_SEARCH_MAX_SOURCES: usize = 12;
-pub(crate) const QUALITY_SEARCH_TIMEOUT_SECONDS: u64 = 15 * 60;
+pub(crate) const QUALITY_SEARCH_TIMEOUT_SECONDS: u64 = 30 * 60;
 
 pub(crate) const BALANCED_SEARCH_MODEL: &str = "gpt-5.6-terra";
 pub(crate) const BALANCED_SEARCH_REASONING_EFFORT: &str = "low";

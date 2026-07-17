@@ -306,7 +306,12 @@ page; no compilation is required.
 The `TG Bot` view shows private conversations and persistent Telegram-group
 sessions scoped to one user in one group. The
 browser must be open to run Kennedy, but Telegram messages remain durably
-queued while it is closed. `/reset` closes the current Telegram session and
+queued while it is closed. Queue heads from different private-user and
+group-user streams run independently. Each has a durable 30-minute response
+deadline; an overrun is canceled and completed so the next message can proceed.
+If a queued event points to a missing conversation record, the bridge safely
+rebinds it to a fresh record without discarding saved media or transcription.
+`/reset` closes the current Telegram session and
 queues its full Chatend for the same history-ingress flow as an ended UI
 conversation. In a group, `/reset` closes only the invoking user's session for
 that group after checkpointing all unseen group messages. Each allowed group has its own blank
@@ -329,13 +334,17 @@ The browser conversation composer also offers `Send & end`: it checkpoints one
 final user message without asking Kennedy to answer, then immediately closes
 the conversation into the normal history-ingress queue.
 
-The top bar also provides autonomous **Free time** with a duration in minutes
-(30 by default, fractional values allowed for tests). Kennedy receives the full
-read/web/Kmap-write tool set and can call `EndFreeTimeSession({})` to choose a
-fresh Chatend without giving up any remaining time. Free-time records survive a
-reload and roll through normal history ingress. A notice is injected for the
+The dedicated **Self Time** tab starts an autonomous run with a duration in
+minutes (30 by default, fractional values allowed for tests) and an optional
+user prompt that carries into every clean-slate slice. Kennedy receives the
+full read/web/Kmap-write tool set and can call `EndSelfTimeSession({})` to choose
+a fresh Chatend without giving up any remaining time. Self-time records survive
+a reload and roll through normal history ingress. A notice is injected for the
 last three minutes; the deadline allows one tool-free wrap-up response and a
-hard cancellation follows two minutes later.
+hard cancellation follows two minutes later. Start feedback is immediate and
+both the browser and history service prevent overlapping runs. Model and search
+requests retain their provider/profile timeout, including long quality
+searches, but can never run past the self-time hard stop.
 
 The browser composer and Telegram also accept PDF, DOCX, spreadsheet, CSV, and
 text documents up to 20 MiB. Kennedy receives locally extracted, bounded text;

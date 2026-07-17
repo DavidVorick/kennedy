@@ -1,4 +1,4 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260717.7";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260717.8";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
@@ -172,7 +172,7 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       onUpdate();
       const checkpointStarted = performance.now();
       await checkpoint();
-      addTimingStep(timing, "checkpoint", "Final free-time save", elapsedMs(checkpointStarted));
+      addTimingStep(timing, "checkpoint", "Final self-time save", elapsedMs(checkpointStarted));
       return AGENT_LOOP_SESSION_ENDED;
     }
 
@@ -195,15 +195,15 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
 
     calls = calls.map((call, index) => ({ ...call, id: `text_call_${round + 1}_${index + 1}` }));
     const resetIsMixed = calls.length > 1 && calls.some(call => call.name === "ResetContext");
-    const sessionEndIsMixed = calls.length > 1 && calls.some(call => call.name === "EndFreeTimeSession");
+    const sessionEndIsMixed = calls.length > 1 && calls.some(call => ["EndSelfTimeSession", "EndFreeTimeSession"].includes(call.name));
     let sessionEnded = false;
     for (const call of calls) {
       throwIfCancelled(signal);
       const toolStarted = performance.now();
       const execution = resetIsMixed && call.name === "ResetContext"
         ? executor.failure(call, "mixed_reset_call", "ResetContext must be requested by itself so the chatend can be rebuilt safely.")
-        : sessionEndIsMixed && call.name === "EndFreeTimeSession"
-          ? executor.failure(call, "mixed_session_end_call", "EndFreeTimeSession must be requested by itself so the session can close safely.")
+        : sessionEndIsMixed && ["EndSelfTimeSession", "EndFreeTimeSession"].includes(call.name)
+          ? executor.failure(call, "mixed_session_end_call", `${call.name} must be requested by itself so the session can close safely.`)
         : await executor.execute(call, { signal, operationId });
       throwIfCancelled(signal);
       const durationMs = addTimingStep(

@@ -312,7 +312,17 @@ messages is detached and silently queued for history ingress after its pending
 passive context is checkpointed. More than 100 uninvoked messages
 queue the oldest 80 for background ingress. The browser provisions reserved roots, binds each
 event to Conversation History, runs the Chatend/tool loop, and returns only
-Kennedy's final text. The relay never receives the rest of the Chatend.
+Kennedy's final text. Fetched queue heads run independently in the browser, so
+the bridge continues polling and can start other private-user or group-user
+streams while one head is waiting on long model or tool work; the relay remains
+the authority for ordering within each stream. Event binding records a durable
+processing start. The browser enforces a 30-minute deadline from that value,
+cancels the active turn on expiry, and invokes an idempotent relay abort that
+completes the event before best-effort Telegram notification and clears only a
+still-matching stream pointer. A missing Conversation History target is repaired
+by compare-and-swap rebinding from the exact stale ID, retaining stored media
+and transcription and restarting the recovered attempt's deadline. The relay
+never receives the rest of the Chatend.
 
 ### 4.6 Audio Ingress Backend
 
@@ -392,22 +402,33 @@ to `ingress_in_progress`, and completes it before claiming the next. Live
 conversations remain usable throughout. Completed records and both archives
 remain queryable from the sidebar.
 
-### 5.2 Autonomous Free Time
+### 5.2 Autonomous Self Time
 
-Free time is a durable autonomous browser session family. The top-bar control
-creates a run-level Kweb provenance and a `free-time` Conversation History
-record containing an absolute deadline and clean-slate slice number. Kennedy's
-prompt tells her to have fun and includes the shared read/web manuals plus the
-Kmap write manual. The free-time executor therefore permits every baseline
-Kennedy tool and adds `EndFreeTimeSession`, whose loop-control result closes the
-current record and opens a fresh slice without changing the run deadline.
+Self time is a durable autonomous browser session family presented in its own
+category tab alongside Conversation, TG Bot, and Audio Ingress. Its start panel
+accepts a duration and optional custom prompt. The controller stores that prompt
+in the run metadata and repeats it in every clean-slate slice. Starting creates
+a run-level Kweb provenance and a backward-compatible `free-time` Conversation
+History record containing an absolute deadline and clean-slate slice number.
+Kennedy's prompt tells her to have fun and includes the shared read/web manuals
+plus the Kmap write manual. The self-time executor therefore permits every
+baseline Kennedy tool and adds `EndSelfTimeSession`, whose loop-control result closes the
+current record and opens a fresh slice without changing the run deadline only
+when at least five minutes remain. Below that threshold, yielding ends the run.
 
-The controller owns a cross-tab Web Lock, restores pending work after reload,
-and sends every closed slice through normal history ingress. It checks the
-clock before requests and after responses, durably injects a warning inside the
-last three minutes, blocks tools at expiry, and grants one wrap-up response.
-Provider request timeouts are clamped to the remaining two-minute shutdown
-grace; a browser cancellation timer enforces the same hard stop.
+The controller immediately exposes one pending start promise, owns a cross-tab
+Web Lock, restores pending work after reload, and sends every closed slice
+through normal history ingress. Conversation History atomically refuses a
+second active `free-time` record, closing the remaining cross-browser race. The
+controller checks the clock before requests and after responses, durably
+injects a warning inside the last three minutes, blocks tools at expiry, and
+grants one wrap-up response. Provider request timeouts remain profile-specific
+(including the longer quality-search allowance) and are clamped only when the
+remaining two-minute shutdown grace is shorter; a browser cancellation timer
+enforces the same hard stop. Conversation History list reconciliation is
+version-monotonic, preventing a delayed response from replacing a newer local
+checkpoint version, and conflict recovery immediately adopts the latest server
+record.
 
 ### 5.3 History Ingress
 

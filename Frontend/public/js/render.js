@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260717.6";
+import { formatKmapContext } from "./human_format.js?v=20260717.8";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
@@ -145,7 +145,7 @@ export function conversationTitle(record, limit = 54) {
   const sessionType = record?.state?.sessionType || record?.state?.archive?.sessionType;
   if (sessionType === "free-time") {
     const freeTime = record?.state?.freeTime || record?.state?.archive?.freeTime || {};
-    return `Free time · session ${freeTime.sliceIndex || 1}`;
+    return `Self time · slice ${freeTime.sliceIndex || 1}`;
   }
   if (sessionType === "telegram-group") {
     const channel = record?.state?.channel || record?.state?.archive?.channel || {};
@@ -176,6 +176,14 @@ export function sortConversationHistory(records) {
     String(right?.started_at || "").localeCompare(String(left?.started_at || "")) ||
     String(left?.id || "").localeCompare(String(right?.id || ""))
   );
+}
+
+export function reconcileConversationHistory(cachedRecords, incomingRecords) {
+  const cachedById = new Map((cachedRecords || []).map(record => [record.id, record]));
+  return sortConversationHistory((incomingRecords || []).map(record => {
+    const cached = cachedById.get(record.id);
+    return Number(cached?.version) > Number(record?.version) ? cached : record;
+  }));
 }
 
 function historyDate(value) {
@@ -216,7 +224,7 @@ export function renderConversationHistory(container, records, {
     };
     const basePhase = phases[record.phase] || record.phase.replaceAll("_", " ");
     const recordSessionType = record?.state?.sessionType || record?.state?.archive?.sessionType;
-    const phase = recordSessionType === "free-time" && record.phase === "active" ? "Live · Free time" : basePhase;
+    const phase = recordSessionType === "free-time" && record.phase === "active" ? "Live · Self time" : basePhase;
     const status = element("span", `history-phase ${record.phase === "active" ? "live" : "closed"}`, phase);
     status.setAttribute("aria-label", phase);
     meta.append(status, element("time", "", historyDate(record.started_at)));

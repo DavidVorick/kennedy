@@ -71,6 +71,13 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "state_conflict", message)
     }
+    fn free_time_active() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "free_time_already_active",
+            "A free-time run is already active.",
+        )
+    }
     fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!(error=%error, "conversation history request failed");
         Self::new(
@@ -327,14 +334,23 @@ async fn create_conversation(
     State(state): State<AppState>,
     Json(input): Json<CreateConversation>,
 ) -> Result<(StatusCode, Json<ConversationRecord>), ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    Ok((StatusCode::CREATED, Json(insert_conversation(&db, input)?)))
+}
+
+fn insert_conversation(
+    db: &Connection,
+    input: CreateConversation,
+) -> Result<ConversationRecord, ApiError> {
     validate_started_at(&input.started_at)?;
+    if is_free_time_session(&input.state) && active_free_time(db)?.is_some() {
+        return Err(ApiError::free_time_active());
+    }
     let state_json = serde_json::to_string(&input.state).map_err(ApiError::internal)?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    let db = state.db.lock().map_err(ApiError::internal)?;
     db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES(?1,'active',?2,?3,?4,1)", params![id,input.started_at,now,state_json]).map_err(ApiError::internal)?;
-    let record = fetch_record(&db, &id)?;
-    Ok((StatusCode::CREATED, Json(record)))
+    fetch_record(db, &id)
 }
 
 async fn list_conversations(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -380,15 +396,36 @@ fn is_telegram_session(state: &Value) -> bool {
     telegram(state.get("sessionType")) || telegram(state.pointer("/archive/sessionType"))
 }
 
-fn is_idle_protected_session(state: &Value) -> bool {
+fn is_free_time_session(state: &Value) -> bool {
     let free_time = |value: Option<&Value>| {
         value
             .and_then(Value::as_str)
             .is_some_and(|session_type| session_type == "free-time")
     };
-    is_telegram_session(state)
-        || free_time(state.get("sessionType"))
-        || free_time(state.pointer("/archive/sessionType"))
+    free_time(state.get("sessionType")) || free_time(state.pointer("/archive/sessionType"))
+}
+
+fn is_idle_protected_session(state: &Value) -> bool {
+    is_telegram_session(state) || is_free_time_session(state)
+}
+
+fn active_free_time(db: &Connection) -> Result<Option<ConversationRecord>, ApiError> {
+    let mut statement = db
+        .prepare(&format!(
+            "{} WHERE phase='active' ORDER BY updated_at DESC",
+            conversation_select()
+        ))
+        .map_err(ApiError::internal)?;
+    let records = statement
+        .query_map([], row_record)
+        .map_err(ApiError::internal)?;
+    for record in records {
+        let record = record.map_err(ApiError::internal)?;
+        if is_free_time_session(&record.state) {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 fn discard_unstarted(db: &mut Connection) -> Result<Vec<String>, ApiError> {
@@ -960,6 +997,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn create_allows_only_one_active_free_time_record() {
+        let db = database();
+        let free_time = || CreateConversation {
+            started_at: "2026-07-17T12:00:00Z".into(),
+            state: json!({"sessionType":"free-time","freeTime":{"runId":Uuid::new_v4().to_string()}}),
+        };
+        let first = insert_conversation(&db, free_time()).unwrap();
+        let error = insert_conversation(&db, free_time()).unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "free_time_already_active");
+
+        insert_conversation(
+            &db,
+            CreateConversation {
+                started_at: "2026-07-17T12:00:01Z".into(),
+                state: json!({"sessionType":"conversation"}),
+            },
+        )
+        .unwrap();
+        update_active(
+            &db,
+            &first.id,
+            first.version,
+            &first.state,
+            "ingress_pending",
+        )
+        .unwrap();
+        insert_conversation(&db, free_time()).unwrap();
     }
 
     #[test]

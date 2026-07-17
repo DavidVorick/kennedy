@@ -58,7 +58,7 @@ The three WebSearch modes are also compiled policy:
 
 | Mode | Provider and model | Reasoning | Search context | Deadline | Source cap |
 | --- | --- | --- | --- | --- | --- |
-| `quality` | Codex `gpt-5.6-sol` | `xhigh` | `high` | 900 seconds | 12 |
+| `quality` | Codex `gpt-5.6-sol` | `xhigh` | `high` | 1,800 seconds | 12 |
 | `balanced` | Codex `gpt-5.6-terra` | `low` | `low` | 90 seconds | 8 |
 | `fast` | Gemini `gemini-3.1-flash-lite` | `low` | Google Search grounding | 45 seconds | 6 |
 

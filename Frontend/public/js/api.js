@@ -142,9 +142,13 @@ export const TelegramRelayAPI = (base) => ({
     if (!response.ok) throw new ApiError(`Telegram group media fetch failed (${response.status}).`, response.status, "request_failed");
     return response.blob();
   },
-  bind: (id, conversationId) => requestJSON(base, `/api/v1/events/${id}/bind`, { method: "POST", body: JSON.stringify({ conversationId }) }),
+  bind: (id, conversationId, expectedConversationId = null) => requestJSON(base, `/api/v1/events/${id}/bind`, {
+    method: "POST",
+    body: JSON.stringify({ conversationId, ...(expectedConversationId ? { expectedConversationId } : {}) }),
+  }),
   saveTranscription: (id, text, transcriptionModel) => requestJSON(base, `/api/v1/events/${id}/transcription`, { method: "POST", body: JSON.stringify({ text, transcriptionModel }) }),
   reply: (id, conversationId, text, contextWarning = null) => requestJSON(base, `/api/v1/events/${id}/reply`, { method: "POST", body: JSON.stringify({ conversationId, text, contextWarning }) }),
+  abort: (id, conversationId, message) => requestJSON(base, `/api/v1/events/${id}/abort`, { method: "POST", body: JSON.stringify({ conversationId, message }) }),
   resetCompleted: (id, message) => requestJSON(base, `/api/v1/events/${id}/reset-completed`, { method: "POST", body: JSON.stringify({ message }) }),
   provisioningUsers: () => requestJSON(base, "/api/v1/users/provisioning"),
   userByHandle: (handle) => requestJSON(base, `/api/v1/users/by-handle/${encodeURIComponent(handle)}`),

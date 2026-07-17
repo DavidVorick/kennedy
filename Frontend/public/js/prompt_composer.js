@@ -56,7 +56,7 @@ export function formatModelAttribution(model, reasoningEffort) {
 function sessionDetail(mode, sessionType, sourceSessionType) {
   if (mode === "conversation") {
     if (sessionType === "free-time") {
-      return "Channel: autonomous free time in Kennedy's browser harness. No user response is expected. Read, web, and Kmap write tools are all authorized for this session.";
+      return "Channel: autonomous self time in Kennedy's browser harness. No live user response is expected. Read, web, and Kmap write tools are all authorized for this session.";
     }
     if (sessionType === "telegram-group") {
       return "Channel: Telegram group. This is a persistent session scoped to one participant and one group. Every group message accumulates as passive context, but only this participant's direct invocations trigger your response; other participants have separate sessions. Other participant roots are references that you may load if useful.";
@@ -69,7 +69,7 @@ function sessionDetail(mode, sessionType, sourceSessionType) {
   if (sourceSessionType === "audio") return "Source: one chronologically placed piece of a vnote transcript.";
   if (sourceSessionType === "telegram-group") return "Source: an archived Telegram group invocation or background group-chat batch.";
   if (sourceSessionType === "telegram") return "Source: an archived Telegram conversation (private message).";
-  if (sourceSessionType === "free-time") return "Source: one archived clean-slate session from an autonomous free-time run.";
+  if (sourceSessionType === "free-time") return "Source: one archived clean-slate session from an autonomous self-time run.";
   return "Source: an archived browser conversation.";
 }
 
@@ -140,7 +140,7 @@ export function composePrompt(manuals, mode, { providerKind = null, model, reaso
   if (mode !== "conversation" || sessionType === "free-time") sections.push(section("Write tools", manuals.writeTools));
   if (providerKind === "codex") sections.push(section("Codex harness", manuals.codexHarness));
   if (typeof sessionContext === "string" && sessionContext.trim()) {
-    sections.push(section(sessionType === "free-time" ? "Free-time schedule" : "Telegram group context", sessionContext.trim()));
+    sections.push(section(sessionType === "free-time" ? "Self-time schedule" : "Telegram group context", sessionContext.trim()));
   }
   sections.push(section("Current runtime", `You are currently running on ${currentModel} with ${currentThinkingMode} thinking mode.`));
   return sections.join("\n\n");

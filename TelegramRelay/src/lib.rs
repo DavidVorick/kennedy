@@ -146,9 +146,11 @@ struct RelayEvent {
     duration_seconds: Option<i64>,
     status: String,
     conversation_id: Option<String>,
+    processing_started_at: Option<String>,
     transcription: Option<String>,
     transcription_model: Option<String>,
     created_at: String,
+    completion_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_root_node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,6 +192,8 @@ struct CompleteRoot {
 #[serde(rename_all = "camelCase")]
 struct BindEvent {
     conversation_id: String,
+    #[serde(default)]
+    expected_conversation_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +209,13 @@ struct ReplyEvent {
     conversation_id: String,
     text: String,
     context_warning: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AbortEvent {
+    conversation_id: Option<String>,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -305,6 +316,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(save_transcription),
         )
         .route("/api/v1/events/{event_id}/reply", post(reply_event))
+        .route("/api/v1/events/{event_id}/abort", post(abort_event))
         .route(
             "/api/v1/events/{event_id}/reset-completed",
             post(complete_reset),
@@ -380,6 +392,21 @@ fn apply_migrations(db: &Connection) -> anyhow::Result<()> {
     db.execute_batch(GROUP_EVENTS_MIGRATION)?;
     migrate_event_context(db)?;
     migrate_group_user_sessions(db)?;
+    migrate_event_deadlines(db)?;
+    Ok(())
+}
+
+fn migrate_event_deadlines(db: &Connection) -> anyhow::Result<()> {
+    let columns = db
+        .prepare("PRAGMA table_info(telegram_events)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|name| name == "processing_started_at") {
+        db.execute_batch("ALTER TABLE telegram_events ADD COLUMN processing_started_at TEXT;")?;
+    }
+    if !columns.iter().any(|name| name == "completion_reason") {
+        db.execute_batch("ALTER TABLE telegram_events ADD COLUMN completion_reason TEXT;")?;
+    }
     Ok(())
 }
 
@@ -516,15 +543,27 @@ fn migrate_document_events(db: &Connection) -> anyhow::Result<()> {
         |row| row.get::<_, String>(0),
     )?;
     let mut columns = db.prepare("PRAGMA table_info(telegram_events)")?;
-    let has_file_name = columns
+    let column_names = columns
         .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == "file_name");
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_file_name = column_names.iter().any(|name| name == "file_name");
     if schema.contains("'document'") && has_file_name {
         return Ok(());
     }
     let file_name_source = if has_file_name { "file_name" } else { "NULL" };
+    let processing_started_at_source = if column_names
+        .iter()
+        .any(|name| name == "processing_started_at")
+    {
+        "processing_started_at"
+    } else {
+        "NULL"
+    };
+    let completion_reason_source = if column_names.iter().any(|name| name == "completion_reason") {
+        "completion_reason"
+    } else {
+        "NULL"
+    };
     db.execute_batch(&format!(
         r#"
         BEGIN IMMEDIATE;
@@ -546,20 +585,23 @@ fn migrate_document_events(db: &Connection) -> anyhow::Result<()> {
             duration_seconds INTEGER,
             status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'complete')),
             conversation_id TEXT,
+            processing_started_at TEXT,
             transcription TEXT,
             transcription_model TEXT,
             created_at TEXT NOT NULL,
-            completed_at TEXT
+            completed_at TEXT,
+            completion_reason TEXT
         );
         INSERT INTO telegram_events_new (
             id,update_id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,
             voice_bytes,mime_type,file_name,duration_seconds,status,conversation_id,transcription,
-            transcription_model,created_at,completed_at
+            transcription_model,created_at,completed_at,processing_started_at,completion_reason
         )
         SELECT
             id,update_id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,
             voice_bytes,mime_type,{file_name_source},duration_seconds,status,conversation_id,
-            transcription,transcription_model,created_at,completed_at
+            transcription,transcription_model,created_at,completed_at,
+            {processing_started_at_source},{completion_reason_source}
         FROM telegram_events;
         DROP TABLE telegram_events;
         ALTER TABLE telegram_events_new RENAME TO telegram_events;
@@ -1357,9 +1399,11 @@ fn row_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayEvent> {
         duration_seconds: row.get(10)?,
         status: row.get(11)?,
         conversation_id: row.get(12)?,
+        processing_started_at: row.get(19)?,
         transcription: row.get(13)?,
         transcription_model: row.get(14)?,
         created_at: row.get(15)?,
+        completion_reason: row.get(20)?,
         user_root_node_id: None,
         group_root_node_id: row.get(18)?,
         group_context: row
@@ -1371,7 +1415,7 @@ fn row_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayEvent> {
 
 fn fetch_event(db: &Connection, id: &str) -> Result<RelayEvent, ApiError> {
     db.query_row(
-        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at,session_kind,group_context_json,group_root_node_id FROM telegram_events WHERE id=?1",
+        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at,session_kind,group_context_json,group_root_node_id,processing_started_at,completion_reason FROM telegram_events WHERE id=?1",
         [id], row_event,
     ).optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)
 }
@@ -1395,7 +1439,7 @@ fn event_queue_key(event: &RelayEvent) -> String {
 async fn list_events(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
     let mut statement = db.prepare(
-        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at,session_kind,group_context_json,group_root_node_id FROM telegram_events WHERE status IN ('pending','processing') ORDER BY update_id",
+        "SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at,session_kind,group_context_json,group_root_node_id,processing_started_at,completion_reason FROM telegram_events WHERE status IN ('pending','processing') ORDER BY update_id",
     ).map_err(ApiError::internal)?;
     let queued = statement
         .query_map([], row_event)
@@ -1476,6 +1520,9 @@ async fn bind_event(
     Json(input): Json<BindEvent>,
 ) -> Result<Json<RelayEvent>, ApiError> {
     validate_conversation_id(&input.conversation_id)?;
+    if let Some(expected) = input.expected_conversation_id.as_deref() {
+        validate_conversation_id(expected)?;
+    }
     let db = state.db.lock().map_err(ApiError::internal)?;
     let event = fetch_event(&db, &id)?;
     if event.status == "complete" {
@@ -1483,18 +1530,34 @@ async fn bind_event(
             "The Telegram event is already complete.",
         ));
     }
-    if let Some(existing) = event.conversation_id.as_deref()
-        && existing != input.conversation_id
-        && event.status != "pending"
+    if let Some(expected) = input.expected_conversation_id.as_deref()
+        && event.conversation_id.as_deref() != Some(expected)
     {
         return Err(ApiError::conflict(
-            "The Telegram event is already bound to another conversation.",
+            "The Telegram event's conversation binding changed before it could be recovered.",
+        ));
+    }
+    let binding_changed = event.conversation_id.as_deref() != Some(input.conversation_id.as_str());
+    let explicit_recovery = event.conversation_id.as_deref().is_some()
+        && input.expected_conversation_id.as_deref() == event.conversation_id.as_deref();
+    if binding_changed && event.status != "pending" && !explicit_recovery {
+        return Err(ApiError::conflict(
+            "The Telegram event is already processing in another conversation; provide its expected binding to recover it safely.",
         ));
     }
     let now = Utc::now().to_rfc3339();
+    let processing_started_at =
+        if event.status == "pending" || binding_changed || event.processing_started_at.is_none() {
+            now.clone()
+        } else {
+            event
+                .processing_started_at
+                .clone()
+                .unwrap_or_else(|| now.clone())
+        };
     db.execute(
-        "UPDATE telegram_events SET status='processing',conversation_id=?1 WHERE id=?2 AND status<>'complete'",
-        params![input.conversation_id, id],
+        "UPDATE telegram_events SET status='processing',conversation_id=?1,processing_started_at=?2 WHERE id=?3 AND status<>'complete'",
+        params![input.conversation_id, processing_started_at, id],
     ).map_err(ApiError::internal)?;
     if event.session_kind == "private" {
         db.execute(
@@ -1702,6 +1765,138 @@ async fn reply_event(
     .map_err(ApiError::internal)?;
     tracing::info!(event_id=%id, duration_ms=started.elapsed().as_millis(), "Telegram reply");
     Ok(Json(fetch_event(&db, &id)?))
+}
+
+fn clear_matching_session_binding(
+    db: &Connection,
+    event: &RelayEvent,
+    updated_at: &str,
+) -> rusqlite::Result<()> {
+    let Some(conversation_id) = event.conversation_id.as_deref() else {
+        return Ok(());
+    };
+    if event.session_kind == "private" {
+        db.execute(
+            "UPDATE authorized_users SET current_conversation_id=NULL,updated_at=?1
+             WHERE telegram_user_id=?2 AND current_conversation_id=?3",
+            params![updated_at, event.telegram_user_id, conversation_id],
+        )?;
+    } else if let Some(group_root_node_id) = event.group_root_node_id.as_deref() {
+        db.execute(
+            "UPDATE telegram_group_user_sessions SET current_conversation_id=NULL,updated_at=?1
+             WHERE group_root_node_id=?2 AND telegram_user_id=?3 AND current_conversation_id=?4",
+            params![
+                updated_at,
+                group_root_node_id,
+                event.telegram_user_id,
+                conversation_id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn complete_aborted_event(
+    db: &Connection,
+    id: &str,
+    expected_conversation_id: Option<&str>,
+    completed_at: &str,
+) -> Result<(RelayEvent, bool), ApiError> {
+    let event = fetch_event(db, id)?;
+    if event.status == "complete" {
+        return Ok((event, false));
+    }
+    if event.conversation_id.as_deref() != expected_conversation_id {
+        return Err(ApiError::conflict(
+            "The Telegram event's conversation binding changed before it could be aborted.",
+        ));
+    }
+    let changed = db
+        .execute(
+            "UPDATE telegram_events
+             SET status='complete',completed_at=?1,completion_reason='timeout'
+             WHERE id=?2 AND status<>'complete'",
+            params![completed_at, id],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 1 {
+        clear_matching_session_binding(db, &event, completed_at).map_err(ApiError::internal)?;
+    }
+    Ok((fetch_event(db, id)?, changed == 1))
+}
+
+async fn abort_event(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<AbortEvent>,
+) -> Result<Json<RelayEvent>, ApiError> {
+    if let Some(conversation_id) = input.conversation_id.as_deref() {
+        validate_conversation_id(conversation_id)?;
+    }
+    let message = input.message.trim();
+    if message.is_empty() {
+        return Err(ApiError::bad("message must not be empty."));
+    }
+    let (event, newly_aborted) = {
+        let db = state.db.lock().map_err(ApiError::internal)?;
+        complete_aborted_event(
+            &db,
+            &id,
+            input.conversation_id.as_deref(),
+            &Utc::now().to_rfc3339(),
+        )?
+    };
+    if !newly_aborted {
+        return Ok(Json(event));
+    }
+
+    let sent = if let Some(bot) = state.bot.as_ref() {
+        let group_reply = (event.session_kind == "group").then_some(event.message_id);
+        match send_telegram_text(bot, event.chat_id, message, group_reply).await {
+            Ok(sent) => sent,
+            Err(error) => {
+                tracing::warn!(event_id=%id, error=%error.message, "Telegram timeout notice could not be delivered");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if event.session_kind == "group" && !sent.is_empty() {
+        let db = state.db.lock().map_err(ApiError::internal)?;
+        let mut through_message_id = event.message_id;
+        for sent_message in sent {
+            through_message_id = through_message_id.max(i64::from(sent_message.id.0));
+            db.execute(
+                "INSERT INTO telegram_group_messages(
+                     chat_id,message_id,update_id,display_name,text,reply_to_message_id,
+                     sent_by_kennedy,created_at,kind,source_conversation_id
+                 ) VALUES(?1,?2,0,'Kennedy',?3,?4,1,?5,'text',?6)
+                 ON CONFLICT(chat_id,message_id) DO NOTHING",
+                params![
+                    event.chat_id,
+                    i64::from(sent_message.id.0),
+                    sent_message.text().unwrap_or(""),
+                    event.message_id,
+                    sent_message.date.to_rfc3339(),
+                    event.conversation_id
+                ],
+            )
+            .map_err(ApiError::internal)?;
+        }
+        if let Some(group_root_node_id) = event.group_root_node_id.as_deref() {
+            queue_stale_group_session_resets(
+                &db,
+                event.chat_id,
+                group_root_node_id,
+                through_message_id,
+            )
+            .map_err(ApiError::internal)?;
+        }
+    }
+    tracing::warn!(event_id=%id, "Telegram response aborted at its hard timeout");
+    Ok(Json(event))
 }
 
 async fn complete_reset(
@@ -3500,7 +3695,7 @@ mod tests {
                 params![id, update, user, chat, now, session_kind, group_root],
             ).unwrap();
         }
-        let mut statement = db.prepare("SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at,session_kind,group_context_json,group_root_node_id FROM telegram_events WHERE status<>'complete' ORDER BY update_id").unwrap();
+        let mut statement = db.prepare("SELECT id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,mime_type,file_name,duration_seconds,status,conversation_id,transcription,transcription_model,created_at,session_kind,group_context_json,group_root_node_id,processing_started_at,completion_reason FROM telegram_events WHERE status<>'complete' ORDER BY update_id").unwrap();
         let queued = statement
             .query_map([], row_event)
             .unwrap()
@@ -3521,7 +3716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_events_can_rebind_after_a_queued_reset_but_processing_events_cannot() {
+    async fn processing_events_require_compare_and_swap_before_orphan_rebinding() {
         let (db, users) = databases();
         observe_identity(&users, 42, Some("taek42"), "David").unwrap();
         ensure_transport_user(&db, 42, Some("taek42"), "David", 42).unwrap();
@@ -3543,22 +3738,37 @@ mod tests {
             Path("event".into()),
             Json(BindEvent {
                 conversation_id: new_id.into(),
+                expected_conversation_id: Some("019f5ca7-020f-7b63-be2f-82785fb68c03".into()),
             }),
         )
         .await
         .unwrap();
         assert_eq!(rebound.0.status, "processing");
         assert_eq!(rebound.0.conversation_id.as_deref(), Some(new_id));
+        assert!(rebound.0.processing_started_at.is_some());
         let error = bind_event(
-            State(state),
+            State(state.clone()),
             Path("event".into()),
             Json(BindEvent {
                 conversation_id: "039f5ca7-020f-7b63-be2f-82785fb68c03".into(),
+                expected_conversation_id: None,
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(error.code, "state_conflict");
+        let recovered_id = "049f5ca7-020f-7b63-be2f-82785fb68c03";
+        let recovered = bind_event(
+            State(state),
+            Path("event".into()),
+            Json(BindEvent {
+                conversation_id: recovered_id.into(),
+                expected_conversation_id: Some(new_id.into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.0.conversation_id.as_deref(), Some(recovered_id));
     }
 
     #[tokio::test]
@@ -3588,6 +3798,7 @@ mod tests {
             Path("group-event".into()),
             Json(BindEvent {
                 conversation_id: "029f5ca7-020f-7b63-be2f-82785fb68c03".into(),
+                expected_conversation_id: None,
             }),
         )
         .await
@@ -3648,6 +3859,7 @@ mod tests {
             Path("legacy-group-event".into()),
             Json(BindEvent {
                 conversation_id: "029f5ca7-020f-7b63-be2f-82785fb68c03".into(),
+                expected_conversation_id: None,
             }),
         )
         .await
@@ -3708,6 +3920,51 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_event_completes_once_and_clears_only_its_matching_session() {
+        let (db, users) = databases();
+        observe_identity(&users, 42, Some("taek42"), "David").unwrap();
+        ensure_transport_user(&db, 42, Some("taek42"), "David", 42).unwrap();
+        let conversation_id = "019f5ca7-020f-7b63-be2f-82785fb68c03";
+        db.execute(
+            "UPDATE authorized_users SET current_conversation_id=?1 WHERE telegram_user_id=42",
+            [conversation_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO telegram_events(
+                 id,update_id,message_id,telegram_user_id,chat_id,display_name,kind,text,
+                 status,conversation_id,processing_started_at,created_at
+             ) VALUES('timed-out',1,1,42,42,'David','text','Hi','processing',?1,?2,?2)",
+            params![conversation_id, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+        let completed_at = Utc::now().to_rfc3339();
+        let (event, changed) =
+            complete_aborted_event(&db, "timed-out", Some(conversation_id), &completed_at).unwrap();
+        assert!(changed);
+        assert_eq!(event.status, "complete");
+        assert_eq!(event.completion_reason.as_deref(), Some("timeout"));
+        let current: Option<String> = db
+            .query_row(
+                "SELECT current_conversation_id FROM authorized_users WHERE telegram_user_id=42",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, None);
+
+        let (_, changed_again) = complete_aborted_event(
+            &db,
+            "timed-out",
+            Some(conversation_id),
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+        assert!(!changed_again);
+    }
+
+    #[test]
     fn existing_relay_schema_migrates_to_document_events() {
         let db = Connection::open_in_memory().unwrap();
         let legacy = INITIAL_MIGRATION
@@ -3715,7 +3972,12 @@ mod tests {
                 "'text', 'voice', 'document', 'reset'",
                 "'text', 'voice', 'reset'",
             )
-            .replace("    file_name TEXT,\n", "");
+            .replace("    file_name TEXT,\n", "")
+            .replace("    processing_started_at TEXT,\n", "")
+            .replace(
+                "    completed_at TEXT,\n    completion_reason TEXT\n",
+                "    completed_at TEXT\n",
+            );
         db.execute_batch(&legacy).unwrap();
         db.execute(
             "INSERT INTO telegram_events(id,update_id,message_id,telegram_user_id,chat_id,display_name,kind,text,status,conversation_id,transcription,transcription_model,created_at) VALUES('queued',1,1,42,42,'David','voice','Hello','processing',?1,'Transcript','gpt-4o-transcribe',?2)",
@@ -3733,6 +3995,8 @@ mod tests {
             Some("019f5ca7-020f-7b63-be2f-82785fb68c03")
         );
         assert_eq!(queued.transcription.as_deref(), Some("Transcript"));
+        assert_eq!(queued.processing_started_at, None);
+        assert_eq!(queued.completion_reason, None);
         db.execute(
             "INSERT INTO telegram_events(id,update_id,message_id,telegram_user_id,chat_id,display_name,kind,voice_bytes,mime_type,file_name,created_at) VALUES('doc',2,2,42,42,'David','document',X'01','application/pdf','notes.pdf',?1)",
             [Utc::now().to_rfc3339()],

@@ -375,8 +375,8 @@ canonical documents; this file is not an append-only log.
   composer and Telegram. Convert them locally to bounded readable text for the
   Chatend while retaining the original file and useful metadata. Searchable
   PDFs are required; image-only PDFs should fail clearly when OCR is needed.
-- Quality web searches can take longer than ten minutes, so their deadline is
-  15 minutes; balanced and fast search deadlines should
+- Quality web searches can take substantially longer than ten minutes, so
+  their deadline is 30 minutes; balanced and fast search deadlines should
   remain latency-oriented.
 - Make PDF upload discoverable through an explicitly labeled composer button.
 - During history ingress, show Kennedy's final review normally but start
@@ -558,21 +558,51 @@ canonical documents; this file is not an append-only log.
   checkpoints, retries, cancellation, and completion so future changes can be
   made against one cohesive boundary.
 
-## Autonomous Free Time
+## Autonomous Self Time
 
-- Add a browser-triggered `free-time` session in which Kennedy is broadly told
-  to have fun and may use the complete read, web, and Kmap write tool set.
+- Present autonomous self time in its own browser category tab, alongside
+  Conversation, TG Bot, and Audio Ingress. Its start panel accepts an optional
+  user prompt, persists it with the run, and repeats it in every clean-slate
+  slice. Retain `free-time` as the durable internal session type for existing
+  records.
+- In self time Kennedy is broadly told to have fun and may use the complete
+  read, web, and Kmap write tool set.
 - Default a run to 30 minutes while allowing a manually entered duration for
   short tests and overnight use. All clean-slate sessions in one run share a
   persisted absolute deadline; opening a new session never resets or reduces
   the remaining time.
-- Provide `EndFreeTimeSession` only during free time. Kennedy calls it alone to
+- Provide `EndSelfTimeSession` only during self time. Kennedy calls it alone to
   archive the current session and immediately open a new clean Chatend if time
   remains. A normal final response has the same rollover behavior.
 - Inject a Chatend timer notice once a live session enters its final three
   minutes. At the deadline block further tools and allow one wrap-up response;
   abort any remaining intelligence operation two minutes later, with each
   provider request capped to that same hard-stop window.
-- Persist and restore active free-time work through Conversation History,
+- Persist and restore active self-time work through Conversation History,
   serialize execution across browser tabs, give each run mutation provenance,
   and send every completed clean-slate session through normal history ingress.
+- Make starting visibly single-flight: disable the control and show a
+  `Starting…` state before the first network wait, and have Conversation History
+  reject creation while any `free-time` record is already active so separate
+  browser contexts cannot create overlapping runs.
+- Preserve the intelligence backend's request allowance for each provider
+  profile (including long quality searches), shortened only when the remaining
+  self-time deadline plus two-minute shutdown grace is smaller. Do not impose a
+  blanket 90-second cap on autonomous work.
+- Reconcile asynchronous Conversation History list responses monotonically by
+  record version, and adopt the latest record after a checkpoint conflict, so a
+  late stale response cannot pin every later tool checkpoint to an old version.
+- When Kennedy yields a self-time slice, open another clean-slate session only
+  if at least five minutes remain in the shared run; otherwise end the run.
+- Keep Telegram streams independent in the browser bridge: do not await an
+  entire fetched batch before polling again. Continue enforcing strict order
+  within each private-user or group-user stream while other stream heads run.
+- Recover a processing Telegram event whose Conversation History record is
+  missing by compare-and-swap rebinding it from the exact stale conversation
+  ID to a fresh record. Preserve any stored media and transcription so the
+  original query completes instead of requiring a replacement chat group.
+- Give every Telegram event a durable 30-minute processing deadline. If no
+  complete response is ready by then, cancel Kennedy's active turn, atomically
+  complete that event as a timeout, clear only its matching session pointer,
+  notify the Telegram chat on a best-effort basis, and close any saved pending
+  turn into history ingress so later events in that stream can proceed.

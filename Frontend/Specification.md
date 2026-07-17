@@ -107,7 +107,7 @@ their combined model-attribution value, its own direct root IDs, and any
 unloaded group-participant root references. Root selection is durable session
 state rather than one application-global user root; group-session records
 store user, group, and Kennedy roots in that order.
-Free-time sessions additionally own persisted run/deadline metadata and a
+Self-time sessions (durably typed as `free-time`) additionally own persisted run/deadline metadata and a
 run-level mutation provenance ID.
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
@@ -326,7 +326,7 @@ The frontend fetches composable prompt assets from
    `HistoryIngressSession.txt`, or `AudioIngressSession.txt`,
 3. `KmapBasics.txt`,
 4. `ReadTools.txt`, containing the Kmap and web read-only tools,
-5. `WriteTools.txt` only for history ingress, audio ingress, and free time,
+5. `WriteTools.txt` only for history ingress, audio ingress, and self time,
 6. `CodexHarness.txt` only when the frontend-selected provider kind is `codex`,
 7. a dynamic runtime section with the configured model and thinking mode.
 
@@ -585,13 +585,15 @@ particular source page-by-page. Fetched content is untrusted evidence, cannot
 override system instructions, and may fail when a page is unsafe, binary,
 blocked, JavaScript-dependent, or otherwise unsupported.
 
-### 8.10 `EndFreeTimeSession`
+### 8.10 `EndSelfTimeSession`
 
-`EndFreeTimeSession` accepts exactly an empty object, is available only when
+`EndSelfTimeSession` accepts exactly an empty object, is available only when
 the tool executor is in `free-time` mode, and must appear alone in its tool
 envelope. Its readable result confirms that total time is unchanged. The agent
-loop checkpoints that result and returns a control sentinel to the free-time
+loop checkpoints that result and returns a control sentinel to the self-time
 controller instead of requesting another response in the same Chatend.
+`EndFreeTimeSession` remains accepted as a compatibility alias for already
+archived durable turns, but new prompts expose only the self-time name.
 
 ### 8.11 Tool Failures
 
@@ -622,7 +624,7 @@ Startup is feature-isolated rather than one all-or-nothing transaction.
    conversation that actually started.
 6. Restore every `active` record as an independently continuable session. Resume
    each saved pending query from a fresh Codex thread, including in the
-   background when another conversation is selected. Active free-time records
+   background when another conversation is selected. Active self-time records
    resume autonomously under their saved absolute deadline and browser lock.
 7. Select the most recently updated active record, or create a new durable
    active record if none exists.
@@ -632,10 +634,10 @@ Startup is feature-isolated rather than one all-or-nothing transaction.
 Each feature starts when only its own prompt dependencies are ready. Missing
 identity, Kmap basics, or shared read tools disables every model session. A
 missing conversation session disables live conversation and Telegram only; a
-missing free-time session disables only free time. A
+missing self-time session disables only self time. A
 missing history-ingress session pauses only conversation
 memory ingress. A missing audio-ingress session pauses only audio-to-Kmap
-mutation. Missing write tools pauses both ingress modes and free time. Read-only history,
+mutation. Missing write tools pauses both ingress modes and self time. Read-only history,
 audio preparation, and the complete audio history remain available, and a
 failure of one ingress queue's poll does not prevent the other from being
 checked.
@@ -730,33 +732,51 @@ another tab from continuing after deletion. Purging an already running or
 completed ingress cannot roll back Kmap mutations that happened before purge,
 and the confirmation says so.
 
-### 9.4 Autonomous Free Time
+### 9.4 Autonomous Self Time
 
-The top-bar control accepts 0.1 through 10,080 minutes and defaults to 30. It
-creates a `free-time` Conversation History record with a run UUID, run start,
-duration, absolute deadline, slice index, and an idempotent run-level Kweb
-provenance ID. The initial autonomous instruction is checkpointed as a pending
-turn before generation begins. The composer is hidden for these records, while
-their transcript, Chatend, tool traffic, countdown, and history phases remain
-inspectable.
+The dedicated Self Time category tab has a start panel that accepts 0.1 through
+10,080 minutes, defaults to 30, and accepts an optional custom prompt up to
+20,000 characters. On the first click it immediately disables the prompt,
+duration, and button, labels the button `Starting…`, and shares one in-page
+start promise across any repeated click handlers. It creates a `free-time`
+Conversation History record with a run UUID, run start, duration, absolute
+deadline, slice index, trimmed custom prompt, and an
+idempotent run-level Kweb provenance ID. The backend rejects creation if a
+free-time record is already active; the frontend then adopts that existing
+record instead of creating an overlap. The initial autonomous instruction is
+checkpointed as a pending turn before generation begins and repeats the custom
+prompt in every clean-slate slice. The composer is
+hidden for these records, while their transcript, Chatend, tool traffic,
+countdown, and history phases remain inspectable. The live status says
+`One run · slice N`, and history rows say `Self time · slice N`, so intentional
+clean-slate rollovers are not presented as separate button-started runs.
 
 One same-origin `kennedy-free-time` Web Lock owns execution across tabs. A
-normal final response or successful `EndFreeTimeSession` finalizes the current
-record into `ingress_pending`. If wall-clock time is still before the persisted
-deadline, the controller increments the slice index and creates a new record
-with a fresh Chatend, context, continuation, counters, and the unchanged run
-deadline/provenance. Startup restores an active pending slice and reacquires the
+normal final response or successful `EndSelfTimeSession` finalizes the current
+record into `ingress_pending`. If at least five minutes remain before the
+persisted deadline, the controller increments the slice index and creates a
+new record with a fresh Chatend, context, continuation, counters, and the
+unchanged run deadline/provenance. With less than five minutes left, it ends
+the run instead. Startup restores an active pending slice and reacquires the
 lock; provider or checkpoint failures retry the same durable turn.
 
 Before every model round and immediately after every model response, the
 session compares wall-clock time with the deadline. At or below three minutes
-it appends and checkpoints one retained `Free time timer` user message. At the
+it appends and checkpoints one retained `Self time timer` user message. At the
 deadline it appends the expiry message, rejects further ordinary tools and
 Kmap mutations, and marks the next model request as the final wrap-up round.
-Generation and quality-search requests carry a timeout no longer than the
-remaining deadline plus a two-minute grace. A browser timer also aborts and
-cancels the operation at that hard stop. Finalization clears `pendingTurn` and
-queues the complete slice archive for the normal memory-ingress coordinator.
+Generation and search requests preserve the intelligence backend's
+provider/profile timeout, including the longer quality-search allowance, but
+the frontend supplies the shorter remaining deadline plus two-minute grace
+when necessary. A browser timer also aborts and cancels the operation at that
+hard stop.
+Finalization clears `pendingTurn` and queues the complete slice archive for the
+normal memory-ingress coordinator.
+
+Conversation History list responses are reconciled with the local cache by
+monotonically increasing record version. A delayed list response therefore
+cannot overwrite a checkpoint response with an older active-record version;
+after a checkpoint conflict the latest server record is adopted before retry.
 
 ## 10. History-Ingress Flow
 
@@ -1032,7 +1052,20 @@ discovered and provisioned by the same bridge loop before their events run.
 One browser tab holds the `kennedy-telegram-bridge` Web Lock. It polls the
 relay's durable per-private-user/per-group-user head events, binds each event to its Conversation
 History ID, runs the normal read-only conversation session, and returns only
-Kennedy's final conversational output. It also polls durable passive group
+Kennedy's final conversational output. Each fetched queue head runs as an
+independent in-flight task; the bridge keeps polling while long model or tool
+work continues, allowing newly available heads from other private users or
+group-user pairs to start without violating the relay's per-stream ordering.
+The relay's persisted processing start gives each event a 30-minute hard
+deadline that survives reloads. On expiry the frontend stops the active
+conversation turn, asks the relay to complete the event as timed out, and
+transitions a saved pending conversation into history ingress; a best-effort
+Telegram notice explains that the request was stopped. If an event points to a
+Conversation History record that is missing or no longer active, the frontend
+creates a replacement and compare-and-swap rebinds from the exact stale ID,
+preserving already stored voice transcription and media and restarting the
+deadline for the recovered attempt.
+It also polls durable passive group
 context ranges and checkpoints them without entering the model loop. Event IDs are stored on user and
 assistant transcript items so reload can resume generation or retry delivery
 without regenerating a completed answer. A `/reset` event closes that user's

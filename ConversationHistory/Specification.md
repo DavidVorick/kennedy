@@ -24,10 +24,14 @@ Each conversation record contains:
   and measured context occupancy when available,
 - optional next-attempt time for a deferred automatic ingress retry.
 
-SQLite permits any number of `active` and `ingress_pending` records but at most
-one `ingress_in_progress` record. Completed and failed records remain available
-as conversation history. A migration removes the older one-unfinished-record
-index; legacy rows receive null activity/end times and remain valid.
+SQLite permits any number of ordinary `active` and `ingress_pending` records
+but at most one `ingress_in_progress` record. The create path also atomically
+rejects a second active `free-time` record with
+`free_time_already_active`; this server-side guard covers separate browser
+contexts in addition to the frontend's Web Lock. Completed and failed records
+remain available as conversation history. A migration removes the older
+one-unfinished-record index; legacy rows receive null activity/end times and
+remain valid.
 
 A current startup also drops the obsolete singleton index idempotently even
 when `user_version` is already 2. This repairs databases touched by an early v2

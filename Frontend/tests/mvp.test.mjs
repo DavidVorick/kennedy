@@ -6,7 +6,7 @@ import { Chatend } from "../public/js/chatend.js";
 import { MAX_RESET_SELF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
-import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, sortConversationHistory } from "../public/js/render.js";
+import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, reconcileConversationHistory, sortConversationHistory } from "../public/js/render.js";
 import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
 import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
@@ -15,7 +15,8 @@ import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelay
 import { formatDuration } from "../public/js/timing.js";
 import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
-import { FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, freeTimeRequestTimeoutSeconds, freeTimeTiming, parseFreeTimeMinutes } from "../public/js/free_time.js";
+import { FREE_TIME_CONTINUATION_MINIMUM_MS, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, MAX_SELF_TIME_PROMPT_CHARACTERS, freeTimeCanStartNewSession, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "../public/js/free_time.js";
+import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventDeadlineMs, telegramEventTimeoutMs } from "../public/js/telegram_timing.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -489,7 +490,7 @@ test("live conversations cannot mutate the Kmap", async () => {
   }
 });
 
-test("free time authorizes Kmap writes and exposes its clean-slate end tool only there", async () => {
+test("self time authorizes Kmap writes and exposes its clean-slate end tool only there", async () => {
   const api = new MockKweb([node(1, [2]), node(2)]);
   const context = new KwebContext(api, id(1)); await context.initialize();
   let endCalls = 0;
@@ -501,7 +502,7 @@ test("free time authorizes Kmap writes and exposes its clean-slate end tool only
   assert.equal(connected.message.tool_result.ok, true);
   assert.deepEqual(api.connected, [id(1), id(2)]);
 
-  const ended = await executor.execute({ id: "end", name: "EndFreeTimeSession", arguments: {} });
+  const ended = await executor.execute({ id: "end", name: "EndSelfTimeSession", arguments: {} });
   assert.equal(ended.endSession, true);
   assert.equal(ended.message.tool_result.result.totalTimeReduced, false);
   assert.equal(endCalls, 1);
@@ -509,10 +510,10 @@ test("free time authorizes Kmap writes and exposes its clean-slate end tool only
   const conversation = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
   const unavailable = await conversation.execute({ id: "end", name: "EndFreeTimeSession", arguments: {} });
   assert.equal(unavailable.message.tool_result.ok, false);
-  assert.match(unavailable.message.content, /only available during free time/);
+  assert.match(unavailable.message.content, /only available during self time/);
 });
 
-test("free-time clocks use one absolute deadline with a three-minute warning and two-minute hard stop", () => {
+test("self-time clocks, rollover threshold, and custom prompt preserve one durable run", () => {
   const now = Date.parse("2026-07-17T12:00:00Z");
   const freeTime = { deadlineAt: "2026-07-17T12:02:30Z" };
   const timing = freeTimeTiming(freeTime, now);
@@ -520,10 +521,25 @@ test("free-time clocks use one absolute deadline with a three-minute warning and
   assert.equal(timing.remainingMs, 150_000);
   assert.equal(timing.hardStopMs, Date.parse(freeTime.deadlineAt) + FREE_TIME_HARD_STOP_GRACE_MS);
   assert.equal(freeTimeRequestTimeoutSeconds(freeTime, now), 270);
+  assert.equal(freeTimeRequestTimeoutSeconds(freeTime, timing.hardStopMs - 29_500), 30);
   assert.equal(FREE_TIME_WARNING_MS, 180_000);
+  assert.equal(FREE_TIME_CONTINUATION_MINIMUM_MS, 300_000);
+  assert.equal(freeTimeCanStartNewSession({ deadlineAt: new Date(now + 300_000).toISOString() }, now), true);
+  assert.equal(freeTimeCanStartNewSession({ deadlineAt: new Date(now + 299_999).toISOString() }, now), false);
   assert.equal(parseFreeTimeMinutes("0.1"), 0.1);
   assert.equal(parseFreeTimeMinutes("480"), 480);
   assert.throws(() => parseFreeTimeMinutes("0"), /between 0.1/);
+  assert.equal(parseSelfTimePrompt("  Study the Telegram relay.  "), "Study the Telegram relay.");
+  assert.throws(() => parseSelfTimePrompt("x".repeat(MAX_SELF_TIME_PROMPT_CHARACTERS + 1)), /at most 20,000 characters/);
+  const opening = freeTimeOpeningMessage({
+    runId: "self-time-run",
+    sliceIndex: 2,
+    runStartedAt: new Date(now).toISOString(),
+    deadlineAt: new Date(now + 300_000).toISOString(),
+    customPrompt: "Study the Telegram relay.",
+  }, now);
+  assert.match(opening, /Self-time session 2 is open/);
+  assert.match(opening, /User-provided focus for this self-time run:\nStudy the Telegram relay\./);
 });
 
 test("web tools reject extra retrieval knobs and remain available during ingress", async () => {
@@ -665,7 +681,7 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.equal(checkpoints[0].includes("Second completed."), true);
 });
 
-test("EndFreeTimeSession checkpoints its result and returns loop control without another generation", async () => {
+test("EndSelfTimeSession checkpoints its result and returns loop control without another generation", async () => {
   const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
   const chatend = new Chatend("free-time instructions", context, [{ role: "user", content: "Have fun." }]);
   let requests = 0;
@@ -675,7 +691,7 @@ test("EndFreeTimeSession checkpoints its result and returns loop control without
       requests += 1;
       return {
         status: "complete", response_id: "free-time-thread", usage: null,
-        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndFreeTimeSession","arguments":{}}]}' },
+        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndSelfTimeSession","arguments":{}}]}' },
       };
     },
   };
@@ -1042,10 +1058,10 @@ test("conversation history titles use the first durable user message", () => {
   assert.equal(conversationTitle({ state: { transcript: [] } }), "New conversation");
 });
 
-test("free-time history titles identify clean-slate slices", () => {
+test("self-time history titles identify clean-slate slices", () => {
   assert.equal(conversationTitle({
     state: { sessionType: "free-time", freeTime: { sliceIndex: 4 }, transcript: [] },
-  }), "Free time · session 4");
+  }), "Self time · slice 4");
 });
 
 test("audio history titles use the durable original filename", () => {
@@ -1099,6 +1115,24 @@ test("conversation history keeps live, finalizing, and finalized records in sepa
     "complete-old",
   ]);
   assert.equal(records[0].id, "complete-new", "sorting must not mutate backend results");
+});
+
+test("conversation history reconciliation never regresses a cached record version", () => {
+  const cached = [
+    { id: "active", version: 4, phase: "active", updated_at: "2026-07-17T12:04:00Z" },
+    { id: "removed", version: 1, phase: "complete", updated_at: "2026-07-17T12:01:00Z" },
+  ];
+  const staleResponse = [
+    { id: "active", version: 3, phase: "active", updated_at: "2026-07-17T12:03:00Z" },
+    { id: "new", version: 1, phase: "complete", updated_at: "2026-07-17T12:02:00Z" },
+  ];
+  const reconciled = reconcileConversationHistory(cached, staleResponse);
+  assert.equal(reconciled.find(record => record.id === "active")?.version, 4);
+  assert.equal(reconciled.some(record => record.id === "removed"), false);
+  assert.equal(reconciled.find(record => record.id === "new")?.version, 1);
+
+  const currentResponse = [{ id: "active", version: 5, phase: "active", updated_at: "2026-07-17T12:05:00Z" }];
+  assert.equal(reconcileConversationHistory(reconciled, currentResponse)[0].version, 5);
 });
 
 test("composer stays editable but cannot send during a conversation transition", () => {
@@ -1666,7 +1700,7 @@ test("system prompt composition uses readable sections rather than markup wrappe
   const manuals = {
     identity: "Identity.",
     conversationSession: "Conversation session.",
-    freeTimeSession: "Free time. Have fun and use EndFreeTimeSession for a clean slate.",
+    freeTimeSession: "Self time. Have fun and use EndSelfTimeSession for a clean slate.",
     historyIngressSession: "History session.",
     audioIngressSession: "Audio session.",
     codexHarness: "The outer harness catches Kennedy tool calls.",
@@ -1681,9 +1715,9 @@ test("system prompt composition uses readable sections rather than markup wrappe
     sessionType: "free-time",
     sessionContext: "The shared deadline is 2026-07-17T12:30:00Z.",
   });
-  assert.match(freeTime, /Free time\. Have fun/);
+  assert.match(freeTime, /Self time\. Have fun/);
   assert.match(freeTime, /Write tools\n\nWrite tools\./);
-  assert.match(freeTime, /Free-time schedule\n\nThe shared deadline/);
+  assert.match(freeTime, /Self-time schedule\n\nThe shared deadline/);
   const history = composePrompt(manuals, "ingress", { sourceSessionType: "telegram" });
   assert.match(history, /Source: an archived Telegram conversation/);
   assert.match(history, /Write tools\n\nWrite tools\./);
@@ -2038,21 +2072,32 @@ test("frontend defaults to main with full and full-history inspectors and retain
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
 });
 
-test("the browser exposes configurable durable free time with cross-tab and hard-stop orchestration", async () => {
+test("the browser exposes self time in a dedicated tab with a durable custom prompt", async () => {
   const [html, app, manual] = await Promise.all([
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
     readFile(new URL("../SystemPrompts/FreeTimeSession.txt", import.meta.url), "utf8"),
   ]);
-  assert.match(html, /id="free-time-minutes"[^>]*min="0\.1"[^>]*max="10080"[^>]*value="30"/);
-  assert.match(html, /id="start-free-time"/);
+  assert.match(html, /id="self-time-tab"[^>]*>Self Time<\/button>/);
+  assert.match(html, /id="self-time-panel"/);
+  assert.match(html, /id="self-time-prompt"[^>]*maxlength="20000"/);
+  assert.match(html, /id="self-time-minutes"[^>]*min="0\.1"[^>]*max="10080"[^>]*value="30"/);
+  assert.match(html, /id="start-self-time"[^>]*>Start self time<\/button>/);
+  assert.match(app, /if \(sessionType === "free-time"\) return "self-time"/);
+  assert.match(app, /customPrompt = parseSelfTimePrompt\(ui\.self_time_prompt\.value\)/);
+  assert.match(app, /customPrompt,/);
   assert.match(app, /navigator\.locks\.request\("kennedy-free-time"/);
+  assert.match(app, /if \(freeTimeStartPromise\) return freeTimeStartPromise/);
+  assert.match(app, /freeTimeStarting = true;\s+update\(\);\s+const work = startFreeTimeCoordinated\(\)/);
+  assert.match(app, /error\?\.code !== "free_time_already_active"/);
   assert.match(app, /FREE_TIME_HARD_STOP_GRACE_MS/);
+  assert.match(app, /if \(freeTimeCanStartNewSession\(metadata\) && !purgedConversationIds\.has\(id\)\)/);
+  assert.match(app, /if \(!freeTimeCanStartNewSession\(freeTime\)\) \{\s+finishRun\(\)/);
   assert.match(app, /session\.stageFreeTimeOpening\(\)/);
   assert.match(app, /chatRuntimeReady\(\) \|\| freeTimeRuntimeReady\(\)/);
-  assert.match(manual, /Have fun/);
-  assert.match(manual, /EndFreeTimeSession/);
-  assert.match(manual, /does not surrender, shorten, reset, or otherwise reduce/);
+  assert.match(manual, /free to do whatever you want/i);
+  assert.match(manual, /EndSelfTimeSession/);
+  assert.match(manual, /allocating all remaining time/);
 });
 
 test("audio recording view starts large artifacts collapsed and includes inline history ingress", async () => {
@@ -2067,6 +2112,28 @@ test("audio recording view starts large artifacts collapsed and includes inline 
   assert.match(render, /renderIngressActivity\(\s*ingress,/s);
   assert.match(app, /ingressActivities: audioIngressActivities\(detail\)/);
   assert.match(app, /loading: audioDetailLoading\.has\(selectedAudioId\) && !detail/);
+});
+
+test("Telegram queue heads run independently without blocking later relay polls", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /function launchTelegramEvent\(event\) \{[\s\S]*telegramInFlight\.add\(event\.id\);[\s\S]*void runTelegramEvent\(event\)/);
+  assert.match(app, /for \(const event of events\) launchTelegramEvent\(event\);/);
+  assert.doesNotMatch(app, /await Promise\.all\(events\.map/);
+});
+
+test("Telegram processing has a durable 30-minute deadline and orphan recovery path", async () => {
+  const now = Date.parse("2026-07-17T19:00:00Z");
+  assert.equal(TELEGRAM_RESPONSE_TIMEOUT_MS, 30 * 60 * 1000);
+  assert.equal(telegramEventDeadlineMs({}, now), now + TELEGRAM_RESPONSE_TIMEOUT_MS);
+  assert.equal(telegramEventTimeoutMs({ processingStartedAt: "2026-07-17T18:45:00Z" }, now), 15 * 60 * 1000);
+  assert.equal(telegramEventTimeoutMs({ processingStartedAt: "2026-07-17T18:00:00Z" }, now), 0);
+
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /event\.conversationId !== record\.id \|\| !event\.processingStartedAt/);
+  assert.match(app, /telegramRelay\.bind\(event\.id, record\.id, event\.conversationId \|\| null\)/);
+  assert.match(app, /runtime\.session\.stopPendingTurn\(\)/);
+  assert.match(app, /telegramRelay\.abort\(event\.id, runtime\.conversationId, TELEGRAM_TIMEOUT_NOTICE\)/);
+  assert.match(app, /closeTimedOutTelegramConversation\(runtime\)/);
 });
 
 test("telegram voice sessions archive media, correlate delivery, and emit context notices outside the Chatend", async () => {
@@ -2289,7 +2356,8 @@ test("audio, document, durable vnote, and Telegram API clients use their queue e
     await AudioIngressAPI("http://audio").nextIngress();
     await AudioIngressAPI("http://audio").history("recording");
     await AudioIngressAPI("http://audio").ingressCheckpoint("piece", { expected_version: 2, state: { historyIngress: {} } });
-    await TelegramRelayAPI("http://telegram").bind("event", "019f5ca7-020f-7b63-be2f-82785fb68c03");
+    await TelegramRelayAPI("http://telegram").bind("event", "019f5ca7-020f-7b63-be2f-82785fb68c03", "029f5ca7-020f-7b63-be2f-82785fb68c03");
+    await TelegramRelayAPI("http://telegram").abort("event", "019f5ca7-020f-7b63-be2f-82785fb68c03", "Timed out");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2305,5 +2373,7 @@ test("audio, document, durable vnote, and Telegram API clients use their queue e
   assert.equal(requests[5].url, "http://audio/api/v1/audio-ingress/pieces/piece/ingress-checkpoint");
   assert.match(requests[5].options.body, /historyIngress/);
   assert.equal(requests[6].url, "http://telegram/api/v1/events/event/bind");
-  assert.match(requests[6].options.body, /conversationId/);
+  assert.match(requests[6].options.body, /"expectedConversationId":"029f5ca7-020f-7b63-be2f-82785fb68c03"/);
+  assert.equal(requests[7].url, "http://telegram/api/v1/events/event/abort");
+  assert.match(requests[7].options.body, /"message":"Timed out"/);
 });

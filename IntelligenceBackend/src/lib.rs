@@ -3448,7 +3448,7 @@ mod tests {
         assert_eq!(quality.model, "gpt-5.6-sol");
         assert_eq!(quality.reasoning_effort, "xhigh");
         assert_eq!(quality.context_size, Some("high"));
-        assert_eq!(quality.timeout_seconds, 15 * 60);
+        assert_eq!(quality.timeout_seconds, 30 * 60);
         assert!(codex_search_prompt("topic", WebSearchMode::Balanced).contains("focused"));
         assert!(codex_search_prompt("topic", WebSearchMode::Quality).contains("thorough"));
     }

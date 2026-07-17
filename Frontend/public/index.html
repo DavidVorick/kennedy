@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kennedy</title>
-  <link rel="stylesheet" href="/css/styles.css?v=20260717.2">
+  <link rel="stylesheet" href="/css/styles.css?v=20260717.3">
 </head>
 <body>
   <header class="topbar">
@@ -14,14 +14,8 @@
     </div>
     <div class="top-actions">
       <span id="service-status" class="status" role="status">Starting…</span>
-      <div class="free-time-controls" aria-label="Kennedy free time">
-        <label for="free-time-minutes">Free time</label>
-        <input id="free-time-minutes" type="number" min="0.1" max="10080" step="0.1" value="30" inputmode="decimal" aria-label="Free-time duration in minutes">
-        <span>min</span>
-        <button id="start-free-time" class="primary" type="button">Start</button>
-        <span id="free-time-status" class="free-time-status" aria-live="polite"></span>
-      </div>
       <button id="chat-tab" class="tab active" type="button">Conversation</button>
+      <button id="self-time-tab" class="tab" type="button">Self Time</button>
       <button id="tg-tab" class="tab" type="button">TG Bot</button>
       <button id="audio-tab" class="tab" type="button">Audio Ingress</button>
       <button id="memory-tab" class="tab" type="button">Memory</button>
@@ -45,6 +39,22 @@
         </section>
       </aside>
       <section class="panel conversation-panel" aria-label="Conversation">
+        <section id="self-time-panel" class="self-time-panel hidden" aria-label="Start self time">
+          <div class="self-time-heading">
+            <div><span class="eyebrow">AUTONOMOUS SESSION</span><h2>Self time</h2></div>
+            <span id="self-time-status" class="self-time-status" aria-live="polite"></span>
+          </div>
+          <label class="self-time-prompt-field" for="self-time-prompt">
+            <span>Optional prompt</span>
+            <textarea id="self-time-prompt" rows="4" maxlength="20000" placeholder="Give Kennedy a focus, question, project, or direction—or leave this blank for completely open-ended self time."></textarea>
+          </label>
+          <div class="self-time-launch">
+            <label for="self-time-minutes">Duration</label>
+            <input id="self-time-minutes" type="number" min="0.1" max="10080" step="0.1" value="30" inputmode="decimal" aria-label="Self-time duration in minutes">
+            <span>minutes</span>
+            <button id="start-self-time" class="primary" type="button">Start self time</button>
+          </div>
+        </section>
         <div id="transcript" class="transcript" aria-live="polite">
           <div class="empty-state">
             <p class="empty-title">What are we working on?</p>
@@ -114,6 +124,6 @@
     </section>
   </main>
 
-  <script type="module" src="/js/app.js?v=20260717.12"></script>
+  <script type="module" src="/js/app.js?v=20260717.20"></script>
 </body>
 </html>

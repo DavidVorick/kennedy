@@ -1,10 +1,10 @@
-import { Chatend } from "./chatend.js?v=20260717.5";
+import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260717.7";
-import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.8";
-import { ToolExecutor } from "./tools.js?v=20260717.7";
-import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.7";
+import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
+import { ToolExecutor } from "./tools.js?v=20260717.8";
+import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.8";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { freeTimeExpiredMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeWarningMessage, formatFreeTimeRemaining } from "./free_time.js?v=20260717.1";
+import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeWarningMessage, formatFreeTimeRemaining } from "./free_time.js?v=20260717.5";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -315,7 +315,7 @@ export class ConversationSession {
         this.pendingCheckpointed = false;
         const finalSaveStarted = performance.now();
         await this.persistSnapshot(this.snapshot());
-        addTimingStep(timing, "checkpoint", "Free-time session save", elapsedMs(finalSaveStarted));
+        addTimingStep(timing, "checkpoint", "Self-time session save", elapsedMs(finalSaveStarted));
         updateTimingSummary(timing);
         this.reportTurnTiming(timing, "ok");
         this.onUpdate();
@@ -436,7 +436,7 @@ export class ConversationSession {
   }
 
   stageFreeTimeOpening() {
-    if (this.sessionType !== "free-time" || !this.freeTime) throw new Error("This is not a free-time session.");
+    if (this.sessionType !== "free-time" || !this.freeTime) throw new Error("This is not a self-time session.");
     if (this.transcript.length || this.pendingTurn) return false;
     if (!this.stageUserInput(freeTimeOpeningMessage(this.freeTime, this.now()))) return false;
     this.pendingTurn = true;
@@ -451,26 +451,32 @@ export class ConversationSession {
   }
 
   assertFreeTimeToolAllowed(name) {
-    if (this.sessionType !== "free-time" || name === "EndFreeTimeSession") return;
+    if (this.sessionType !== "free-time" || ["EndSelfTimeSession", "EndFreeTimeSession"].includes(name)) return;
     if (freeTimeTiming(this.freeTime, this.now()).expired) {
-      throw Object.assign(new Error("The free-time deadline has passed; tools are no longer available during wrap-up."), { code: "free_time_expired" });
+      throw Object.assign(new Error("The self-time deadline has passed; tools are no longer available during wrap-up."), { code: "free_time_expired" });
     }
   }
 
   requestFreeTimeSessionEnd() {
-    if (this.sessionType !== "free-time") throw Object.assign(new Error("This is not a free-time session."), { code: "tool_unavailable" });
+    if (this.sessionType !== "free-time") throw Object.assign(new Error("This is not a self-time session."), { code: "tool_unavailable" });
     this.freeTimeEndReason = "tool";
-    const remaining = freeTimeTiming(this.freeTime, this.now()).remainingMs;
+    const now = this.now();
+    const remaining = freeTimeTiming(this.freeTime, now).remainingMs;
+    const willContinue = freeTimeCanStartNewSession(this.freeTime, now);
     return {
       sessionEnding: true,
       totalTimeReduced: false,
       remaining: formatFreeTimeRemaining(remaining),
-      next: remaining > 0 ? "A new clean-slate free-time session will open with the same deadline." : "The shared free-time deadline has arrived, so the run will end.",
+      next: willContinue
+        ? "A new clean-slate self-time session will open with the same deadline."
+        : remaining > 0
+          ? "Less than five minutes remain, so the self-time run will end instead of opening another session."
+          : "The shared self-time deadline has arrived, so the run will end.",
     };
   }
 
   appendFreeTimeTimerMessage(content) {
-    const message = { role: "user", display_role: "Free time timer", context_kind: "free-time-timer", content };
+    const message = { role: "user", display_role: "Self time timer", context_kind: "free-time-timer", content };
     this.chatend.retained.push(jsonCopy(message));
     this.chatend.append(message);
   }

@@ -28,6 +28,14 @@ in the relay archive. `/reset` is an event: the browser closes the corresponding
 Telegram conversation, requests history ingress, and acknowledges the reset only
 after that transition is durable.
 
+Binding an event records `processing_started_at`, which is the durable origin
+of its 30-minute response deadline. If a processing event names a Conversation
+History record that no longer exists, the browser may replace that binding only
+with an `expectedConversationId` matching the event's current value. This
+compare-and-swap recovery starts a fresh deadline and retains the event's media
+and saved transcription. An ordinary processing event cannot otherwise be
+rebound.
+
 Private active pointers remain in `authorized_users`. Group pointers live in
 `telegram_group_user_sessions`, keyed by stable group-root ID and Telegram user
 ID, and `telegram_events.group_root_node_id` makes that identity durable across
@@ -96,6 +104,15 @@ filename/caption, and duration metadata as private events. Reply bodies contain
 Kennedy's conversational output only, plus an
 optional separate context-window notice. Long messages are split safely below
 Telegram's message limit.
+
+The browser runs fetched stream heads independently and enforces each event's
+durable 30-minute deadline. At expiry it cancels the locally active model/tool
+turn and calls the relay's abort transition. That transition atomically marks
+the exact event complete with `completion_reason: timeout` and clears only a
+private or group-user pointer that still matches the event's binding, allowing
+the next head in that stream to appear immediately. The relay then attempts a
+timeout notice; Telegram delivery failure is logged but cannot put the event
+back in the queue. Repeating the abort is idempotent.
 
 A group `/reset` event carries recent group context. The browser checkpoints
 all unseen messages through the reset message before transitioning the exact

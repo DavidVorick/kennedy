@@ -1,10 +1,11 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.5";
-import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.8";
-import { ConversationSession } from "./conversation.js?v=20260717.10";
-import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260717.2";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260717.7";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.8";
-import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes } from "./free_time.js?v=20260717.1";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.6";
+import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
+import { ConversationSession } from "./conversation.js?v=20260717.13";
+import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260717.3";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260717.8";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260717.11";
+import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./free_time.js?v=20260717.5";
+import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventTimeoutMs } from "./telegram_timing.js?v=20260717.1";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -16,7 +17,7 @@ const CONFIG = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "free-time-minutes", "start-free-time", "free-time-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "send-end-button", "stop-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
+  "service-status", "self-time-panel", "self-time-prompt", "self-time-minutes", "start-self-time", "self-time-status", "chat-view", "memory-view", "chat-tab", "self-time-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "send-end-button", "stop-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["main", "full", "history"];
@@ -42,7 +43,7 @@ let transcriptionAvailable = false;
 let explorer = null;
 let historyRecords = [];
 let selectedConversationId = null;
-let selectedByView = { conversation: null, telegram: null };
+let selectedByView = { conversation: null, "self-time": null, telegram: null };
 let audioRecords = [];
 let selectedAudioId = null;
 let audioDetails = new Map();
@@ -68,6 +69,7 @@ let attachmentDrafts = new Map();
 let extractingAttachments = new Set();
 let freeTimeRun = null;
 let freeTimeStarting = false;
+let freeTimeStartPromise = null;
 let freeTimeRunnerIds = new Set();
 let freeTimeContinuationRuns = new Set();
 let telegramBridgeRunning = false;
@@ -151,6 +153,7 @@ function sessionTypeOf(record) {
 }
 
 function viewForSessionType(sessionType) {
+  if (sessionType === "free-time") return "self-time";
   return String(sessionType).startsWith("telegram") ? "telegram" : "conversation";
 }
 
@@ -162,29 +165,32 @@ function activeFreeTimeRecord() {
   return historyRecords.find(record => record.phase === "active" && sessionTypeOf(record) === "free-time") || null;
 }
 
-function renderFreeTimeControls() {
+function renderSelfTimeControls() {
   const metadata = freeTimeRun || freeTimeOf(activeFreeTimeRecord());
   const active = Boolean(metadata);
-  ui.free_time_minutes.disabled = active || freeTimeStarting;
-  ui.start_free_time.disabled = active || freeTimeStarting || !freeTimeRuntimeReady();
-  ui.start_free_time.textContent = freeTimeStarting ? "Starting…" : active ? "Running" : "Start";
+  ui.self_time_prompt.disabled = active || freeTimeStarting;
+  ui.self_time_minutes.disabled = active || freeTimeStarting;
+  ui.start_self_time.disabled = active || freeTimeStarting || !freeTimeRuntimeReady();
+  ui.start_self_time.textContent = freeTimeStarting ? "Starting…" : active ? "Self time running" : "Start self time";
+  ui.start_self_time.setAttribute("aria-busy", String(freeTimeStarting));
   if (!metadata) {
-    ui.free_time_status.textContent = "";
+    ui.self_time_status.textContent = freeTimeStarting ? "Reserving one run…" : "";
     return;
   }
+  const savedPrompt = String(metadata.customPrompt || "");
+  if (ui.self_time_prompt.value !== savedPrompt) ui.self_time_prompt.value = savedPrompt;
   try {
     const timing = freeTimeTiming(metadata);
-    ui.free_time_status.textContent = timing.expired
+    ui.self_time_status.textContent = timing.expired
       ? `Wrapping up · hard stop in ${formatFreeTimeRemaining(timing.hardStopMs - Date.now())}`
-      : `Session ${metadata.sliceIndex} · ${formatFreeTimeRemaining(timing.remainingMs)} left`;
+      : `One run · slice ${metadata.sliceIndex} · ${formatFreeTimeRemaining(timing.remainingMs)} left`;
   } catch {
-    ui.free_time_status.textContent = "Schedule unavailable";
+    ui.self_time_status.textContent = "Schedule unavailable";
   }
 }
 
 function recordsForView(view = activeView) {
-  const type = view === "telegram" ? "telegram" : "conversation";
-  return sortConversationHistory(historyRecords.filter(record => viewForSessionType(sessionTypeOf(record)) === type));
+  return sortConversationHistory(historyRecords.filter(record => viewForSessionType(sessionTypeOf(record)) === view));
 }
 
 function groupContextOf(record) {
@@ -310,7 +316,7 @@ function archivedDiagnostic(archive, mode, transcript = []) {
 function conversationDiagnostic(record, session) {
   if (session) {
     return {
-      mode: session.sessionType === "free-time" ? "free time" : "conversation", provider, model,
+      mode: session.sessionType === "free-time" ? "self time" : "conversation", provider, model,
       chatend: session.chatend?.messages || [],
       context: session.context?.diagnostics() || {},
       loadCalls: session.executor?.loadCalls || 0,
@@ -375,7 +381,7 @@ function diagnostic() {
     toolLog: [], usage: null, memory: EMPTY_MEMORY, historySegments: [],
   };
   const phases = [];
-  if (conversation) phases.push(historyPhase(sessionTypeOf(record) === "free-time" ? "Free time" : "Conversation", record?.phase === "active" ? "live" : "closed", conversation));
+  if (conversation) phases.push(historyPhase(sessionTypeOf(record) === "free-time" ? "Self time" : "Conversation", record?.phase === "active" ? "live" : "closed", conversation));
   if (status) phases.push(historyPhase("History ingress", status, ingress));
   return { ...current, ingressStatus: status, fullHistory: { phases } };
 }
@@ -466,7 +472,8 @@ function visibleIngressActivity() {
 }
 
 function update() {
-  renderFreeTimeControls();
+  renderSelfTimeControls();
+  ui.self_time_panel.classList.toggle("hidden", activeView !== "self-time");
   if (activeView === "audio") {
     const detail = selectedAudioDetail();
     const audioViewKey = detail?.recording?.id
@@ -512,6 +519,7 @@ function update() {
   const session = selectedSession();
   const viewingHistory = Boolean(record && (record.phase !== "active" || !session));
   const telegramView = activeView === "telegram";
+  const selfTimeView = activeView === "self-time";
   const freeTimeView = sessionTypeOf(record) === "free-time";
   const ingressActivity = visibleIngressActivity();
   renderTranscript(
@@ -525,6 +533,8 @@ function update() {
   );
   if (telegramView && !(viewingHistory ? record?.state?.transcript : session?.transcript)?.length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Keep this page open: the relay queues messages while it is closed, and this visible UI owns Kennedy's Chatend and tool loop."));
+  } else if (selfTimeView && !(viewingHistory ? record?.state?.transcript : session?.transcript)?.length && !ingressActivity?.diagnostic) {
+    ui.transcript.replaceChildren(element("div", "empty-state", "Start a self-time run above. Kennedy can follow your optional prompt or explore freely, and every clean-slate slice will remain visible here."));
   }
   renderConversationHistory(ui.conversation_history, recordsForView(), {
     selectedId: selectedConversationId,
@@ -554,7 +564,7 @@ function update() {
     sessionBusy: Boolean(session?.busy),
     transitionBusy: creatingConversation || endingIds.has(selectedConversationId),
     pendingTurn: Boolean(session?.pendingTurn),
-    viewingHistory: viewingHistory || telegramView || freeTimeView,
+    viewingHistory: viewingHistory || telegramView || selfTimeView || freeTimeView,
     transcriptLength: session?.transcript.length || 0,
   });
   const extractingAttachment = extractingAttachments.has(selectedConversationId);
@@ -567,7 +577,7 @@ function update() {
   ui.stop_button.disabled = Boolean(session?.stopping);
   ui.stop_button.textContent = session?.stopping ? "Stopping…" : "Stop Kennedy";
   ui.new_conversation.disabled = controls.newDisabled || !chatRuntimeReady();
-  ui.new_conversation.classList.toggle("hidden", telegramView);
+  ui.new_conversation.classList.toggle("hidden", telegramView || selfTimeView);
   ui.voice_button.disabled = controls.sendDisabled || !transcriptionAvailable
     || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function";
   const attachments = attachmentDrafts.get(selectedConversationId) || [];
@@ -577,19 +587,19 @@ function update() {
     : "PDF, Word, spreadsheet, or text";
   ui.clear_attachments.classList.toggle("hidden", !attachments.length);
   ui.clear_attachments.disabled = controls.sendDisabled || extractingAttachment;
-  ui.history_eyebrow.textContent = telegramView ? "TELEGRAM SESSIONS" : "YOUR CONVERSATIONS";
-  ui.history_title.textContent = telegramView ? "Bot chats" : "History";
+  ui.history_eyebrow.textContent = telegramView ? "TELEGRAM SESSIONS" : selfTimeView ? "SELF-TIME SESSIONS" : "YOUR CONVERSATIONS";
+  ui.history_title.textContent = telegramView ? "Bot chats" : selfTimeView ? "Self time" : "History";
   ui.chatend_title.textContent = currentDiagnostic.mode === "history ingress"
     ? `History ingress · ${currentDiagnostic.ingressStatus || "in progress"}`
-    : freeTimeView ? "Free-time Chatend"
+    : freeTimeView ? "Self-time Chatend"
     : telegramView ? "Telegram Chatend" : currentDiagnostic.ingressStatus
       ? `Chatend · ingress ${currentDiagnostic.ingressStatus}`
       : "Chatend";
   ui.end_button.textContent = session?.pendingTurn ? "Retry saved query" : "End conversation";
   ui.activity.textContent = freeTimeView
-    ? session?.stopping ? "Free time reached its hard stop"
-      : session?.busy ? "Kennedy is enjoying free time"
-        : "This free-time session is closing"
+    ? session?.stopping ? "Self time reached its hard stop"
+      : session?.busy ? "Kennedy is enjoying self time"
+        : "This self-time session is closing"
     : telegramView
     ? session?.busy ? "Kennedy is answering this Telegram message" : "Messages are delivered automatically"
     : viewingHistory
@@ -789,7 +799,7 @@ async function toggleVoiceRecording() {
 }
 
 function reconcileLiveSessions(records) {
-  historyRecords = sortConversationHistory(records);
+  historyRecords = reconcileConversationHistory(historyRecords, records);
   const activeIds = new Set(historyRecords.filter(record => record.phase === "active").map(record => record.id));
   for (const id of liveSessions.keys()) {
     if (!activeIds.has(id)) liveSessions.delete(id);
@@ -1010,6 +1020,7 @@ async function persistSession(id, state, metadata = {}) {
   } catch (error) {
     if (error.code !== "state_conflict") throw error;
     const latest = await conversationHistory.get(id);
+    upsertHistory(latest);
     if (latest.phase !== "active" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
     record = latest;
   }
@@ -1110,7 +1121,26 @@ async function createFreeTimeSlice(freeTime, { select = false } = {}) {
   });
   await session.initialize();
   session.stageFreeTimeOpening();
-  let record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
+  let record;
+  try {
+    record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
+  } catch (error) {
+    if (error?.code !== "free_time_already_active") throw error;
+    await refreshHistory();
+    record = activeFreeTimeRecord();
+    if (!record) throw error;
+    freeTimeRun = freeTimeOf(record);
+    if (!liveSessions.has(record.id)) await buildConversation(record);
+    if (select) {
+      if (activeView !== "self-time") showView("self-time");
+      selectedConversationId = record.id;
+      selectedByView["self-time"] = record.id;
+      restoreDraft();
+    }
+    update();
+    launchFreeTimeRecord(record.id);
+    return record;
+  }
   session.persist = (state, metadata) => persistSession(record.id, state, metadata);
   liveSessions.set(record.id, session);
   drafts.set(record.id, "");
@@ -1120,9 +1150,9 @@ async function createFreeTimeSlice(freeTime, { select = false } = {}) {
   record = historyRecords.find(item => item.id === record.id) || record;
   freeTimeRun = freeTime;
   if (select) {
-    if (activeView !== "conversation") showView("conversation");
+    if (activeView !== "self-time") showView("self-time");
     selectedConversationId = record.id;
-    selectedByView.conversation = record.id;
+    selectedByView["self-time"] = record.id;
     restoreDraft();
   }
   update();
@@ -1131,6 +1161,22 @@ async function createFreeTimeSlice(freeTime, { select = false } = {}) {
 }
 
 async function startFreeTime() {
+  if (freeTimeStartPromise) return freeTimeStartPromise;
+  if (freeTimeRun || activeFreeTimeRecord()) return null;
+  freeTimeStarting = true;
+  update();
+  const work = startFreeTimeCoordinated();
+  freeTimeStartPromise = work;
+  try {
+    return await work;
+  } finally {
+    if (freeTimeStartPromise === work) freeTimeStartPromise = null;
+    freeTimeStarting = false;
+    update();
+  }
+}
+
+async function startFreeTimeCoordinated() {
   if (navigator.locks?.request) {
     return navigator.locks.request("kennedy-free-time-start", async () => {
       await refreshHistory();
@@ -1142,9 +1188,10 @@ async function startFreeTime() {
 }
 
 async function startFreeTimeUnlocked() {
-  if (freeTimeStarting || freeTimeRun || activeFreeTimeRecord()) return;
-  if (!freeTimeRuntimeReady()) throw new Error("Free time cannot start until Kweb, conversation history, intelligence, and the free-time prompts are available.");
-  const durationMinutes = parseFreeTimeMinutes(ui.free_time_minutes.value || DEFAULT_FREE_TIME_MINUTES);
+  if (freeTimeRun || activeFreeTimeRecord()) return;
+  if (!freeTimeRuntimeReady()) throw new Error("Self time cannot start until Kweb, conversation history, intelligence, and the self-time prompts are available.");
+  const durationMinutes = parseFreeTimeMinutes(ui.self_time_minutes.value || DEFAULT_FREE_TIME_MINUTES);
+  const customPrompt = parseSelfTimePrompt(ui.self_time_prompt.value);
   const runStartedAt = new Date().toISOString();
   const runId = crypto.randomUUID();
   const freeTime = {
@@ -1152,23 +1199,17 @@ async function startFreeTimeUnlocked() {
     runStartedAt,
     deadlineAt: new Date(Date.now() + Math.round(durationMinutes * 60_000)).toISOString(),
     durationMinutes,
+    customPrompt,
     sliceIndex: 1,
   };
-  freeTimeStarting = true;
-  update();
-  try {
-    const provenance = await kweb.createProvenance({
-      data: JSON.stringify({ kind: "free-time", ...freeTime }, null, 2),
-      source: "free-time",
-      source_created_at: runStartedAt,
-      idempotency_key: `free-time:${runId}`,
-    });
-    freeTime.provenanceId = provenance.id;
-    await createFreeTimeSlice(freeTime, { select: true });
-  } finally {
-    freeTimeStarting = false;
-    update();
-  }
+  const provenance = await kweb.createProvenance({
+    data: JSON.stringify({ kind: "free-time", ...freeTime }, null, 2),
+    source: "free-time",
+    source_created_at: runStartedAt,
+    idempotency_key: `free-time:${runId}`,
+  });
+  freeTime.provenanceId = provenance.id;
+  await createFreeTimeSlice(freeTime, { select: true });
 }
 
 function launchFreeTimeRecord(id) {
@@ -1184,12 +1225,12 @@ function launchFreeTimeRecord(id) {
     : run();
   Promise.resolve(work).catch(error => {
     if (!purgedConversationIds.has(id)) {
-      showError(ui.error_banner, `Free time will retry its saved session: ${error.message}`);
+      showError(ui.error_banner, `Self time will retry its saved session: ${error.message}`);
       setTimeout(() => launchFreeTimeRecord(id), 2_000);
     }
   }).finally(() => {
     freeTimeRunnerIds.delete(id);
-    renderFreeTimeControls();
+    renderSelfTimeControls();
   });
 }
 
@@ -1197,18 +1238,21 @@ function scheduleFreeTimeContinuation(freeTime, select) {
   if (freeTimeContinuationRuns.has(freeTime.runId)) return;
   freeTimeContinuationRuns.add(freeTime.runId);
   freeTimeRun = freeTime;
+  const finishRun = () => {
+    freeTimeContinuationRuns.delete(freeTime.runId);
+    if (freeTimeRun?.runId === freeTime.runId) freeTimeRun = null;
+    update();
+  };
   const attempt = async () => {
-    if (Date.now() >= Date.parse(freeTime.deadlineAt)) {
-      freeTimeContinuationRuns.delete(freeTime.runId);
-      if (freeTimeRun?.runId === freeTime.runId) freeTimeRun = null;
-      update();
+    if (!freeTimeCanStartNewSession(freeTime)) {
+      finishRun();
       return;
     }
     try {
       await createFreeTimeSlice(freeTime, { select });
       freeTimeContinuationRuns.delete(freeTime.runId);
     } catch (error) {
-      showError(ui.error_banner, `The next free-time session will retry opening: ${error.message}`);
+      showError(ui.error_banner, `The next self-time session will retry opening: ${error.message}`);
       setTimeout(attempt, 2_000);
     }
   };
@@ -1224,7 +1268,7 @@ async function runFreeTimeRecord(id) {
     if (current) {
       freeTimeRun = freeTimeOf(current);
       launchFreeTimeRecord(current.id);
-    } else if (freeTimeRun && Date.now() >= Date.parse(freeTimeRun.deadlineAt)) {
+    } else if (freeTimeRun && !freeTimeCanStartNewSession(freeTimeRun)) {
       freeTimeRun = null;
       update();
     } else if (freeTimeRun) {
@@ -1241,14 +1285,14 @@ async function runFreeTimeRecord(id) {
   const timing = freeTimeTiming(metadata);
   freeTimeRun = metadata;
   const warningTimer = freeTimeTimerAt(timing.deadlineMs - FREE_TIME_WARNING_MS, () => {
-    renderFreeTimeControls();
+    renderSelfTimeControls();
     if (!session.busy && session.pendingTurn) {
-      session.prepareFreeTimeRound().catch(error => showError(ui.error_banner, `The free-time warning could not be saved: ${error.message}`));
+      session.prepareFreeTimeRound().catch(error => showError(ui.error_banner, `The self-time warning could not be saved: ${error.message}`));
     }
   });
-  const deadlineTimer = freeTimeTimerAt(timing.deadlineMs, renderFreeTimeControls);
+  const deadlineTimer = freeTimeTimerAt(timing.deadlineMs, renderSelfTimeControls);
   const hardStopTimer = freeTimeTimerAt(timing.hardStopMs, () => {
-    renderFreeTimeControls();
+    renderSelfTimeControls();
     if (session.canStop) Promise.resolve(session.stopPendingTurn()).catch(() => {});
   });
   let reason = session.freeTime?.sliceEndedReason || null;
@@ -1281,7 +1325,7 @@ async function runFreeTimeRecord(id) {
         }
         if (lastRetryError !== error.message) {
           lastRetryError = error.message;
-          showError(ui.error_banner, `Free time is retrying Kennedy's saved round: ${error.message}`);
+          showError(ui.error_banner, `Self time is retrying Kennedy's saved round: ${error.message}`);
         }
         await new Promise(resolve => setTimeout(resolve, 2_000));
       }
@@ -1289,7 +1333,7 @@ async function runFreeTimeRecord(id) {
     await session.finalizeFreeTime(reason);
     const selectNext = selectedConversationId === id;
     await closeFreeTimeSession(id, session);
-    if (Date.now() < timing.deadlineMs && !purgedConversationIds.has(id)) {
+    if (freeTimeCanStartNewSession(metadata) && !purgedConversationIds.has(id)) {
       scheduleFreeTimeContinuation(nextFreeTimeSlice(metadata), selectNext);
     } else if (freeTimeRun?.runId === metadata.runId) {
       freeTimeRun = null;
@@ -1486,7 +1530,7 @@ async function createTelegramConversation(event) {
   return { record, session };
 }
 
-async function telegramConversationFor(event) {
+async function telegramConversationFor(event, runtime = null) {
   const group = event.sessionKind === "group";
   let record = event.conversationId
     ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
@@ -1507,7 +1551,14 @@ async function telegramConversationFor(event) {
     ({ record, session } = await createTelegramConversation(event));
     created = true;
   }
-  if (event.conversationId !== record.id) await telegramRelay.bind(event.id, record.id);
+  if (runtime) {
+    runtime.record = record;
+    runtime.session = session;
+  }
+  if (event.conversationId !== record.id || !event.processingStartedAt) {
+    await telegramRelay.bind(event.id, record.id, event.conversationId || null);
+  }
+  if (runtime) runtime.conversationId = record.id;
   if (group && !created) {
     session.channel = {
       ...(session.channel || {}),
@@ -1521,7 +1572,7 @@ async function telegramConversationFor(event) {
   return { record, session };
 }
 
-async function processTelegramReset(event) {
+async function processTelegramReset(event, runtime = null) {
   const group = event.sessionKind === "group";
   let record = event.conversationId
     ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
@@ -1539,6 +1590,14 @@ async function processTelegramReset(event) {
   }
   let session = liveSessions.get(record.id);
   if (!session) session = await buildConversation(record);
+  if (runtime) {
+    runtime.record = record;
+    runtime.session = session;
+    runtime.conversationId = record.id;
+  }
+  if (event.conversationId !== record.id || !event.processingStartedAt) {
+    await telegramRelay.bind(event.id, record.id, event.conversationId || null);
+  }
   if (session.busy) throw new Error("The Telegram session is still completing its previous message.");
   if (session.pendingTurn) await session.resumePendingTurn();
   if (group && event.groupContext) {
@@ -1756,7 +1815,7 @@ async function syncGroupSessionUpdates() {
   }
 }
 
-async function processTelegramEvent(event) {
+async function processTelegramEvent(event, runtime = null) {
   const processingStarted = performance.now();
   await directoryUserForEvent(event);
   if (event.sessionKind === "group" && event.groupContext) {
@@ -1766,9 +1825,9 @@ async function processTelegramEvent(event) {
     };
   }
   if (event.kind === "reset") {
-    await processTelegramReset(event);
+    await processTelegramReset(event, runtime);
   } else {
-    const { record, session } = await telegramConversationFor(event);
+    const { record, session } = await telegramConversationFor(event, runtime);
     let response = session.answerForExternalEvent(event.id);
     if (!response) {
       if (session.pendingTurn && session.pendingExternalEventId === event.id) {
@@ -1906,27 +1965,112 @@ async function syncGroupIngressBatches() {
   }
 }
 
+const TELEGRAM_TIMEOUT_NOTICE = "Kennedy could not complete a response within 30 minutes, so this request was stopped. Please send it again if you want to retry it.";
+
+function waitAtMost(promise, milliseconds) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise(resolve => { timer = setTimeout(() => resolve(null), milliseconds); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function closeTimedOutTelegramConversation(runtime) {
+  const id = runtime.record?.id;
+  if (!id) return;
+  let latest = await conversationHistory.get(id).catch(() => null);
+  if (!latest || latest.phase !== "active") return;
+  if (!runtime.session?.pendingTurn && !latest.state?.pendingTurn) return;
+  for (let attempt = 0; attempt < 3 && latest?.phase === "active"; attempt += 1) {
+    try {
+      const closed = await conversationHistory.requestIngress(id, {
+        expected_version: latest.version,
+        state: latest.state,
+      });
+      upsertHistory(closed);
+      liveSessions.delete(id);
+      if (selectedConversationId === id) update();
+      kickHistoryIngress();
+      return;
+    } catch (error) {
+      if (error?.code !== "state_conflict") throw error;
+      latest = await conversationHistory.get(id).catch(() => null);
+    }
+  }
+}
+
+async function abortTimedOutTelegramEvent(event, runtime) {
+  if (runtime.session?.canStop) {
+    await waitAtMost(Promise.resolve(runtime.session.stopPendingTurn()).catch(() => null), 5_000);
+  }
+  await telegramRelay.abort(event.id, runtime.conversationId, TELEGRAM_TIMEOUT_NOTICE);
+  await closeTimedOutTelegramConversation(runtime);
+  await refreshHistory();
+  Promise.resolve(intelligence.recordTiming({
+    action: "delivery",
+    status: "error",
+    sessionType: event.sessionKind === "group" ? "telegram-group" : "telegram",
+    durationMs: TELEGRAM_RESPONSE_TIMEOUT_MS,
+    processingDurationMs: TELEGRAM_RESPONSE_TIMEOUT_MS,
+  })).catch(() => {});
+}
+
+async function runTelegramEvent(event) {
+  const runtime = { conversationId: event.conversationId || null, record: null, session: null };
+  let deadlineTimer = null;
+  const work = processTelegramEvent(event, runtime).then(
+    () => ({ ok: true }),
+    error => ({ ok: false, error }),
+  );
+  try {
+    const outcome = await Promise.race([
+      work,
+      new Promise(resolve => {
+        deadlineTimer = setTimeout(() => resolve({ timeout: true }), telegramEventTimeoutMs(event));
+      }),
+    ]);
+    if (outcome.timeout) {
+      if (runtime.session?.canStop) {
+        await waitAtMost(Promise.resolve(runtime.session.stopPendingTurn()).catch(() => null), 5_000);
+      }
+      const settled = await waitAtMost(work, 5_000);
+      if (settled?.ok) {
+        await refreshHistory();
+        return;
+      }
+      await abortTimedOutTelegramEvent(event, runtime);
+      ui.service_status.textContent = `Ready · ${model}`;
+      showError(ui.error_banner, "A Telegram request reached its 30-minute hard timeout and was aborted so later messages can continue.");
+      return;
+    }
+    if (!outcome.ok) throw outcome.error;
+    await refreshHistory();
+    if (ui.service_status.textContent === "Telegram queue needs attention") ui.service_status.textContent = `Ready · ${model}`;
+  } catch (error) {
+    console.error("Telegram event processing failed", event.id, error);
+    ui.service_status.textContent = "Telegram queue needs attention";
+    showError(ui.error_banner, `Telegram delivery will retry: ${error.message}`);
+  } finally {
+    clearTimeout(deadlineTimer);
+    telegramInFlight.delete(event.id);
+  }
+}
+
+function launchTelegramEvent(event) {
+  if (telegramInFlight.has(event.id)) return;
+  telegramInFlight.add(event.id);
+  void runTelegramEvent(event).catch(error => {
+    console.error("Telegram event task failed while reporting an error", event.id, error);
+  });
+}
+
 async function pollTelegramEvents() {
   await provisionDirectoryRoots();
   await syncGroupSessionUpdates();
   await syncGroupIngressBatches();
   const events = (await telegramRelay.events()).events || [];
   if (ui.service_status.textContent === "Telegram relay unavailable") ui.service_status.textContent = `Ready · ${model}`;
-  await Promise.all(events.map(async event => {
-    if (telegramInFlight.has(event.id)) return;
-    telegramInFlight.add(event.id);
-    try {
-      await processTelegramEvent(event);
-      await refreshHistory();
-      if (ui.service_status.textContent === "Telegram queue needs attention") ui.service_status.textContent = `Ready · ${model}`;
-    } catch (error) {
-      console.error("Telegram event processing failed", event.id, error);
-      ui.service_status.textContent = "Telegram queue needs attention";
-      showError(ui.error_banner, `Telegram delivery will retry: ${error.message}`);
-    } finally {
-      telegramInFlight.delete(event.id);
-    }
-  }));
+  for (const event of events) launchTelegramEvent(event);
 }
 
 async function telegramBridgeLoop() {
@@ -1956,14 +2100,15 @@ function startTelegramBridge() {
 }
 
 function showView(view) {
-  if (!["conversation", "telegram", "audio", "memory"].includes(view)) return;
-  if (["conversation", "telegram"].includes(activeView)) selectedByView[activeView] = selectedConversationId;
+  if (!["conversation", "self-time", "telegram", "audio", "memory"].includes(view)) return;
+  if (["conversation", "self-time", "telegram"].includes(activeView)) selectedByView[activeView] = selectedConversationId;
   saveDraft();
   activeView = view;
   const memory = view === "memory";
   ui.chat_view.classList.toggle("hidden", memory);
   ui.memory_view.classList.toggle("hidden", !memory);
   ui.chat_tab.classList.toggle("active", view === "conversation");
+  ui.self_time_tab.classList.toggle("active", view === "self-time");
   ui.tg_tab.classList.toggle("active", view === "telegram");
   ui.audio_tab.classList.toggle("active", view === "audio");
   ui.memory_tab.classList.toggle("active", memory);
@@ -2018,11 +2163,11 @@ async function initialize() {
       kmapBasics: "Conversation and memory-ingress model sessions are unavailable",
       readTools: "Conversation and memory-ingress model sessions are unavailable",
       conversationSession: "New and restored conversations are unavailable",
-      freeTimeSession: "New and restored free-time sessions are unavailable",
+      freeTimeSession: "New and restored self-time sessions are unavailable",
       historyIngressSession: "Conversation-history memory ingress is paused",
       audioIngressSession: "Audio preparation and history remain available, but audio memory ingress is paused",
       codexHarness: "Codex-backed conversation and memory-ingress model sessions are unavailable",
-      writeTools: "Conversation-history ingress, audio memory ingress, and free time are paused",
+      writeTools: "Conversation-history ingress, audio memory ingress, and self time are paused",
     };
     for (const [key, message] of Object.entries(loaded.errors)) {
       showError(ui.error_banner, `${promptImpact[key] || "A model mode is unavailable"}: ${message}`);
@@ -2128,7 +2273,7 @@ async function initialize() {
 }
 
 ui.message_form.addEventListener("submit", submitMessage);
-ui.start_free_time.addEventListener("click", () => startFreeTime().catch(error => showError(ui.error_banner, error.message)));
+ui.start_self_time.addEventListener("click", () => startFreeTime().catch(error => showError(ui.error_banner, error.message)));
 ui.message_input.addEventListener("input", () => {
   if (!selectedSession()) return;
   drafts.set(selectedConversationId, ui.message_input.value);
@@ -2181,7 +2326,7 @@ ui.message_resize_handle.addEventListener("keydown", event => {
 });
 const messageInputResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(syncComposerResizeValue) : null;
 messageInputResizeObserver?.observe(ui.message_input);
-setInterval(renderFreeTimeControls, 1_000);
+setInterval(renderSelfTimeControls, 1_000);
 ui.end_button.addEventListener("click", () => selectedSession()?.pendingTurn ? resumeSavedQuery() : endConversation());
 ui.send_end_button.addEventListener("click", () => sendAndEndConversation());
 ui.stop_button.addEventListener("click", () => stopConversationTurn());
@@ -2189,6 +2334,7 @@ ui.new_conversation.addEventListener("click", () => createNewConversation().catc
 ui.clear_log.addEventListener("click", () => clearError(ui.error_banner));
 for (const mode of INSPECTOR_MODES) ui[`inspector_${mode}`].addEventListener("click", () => { inspectorMode = mode; update(); });
 ui.chat_tab.addEventListener("click", () => showView("conversation"));
+ui.self_time_tab.addEventListener("click", () => showView("self-time"));
 ui.tg_tab.addEventListener("click", () => showView("telegram"));
 ui.audio_tab.addEventListener("click", () => showView("audio"));
 ui.memory_tab.addEventListener("click", () => showView("memory"));

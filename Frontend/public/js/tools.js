@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260717.7";
+import { formatToolResult } from "./human_format.js?v=20260717.8";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
@@ -140,7 +140,8 @@ export class ToolExecutor {
         case "UpdateNode": outcome = await this.updateNode(call.arguments); break;
         case "WebSearch": outcome = await this.webSearch(call.arguments, { signal, operationId }); break;
         case "WebFetch": outcome = await this.webFetch(call.arguments, { signal, operationId }); break;
-        case "EndFreeTimeSession": outcome = await this.endFreeTimeSession(call.arguments); break;
+        case "EndSelfTimeSession":
+        case "EndFreeTimeSession": outcome = await this.endSelfTimeSession(call.arguments); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
       }
       const durationMs = elapsedMs(started);
@@ -225,7 +226,7 @@ export class ToolExecutor {
     return { result: { node: this.context.toContextNode(payload.node), replacedFixedConnection, cleared: childId === null } };
   }
 
-  assertWrite() { if (!["ingress", "free-time"].includes(this.mode) || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress or free time."), { code: "tool_unavailable" }); }
+  assertWrite() { if (!["ingress", "free-time"].includes(this.mode) || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress or self time."), { code: "tool_unavailable" }); }
   assertWeb() { if (!["conversation", "ingress", "free-time"].includes(this.mode) || !this.intelligence) throw Object.assign(new Error("This web tool is not available in this session."), { code: "tool_unavailable" }); }
 
   async webSearch(args, { signal = null, operationId = null } = {}) {
@@ -264,10 +265,10 @@ export class ToolExecutor {
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
   }
 
-  async endFreeTimeSession(args) {
+  async endSelfTimeSession(args) {
     validateObject(args, []);
     if (this.mode !== "free-time" || typeof this.endSession !== "function") {
-      throw Object.assign(new Error("This tool is only available during free time."), { code: "tool_unavailable" });
+      throw Object.assign(new Error("This tool is only available during self time."), { code: "tool_unavailable" });
     }
     const result = await this.endSession();
     return { result, endSession: true };

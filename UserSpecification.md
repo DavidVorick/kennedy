@@ -319,8 +319,9 @@ is for simple latency-sensitive lookups where reduced research quality is
 acceptable; `quality` is reserved for difficult, high-stakes, cross-source, or
 conflict-resolution research. The intelligence layer maps those modes to a
 provider, model, reasoning effort, search context, deadlines, page selection,
-and result limits. The result contains a synthesized research answer and the
-source URLs used to produce it.
+and result limits. Quality searches have a 30-minute deadline; balanced and
+fast searches retain their latency-oriented limits. The result contains a
+synthesized research answer and the source URLs used to produce it.
 
 The call signature is WebSearch(question, mode). It is available in both live
 conversation and ingress sessions. Provider live-data feeds may return an
@@ -349,7 +350,7 @@ files in this order:
    Kmap may contain additional tools and more detailed tool documentation.
 4. `ReadTools.txt` lists all shared read-only tools, including Kmap reads and
    web research.
-5. Writable ingress and free-time sessions receive `WriteTools.txt`.
+5. Writable ingress and self-time sessions receive `WriteTools.txt`.
 6. The frontend adds the current model, thinking mode, channel, or source
    details that are known only at runtime.
 
@@ -408,7 +409,7 @@ Kennedy can be called using a few different session types:
 + Conversation
 + Telegram Conversation
 + Telegram Group Invocation
-+ Free Time
++ Self Time
 + History Ingress
 + Self-Action
 
@@ -465,7 +466,16 @@ history ingress; the ingress session explicitly knows that its source was
 Telegram. Each newly crossed 100,000-token current-context band produces a
 separate delivery notice containing current and maximum context usage and
 recommending `/reset`. That operational notice is not part of Kennedy's
-Chatend.
+Chatend. The browser continues polling and launches each relay queue head
+independently, so long model or tool work in one private or group-user stream
+does not delay newly arriving work in another stream. Ordering within one
+stream remains strict. Each event has a durable 30-minute response deadline.
+If Kennedy has not produced a complete response by then, the browser cancels
+that turn, the relay completes it as a timeout, sends a best-effort notice, and
+allows the next message in that stream to proceed. A stale event binding whose
+Conversation History record disappeared is safely rebound to a fresh record;
+its original voice note, transcription, or document is reused rather than
+discarded.
 
 UI recordings and Telegram voice notes preserve their original audio. The
 intelligence backend publishes model input modalities and uses paid OpenAI
@@ -549,29 +559,36 @@ clarification notes or concrete follow-up tasks when context is materially
 missing. Preparation is server-side and restartable; Kmap mutation resumes from
 durable checkpoints whenever Kennedy's browser worker is available.
 
-### Free Time
+### Self Time
 
-The browser's Free time control starts an autonomous run for 30 minutes by
-default. The duration field accepts fractional minutes for short tests and up
-to seven days for long or overnight runs. The run stores one absolute deadline
-in Conversation History, so reload recovery and every clean-slate rollover use
-the same remaining allowance.
+The browser's dedicated Self Time category tab starts an autonomous run for 30
+minutes by default. It accepts an optional custom prompt, stores that prompt in
+the run metadata, and gives it to Kennedy in every clean-slate slice. The start
+control visibly enters `Starting…` and disables itself immediately; repeat
+clicks share that one start, and the history backend refuses a second active
+`free-time` record from another browser context. The duration field accepts
+fractional minutes for short tests and up to seven days for long or overnight
+runs. The run stores one absolute deadline in Conversation History, so reload
+recovery and every clean-slate rollover use the same remaining allowance.
 
 Kennedy is told to have fun, follow her own interests, and not wait for user
-work. Free time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
+work. Self time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
 Kmap write tools. A run-level provenance record is supplied automatically for
-memory mutations. `EndFreeTimeSession({})` is available only in this mode and
+memory mutations. `EndSelfTimeSession({})` is available only in this mode and
 must be called alone. It closes and archives the current session without
-reducing the shared allowance; if time remains, a fresh free-time Chatend opens
-immediately. Returning ordinary final text also rolls into a fresh session.
+reducing the shared allowance; if at least five minutes remain, a fresh
+self-time Chatend opens immediately. With less than five minutes left, the run
+ends instead. Returning ordinary final text uses the same rollover threshold.
 
 When less than three minutes remain, the harness injects one timer notification
 into the current Chatend. At the deadline all tools except the end control are
 blocked and Kennedy receives one final wrap-up round. The active intelligence
-operation is cancelled at a hard stop two minutes later, and generation/search
-requests are server-bounded to the remaining hard-stop interval. A same-origin
-browser lock prevents two tabs from running the autonomous loop concurrently.
-Every completed clean-slate session is queued for ordinary history ingress.
+operation is cancelled at a hard stop two minutes later. Generation and search
+requests retain the intelligence provider's profile-specific allowance, so a
+quality search can run longer than 90 seconds, while the remaining hard-stop
+interval is always the upper bound. A same-origin browser lock prevents two
+tabs from running the autonomous loop concurrently. Every completed clean-slate
+session is queued for ordinary history ingress.
 
 ### History Ingress
 
