@@ -6,18 +6,20 @@ startup. Edit a file and reload the page to test a change; no Rust or JavaScript
 rebuild is needed.
 
 - `KennedyIdentity.txt` defines who Kennedy is and establishes that her learned
-  strategy lives in the Kmap rather than in static harness instructions.
-- `ConversationManual.txt` describes the live-conversation mode, its read-only
-  Kmap mechanics, and the exact tools available there.
-- `HistoryIngress.txt` describes the non-interactive ingress mode, its Kmap
-  mechanics, and the exact mutation tools available there.
-- `AudioIngress.txt` adds timestamp, transcript-fallibility, and clarification
-  policy for audio ingress while reusing the history-ingress tool protocol.
+  strategy lives in the kmap rather than in static harness instructions.
+- `ConversationSession.txt`, `HistoryIngressSession.txt`, and
+  `AudioIngressSession.txt` are mutually exclusive, minimal descriptions of
+  the current session and its context-loading budget.
+- `KmapBasics.txt` defines identifier lifetime, the two automatic roots, the
+  text tool-call protocol, and the fact that more tools and documentation may
+  be available through the kmap.
+- `ReadTools.txt` defines all shared read-only tools, including kmap reads and
+  web research.
+- `WriteTools.txt` defines the kmap mutation tools included only in ingress.
 
-The identity is composed first, followed by the mode manual, then a dynamic
-runtime sentence identifying the configured model and thinking mode. Mode
-manuals are deliberately limited to mode behavior, technical Kmap facts, the transparent
-tool-request protocol, and exact tool contracts. Strategy and learned judgment
-belong in Kennedy's Kmap. Keep technical contracts synchronized with validation
-and execution in `Frontend/public/js/tools.js`; hard limits remain enforced in
-code.
+The browser composes the identity first, then the selected session type, kmap
+basics, read-only tools, optional write tools, and a dynamic runtime sentence
+identifying the configured model and thinking mode. Each fact or tool contract
+has one prompt source; strategy and learned judgment belong in Kennedy's kmap. Keep
+technical contracts synchronized with validation and execution in
+`Frontend/public/js/tools.js`; hard limits remain enforced in code.

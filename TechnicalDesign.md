@@ -44,12 +44,12 @@ or reveal surface. Stable runtime policy is compiled into code; only
 deployment-specific listeners, paths, limits, and the vault location are CLI
 options.
 
-System-prompt manuals are frontend source assets under `Frontend/SystemPrompts`.
-Every session composes `KennedyIdentity.txt` with its technical mode policy.
-Audio ingress layers `AudioIngress.txt` onto the common mutation mechanics in
-`HistoryIngress.txt`. Harness strategy is durable Kmap knowledge rather than
-static prompt policy. The frontend appends provider-reported current model and
-thinking mode to every composed system prompt.
+System-prompt assets are frontend source files under `Frontend/SystemPrompts`.
+Every session composes identity, one minimal session description, shared Kmap
+basics, and shared read tools, including Kmap reads and web research. History
+and audio ingress additionally receive write tools.
+Harness strategy is durable Kmap knowledge rather than static prompt policy.
+The frontend appends the provider-reported current model and thinking mode.
 
 ## 2. Design Principles
 
@@ -200,11 +200,12 @@ directory instead of duplicating the frontend's filename manifest in Rust.
 Adding a new mode prompt therefore cannot fail merely because a second
 hardcoded allowlist was not updated.
 
-Frontend startup treats Kweb, prompt manuals, conversation history,
+Frontend startup treats Kweb, prompt assets, conversation history,
 intelligence, Telegram, and audio ingress as separate feature dependencies.
-Successful subsystems remain usable when a sibling subsystem fails. Prompt
-manuals are loaded independently and gate only the modes that consume them;
-in particular, `AudioIngress.txt` gates audio Kmap mutation without gating
+Successful subsystems remain usable when a sibling subsystem fails. Shared
+identity, Kmap-basics, and read-tools assets gate every model session;
+session-specific and write assets gate only modes that consume them. In
+particular, `AudioIngressSession.txt` gates audio Kmap mutation without gating
 conversation chat, ordinary history ingress, audio preparation, or audio
 history inspection. Conversation and audio ingress queue polls also isolate
 transient failures from one another.
@@ -352,16 +353,16 @@ remain queryable from the sidebar.
 
 ### 5.2 History Ingress
 
-History ingress uses a separate chatend composed from `KennedyIdentity.txt` and
-`HistoryIngress.txt`, the canonical archived conversation text, and both loaded
-root nodes. The provenance node stores the complete recovery JSON for
+History ingress uses a separate chatend composed from identity, the history
+session description, Kmap basics, read tools, and write tools, followed by the
+canonical archived conversation text and both loaded root nodes. The
+provenance node stores the complete recovery JSON for
 durability, but ingress parses it and formats only its `messages`; recovery
 counters, diagnostics, media data URLs, and the JSON envelope do not enter
 Kennedy's context.
 Kennedy may navigate the kweb, connect nodes, reorganize fanout, manage task
-slots, and create or update knowledge nodes. WebSearch and WebFetch are not
-available; ingress must interpret only the archived conversation and Kmap
-material in front of it. The current provenance identifier is held by the
+slots, create or update knowledge nodes, and use WebSearch or WebFetch when
+external evidence would help. The current provenance identifier is held by the
 frontend and supplied implicitly when it translates CreateNode and UpdateNode
 tool calls into Kweb API requests.
 
@@ -399,8 +400,8 @@ live composer.
 Conversation records declare `sessionType: conversation` or
 `sessionType: telegram`. Prompt composition tells Kennedy which one she is in;
 history ingress separately declares whether its archive came from a Telegram
-session or a browser conversation. A Telegram session uses the ordinary
-conversation manual and read-only conversation tool set. It ends only on
+session or a browser conversation. A Telegram session uses the conversation
+session description and read-only conversation tool set. It ends only on
 `/reset`, which queues the complete recovery archive; normal sequential history
 ingress extracts its canonical Chatend text. Each time current context crosses another 100,000-token band,
 the relay sends a separate operational notice with current and maximum tokens
@@ -438,13 +439,12 @@ SHA and piece index, with `source_created_at` equal to recording start. Its
 model context repeats the timestamp and explicitly defines it as recording
 time rather than upload or ingress time.
 
-Audio ingress combines the common history-ingress mutation contract with
-`AudioIngress.txt`. Kennedy treats the transcript as fallible evidence,
-preserves dated historical or superseded claims instead of replacing newer
-knowledge, avoids inventing speaker identity, and creates dated clarification
-notes or concrete tasks when important context is missing or contradictory.
-Pieces from one recording are queued in chronological order and ingressed one
-at a time. Every tool-round checkpoint and the complete diagnostic
+Audio ingress selects `AudioIngressSession.txt` and combines it with shared
+Kmap basics, read tools, and write tools. Recording-time semantics are supplied
+with the immutable audio provenance; additional learned audio-ingress judgment
+belongs in the Kmap rather than duplicated static instructions. Pieces from one
+recording are queued in chronological order and ingressed one at a time. Every
+tool-round checkpoint and the complete diagnostic
 history survive both server and browser restarts. Nonterminal failures use
 durable increasing retry delays; a terminal piece can be explicitly requeued
 from the UI without discarding its previous failure log. Preparation runs
@@ -529,8 +529,12 @@ Frontend/
   Specification.md
   SystemPrompts/
     KennedyIdentity.txt
-    ConversationManual.txt
-    HistoryIngress.txt
+    ConversationSession.txt
+    HistoryIngressSession.txt
+    AudioIngressSession.txt
+    KmapBasics.txt
+    ReadTools.txt
+    WriteTools.txt
   public/
 IntelligenceBackend/
   Specification.md

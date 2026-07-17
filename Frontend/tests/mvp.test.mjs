@@ -8,7 +8,7 @@ import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, sortConversationHistory } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
-import { composePrompt, formatModelAttribution, loadPromptManuals } from "../public/js/prompt_composer.js";
+import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
 import { formatKmapContext } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
@@ -18,6 +18,15 @@ import { formatChatend, formatContextWindowProgress } from "../public/js/chatend
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
 const node = (n, active = [], fanout = [], tasks = [], lastModifiedBy = "legacy-unknown") => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}`, long_description: `Details ${n}`, last_modified_by: lastModifiedBy, task_connections: tasks.map(([task, priority]) => ({ ...summary(task), priority })), active_connections: active.map(summary), fanout_connections: fanout.map(summary), history_head_id: id(100 + n) });
+const promptManuals = (label = "Shared") => ({
+  identity: `${label} identity`,
+  conversationSession: `${label} conversation session`,
+  historyIngressSession: `${label} history-ingress session`,
+  audioIngressSession: `${label} audio-ingress session`,
+  kmapBasics: `${label} Kmap basics`,
+  readTools: `${label} read and web tools`,
+  writeTools: `${label} write tools`,
+});
 
 class MockKweb {
   constructor(nodes) { this.nodes = new Map(nodes.map(n => [n.id, n])); this.connected = null; }
@@ -373,16 +382,18 @@ test("live conversations cannot mutate the Kmap", async () => {
   }
 });
 
-test("web tools reject extra retrieval knobs and remain unavailable during ingress", async () => {
-  const intelligence = { webSearch: async () => { throw new Error("must not run"); } };
+test("web tools reject extra retrieval knobs and remain available during ingress", async () => {
+  const searches = [];
+  const intelligence = { webSearch: async body => { searches.push(body); return { answer: "Ingress evidence.", sources: [] }; } };
   const conversation = new ToolExecutor({ mode: "conversation", context: {}, api: {}, intelligence, loadLimit: 20 });
   const extra = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "fast", maxResults: 10 } });
   assert.match(extra.message.content, /Expected exactly: question, mode/);
   const invalidMode = await conversation.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "turbo" } });
   assert.match(invalidMode.message.content, /mode must be one of: quality, balanced, fast/);
-  const ingress = new ToolExecutor({ mode: "ingress", context: {}, api: {}, intelligence, provenanceId: "p", loadLimit: 50 });
-  const unavailable = await ingress.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "fast" } });
-  assert.match(unavailable.message.content, /only available during a live conversation/);
+  const ingress = new ToolExecutor({ mode: "ingress", context: {}, api: {}, intelligence, provider: "primary", model: "model", provenanceId: "p", loadLimit: 50 });
+  const result = await ingress.execute({ id: "search", name: "WebSearch", arguments: { question: "topic", mode: "fast" } });
+  assert.equal(result.message.tool_result.ok, true);
+  assert.deepEqual(searches, [{ provider: "primary", model: "model", question: "topic", mode: "fast" }]);
 });
 
 test("chatend reset orders retained self-messages before roots and requested nodes", async () => {
@@ -604,7 +615,7 @@ test("a repeated ResetContext loop cannot successfully reset more than the share
 test("conversation provenance preserves the complete structured Chatend", async () => {
   const session = new ConversationSession({
     kweb: new MockKweb([node(1)]), intelligence: {},
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1),
+    manuals: promptManuals("Shared"), rootNodeId: id(1),
     provider: "p", model: "m", onUpdate: () => {},
   });
   await session.initialize();
@@ -631,7 +642,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
 test("a structured Chatend archive retains activity while refreshing current manuals and context", async () => {
   const kweb = new MockKweb([node(1), node(2), node(3)]);
   const source = new ConversationSession({
-    kweb, intelligence: {}, manuals: { shared: "Shared", conversation: "Conversation" },
+    kweb, intelligence: {}, manuals: promptManuals("Shared"),
     rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
   });
   await source.initialize();
@@ -645,7 +656,7 @@ test("a structured Chatend archive retains activity while refreshing current man
   const saved = source.snapshot();
 
   const restored = new ConversationSession({
-    kweb, intelligence: {}, manuals: { shared: "Changed", conversation: "Changed" },
+    kweb, intelligence: {}, manuals: promptManuals("Changed"),
     rootNodeIds: [id(1), id(3)], provider: "p", model: "m", onUpdate: () => {},
   });
   await restored.initialize(saved);
@@ -695,7 +706,7 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   }, recordTiming: timing => timings.push(timing) };
   const checkpoints = [];
   await runHistoryIngress({
-    kweb, intelligence, manuals: { shared: "Shared", ingress: "Ingress" },
+    kweb, intelligence, manuals: promptManuals("Ingress"),
     rootNodeId: id(1), provenanceId: "provenance", provider: "p", model: "m",
     checkpoint: async archive => checkpoints.push(structuredClone(archive)), onUpdate: () => {},
   });
@@ -733,7 +744,7 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   await runHistoryIngress({
     kweb,
     intelligence: { generate: async () => { throw new Error("completed ingress must not regenerate"); } },
-    manuals: { shared: "Changed", ingress: "Changed" }, rootNodeId: id(1),
+    manuals: promptManuals("Changed"), rootNodeId: id(1),
     provenanceId: "provenance", provider: "p", model: "m",
     restoredArchive: checkpoints.at(-1), checkpoint: async archive => resumed.push(archive), onUpdate: () => {},
   });
@@ -749,7 +760,7 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   await assert.rejects(() => runHistoryIngress({
     kweb,
     intelligence: { generate: async () => { throw new Error("round limit must prevent generation"); } },
-    manuals: { shared: "Changed", ingress: "Changed" }, rootNodeId: id(1),
+    manuals: promptManuals("Changed"), rootNodeId: id(1),
     provenanceId: "provenance", provider: "p", model: "m",
     restoredArchive: exhausted, checkpoint: async () => {}, onUpdate: () => {},
   }), /100-round tool-loop safety limit/);
@@ -770,7 +781,7 @@ test("history ingress durably checkpoints pre-reset Full History segments", asyn
   } };
   const checkpoints = [];
   await runHistoryIngress({
-    kweb, intelligence, manuals: { shared: "Shared", ingress: "Ingress" },
+    kweb, intelligence, manuals: promptManuals("Ingress"),
     rootNodeId: id(1), provenanceId: "provenance", provider: "p", model: "m",
     checkpoint: async archive => checkpoints.push(structuredClone(archive)), onUpdate: () => {},
   });
@@ -1062,7 +1073,7 @@ test("conversation checkpoints the pending query before any model request", asyn
     recordTiming: timing => timings.push(timing),
   };
   const session = new ConversationSession({
-    kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    kweb, intelligence, manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async (state, details) => { events.push(state.pendingTurn ? "checkpoint-pending" : "checkpoint-complete"); metadata.push(details); }, onUpdate: () => {},
   });
   await session.initialize();
@@ -1102,7 +1113,7 @@ test("an in-flight conversation can be stopped and remains explicitly retryable"
     cancelOperation: async operationId => { cancelledOperationId = operationId; return { cancelled: true }; },
   };
   const session = new ConversationSession({
-    kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" },
+    kweb, intelligence, manuals: promptManuals("Shared"),
     rootNodeId: id(1), provider: "p", model: "m", persist: async () => {}, onUpdate: () => {},
   });
   await session.initialize();
@@ -1131,7 +1142,7 @@ test("document attachments become model-readable text without duplicating extrac
     message: { role: "assistant", content: "I read the report." }, usage: null,
   }) };
   const session = new ConversationSession({
-    kweb, intelligence, manuals: { shared: "Shared", conversation: "Conversation" },
+    kweb, intelligence, manuals: promptManuals("Shared"),
     rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
   });
   await session.initialize();
@@ -1159,7 +1170,7 @@ test("restored pending conversation resumes from durable transcript and context"
   const session = new ConversationSession({
     kweb,
     intelligence: { generate: async () => { generated += 1; return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered answer." }, usage: null }; } },
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m", persist: async () => {}, onUpdate: () => {},
+    manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m", persist: async () => {}, onUpdate: () => {},
   });
   await session.initialize({ startedAt: "2026-07-12T00:00:00Z", transcript: [{ role: "user", content: "Interrupted query" }], loadedNodeIds: [id(1), id(2)], pendingTurn: true });
   assert.deepEqual(session.context.loadedNodeIds, [id(1), id(2)]);
@@ -1173,7 +1184,7 @@ test("a restored user tail is retryable even when an older checkpoint omitted pe
   const session = new ConversationSession({
     kweb: new MockKweb([node(1)]),
     intelligence: { generate: async () => ({ status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered." }, usage: null }) },
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async () => {}, onUpdate: () => {},
   });
   await session.initialize({ transcript: [{ role: "user", content: "Unanswered" }], pendingTurn: false });
@@ -1204,7 +1215,7 @@ test("a structured pending Chatend resumes from cold start without duplicating i
   const interrupted = new ConversationSession({
     kweb,
     intelligence: { generate: async () => { throw new Error("connection lost"); } },
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async state => { saved = structuredClone(state); }, onUpdate: () => {},
   });
   await interrupted.initialize();
@@ -1219,7 +1230,7 @@ test("a structured pending Chatend resumes from cold start without duplicating i
       requests.push(request);
       return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered once." }, usage: null };
     } },
-    manuals: { shared: "Changed", conversation: "Changed" }, rootNodeId: id(1), provider: "p", model: "m",
+    manuals: promptManuals("Changed"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async () => {}, onUpdate: () => {},
   });
   await restored.initialize(saved);
@@ -1244,7 +1255,7 @@ test("a failed mid-loop checkpoint rolls back transient tool state before retry"
       };
       return { status: "complete", response_id: "retry-response", message: { role: "assistant", content: "Recovered cleanly." }, usage: null };
     } },
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async () => { checkpoints += 1; if (checkpoints === 2) throw new Error("checkpoint interrupted"); }, onUpdate: () => {},
   });
   await session.initialize();
@@ -1267,7 +1278,7 @@ test("an answer is not exposed as complete when its durable checkpoint fails", a
   const session = new ConversationSession({
     kweb,
     intelligence: { generate: async () => ({ status: "complete", response_id: "response", message: { role: "assistant", content: "Unsaved answer." }, usage: null }) },
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async () => { checkpoints += 1; if (checkpoints === 2) throw new Error("history unavailable"); }, onUpdate: () => {},
   });
   await session.initialize();
@@ -1284,7 +1295,7 @@ test("retry persists an initially failed pending checkpoint before generation", 
   const session = new ConversationSession({
     kweb,
     intelligence: { generate: async () => { events.push("generate"); return { status: "complete", response_id: "response", message: { role: "assistant", content: "Answer." }, usage: null }; } },
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1), provider: "p", model: "m",
+    manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async state => { events.push(state.pendingTurn ? "persist-pending" : "persist-complete"); if (fail) { fail = false; throw new Error("history unavailable"); } }, onUpdate: () => {},
   });
   await session.initialize();
@@ -1307,16 +1318,35 @@ test("Kmap context is readable text rather than JSON", async () => {
 });
 
 test("system prompt composition uses readable sections rather than markup wrappers", () => {
-  const prompt = composePrompt({ shared: "Shared paragraph.", conversation: "Conversation paragraph.", ingress: "Ingress paragraph." }, "conversation", { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
-  assert.equal(prompt, "Kennedy's identity\n\nShared paragraph.\n\nConversation session instructions\n\nConversation paragraph.\n\nCurrent session\n\nThis is a conversation session in Kennedy's browser UI.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
-  assert.match(composePrompt({ shared: "Shared.", conversation: "Conversation." }, "conversation", { sessionType: "telegram" }), /This is a telegram session/);
-  assert.match(composePrompt({ shared: "Shared.", ingress: "Ingress." }, "ingress", { sourceSessionType: "telegram" }), /ingressing an archived telegram session/);
-  const audio = composePrompt({ shared: "Shared.", ingress: "Ingress mechanics.", audioIngress: "Audio timestamp policy." }, "ingress", { sourceSessionType: "audio" });
-  assert.match(audio, /Audio-ingress session instructions/);
-  assert.match(audio, /Ingress mechanics/);
-  assert.match(audio, /Audio timestamp policy/);
+  const manuals = {
+    identity: "Identity.",
+    conversationSession: "Conversation session.",
+    historyIngressSession: "History session.",
+    audioIngressSession: "Audio session.",
+    kmapBasics: "Kmap basics.",
+    readTools: "Kmap read tools.\n\nWeb tools.",
+    writeTools: "Write tools.",
+  };
+  const prompt = composePrompt(manuals, "conversation", { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+  assert.equal(prompt, "Kennedy's identity\n\nIdentity.\n\nSession type\n\nConversation session.\n\nChannel: Kennedy's browser UI.\n\nKmap basics\n\nKmap basics.\n\nRead-only tools\n\nKmap read tools.\n\nWeb tools.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
+  assert.match(composePrompt(manuals, "conversation", { sessionType: "telegram" }), /Channel: Telegram/);
+  const history = composePrompt(manuals, "ingress", { sourceSessionType: "telegram" });
+  assert.match(history, /Source: an archived Telegram conversation/);
+  assert.match(history, /Write tools\n\nWrite tools\./);
+  assert.match(history, /Web tools\./);
+  const audio = composePrompt(manuals, "ingress", { sourceSessionType: "audio" });
+  assert.match(audio, /Session type\n\nAudio session\./);
+  assert.doesNotMatch(audio, /History session\./);
+  assert.ok(audio.indexOf("Kennedy's identity") < audio.indexOf("Session type"));
+  assert.ok(audio.indexOf("Session type") < audio.indexOf("Kmap basics"));
+  assert.ok(audio.indexOf("Kmap basics") < audio.indexOf("Read-only tools"));
+  assert.ok(audio.indexOf("Read-only tools") < audio.indexOf("Write tools"));
   assert.equal(formatModelAttribution("gpt-5.6-sol", "xhigh"), "gpt-5.6-sol-xhigh");
   assert.equal(prompt.includes("<kennedy_"), false);
+  assert.deepEqual(requiredPromptKeys("conversation"), ["identity", "conversationSession", "kmapBasics", "readTools"]);
+  assert.deepEqual(requiredPromptKeys("ingress"), ["identity", "historyIngressSession", "kmapBasics", "readTools", "writeTools"]);
+  assert.equal(promptsReady(manuals, "ingress", { sourceSessionType: "audio" }), true);
+  assert.throws(() => composePrompt({ ...manuals, readTools: "" }, "conversation"), /Missing system prompt sections: readTools/);
 });
 
 test("chatend inspector system view excludes conversation and Kmap context", async () => {
@@ -1329,7 +1359,7 @@ test("chatend inspector system view excludes conversation and Kmap context", asy
   assert.match(inspectorText(diagnostic, "memory"), /Current Kmap context/);
 });
 
-test("system prompt loader requests the identity and mode manuals", async () => {
+test("system prompt loader requests every composable prompt layer", async () => {
   const originalFetch = globalThis.fetch;
   const requested = [];
   globalThis.fetch = async path => {
@@ -1343,19 +1373,22 @@ test("system prompt loader requests the identity and mode manuals", async () => 
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(requested.sort(), [
-    "/base/system-prompts/AudioIngress.txt",
-    "/base/system-prompts/ConversationManual.txt",
-    "/base/system-prompts/HistoryIngress.txt",
+    "/base/system-prompts/AudioIngressSession.txt",
+    "/base/system-prompts/ConversationSession.txt",
+    "/base/system-prompts/HistoryIngressSession.txt",
     "/base/system-prompts/KennedyIdentity.txt",
+    "/base/system-prompts/KmapBasics.txt",
+    "/base/system-prompts/ReadTools.txt",
+    "/base/system-prompts/WriteTools.txt",
   ]);
-  assert.equal(loaded.errors.audioIngress, undefined);
-  assert.equal(loaded.manuals.audioIngress, "/base/system-prompts/AudioIngress.txt");
+  assert.equal(loaded.errors.audioIngressSession, undefined);
+  assert.equal(loaded.manuals.audioIngressSession, "/base/system-prompts/AudioIngressSession.txt");
 });
 
 test("a missing audio prompt disables only audio memory ingress", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async path => ({
-    ok: !String(path).endsWith("/AudioIngress.txt"),
+    ok: !String(path).endsWith("/AudioIngressSession.txt"),
     text: async () => `Loaded ${path}`,
   });
   let loaded;
@@ -1364,38 +1397,44 @@ test("a missing audio prompt disables only audio memory ingress", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.match(loaded.errors.audioIngress, /Could not load system prompt AudioIngress\.txt/);
+  assert.match(loaded.errors.audioIngressSession, /Could not load system prompt AudioIngressSession\.txt/);
   assert.match(loaded.manuals.identity, /KennedyIdentity\.txt/);
-  assert.match(loaded.manuals.conversation, /ConversationManual\.txt/);
-  assert.match(loaded.manuals.ingress, /HistoryIngress\.txt/);
+  assert.match(loaded.manuals.conversationSession, /ConversationSession\.txt/);
+  assert.match(loaded.manuals.historyIngressSession, /HistoryIngressSession\.txt/);
+  assert.equal(promptsReady(loaded.manuals, "ingress", { sourceSessionType: "conversation" }), true);
+  assert.equal(promptsReady(loaded.manuals, "ingress", { sourceSessionType: "audio" }), false);
 });
 
-test("session manuals enforce exclusive tool-request responses", async () => {
-  for (const file of ["ConversationManual.txt", "HistoryIngress.txt"]) {
-    const manual = await readFile(new URL(`../SystemPrompts/${file}`, import.meta.url), "utf8");
-    assert.match(manual, /closing brace must be the final non-whitespace character/);
-    assert.match(manual, /Do not use a Markdown fence/);
-    assert.match(manual, /include any other text before or after the object/);
-  }
+test("shared Kmap basics enforce exclusive tool-request responses", async () => {
+  const basics = await readFile(new URL("../SystemPrompts/KmapBasics.txt", import.meta.url), "utf8");
+  assert.match(basics, /closing brace must be the final non-whitespace character/);
+  assert.match(basics, /Do not use a Markdown fence/);
+  assert.match(basics, /include any other text before or after the object/);
+  assert.match(basics, /Additional tools and their documentation may be available in the kmap/);
 });
 
-test("mode manuals expose technical contracts without embedding Kmap strategy", async () => {
+test("layered prompt assets separate session, shared read, web, and write contracts", async () => {
   const identity = await readFile(new URL("../SystemPrompts/KennedyIdentity.txt", import.meta.url), "utf8");
-  assert.match(identity, /use the kmap itself to understand the best way to use the kmap/i);
-  const conversation = await readFile(new URL("../SystemPrompts/ConversationManual.txt", import.meta.url), "utf8");
-  assert.doesNotMatch(conversation, /ConnectNodes\n  Call:/);
-  assert.doesNotMatch(conversation, /ConsolidateFanout\n  Call:/);
-  assert.doesNotMatch(conversation, /AssignTask\n  Call:/);
-  assert.match(conversation, /Kmap is read-only in this mode/);
-  assert.match(conversation, /human-readable Chatend text shown in the Full inspector/);
-  assert.match(conversation, /recovery archive's JSON envelope are not included/);
-  assert.match(conversation, /At most ten nodes may be directly loaded at once, including both roots/);
-  const ingress = await readFile(new URL("../SystemPrompts/HistoryIngress.txt", import.meta.url), "utf8");
-  assert.match(ingress, /ConsolidateFanout\n  Call:/);
-  assert.match(ingress, /AssignTask\n  Call:/);
-  assert.match(ingress, /Use the string "blank" as childIdentifier/);
-  assert.match(ingress, /Limits: 100 model rounds and five failed attempts per ingress session; ResetContext and recovery renew neither\./);
-  for (const manual of [conversation, ingress]) {
+  assert.match(identity, /make liberal use of the kmap/i);
+  const conversation = await readFile(new URL("../SystemPrompts/ConversationSession.txt", import.meta.url), "utf8");
+  const history = await readFile(new URL("../SystemPrompts/HistoryIngressSession.txt", import.meta.url), "utf8");
+  const audio = await readFile(new URL("../SystemPrompts/AudioIngressSession.txt", import.meta.url), "utf8");
+  const readTools = await readFile(new URL("../SystemPrompts/ReadTools.txt", import.meta.url), "utf8");
+  const writeTools = await readFile(new URL("../SystemPrompts/WriteTools.txt", import.meta.url), "utf8");
+  assert.match(conversation, /kmap is read-only in this session/i);
+  assert.match(history, /kmap is writable in this session/i);
+  assert.match(audio, /kmap is writable in this session/i);
+  for (const session of [conversation, history, audio]) {
+    assert.doesNotMatch(session, /KENNEDY_TOOL_CALLS|LoadNode\n  Call:/);
+  }
+  assert.match(readTools, /At most ten nodes may be directly loaded at once, including both roots/);
+  assert.match(readTools, /WebSearch\n  Call:/);
+  assert.match(readTools, /WebFetch\n  Call:/);
+  assert.match(writeTools, /ConsolidateFanout\n  Call:/);
+  assert.match(writeTools, /AssignTask\n  Call:/);
+  assert.match(writeTools, /Use the string "blank" as childIdentifier/);
+  assert.doesNotMatch(writeTools, /WebSearch\n  Call:|WebFetch\n  Call:/);
+  for (const manual of [conversation, history, audio, readTools, writeTools]) {
     assert.doesNotMatch(manual, /knowledge-hungry|use a promising|navigate enough|prefer to|consider assigning/i);
   }
 });
@@ -1645,7 +1684,7 @@ test("telegram voice sessions archive media, correlate delivery, and emit contex
       message: { role: "assistant", content: "I heard you." },
       usage: { input_tokens: 100001, output_tokens: 20, cached_tokens: 90000, cache_write_tokens: 0, reasoning_tokens: 0 },
     }) },
-    manuals: { shared: "Shared", conversation: "Conversation" }, rootNodeId: id(1),
+    manuals: promptManuals("Shared"), rootNodeId: id(1),
     provider: "p", model: "m", contextWindowTokens: 1050000, sessionType: "telegram",
     channel: { telegramUserId: 42, username: "taek42" },
     persist: async state => checkpoints.push(structuredClone(state)), onUpdate: () => {},

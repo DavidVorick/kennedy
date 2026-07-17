@@ -1202,16 +1202,19 @@ mod tests {
             std::env::temp_dir().join(format!("kennedy-prompts-{}", hex::encode(new_id())));
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(
-            directory.join("AudioIngress.txt"),
+            directory.join("AudioIngressSession.txt"),
             "Audio ingress instructions.",
         )
         .unwrap();
         let mut prompt_state = state(db());
         prompt_state.prompts_dir = directory.clone();
 
-        let response = get_prompt(State(prompt_state), Path("AudioIngress.txt".to_owned()))
-            .await
-            .unwrap();
+        let response = get_prompt(
+            State(prompt_state),
+            Path("AudioIngressSession.txt".to_owned()),
+        )
+        .await
+        .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

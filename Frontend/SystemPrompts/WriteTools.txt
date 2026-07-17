@@ -1,0 +1,19 @@
+ConnectNodes
+  Call: {"identifiers":[2,3,8]}
+  Requires at least two distinct identifiers whose complete contents are in context. It makes every supplied node an active connection of every other supplied node. Backend active-connection overflow is demoted to fanout according to connection recency; the mutation fails atomically if a fanout limit would be exceeded.
+
+ConsolidateFanout
+  Call: {"parentIdentifier":2,"aggregatorIdentifier":3,"fanoutIdentifiers":[8,9]}
+  Requires complete parent and aggregator nodes. The aggregator and every moved node must be distinct current fanout connections of the parent. It keeps the aggregator under the parent and moves the listed fanout connections under the aggregator. The mutation fails atomically if the aggregator's fanout limit would be exceeded.
+
+AssignTask
+  Call: {"parentIdentifier":2,"childIdentifier":3,"priority":"high"}
+  Requires complete parent and child nodes and a priority of high, medium, or low. It replaces that directional task slot. Use the string "blank" as childIdentifier to clear the slot.
+
+CreateNode
+  Call: {"parentIdentifiers":[2,3],"shortName":"New Memory","shortDescription":"Short description.","longDescription":"Complete durable knowledge."}
+  Requires one or more distinct, fully available parent nodes. It creates a node, connects it to all supplied parents, and returns the new node in full context. The short name is 4–50 characters, the short description is at most 200 characters, and the long description is at most 1000 words.
+
+UpdateNode
+  Call: {"identifier":3,"newShortName":"Updated Memory","newShortDescription":"Updated description.","newLongDescription":"Complete updated durable knowledge."}
+  Requires a fully available node. It replaces all three descriptive fields, appends the current provenance to node history, and returns the updated node. The same field limits as CreateNode apply; omitted prior text is removed.

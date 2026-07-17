@@ -218,17 +218,17 @@ export class ToolExecutor {
   }
 
   assertIngress() { if (this.mode !== "ingress" || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" }); }
-  assertConversationWeb() { if (this.mode !== "conversation" || !this.intelligence) throw Object.assign(new Error("This web tool is only available during a live conversation."), { code: "tool_unavailable" }); }
+  assertWeb() { if (!["conversation", "ingress"].includes(this.mode) || !this.intelligence) throw Object.assign(new Error("This web tool is not available in this session."), { code: "tool_unavailable" }); }
 
   async webSearch(args, { signal = null, operationId = null } = {}) {
-    this.assertConversationWeb(); validateObject(args, ["question", "mode"]);
+    this.assertWeb(); validateObject(args, ["question", "mode"]);
     const question = nonemptyString(args.question, "question", 4000);
     const mode = choice(args.mode, "mode", ["quality", "balanced", "fast"]);
     return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question, mode }, { signal, operationId }) };
   }
 
   async webFetch(args, { signal = null, operationId = null } = {}) {
-    this.assertConversationWeb(); validateObject(args, ["url"]);
+    this.assertWeb(); validateObject(args, ["url"]);
     const url = nonemptyString(args.url, "url", 4096);
     return { result: await this.intelligence.webFetch({ url }, { signal, operationId }) };
   }

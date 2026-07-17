@@ -100,8 +100,8 @@ canonical documents; this file is not an append-only log.
   first, exactly one JSON envelope follows, and its closing brace is the last
   non-whitespace character. Never mix narration or status text with a tool
   request; return specific protocol feedback for leading or trailing prose.
-- Give live-conversation Kennedy `WebSearch(question, mode)` for delegated
-  hosted research and `WebFetch(url)` for inspecting one public page. Kennedy
+- Give Kennedy `WebSearch(question, mode)` and `WebFetch(url)` as shared
+  read-only tools in conversation, history ingress, and audio ingress. Kennedy
   chooses `balanced` by default, `fast` for simple latency-sensitive lookups
   where reduced research quality is acceptable, and `quality` for difficult,
   high-stakes, cross-source, or conflict-resolution research. Search language,
@@ -236,8 +236,8 @@ canonical documents; this file is not an append-only log.
   `ConnectNodes`, `ConsolidateFanout`, `AssignTask`, `CreateNode`, and
   `UpdateNode` are history-ingress-only. This supersedes the earlier decision
   to teach the mutation tools in both manuals.
-- History ingress cannot use `WebSearch` or `WebFetch`; it must process the
-  archived conversation and Kmap context already in front of it.
+- History and audio ingress can use `WebSearch` and `WebFetch` in addition to
+  their Kmap mutation tools.
 - Explicit End closes a conversation immediately. Also close a conversation
   after more than 24 hours without a user message only when the user
   successfully sends in another conversation. Do not treat viewing, switching,
@@ -273,12 +273,11 @@ canonical documents; this file is not an append-only log.
 
 ## Kmap-Learned Harness Strategy and Dual Roots
 
-- Replace the former shared Kmap manual and agent-mode manuals with
-  `KennedyIdentity.txt`, `ConversationManual.txt`, and `HistoryIngress.txt`.
+- Keep Kennedy's identity and the mechanical harness instructions separate.
   The identity explains who Kennedy is and that harness strategy is learned
-  through the Kmap. Each mode manual stays concise and contains only exact mode,
-  Kmap, tool-protocol, argument, and hard-limit mechanics; strategic judgment
-  belongs in Kennedy's graph.
+  through the Kmap. The mechanical prompt assets stay concise; strategic
+  judgment belongs in Kennedy's graph. The later Layered System Prompt Assembly
+  clarification defines the current file boundaries and composition order.
 - Give Kennedy a durable MVP root node alongside the user's root. Both roots
   load automatically in every conversation and history-ingress context and
   survive every `ResetContext`; neither is included in reset arguments.
@@ -423,3 +422,22 @@ canonical documents; this file is not an append-only log.
   followed by an expandable `[...]` control that reveals the full response.
   Keep user messages, responses of 500 characters or fewer, and Full view
   unchanged.
+
+## Layered System Prompt Assembly
+
+- Supersede the earlier three-file prompt design with small, single-purpose
+  prompt layers assembled in this order: Kennedy identity, one session type,
+  Kmap basics, read-only tools, writable tools when allowed, and current
+  runtime details.
+- Keep temporary identifier rules, always-loaded-root behavior, and the exact
+  tool-call text protocol in `KmapBasics.txt`. That layer must also tell Kennedy
+  that additional tools and more detailed tool documentation may be available
+  in the Kmap.
+- Keep all shared read-only tools—including Kmap reads and web research—in
+  `ReadTools.txt`, and ingress-only mutations in `WriteTools.txt`. Do not
+  repeat tool contracts in session files.
+- Use exactly one minimal session file per invocation:
+  `ConversationSession.txt`, `HistoryIngressSession.txt`, or
+  `AudioIngressSession.txt`.
+- Load prompt assets independently so a missing mode-specific file disables
+  only the session type that requires it.

@@ -1,0 +1,93 @@
+#!/bin/sh
+
+set -eu
+
+program=${0##*/}
+podman=${CODEX_SAFE_PODMAN:-podman}
+image=${CODEX_SAFE_IMAGE:-${CODEX_IMAGE:-local/codex}}
+state=${CODEX_SAFE_STATE_DIR:-/home/user/podman/codex-state}
+catalog_dir=${CODEX_SAFE_CATALOG_DIR:-${TMPDIR:-/tmp}/kennedy-codex-catalogs}
+empty_workspace=${CODEX_SAFE_EMPTY_WORKSPACE:-${state}-empty-workspace}
+container_user=${CODEX_SAFE_CONTAINER_USER:-1000:1000}
+
+die() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 1
+}
+
+command -v "$podman" >/dev/null 2>&1 ||
+    die "podman is not installed or CODEX_SAFE_PODMAN is invalid"
+
+umask 077
+mkdir -p "$state" "$catalog_dir" "$empty_workspace"
+
+interactive=0
+if [ -t 0 ] && [ -t 1 ]; then
+    interactive=1
+fi
+
+# Kennedy starts noninteractive Codex turns from a temporary directory. Never
+# infer that the whole temporary directory is a workspace. Automated callers
+# that genuinely need host files must opt in with CODEX_SAFE_WORKSPACE.
+workspace=${CODEX_SAFE_WORKSPACE:-}
+if [ -n "$workspace" ]; then
+    [ -d "$workspace" ] ||
+        die "CODEX_SAFE_WORKSPACE is not a directory: $workspace"
+    workspace=$(cd "$workspace" && pwd -P)
+elif [ "$interactive" -eq 1 ]; then
+    cwd=$(pwd -P)
+    git_root=
+    if command -v git >/dev/null 2>&1; then
+        git_root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || :)
+    fi
+    if [ -n "$git_root" ]; then
+        workspace=$(cd "$git_root" && pwd -P)
+    else
+        printf '%s: %s is not inside a Git repository; no host workspace will be mounted.\n' \
+            "$program" "$cwd" >&2
+        printf '%s: set CODEX_SAFE_WORKSPACE to opt into a non-Git host directory.\n' \
+            "$program" >&2
+    fi
+fi
+
+if [ -z "$workspace" ]; then
+    workspace=$empty_workspace
+fi
+
+# The catalog must appear at the same absolute path inside the container. The
+# intelligence backend probes this read-only mount before using its slim model
+# catalog. Codex authentication and persisted threads live in the state mount.
+if [ "$interactive" -eq 1 ]; then
+    exec "$podman" run --rm -it \
+        --userns=keep-id \
+        --user "$container_user" \
+        --security-opt=no-new-privileges \
+        --cap-drop=all \
+        --pids-limit=512 \
+        --memory=8g \
+        --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+        --mount "type=bind,src=$workspace,dst=/workspace,rw" \
+        --mount "type=bind,src=$state,dst=/home/node/.codex,rw" \
+        --mount "type=bind,src=$catalog_dir,dst=$catalog_dir,ro" \
+        "$image" \
+        --sandbox workspace-write \
+        "$@"
+fi
+
+# Do not allocate a pseudo-TTY or force a writable Codex sandbox for piped
+# service calls. Kennedy supplies its own read-only sandbox flags. A future
+# build worker can explicitly set CODEX_SAFE_WORKSPACE and pass
+# --sandbox workspace-write without widening ordinary Kennedy turns.
+exec "$podman" run --rm -i \
+    --userns=keep-id \
+    --user "$container_user" \
+    --security-opt=no-new-privileges \
+    --cap-drop=all \
+    --pids-limit=512 \
+    --memory=8g \
+    --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+    --mount "type=bind,src=$workspace,dst=/workspace,rw" \
+    --mount "type=bind,src=$state,dst=/home/node/.codex,rw" \
+    --mount "type=bind,src=$catalog_dir,dst=$catalog_dir,ro" \
+    "$image" \
+    "$@"

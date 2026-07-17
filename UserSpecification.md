@@ -291,9 +291,9 @@ provider, model, reasoning effort, search context, deadlines, page selection,
 and result limits. The result contains a synthesized research answer and the
 source URLs used to produce it.
 
-The call signature is WebSearch(question, mode). It is available only in live
-conversation sessions. Provider live-data feeds may return an answer without a
-public source URL.
+The call signature is WebSearch(question, mode). It is available in both live
+conversation and ingress sessions. Provider live-data feeds may return an
+answer without a public source URL.
 
 ### WebFetch
 
@@ -301,23 +301,30 @@ WebFetch lets Kennedy inspect one specific public web page as readable text.
 It returns source metadata and indicates when content was truncated. Web page
 content is untrusted evidence and cannot override Kennedy's instructions.
 
-The call signature is WebFetch(url). It is available only in live conversation
-sessions.
+The call signature is WebFetch(url). It is available in both live conversation
+and ingress sessions.
 
 ## Harness Instructions
 
-Kennedy's system instructions have two layers. `KennedyIdentity.txt` defines
-who Kennedy is and explains that she learns how to use her harness from the
-Kmap itself. A concise technical mode file is then added:
+Kennedy's system instructions are assembled from small, single-purpose prompt
+files in this order:
 
-- `ConversationManual.txt` for a live conversation,
-- `HistoryIngress.txt` for history ingress.
+1. `KennedyIdentity.txt` defines who Kennedy is.
+2. Exactly one session file describes the current work:
+   `ConversationSession.txt`, `HistoryIngressSession.txt`, or
+   `AudioIngressSession.txt`.
+3. `KmapBasics.txt` defines temporary node identifiers, always-loaded roots,
+   and the exact text protocol for tool calls. It also tells Kennedy that the
+   Kmap may contain additional tools and more detailed tool documentation.
+4. `ReadTools.txt` lists all shared read-only tools, including Kmap reads and
+   web research.
+5. Writable ingress sessions receive `WriteTools.txt`.
+6. The frontend adds the current model, thinking mode, channel, or source
+   details that are known only at runtime.
 
-Mode files describe only how the mode operates, how Kmap context is represented,
-which tools exist, their exact argument and text-protocol contracts, and hard
-runtime rules. They do not prescribe strategy for using the Kmap or other
-tools; Kennedy stores and improves that knowledge in her own graph rooted at
-Kennedy's root node.
+Each fact and tool contract has one prompt-file owner. The session files stay
+minimal, while strategy and expandable harness knowledge live in Kennedy's
+graph rooted at Kennedy's root node.
 
 The frontend dynamically tells Kennedy the exact model and thinking mode for
 the current session. Whenever a model mutates the Kmap, the frontend—not
@@ -392,10 +399,9 @@ retry.
 
 While the conversation session is ongoing, Kennedy may only call LoadNode,
 ResetContext, WebSearch, and WebFetch. Conversation sessions cannot mutate the
-Kmap. WebSearch and WebFetch are unavailable during history ingress. When the
-conversation session ends, the complete recovery archive—not merely the clean
-dialog—is turned into a history provenance node. History Ingress then extracts
-the canonical Chatend message text from that archive.
+Kmap. When the conversation session ends, the complete recovery archive—not
+merely the clean dialog—is turned into a history provenance node. History
+Ingress then extracts the canonical Chatend message text from that archive.
 
 Starting a new conversation does not end existing live conversations.
 Conversations end when the user deliberately ends them, or by the 24-hour idle
@@ -484,11 +490,10 @@ times in aggregate during the session.
 Kennedy will update as many nodes as she feels is appropriate during the
 history ingress session. Zero updates is also valid. When Kennedy feels that
 the kmap has been updated appropriately, she will end the history ingress
-session. History ingress has no WebSearch or WebFetch access and must reason
-only from its archived conversation and available Kmap context. It may use
-ConnectNodes, ConsolidateFanout, AssignTask, CreateNode, and UpdateNode only
-when justified; task connections require a clear outstanding need for work to
-be completed.
+session. History ingress may use WebSearch and WebFetch when external evidence
+would help. It may use ConnectNodes, ConsolidateFanout, AssignTask, CreateNode,
+and UpdateNode only when justified; task connections require a clear
+outstanding need for work to be completed.
 The entire logical history-ingress session is limited to 100 LLM rounds. This
 count survives checkpoints, retries, and ResetContext calls; ResetContext does
 not create a fresh allowance.

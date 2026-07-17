@@ -1,7 +1,7 @@
 import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260716.5";
-import { loadPromptManuals } from "./prompt_composer.js?v=20260716.2";
-import { ConversationSession } from "./conversation.js?v=20260716.12";
-import { runHistoryIngress } from "./history_ingress.js?v=20260716.2";
+import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.2";
+import { ConversationSession } from "./conversation.js?v=20260717.2";
+import { runHistoryIngress } from "./history_ingress.js?v=20260717.2";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
 import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260716.7";
 
@@ -72,15 +72,15 @@ let telegramRelayReady = false;
 const INGRESS_FAILURE_LIMIT = 5;
 
 function conversationPromptsReady() {
-  return Boolean(manuals.identity && manuals.conversation);
+  return promptsReady(manuals, "conversation");
 }
 
 function historyPromptsReady() {
-  return Boolean(manuals.identity && manuals.ingress);
+  return promptsReady(manuals, "ingress", { sourceSessionType: "conversation" });
 }
 
 function audioPromptsReady() {
-  return historyPromptsReady() && Boolean(manuals.audioIngress);
+  return promptsReady(manuals, "ingress", { sourceSessionType: "audio" });
 }
 
 function chatRuntimeReady() {
@@ -88,8 +88,10 @@ function chatRuntimeReady() {
 }
 
 function memoryIngressRuntimeReady() {
-  return kwebReady && intelligenceReady && historyPromptsReady()
-    && (conversationHistoryReady || (audioIngressReady && audioPromptsReady()));
+  return kwebReady && intelligenceReady && (
+    (conversationHistoryReady && historyPromptsReady())
+    || (audioIngressReady && audioPromptsReady())
+  );
 }
 
 function sessionTypeOf(record) {
@@ -1154,7 +1156,7 @@ function archivedIngressMetrics(state, live = null) {
 
 async function nextMemoryIngress() {
   const [conversationResult, audioResult] = await Promise.all([
-    conversationHistoryReady
+    conversationHistoryReady && historyPromptsReady()
       ? conversationHistory.nextIngress().catch(error => {
         showError(ui.error_banner, `Conversation memory queue is temporarily unavailable: ${error.message}`);
         return { conversation: null };
@@ -1445,9 +1447,12 @@ async function initialize() {
     manuals = loaded.manuals;
     const promptImpact = {
       identity: "Conversation and memory-ingress model sessions are unavailable",
-      conversation: "New and restored conversations are unavailable",
-      ingress: "Conversation-history and audio memory ingress are paused",
-      audioIngress: "Audio preparation and history remain available, but audio memory ingress is paused",
+      kmapBasics: "Conversation and memory-ingress model sessions are unavailable",
+      readTools: "Conversation and memory-ingress model sessions are unavailable",
+      conversationSession: "New and restored conversations are unavailable",
+      historyIngressSession: "Conversation-history memory ingress is paused",
+      audioIngressSession: "Audio preparation and history remain available, but audio memory ingress is paused",
+      writeTools: "Conversation-history and audio memory ingress are paused",
     };
     for (const [key, message] of Object.entries(loaded.errors)) {
       showError(ui.error_banner, `${promptImpact[key] || "A model mode is unavailable"}: ${message}`);

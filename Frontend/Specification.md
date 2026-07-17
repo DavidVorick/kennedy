@@ -18,9 +18,12 @@ Frontend/
   Specification.md
   SystemPrompts/
     KennedyIdentity.txt
-    ConversationManual.txt
-    HistoryIngress.txt
-    AudioIngress.txt
+    ConversationSession.txt
+    HistoryIngressSession.txt
+    AudioIngressSession.txt
+    KmapBasics.txt
+    ReadTools.txt
+    WriteTools.txt
   public/
     index.html
     css/
@@ -272,38 +275,34 @@ archived system and Kmap context messages before generation.
 
 ## 7. Prompt Composition
 
-The frontend fetches manuals from `/system-prompts/{filename}`.
-
-Conversation instructions are composed, in order, from:
-
-1. `KennedyIdentity.txt`,
-2. `ConversationManual.txt`.
-
-History-ingress instructions are composed from:
+The frontend fetches composable prompt assets from
+`/system-prompts/{filename}`. It assembles every session in this order:
 
 1. `KennedyIdentity.txt`,
-2. `HistoryIngress.txt`.
+2. exactly one of `ConversationSession.txt`, `HistoryIngressSession.txt`, or
+   `AudioIngressSession.txt`,
+3. `KmapBasics.txt`,
+4. `ReadTools.txt`, containing the Kmap and web read-only tools,
+5. `WriteTools.txt` only for history and audio ingress,
+6. a dynamic runtime section with the configured model and thinking mode.
 
-Manual contents are inserted without rewriting. The prompt composer may add
-short human-readable section headings and the current context block, but must
-not add XML wrappers, JSON serialization, or duplicate behavioral instructions
-already present in the manuals. The identity establishes Kennedy's purpose and
-Kmap-based learning model. Mode manuals contain only mode mechanics, exact Kmap
-facts, and tool contracts; Kmap usage strategy belongs in Kennedy's own graph.
-The conversation manual also states the lifecycle fact that the canonical
-human-readable Chatend text is retained for read-write history ingress when the
-conversation ends, where learned information can be integrated into the Kmap.
+The selected session asset contains only session purpose, mutability, and the
+context-loading budget. `KmapBasics.txt` is the single source for identifier
+lifetime, automatic roots, the exclusive text tool-call protocol, and the fact
+that additional tools and documentation may be found in the Kmap. Each tool
+contract likewise has one source asset. The composer adds short readable
+headings and channel/source details but does not add XML wrappers, JSON
+serialization, or duplicate behavioral instructions. Kmap usage strategy and
+learned judgment belong in Kennedy's graph rather than static prompts.
 
-After the selected mode manual, the composer adds a short dynamic runtime
-section stating the exact configured model and thinking mode. These values come
-from intelligence-provider metadata rather than a static manual, so restored
-sessions also receive the runtime identity that will actually execute them.
+Runtime values come from intelligence-provider metadata, so restored sessions
+receive the identity that will actually execute them.
 
 ## 8. Agent Tools
 
-All tool names, argument shapes, usage policy, and the request protocol are
-written in the session's system-prompt manual. No provider-native function or
-custom-tool definitions are sent.
+All baseline tool names and argument shapes live in the composable tool assets;
+the request protocol lives once in `KmapBasics.txt`. No provider-native
+function or custom-tool definitions are sent.
 
 For every mutating Kmap request, the tool executor automatically adds
 `model_attribution` using the active configured model and reasoning effort.
@@ -489,7 +488,7 @@ current model attribution automatically.
 
 ### 8.8 `WebSearch`
 
-Available only during live conversation.
+Available during live conversation, history ingress, and audio ingress.
 
 ```json
 {
@@ -512,7 +511,7 @@ continuation chain.
 
 ### 8.9 `WebFetch`
 
-Available only during live conversation.
+Available during live conversation, history ingress, and audio ingress.
 
 ```json
 {
@@ -561,13 +560,15 @@ Startup is feature-isolated rather than one all-or-nothing transaction.
 8. Start the sequential history-ingress worker for the queue without blocking
    any active conversation.
 
-Each feature starts when only its own dependencies are ready. A missing
-conversation prompt disables live conversation and Telegram sessions but not
-memory or audio history. A missing common ingress prompt pauses both mutation
-queues without disabling read-only history. A missing `AudioIngress.txt` pauses
-only audio-to-Kmap mutation: ordinary conversation ingress, audio preparation,
-and the complete audio history UI continue. Failure of one ingress queue's
-poll does not prevent the other queue from being checked.
+Each feature starts when only its own prompt dependencies are ready. Missing
+identity, Kmap basics, or shared read tools disables every model session. A
+missing conversation session disables live conversation and Telegram only. A
+missing history-ingress session pauses only conversation
+memory ingress. A missing audio-ingress session pauses only audio-to-Kmap
+mutation. Missing write tools pauses both ingress modes. Read-only history,
+audio preparation, and the complete audio history remain available, and a
+failure of one ingress queue's poll does not prevent the other from being
+checked.
 
 ### 9.2 User Turn
 
@@ -651,8 +652,8 @@ conversation's Kweb tool history.
    model context,
 4. load the user and Kennedy roots,
 5. set the session LoadNode counter to zero,
-6. generate with the ingress manual describing the memory navigation and
-   mutation tools; WebSearch and WebFetch are unavailable,
+6. generate with the ingress prompt describing the shared read tools and
+   ingress mutation tools,
 7. execute tools until Kennedy returns final text,
 8. append live requests, results, and completion after the clean transcript in
    the same scroll container,
@@ -689,9 +690,10 @@ For audio, the frontend creates `audio-vnote` provenance with the recording's
 SHA-256/piece idempotency key and recording-start `source_created_at`. The
 retained content is the Sol-produced final transcript piece, not Gemini JSON or
 audio bytes. Its heading repeats recording time, hash, filename, and piece
-position. Prompt composition adds `AudioIngress.txt` after the common mutation
-manual and explicitly tells Kennedy that `Created` is historical recording
-time. The audio backend stores the same complete ingress Chatend checkpoints,
+position. Prompt composition selects `AudioIngressSession.txt`, then adds the
+same Kmap basics, read tools, and write tools used by other sessions. The
+audio-provenance context explicitly tells Kennedy that `Created` is historical
+recording time. The audio backend stores the same complete ingress Chatend checkpoints,
 versions, and five-consecutive-attempt failure history as conversation ingress.
 Failed attempts become eligible again after one, five, fifteen, and sixty
 minutes. It marks the recording complete only after every chronological piece

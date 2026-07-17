@@ -260,20 +260,23 @@ Kennedy's live system prompts are deliberately plain-text files in
 [`Frontend/SystemPrompts`](Frontend/SystemPrompts/README.md):
 
 - `KennedyIdentity.txt` — Kennedy's identity and Kmap-based learning model.
-- `ConversationManual.txt` — exact live-mode, read-only Kmap, and tool
-  mechanics.
-- `HistoryIngress.txt` — exact ingress-mode and Kmap mutation mechanics.
-- `AudioIngress.txt` — timestamp-aware and uncertainty-aware vnote policy layered
-  onto the ingress mechanics.
+- `ConversationSession.txt`, `HistoryIngressSession.txt`, and
+  `AudioIngressSession.txt` — minimal, mutually exclusive session descriptions.
+- `KmapBasics.txt` — shared identifier, root, tool-protocol, and
+  Kmap-discoverable-capability facts.
+- `ReadTools.txt` — shared Kmap and web read-only tools.
+- `WriteTools.txt` — ingress-only Kmap mutation tools.
 
 Kennedy's strategy for using her harness is intentionally learned and stored in
-her own Kmap graph rather than embedded in the mode manuals. Every session
-starts with both the user's root and Kennedy's root loaded.
+her own Kmap graph rather than embedded in static prompts. The frontend composes
+identity, session type, Kmap basics, read-only tools, optional write tools, and
+the current runtime in that order. Every session starts with both the user's
+root and Kennedy's root loaded.
 
-Kennedy's local tools use a text protocol documented in the session manuals,
-so tool requests and results are visible in the chatend. Live conversations can
-read Kmap memory and use WebSearch/WebFetch but cannot mutate the Kmap; the
-serialized, offline history-ingress worker owns memory mutation. Kennedy
+Kennedy's local tools use a text protocol documented once in `KmapBasics.txt`,
+so tool requests and results are visible in the chatend. Every session can read
+Kmap memory and use WebSearch/WebFetch. Live conversations cannot mutate the
+Kmap; the serialized, offline history-ingress worker owns memory mutation. Kennedy
 chooses `quality`, `balanced`, or `fast` for each WebSearch call; the concrete
 provider, model, reasoning, context, deadline, and retrieval bounds for those
 modes stay in the intelligence backend. The UI also reports provider token
