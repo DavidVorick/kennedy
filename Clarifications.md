@@ -431,6 +431,12 @@ canonical documents; this file is not an append-only log.
 
 ## Layered System Prompt Assembly
 
+- The frontend chooses the inference provider from backend metadata before it
+  composes Kennedy's prompt. When that selected provider's explicit kind is
+  `codex`, include a concise `CodexHarness.txt` layer explaining that Codex is
+  an inner wrapper, its API/tool limitation claims may be wrong, and Kennedy's
+  tool calls are caught by the outer harness. Do not include or require this
+  layer for other provider kinds.
 - Supersede the earlier three-file prompt design with small, single-purpose
   prompt layers assembled in this order: Kennedy identity, one session type,
   Kmap basics, read-only tools, writable tools when allowed, and current
@@ -451,3 +457,44 @@ canonical documents; this file is not an append-only log.
   be recovered or resumed. Purge must permanently delete its durable history
   record without history ingress, so the stuck conversation neither reappears
   in history nor updates the Kmap.
+
+## Multi-User Telegram Identity and Groups
+
+- Supersede the earlier private-only Telegram authorization design. Keep
+  Telegram identity-to-root mappings in a dedicated SQLite database; the Kweb
+  database remains limited to Kmap data. A normalized whitelisted handle owns
+  a reserved, initially blank Kmap root. Its first observed matching Telegram
+  account pins the stable numeric user ID under TOFU, after which the numeric ID
+  is authoritative and a different account presenting that handle is refused.
+- Seed only `@taek42` as an unresolved privileged handle. Do not special-case
+  David in backend request paths. The frontend maps the web UI to that handle's
+  root (and preserves the existing legacy user root); David's eventual numeric
+  Telegram ID is learned through the same TOFU path as every other handle.
+- `/adduser @handle` is available only to the numeric identity pinned to the
+  initial privileged entry. It immediately whitelists the handle and reserves
+  a blank root; there is no registration, onboarding, or code-driven user
+  interaction beyond the command.
+- A Telegram group is usable only while Kennedy can maintain a complete member
+  ledger and every member is a TOFU-valid whitelisted identity. Kennedy must be
+  a group administrator. Any observed unknown member, handle/ID conflict, loss
+  of administrator monitoring after activation, or incomplete membership
+  ledger permanently blacklists that chat ID. Later whitelisting or membership
+  changes never revive it; users must create a new group.
+- Invoke Kennedy in an allowed group only when a message mentions her bot
+  handle or replies to one of her messages. Every invocation is an independent
+  `telegram-group` session. Assign every observed group its own reserved blank
+  Kmap root. Load the invoking user's root, the group's root, and Kennedy's root
+  in that order; register every other current participant root as a
+  session-local reference Kennedy may choose to load. Dynamic context
+  identifies the group and all participants/root identifiers and includes the
+  latest 50 group messages. `/reset` remains private-DM-only.
+- After more than 100 non-invocation group messages, queue the oldest 80 since
+  the last invocation or batch for background history ingress, leaving a
+  20-message buffer. Background batches load the group root and Kennedy's root,
+  since they have no invoking user. Group roots survive Telegram chat-ID
+  migration and permanent blacklisting. Group invocations and background
+  batches use normal durable Conversation History recovery and sequential Kmap
+  ingress.
+- Do not add static prompt warnings, confidentiality partitions, or Kmap access
+  controls. These users are trusted and Kennedy may load any participant's
+  root. Group membership/session facts belong to dynamic Chatend context.

@@ -142,7 +142,13 @@ export function renderTranscript(container, transcript, ingressActivity = null, 
 }
 
 export function conversationTitle(record, limit = 54) {
-  if ((record?.state?.sessionType || record?.state?.archive?.sessionType) === "telegram") {
+  const sessionType = record?.state?.sessionType || record?.state?.archive?.sessionType;
+  if (sessionType === "telegram-group") {
+    const channel = record?.state?.channel || record?.state?.archive?.channel || {};
+    const title = channel.groupContext?.groupTitle || "Telegram group";
+    return channel.backgroundIngress ? `${title} · background ingress` : title;
+  }
+  if (sessionType === "telegram") {
     const username = record?.state?.channel?.username || record?.state?.archive?.channel?.username;
     const displayName = record?.state?.channel?.displayName || record?.state?.archive?.channel?.displayName || "Telegram user";
     return username ? `@${String(username).replace(/^@/, "")}` : displayName;

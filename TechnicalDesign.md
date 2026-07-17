@@ -21,9 +21,9 @@ The MVP has six logical runtime components:
 4. **Conversation history backend**: a Rust HTTP service. It durably checkpoints
    active browser conversations and owns the sequential history-ingress queue.
 5. **Telegram relay**: a Rust service built on `teloxide`. It long-polls
-   Telegram, durably queues authorized text/voice/document/reset events, and ferries
-   conversational output between Telegram and the browser without constructing
-   prompts or running Kennedy.
+   Telegram, owns a separate identity/group-policy database, durably queues
+   private and group work, and ferries conversational output between Telegram
+   and the browser without constructing prompts or running Kennedy.
 6. **Audio ingress backend**: a Rust HTTP service. It durably accepts vnote WAV
    files, owns content-hash idempotency and restartable preparation, transcribes
    ordered overlapping chunks with Gemini, reconciles a final transcript with
@@ -87,7 +87,7 @@ One kennedy-server process
   │    └─ serves frontend and manuals
   ├─ Intelligence API :4322 ------------ Podman Codex + OpenAI transcription + public web
   ├─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
-  ├─ Telegram Relay API :4324 ---------- kennedy-telegram.sqlite3 + Telegram long polling
+  ├─ Telegram Relay API :4324 ---------- kennedy-telegram.sqlite3 + kennedy-users.sqlite3 + Telegram long polling
   └─ Audio Ingress API :4325 ----------- kennedy-audio.sqlite3 + kennedy-audio-ingress/
 
 Browser frontend calls all five APIs directly. No backend calls another.
@@ -108,7 +108,7 @@ requests from the Kweb frontend origin. Every listener binds to loopback by
 default.
 
 The encrypted vault is portable rather than machine-bound. Copying it with the
-four databases and audio media preserves configured credentials and queued
+five databases and audio media preserves configured credentials and queued
 vnotes on a new machine, where the same passphrase unlocks the vault. The vault
 is excluded from Git. Kennedy has no tracked runtime configuration file.
 
@@ -122,8 +122,8 @@ backup fails while Kennedy is running, and a competing server fails before it
 can mutate a backup source.
 
 While that boundary is held, the command uses SQLite's backup API to create
-standalone snapshots of the audio-ingress, Telegram, conversation-history, and
-Kmap databases, copies the complete audio media tree and still-encrypted
+standalone snapshots of the audio-ingress, Telegram transport, user directory,
+conversation-history, and Kmap databases, copies the complete audio media tree and still-encrypted
 credential vault when present, verifies SQLite integrity and foreign keys, and
 atomically publishes a private timestamped `.tar.gz`. The archive contains a
 checksummed JSON manifest and a recovery README beginning with the creating
@@ -192,7 +192,8 @@ or abrupt close while refreshing the active manuals and required root context.
 The Kweb backend owns:
 
 - creation and migration of the SQLite schema,
-- the hardcoded MVP user root and Kennedy root,
+- the legacy compatibility user root, Kennedy root, and idempotent creation of
+  externally reserved blank user/group-root nodes,
 - knowledge, provenance, and history nodes,
 - connection ordering, promotion, and demotion,
 - atomic create, update, and connect operations,
@@ -200,8 +201,8 @@ The Kweb backend owns:
 - read APIs used by context loading and the memory explorer,
 - serving the frontend and prompt-manual files.
 
-It knows nothing about short identifiers, chatends, LLM messages, session call
-budgets, or provider APIs.
+It knows nothing about Telegram identities, whitelists, group membership, short
+identifiers, chatends, LLM messages, session call budgets, or provider APIs.
 
 The prompt route accepts safe plain `.txt` basenames from the configured prompt
 directory instead of duplicating the frontend's filename manifest in Rust.
@@ -268,8 +269,9 @@ It does not call the Kweb or intelligence APIs or validate their identifiers.
 It permits multiple `active` and `ingress_pending` records while enforcing one
 `ingress_in_progress` record. A user-activity checkpoint also closes other
 active conversations idle for more than 24 hours, unless Kennedy still owes a
-response in that record. Telegram sessions are exempt and remain active until
-their user sends `/reset`.
+  response in that record. All Telegram session types are exempt from idle
+closure. Private sessions remain active until `/reset`; independent group
+invocations and background batches are explicitly queued immediately.
 The backend atomically records concise ingress failure diagnostics. The fifth
 failure moves the record to `ingress_failed`, removes it from queue selection,
 and frees the worker to process the next conversation; failed records and all
@@ -280,14 +282,23 @@ this destructive path for stuck sessions and cancels locally owned work first.
 
 ### 4.5 Telegram Relay
 
-The relay owns the bot token, numeric Telegram authorization bindings, original
-Telegram voice/document bytes, and the per-user inbound/outbound delivery queue. It
-bootstraps the configured `@taek42` username once and thereafter authorizes by
-stable numeric Telegram user ID. It accepts private chats only and refuses all
-unpaired users without storing their content. The browser binds each event to a
-Conversation History record, runs the normal frontend Chatend/tool loop, and
-returns Kennedy's final conversational text. The relay never receives the rest
-of the Chatend.
+The relay owns the bot token, transport/event database, and a separate user
+directory containing whitelist handles, TOFU-pinned numeric IDs, reserved user
+and group Kmap root IDs, root readiness, and permanent group decisions. `@taek42` is the only
+initial unresolved privileged handle; the backend uses the generic directory
+capability rather than a David-specific ID path. Its eventual numeric ID and
+every `/adduser @handle` entry are pinned on first matching observation.
+
+Private chats retain per-user sessions and `/reset`. In groups, Kennedy must be
+an administrator and the observed active-member ledger must exactly match the
+Telegram member count with every identity whitelisted. Unknown/conflicting
+members, an incomplete ledger, or loss of monitoring after activation
+permanently blacklists the chat ID. Each observed group keeps a stable root even
+after blacklisting or a Telegram chat-ID migration. Mentions and replies queue
+fresh invocations with 50 messages of context; more than 100 uninvoked messages
+queue the oldest 80 for background ingress. The browser provisions reserved roots, binds each
+event to Conversation History, runs the Chatend/tool loop, and returns only
+Kennedy's final text. The relay never receives the rest of the Chatend.
 
 ### 4.6 Audio Ingress Backend
 
@@ -366,7 +377,7 @@ remain queryable from the sidebar.
 
 History ingress uses a separate chatend composed from identity, the history
 session description, Kmap basics, read tools, and write tools, followed by the
-canonical archived conversation text and both loaded root nodes. The
+canonical archived conversation text and the archived session's loaded roots. The
 provenance node stores the complete recovery JSON for
 durability, but ingress parses it and formats only its `messages`; recovery
 counters, diagnostics, media data URLs, and the JSON envelope do not enter
@@ -408,15 +419,26 @@ live composer.
 
 ### 5.3 Telegram and Conversational Audio
 
-Conversation records declare `sessionType: conversation` or
-`sessionType: telegram`. Prompt composition tells Kennedy which one she is in;
+Conversation records declare `sessionType: conversation`, `telegram`, or
+`telegram-group`. Prompt composition tells Kennedy which one she is in;
 history ingress separately declares whether its archive came from a Telegram
-session or a browser conversation. A Telegram session uses the conversation
+session or a browser conversation. A private Telegram session uses the conversation
 session description and read-only conversation tool set. It ends only on
 `/reset`, which queues the complete recovery archive; normal sequential history
 ingress extracts its canonical Chatend text. Each time current context crosses another 100,000-token band,
 the relay sends a separate operational notice with current and maximum tokens
 and suggests `/reset`; the notice is not added to the Chatend.
+
+Each group invocation instead ends after its one reply. Its direct roots are
+the invoker's reserved user root, the group's reserved root, and Kennedy's root
+in that order. Every other member root receives a session-local short identifier
+without being loaded, so Kennedy may load it deliberately. Dynamic context
+lists the group root, all participants/root identifiers, and the latest 50
+messages. Background 80-message archives have no invoker, so they load the
+group root followed by Kennedy's root and register all participant roots before
+ordinary sequential history ingress. Group-root assignments are created when a
+group is first observed and survive permanent blacklisting and Telegram chat-ID
+migration.
 
 Browser recordings and Telegram voice notes follow the same capability-aware
 path. The frontend preserves the original recording and asks the intelligence
@@ -563,8 +585,8 @@ Implementation code belongs under its owning component directory.
 
 ## 9. MVP Non-Goals
 
-- General-purpose user administration beyond configured Telegram bootstrap
-  identities.
+- General-purpose user administration beyond David's `/adduser @handle`
+  whitelist command.
 - Network deployment beyond the local machine.
 - Manual knowledge editing, deletion, or fanout pruning.
 - Self-action sessions.

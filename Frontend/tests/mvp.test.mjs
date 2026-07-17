@@ -23,6 +23,7 @@ const promptManuals = (label = "Shared") => ({
   conversationSession: `${label} conversation session`,
   historyIngressSession: `${label} history-ingress session`,
   audioIngressSession: `${label} audio-ingress session`,
+  codexHarness: `${label} Codex outer-harness note`,
   kmapBasics: `${label} Kmap basics`,
   readTools: `${label} read and web tools`,
   writeTools: `${label} write tools`,
@@ -49,7 +50,7 @@ test("short IDs are stable within a context and reset from one", async () => {
   assert.equal(context.resolve(context.shortId(id(3))), id(3));
 });
 
-test("both roots load automatically and survive every reset", async () => {
+test("all declared roots load automatically and survive every reset", async () => {
   const api = new MockKweb([node(1), node(2), node(3), node(4)]);
   const context = new KwebContext(api, [id(1), id(2)]);
   await context.initialize();
@@ -60,6 +61,18 @@ test("both roots load automatically and survive every reset", async () => {
   assert.deepEqual(context.snapshot().rootIdentifiers, [1, 2]);
   await assert.rejects(() => context.reset([id(1)]), error => error.code === "root_in_reset");
   await assert.rejects(() => context.reset([id(2)]), error => error.code === "root_in_reset");
+});
+
+test("a three-root group context leaves seven direct-load slots", async () => {
+  const api = new MockKweb(Array.from({ length: 11 }, (_, index) => node(index + 1)));
+  const context = new KwebContext(api, [id(1), id(2), id(3)]);
+  await context.initialize();
+  await context.reset([id(4), id(5), id(6), id(7), id(8), id(9), id(10)]);
+  assert.deepEqual(context.loadedNodeIds, Array.from({ length: 10 }, (_, index) => id(index + 1)));
+  await assert.rejects(
+    () => context.reset([id(4), id(5), id(6), id(7), id(8), id(9), id(10), id(11)]),
+    error => error.code === "loaded_node_limit",
+  );
 });
 
 test("memory explorer provides direct navigation to both Kmap roots", async () => {
@@ -707,7 +720,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
   const session = new ConversationSession({
     kweb: new MockKweb([node(1)]), intelligence: {},
     manuals: promptManuals("Shared"), rootNodeId: id(1),
-    provider: "p", model: "m", onUpdate: () => {},
+    provider: "p", providerKind: "codex", model: "m", onUpdate: () => {},
   });
   await session.initialize();
   session.transcript = [{ role: "user", content: "Hi" }, { role: "kennedy", content: "Hello" }];
@@ -723,6 +736,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
   assert.equal(archive.version, 2);
   assert.equal("modelAttribution" in archive, false);
   assert.match(archive.systemPrompt, /Shared/);
+  assert.match(archive.systemPrompt, /Codex harness\n\nShared Codex outer-harness note/);
   assert.equal(archive.context.snapshot.nodes[0].longDescription, "Details 1");
   assert.match(archive.messages.find(message => typeof message.content === "string" && message.content.includes("KENNEDY_TOOL_CALLS")).content, /LoadNode/);
   assert.match(archive.messages.find(message => message.display_role === "Memory tool result").content, /Loaded/);
@@ -801,7 +815,7 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   const checkpoints = [];
   await runHistoryIngress({
     kweb, intelligence, manuals: promptManuals("Ingress"),
-    rootNodeId: id(1), provenanceId: "provenance", provider: "p", model: "m",
+    rootNodeId: id(1), provenanceId: "provenance", provider: "p", providerKind: "codex", model: "m",
     checkpoint: async archive => checkpoints.push(structuredClone(archive)), onUpdate: () => {},
   });
   assert.equal(generations, 1);
@@ -809,6 +823,7 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   assert.equal(checkpoints.at(-1).completed, true);
   assert.equal("modelAttribution" in checkpoints.at(-1), false);
   assert.match(checkpoints.at(-1).systemPrompt, /Ingress/);
+  assert.match(checkpoints.at(-1).systemPrompt, /Codex harness\n\nIngress Codex outer-harness note/);
   assert.match(checkpoints.at(-1).retained[0].content, /Archived Chatend\n\nAgent manuals\n\nArchived instructions/);
   assert.match(checkpoints.at(-1).retained[0].content, /David\n\nArchived words\./);
   assert.match(checkpoints.at(-1).retained[0].content, /Loaded Kmap node summaries from the archived session/);
@@ -1482,6 +1497,7 @@ test("system prompt composition uses readable sections rather than markup wrappe
     conversationSession: "Conversation session.",
     historyIngressSession: "History session.",
     audioIngressSession: "Audio session.",
+    codexHarness: "The outer harness catches Kennedy tool calls.",
     kmapBasics: "Kmap basics.",
     readTools: "Kmap read tools.\n\nWeb tools.",
     writeTools: "Write tools.",
@@ -1501,10 +1517,16 @@ test("system prompt composition uses readable sections rather than markup wrappe
   assert.ok(audio.indexOf("Kmap basics") < audio.indexOf("Read-only tools"));
   assert.ok(audio.indexOf("Read-only tools") < audio.indexOf("Write tools"));
   assert.equal(formatModelAttribution("gpt-5.6-sol", "xhigh"), "gpt-5.6-sol-xhigh");
+  const codex = composePrompt(manuals, "conversation", { providerKind: "codex" });
+  assert.match(codex, /Codex harness\n\nThe outer harness catches Kennedy tool calls\./);
+  assert.doesNotMatch(composePrompt(manuals, "conversation", { providerKind: "direct-api" }), /Codex harness|outer harness/);
   assert.equal(prompt.includes("<kennedy_"), false);
   assert.deepEqual(requiredPromptKeys("conversation"), ["identity", "conversationSession", "kmapBasics", "readTools"]);
+  assert.deepEqual(requiredPromptKeys("conversation", { providerKind: "codex" }), ["identity", "conversationSession", "kmapBasics", "readTools", "codexHarness"]);
   assert.deepEqual(requiredPromptKeys("ingress"), ["identity", "historyIngressSession", "kmapBasics", "readTools", "writeTools"]);
   assert.equal(promptsReady(manuals, "ingress", { sourceSessionType: "audio" }), true);
+  assert.equal(promptsReady({ ...manuals, codexHarness: "" }, "conversation", { providerKind: "codex" }), false);
+  assert.equal(promptsReady({ ...manuals, codexHarness: "" }, "conversation", { providerKind: "direct-api" }), true);
   assert.throws(() => composePrompt({ ...manuals, readTools: "" }, "conversation"), /Missing system prompt sections: readTools/);
 });
 
@@ -1533,6 +1555,7 @@ test("system prompt loader requests every composable prompt layer", async () => 
   }
   assert.deepEqual(requested.sort(), [
     "/base/system-prompts/AudioIngressSession.txt",
+    "/base/system-prompts/CodexHarness.txt",
     "/base/system-prompts/ConversationSession.txt",
     "/base/system-prompts/HistoryIngressSession.txt",
     "/base/system-prompts/KennedyIdentity.txt",
@@ -1542,6 +1565,7 @@ test("system prompt loader requests every composable prompt layer", async () => 
   ]);
   assert.equal(loaded.errors.audioIngressSession, undefined);
   assert.equal(loaded.manuals.audioIngressSession, "/base/system-prompts/AudioIngressSession.txt");
+  assert.equal(loaded.manuals.codexHarness, "/base/system-prompts/CodexHarness.txt");
 });
 
 test("a missing audio prompt disables only audio memory ingress", async () => {
@@ -1578,15 +1602,19 @@ test("layered prompt assets separate session, shared read, web, and write contra
   const conversation = await readFile(new URL("../SystemPrompts/ConversationSession.txt", import.meta.url), "utf8");
   const history = await readFile(new URL("../SystemPrompts/HistoryIngressSession.txt", import.meta.url), "utf8");
   const audio = await readFile(new URL("../SystemPrompts/AudioIngressSession.txt", import.meta.url), "utf8");
+  const codexHarness = await readFile(new URL("../SystemPrompts/CodexHarness.txt", import.meta.url), "utf8");
   const readTools = await readFile(new URL("../SystemPrompts/ReadTools.txt", import.meta.url), "utf8");
   const writeTools = await readFile(new URL("../SystemPrompts/WriteTools.txt", import.meta.url), "utf8");
   assert.match(conversation, /kmap is read-only in this session/i);
   assert.match(history, /kmap is writable in this session/i);
   assert.match(audio, /kmap is writable in this session/i);
+  assert.match(codexHarness, /outer harness is calling you through Codex/i);
+  assert.match(codexHarness, /APIs or tools are limited/i);
+  assert.match(codexHarness, /outer harness will catch them/i);
   for (const session of [conversation, history, audio]) {
     assert.doesNotMatch(session, /KENNEDY_TOOL_CALLS|LoadNode\n  Call:/);
   }
-  assert.match(readTools, /At most ten nodes may be directly loaded at once, including both roots/);
+  assert.match(readTools, /At most ten nodes may be directly loaded at once, including every always-loaded root/);
   assert.match(readTools, /WebSearch\n  Call:/);
   assert.match(readTools, /WebFetch\n  Call:/);
   assert.match(writeTools, /ConsolidateFanout\n  Call:/);
@@ -1792,6 +1820,9 @@ test("frontend initialization and ingress queues degrade by feature", async () =
   assert.match(app, /conversationHistory\.nextIngress\(\)\.catch/);
   assert.match(app, /audioIngress\.nextIngress\(\)\.catch/);
   assert.match(app, /Audio preparation and history remain available, but audio memory ingress is paused/);
+  assert.match(app, /providerKind = selected\.kind/);
+  assert.match(app, /promptsReady\(manuals, "conversation", \{ providerKind \}\)/);
+  assert.match(app, /provider, providerKind, model, reasoningEffort/);
 });
 
 test("frontend defaults to main with full and full-history inspectors and retains both Kmap root controls", async () => {
@@ -1861,6 +1892,84 @@ test("telegram voice sessions archive media, correlate delivery, and emit contex
   assert.equal(session.archive().sessionType, "telegram");
   assert.equal(session.archive().media[0].dataUrl, "data:audio/ogg;base64,AAAA");
   assert.equal(checkpoints.at(-1).pendingExternalEventId, null);
+});
+
+test("Telegram group sessions load the invoker, group, and Kennedy roots while registering every other participant root", async () => {
+  const groupContext = {
+    groupTitle: "Trusted friends",
+    chatId: -100,
+    invokingTelegramUserId: 42,
+    groupRootNodeId: id(2),
+    groupRootReady: true,
+    participants: [
+      { telegramUserId: 42, username: "taek42", displayName: "David", rootNodeId: id(1) },
+      { telegramUserId: 77, username: "friend", displayName: "Friend", rootNodeId: id(4) },
+    ],
+    messages: [
+      { messageId: 9, telegramUserId: 77, username: "friend", displayName: "Friend", text: "Earlier context", sentByKennedy: false },
+      { messageId: 10, telegramUserId: 42, username: "taek42", displayName: "David", text: "@kennedy thoughts?", sentByKennedy: false },
+    ],
+  };
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1), node(2), node(3), node(4)]), intelligence: {}, manuals: promptManuals("Shared"),
+    rootNodeIds: [id(1), id(2), id(3)], referenceRootNodeIds: [id(4)],
+    provider: "p", model: "m", sessionType: "telegram-group",
+    channel: { kind: "telegram-group", telegramUserId: 42, chatId: -100, groupContext },
+    onUpdate: () => {},
+  });
+  await session.initialize();
+  assert.deepEqual(session.context.loadedNodeIds, [id(1), id(2), id(3)]);
+  assert.equal(session.context.resolve(4), id(4));
+  assert.match(session.chatend.systemPrompt, /independent one-invocation session/);
+  assert.match(session.chatend.systemPrompt, /invoking participant's root \(1\), the group root \(2\), and Kennedy's root \(3\)/);
+  assert.match(session.chatend.systemPrompt, /leaving room for 7 additional directly loaded nodes/);
+  assert.match(session.chatend.systemPrompt, /Friend · @friend · Telegram user ID 77 · root node identifier 4/);
+  assert.match(session.chatend.systemPrompt, /Telegram messages supplied as context \(2\)/);
+  assert.deepEqual(session.archive().rootNodeIds, [id(1), id(2), id(3)]);
+  assert.deepEqual(session.archive().referenceRootNodeIds, [id(4)]);
+});
+
+test("background Telegram group ingress directly loads the group and Kennedy roots", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /const directRoots = \[batch\.groupRootNodeId, kennedyRootNodeId\]/);
+  assert.match(app, /groupRootNodeId: batch\.groupRootNodeId/);
+  assert.match(app, /if \(!batch\.groupRootReady\)/);
+});
+
+test("Telegram relay client exposes identity provisioning and group-ingress queues", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    return { ok: true, headers: { get: () => "application/json" }, json: async () => ({}) };
+  };
+  try {
+    const api = TelegramRelayAPI("http://telegram");
+    await api.provisioningUsers();
+    await api.userByHandle("@Taek42");
+    await api.completeHandleRoot("taek42", id(1));
+    await api.userById(42);
+    await api.provisioningGroups();
+    await api.groupById(-100);
+    await api.completeGroupRoot(-100, id(2));
+    await api.groupIngress();
+    await api.completeGroupIngress("batch");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requests.map(request => request.url), [
+    "http://telegram/api/v1/users/provisioning",
+    "http://telegram/api/v1/users/by-handle/%40Taek42",
+    "http://telegram/api/v1/users/by-handle/taek42/root-ready",
+    "http://telegram/api/v1/users/42",
+    "http://telegram/api/v1/groups/provisioning",
+    "http://telegram/api/v1/groups/-100",
+    "http://telegram/api/v1/groups/-100/root-ready",
+    "http://telegram/api/v1/group-ingress",
+    "http://telegram/api/v1/group-ingress/batch/complete",
+  ]);
+  assert.match(requests[2].options.body, new RegExp(id(1)));
+  assert.match(requests[6].options.body, new RegExp(id(2)));
 });
 
 test("audio, document, durable vnote, and Telegram API clients use their queue endpoints", async () => {

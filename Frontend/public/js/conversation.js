@@ -1,6 +1,6 @@
 import { Chatend } from "./chatend.js?v=20260717.5";
-import { KwebContext } from "./kweb_context.js?v=20260717.5";
-import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260717.2";
+import { KwebContext } from "./kweb_context.js?v=20260717.6";
+import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.5";
 import { ToolExecutor } from "./tools.js?v=20260717.5";
 import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.5";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
@@ -21,12 +21,13 @@ function turnStoppedError() {
 }
 
 export class ConversationSession {
-  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, persist = async () => {}, onUpdate = () => {} }) {
+  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, persist = async () => {}, onUpdate = () => {} }) {
     this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals;
     this.rootNodeIds = rootNodeIds || [rootNodeId]; this.rootNodeId = this.rootNodeIds[0];
-    this.provider = provider; this.model = model; this.reasoningEffort = reasoningEffort;
+    this.referenceRootNodeIds = [...new Set(referenceRootNodeIds.filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
+    this.provider = provider; this.providerKind = providerKind; this.model = model; this.reasoningEffort = reasoningEffort;
     this.modelAttribution = formatModelAttribution(model, reasoningEffort);
-    if (!["conversation", "telegram"].includes(sessionType)) throw new Error("Unsupported Kennedy session type.");
+    if (!["conversation", "telegram", "telegram-group"].includes(sessionType)) throw new Error("Unsupported Kennedy session type.");
     this.sessionType = sessionType;
     this.channel = channel ? jsonCopy(channel) : null;
     this.persist = persist; this.onUpdate = onUpdate;
@@ -38,6 +39,10 @@ export class ConversationSession {
   async initialize(restored = null) {
     const archive = restored?.archive?.format === "kennedy-chatend" ? restored.archive : null;
     if (restored) {
+      const savedReferences = restored.referenceRootNodeIds || archive?.referenceRootNodeIds;
+      if (!this.referenceRootNodeIds.length && Array.isArray(savedReferences)) {
+        this.referenceRootNodeIds = [...new Set(savedReferences.filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
+      }
       const savedTranscript = Array.isArray(restored.transcript) ? restored.transcript : archive?.transcript;
       this.transcript = Array.isArray(savedTranscript) ? jsonCopy(savedTranscript) : [];
       this.startedAt = restored.startedAt || archive?.startedAt || this.startedAt;
@@ -60,7 +65,11 @@ export class ConversationSession {
         if (!this.rootNodeIds.includes(durableId) && !this.context.loadedNodeIds.includes(durableId)) await this.context.loadDurable(durableId);
       }
     }
-    this.chatend = new Chatend(composePrompt(this.manuals, "conversation", { model: this.model, reasoningEffort: this.reasoningEffort, sessionType: this.sessionType }), this.context, this.retainedTranscript());
+    for (const durableId of this.referenceRootNodeIds) this.context.registerReference(durableId);
+    const sessionContext = this.sessionType === "telegram-group"
+      ? formatTelegramGroupContext(this.channel?.groupContext, this.context)
+      : "";
+    this.chatend = new Chatend(composePrompt(this.manuals, "conversation", { providerKind: this.providerKind, model: this.model, reasoningEffort: this.reasoningEffort, sessionType: this.sessionType, sessionContext }), this.context, this.retainedTranscript());
     if (Array.isArray(archive?.messages)) {
       this.chatend.restoreMessages(
         jsonCopy(archive.messages),
@@ -86,6 +95,8 @@ export class ConversationSession {
       stateVersion: 2,
       sessionType: this.sessionType,
       channel: jsonCopy(this.channel),
+      rootNodeIds: [...this.rootNodeIds],
+      referenceRootNodeIds: [...this.referenceRootNodeIds],
       startedAt: this.startedAt,
       transcript: jsonCopy(this.transcript),
       media: jsonCopy(this.media),
@@ -103,6 +114,8 @@ export class ConversationSession {
       version: 2,
       sessionType: this.sessionType,
       channel: jsonCopy(this.channel),
+      rootNodeIds: [...this.rootNodeIds],
+      referenceRootNodeIds: [...this.referenceRootNodeIds],
       startedAt: this.startedAt,
       provider: this.provider,
       model: this.model,

@@ -50,6 +50,11 @@ export class KwebContext {
     return this.durableToShort.get(durableId);
   }
 
+  registerReference(durableId) {
+    if (typeof durableId !== "string" || !durableId) throw new Error("A referenced Kmap node identifier must be a non-empty string.");
+    return this.shortId(durableId);
+  }
+
   resolve(identifier) {
     if (!Number.isInteger(identifier) || identifier < 1 || !this.shortToDurable.has(identifier)) throw Object.assign(new Error(`Unknown memory identifier ${identifier}.`), { code: "unknown_identifier" });
     return this.shortToDurable.get(identifier);

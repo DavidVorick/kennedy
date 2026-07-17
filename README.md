@@ -10,8 +10,10 @@ browser-native frontend:
 - `kennedy-conversation-history` checkpoints active conversations and durably
   stores complete conversation and history-ingress recovery archives, with
   multiple live conversations and a serialized history-ingress queue.
-- `kennedy-telegram-relay` uses `teloxide` to queue authorized Telegram text,
-  voice, document, and reset events while the browser remains the visible Chatend owner.
+- `kennedy-telegram-relay` uses `teloxide` plus a separate user-directory SQLite
+  database to enforce TOFU whitelists/permanent group decisions and queue
+  authorized private or group work while the browser remains the visible
+  Chatend owner.
 - `kennedy-audio-ingress` durably owns content-addressed vnotes, restartable
   Gemini/Sol transcript preparation, and timestamped Kennedy-ingress pieces.
 - `Frontend/public` owns live conversations, context, tool execution, durable
@@ -116,8 +118,11 @@ BotFather and store its token under Kennedy's conventional secret name:
 cargo run -p kennedy-server -- secrets set telegram-bot-token
 ```
 
-The first private message from `@taek42` binds that stable numeric Telegram
-user ID; later authorization no longer depends on the username. The encrypted
+The first observed Telegram account presenting the initially whitelisted
+`@taek42` handle pins its stable numeric user ID under TOFU; later authorization
+no longer depends on the username. David can whitelist another trusted handle
+with `/adduser @theirHandle`, which reserves that user's blank Kmap root before
+its first matching observation. The encrypted
 vault is mode `0600`, excluded by `.gitignore`, contains arbitrary named
 secrets, and has no reveal command or HTTP API. Available maintenance commands
 are `secrets list`, `secrets remove NAME`, and `secrets change-passphrase`.
@@ -132,13 +137,14 @@ cargo run -p kennedy-server
 
 When the encrypted vault exists, startup prompts once for its passphrase and
 keeps the unlocked values only inside `kennedy-server`. Copy
-`kennedy-secrets.age` alongside the four SQLite databases and audio-ingress
+`kennedy-secrets.age` alongside the five SQLite databases and audio-ingress
 media directory to migrate the same credentials to another machine; the same
 vault passphrase unlocks them there.
 
 Open `http://127.0.0.1:4321`. The Kweb and conversation databases are created
 as `kennedy.sqlite3`, `kennedy-conversations.sqlite3`,
-`kennedy-telegram.sqlite3`, and `kennedy-audio.sqlite3` on first run. Original
+`kennedy-telegram.sqlite3`, `kennedy-users.sqlite3`, and
+`kennedy-audio.sqlite3` on first run. Original
 vnotes and restartable working chunks live under `kennedy-audio-ingress/`. The
 five APIs bind to loopback ports 4321 through 4325. Without a Telegram token,
 port 4324 reports the relay as disabled and the rest of Kennedy remains usable.
@@ -222,7 +228,7 @@ instance from modifying persistent state during a backup.
 
 The result is a private
 `backups/kennedy-backup-YYYY-MM-DDTHH-MM-SSZ.tar.gz` archive containing
-verified standalone snapshots of all four SQLite databases, the complete
+verified standalone snapshots of all five SQLite databases, the complete
 audio-ingress media directory, the encrypted credential vault when present, a
 machine-readable checksum manifest, and a self-contained recovery README. The
 README begins with the creating source commit and includes the exact SQLite DDL
@@ -232,7 +238,7 @@ off-machine storage.
 
 Use `--backup-dir PATH` to select another destination. The existing global
 `--kweb-bind`, `--kweb-database`, `--conversation-history-database`,
-`--telegram-database`, `--audio-ingress-database`,
+`--telegram-database`, `--user-database`, `--audio-ingress-database`,
 `--audio-ingress-media`, and `--vault-path` flags select the lock address and
 source files when their deployment values differ from the defaults.
 
@@ -270,8 +276,9 @@ Kennedy's live system prompts are deliberately plain-text files in
 Kennedy's strategy for using her harness is intentionally learned and stored in
 her own Kmap graph rather than embedded in static prompts. The frontend composes
 identity, session type, Kmap basics, read-only tools, optional write tools, and
-the current runtime in that order. Every session starts with both the user's
-root and Kennedy's root loaded.
+the current runtime in that order. Web and private Telegram sessions start with
+the user and Kennedy roots loaded; group invocations additionally load the
+group root.
 
 Kennedy's local tools use a text protocol documented once in `KmapBasics.txt`,
 so tool requests and results are visible in the chatend. Every session can read
@@ -288,11 +295,19 @@ of loaded Kmap memory.
 The browser fetches these files at session startup. Edit them and reload the
 page; no compilation is required.
 
-The `TG Bot` view shows one normal Kennedy conversation per Telegram user. The
+The `TG Bot` view shows private conversations and independent Telegram-group
+invocations. The
 browser must be open to run Kennedy, but Telegram messages remain durably
 queued while it is closed. `/reset` closes the current Telegram session and
 queues its full Chatend for the same history-ingress flow as an ended UI
-conversation. The browser composer also has a microphone button; both sources
+conversation; it is private-DM-only because each mentioned/replied-to group
+invocation already ends after one reply. Each allowed group has its own blank
+Kmap root. Kennedy loads the invoker's root, the group root, and her own root,
+lists every other participant's root as a loadable reference, and receives the
+latest 50 messages. More than 100 uninvoked group messages queues the oldest 80
+for background ingress with the group and Kennedy roots loaded. Groups require Kennedy to be an
+administrator and are permanently blacklisted on an unknown/conflicting member
+or incomplete membership ledger. The browser composer also has a microphone button; both sources
 preserve the original audio with the paid transcription.
 
 The browser composer and Telegram also accept PDF, DOCX, spreadsheet, CSV, and
@@ -317,7 +332,8 @@ thread-ID validation, and search-source extraction.
 
 ## MVP boundaries
 
-The MVP intentionally has one local Kmap user, bootstrap-only Telegram access
-control, no streaming, and no manual memory editing or deletion. Active conversations and unfinished
+The MVP intentionally has a small code-seeded Telegram whitelist with one
+`/adduser` administrator, trusted shared-Kmap access without per-root access
+controls, no streaming, and no manual memory editing or deletion. Active conversations and unfinished
 history ingress survive an abrupt UI close; transient provider-chain and tool
 telemetry are rebuilt rather than restored.

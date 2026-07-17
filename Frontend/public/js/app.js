@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.1";
-import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.2";
-import { ConversationSession } from "./conversation.js?v=20260717.5";
-import { runHistoryIngress } from "./history_ingress.js?v=20260717.5";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.3";
+import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.5";
+import { ConversationSession } from "./conversation.js?v=20260717.7";
+import { runHistoryIngress } from "./history_ingress.js?v=20260717.7";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260717.5";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.5";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.6";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -11,6 +11,7 @@ const CONFIG = {
   conversationHistoryBase: "http://127.0.0.1:4323",
   telegramRelayBase: "http://127.0.0.1:4324",
   audioIngressBase: "http://127.0.0.1:4325",
+  webUserHandle: "taek42",
 };
 
 const ui = Object.fromEntries([
@@ -26,7 +27,11 @@ const audioIngress = AudioIngressAPI(CONFIG.audioIngressBase);
 
 let manuals = {};
 let rootNodeIds = null;
+let legacyUserRootNodeId = null;
+let kennedyRootNodeId = null;
+let webDirectoryUser = null;
 let provider = null;
+let providerKind = null;
 let model = null;
 let reasoningEffort = null;
 let contextWindowTokens = 0;
@@ -75,15 +80,15 @@ let telegramRelayReady = false;
 const INGRESS_FAILURE_LIMIT = 5;
 
 function conversationPromptsReady() {
-  return promptsReady(manuals, "conversation");
+  return promptsReady(manuals, "conversation", { providerKind });
 }
 
 function historyPromptsReady() {
-  return promptsReady(manuals, "ingress", { sourceSessionType: "conversation" });
+  return promptsReady(manuals, "ingress", { sourceSessionType: "conversation", providerKind });
 }
 
 function audioPromptsReady() {
-  return promptsReady(manuals, "ingress", { sourceSessionType: "audio" });
+  return promptsReady(manuals, "ingress", { sourceSessionType: "audio", providerKind });
 }
 
 function chatRuntimeReady() {
@@ -101,9 +106,83 @@ function sessionTypeOf(record) {
   return record?.state?.sessionType || record?.state?.archive?.sessionType || "conversation";
 }
 
+function viewForSessionType(sessionType) {
+  return String(sessionType).startsWith("telegram") ? "telegram" : "conversation";
+}
+
 function recordsForView(view = activeView) {
   const type = view === "telegram" ? "telegram" : "conversation";
-  return sortConversationHistory(historyRecords.filter(record => sessionTypeOf(record) === type));
+  return sortConversationHistory(historyRecords.filter(record => viewForSessionType(sessionTypeOf(record)) === type));
+}
+
+function groupContextOf(record) {
+  return record?.state?.channel?.groupContext
+    || record?.state?.archive?.channel?.groupContext
+    || record?.state?.historyIngress?.groupContext
+    || null;
+}
+
+function rootsForRecord(record) {
+  const archived = record?.state?.archive;
+  const saved = record?.state?.rootNodeIds || archived?.rootNodeIds;
+  return Array.isArray(saved) && saved.length ? [...saved] : [...rootNodeIds];
+}
+
+function referencesForGroup(groupContext, directRoots) {
+  if (!Array.isArray(groupContext?.participants)) return [];
+  return [...new Set(groupContext.participants
+    .map(participant => participant?.rootNodeId)
+    .filter(id => typeof id === "string" && id && !directRoots.includes(id)))];
+}
+
+function referencesForRecord(record, directRoots = rootsForRecord(record)) {
+  const archived = record?.state?.archive;
+  const saved = record?.state?.referenceRootNodeIds || archived?.referenceRootNodeIds;
+  return Array.isArray(saved) ? [...saved] : referencesForGroup(groupContextOf(record), directRoots);
+}
+
+async function provisionDirectoryRoots() {
+  if (!kwebReady || !telegramRelayReady) return;
+  const [pendingUsers, pendingGroups] = await Promise.all([
+    telegramRelay.provisioningUsers(),
+    telegramRelay.provisioningGroups(),
+  ]);
+  for (const entry of pendingUsers.users || []) {
+    const isWebUser = String(entry.handle).toLowerCase() === CONFIG.webUserHandle.toLowerCase();
+    const targetRoot = isWebUser ? legacyUserRootNodeId : entry.rootNodeId;
+    if (!isWebUser) await kweb.bootstrapNode(targetRoot);
+    await telegramRelay.completeHandleRoot(entry.handle, targetRoot);
+  }
+  for (const group of pendingGroups.groups || []) {
+    await kweb.bootstrapNode(group.rootNodeId, "Group Root");
+    await telegramRelay.completeGroupRoot(group.chatId, group.rootNodeId);
+  }
+  webDirectoryUser = await telegramRelay.userByHandle(CONFIG.webUserHandle);
+  rootNodeIds = [webDirectoryUser.rootNodeId, kennedyRootNodeId];
+}
+
+async function directoryUserForEvent(event) {
+  await provisionDirectoryRoots();
+  const user = await telegramRelay.userById(event.telegramUserId);
+  if (!user.rootReady) {
+    await kweb.bootstrapNode(user.rootNodeId);
+    return telegramRelay.completeUserRoot(user.telegramUserId, user.rootNodeId);
+  }
+  return user;
+}
+
+async function provisionGroupRoot(chatId) {
+  await provisionDirectoryRoots();
+  let group = await telegramRelay.groupById(chatId);
+  if (!group.rootReady) {
+    await kweb.bootstrapNode(group.rootNodeId, "Group Root");
+    group = await telegramRelay.completeGroupRoot(group.chatId, group.rootNodeId);
+  }
+  return group;
+}
+
+async function directoryGroupForEvent(event) {
+  return event.sessionKind === "group" ? provisionGroupRoot(event.chatId) : null;
 }
 
 function selectedRecord() {
@@ -847,8 +926,10 @@ async function persistSession(id, state, metadata = {}) {
 
 async function buildConversation(record) {
   const sessionType = sessionTypeOf(record);
+  const sessionRoots = rootsForRecord(record);
+  const referenceRootNodeIds = referencesForRecord(record, sessionRoots);
   const session = new ConversationSession({
-    kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+    kweb, intelligence, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
     sessionType,
     channel: record.state?.channel || record.state?.archive?.channel || null,
     persist: (state, metadata) => persistSession(record.id, state, metadata),
@@ -867,7 +948,7 @@ async function createNewConversation() {
   update();
   try {
     const session = new ConversationSession({
-      kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+      kweb, intelligence, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
       sessionType: "conversation",
       onUpdate: update,
     });
@@ -895,7 +976,7 @@ async function selectConversation(id) {
   const record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
   upsertHistory(record);
   selectedConversationId = id;
-  selectedByView[sessionTypeOf(record)] = id;
+  selectedByView[viewForSessionType(sessionTypeOf(record))] = id;
   restoreDraft();
   update();
   if (record.phase === "active" && !liveSessions.has(id) && chatRuntimeReady()) {
@@ -1002,16 +1083,25 @@ async function endConversation() {
 }
 
 async function createTelegramConversation(event) {
+  const directoryUser = await directoryUserForEvent(event);
+  const sessionType = event.sessionKind === "group" ? "telegram-group" : "telegram";
+  const directoryGroup = await directoryGroupForEvent(event);
+  const sessionRoots = directoryGroup
+    ? [directoryUser.rootNodeId, directoryGroup.rootNodeId, kennedyRootNodeId]
+    : [directoryUser.rootNodeId, kennedyRootNodeId];
+  const groupContext = sessionType === "telegram-group" ? event.groupContext : null;
+  const referenceRootNodeIds = referencesForGroup(groupContext, sessionRoots);
   const channel = {
-    kind: "telegram",
+    kind: sessionType,
     telegramUserId: event.telegramUserId,
     chatId: event.chatId,
     username: event.username || null,
     displayName: event.displayName,
+    groupContext,
   };
   const session = new ConversationSession({
-    kweb, intelligence, manuals, rootNodeIds, provider, model, reasoningEffort,
-    contextWindowTokens, maxInputTokens, sessionType: "telegram", channel, onUpdate: update,
+    kweb, intelligence, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort,
+    contextWindowTokens, maxInputTokens, sessionType, channel, onUpdate: update,
   });
   await session.initialize();
   const record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
@@ -1022,10 +1112,11 @@ async function createTelegramConversation(event) {
 }
 
 async function telegramConversationFor(event) {
+  const group = event.sessionKind === "group";
   let record = event.conversationId
     ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
     : null;
-  if (!record) {
+  if (!record && !group) {
     record = historyRecords.find(item => item.phase === "active"
       && sessionTypeOf(item) === "telegram"
       && String(item.state?.channel?.telegramUserId) === String(event.telegramUserId));
@@ -1038,6 +1129,7 @@ async function telegramConversationFor(event) {
 }
 
 async function processTelegramReset(event) {
+  if (event.sessionKind === "group") throw new Error("Telegram group sessions are independent and cannot be reset.");
   let record = event.conversationId
     ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
     : null;
@@ -1132,6 +1224,7 @@ async function telegramDocumentInput(event) {
 
 async function processTelegramEvent(event) {
   const processingStarted = performance.now();
+  await directoryUserForEvent(event);
   if (event.kind === "reset") {
     await processTelegramReset(event);
   } else {
@@ -1165,6 +1258,13 @@ async function processTelegramEvent(event) {
     }
     if (!response) throw new Error("Kennedy completed the turn without a recoverable Telegram response.");
     if (response.content) await telegramRelay.reply(event.id, record.id, response.content, response.contextWarning || null);
+    if (event.sessionKind === "group") {
+      const latest = historyRecords.find(item => item.id === record.id) || record;
+      const closed = await conversationHistory.requestIngress(record.id, { expected_version: latest.version, state: session.snapshot() });
+      upsertHistory(closed);
+      liveSessions.delete(record.id);
+      kickHistoryIngress();
+    }
   }
   const processingDurationMs = Math.max(0, Math.round(performance.now() - processingStarted));
   const receivedAt = Date.parse(event.createdAt);
@@ -1172,11 +1272,110 @@ async function processTelegramEvent(event) {
     ? Math.max(processingDurationMs, Date.now() - receivedAt)
     : processingDurationMs;
   Promise.resolve(intelligence.recordTiming({
-    action: "delivery", status: "ok", sessionType: "telegram", durationMs, processingDurationMs,
+    action: "delivery", status: "ok", sessionType: event.sessionKind === "group" ? "telegram-group" : "telegram", durationMs, processingDurationMs,
   })).catch(() => {});
 }
 
+function groupMessageContent(message) {
+  const handle = message.username ? ` @${String(message.username).replace(/^@/, "")}` : "";
+  return `${message.displayName || "Telegram participant"}${handle}: ${message.text || ""}`;
+}
+
+function groupIngressState(batch) {
+  const groupContext = {
+    groupTitle: batch.groupTitle || "Telegram group",
+    chatId: batch.chatId,
+    invokingTelegramUserId: null,
+    groupRootNodeId: batch.groupRootNodeId,
+    groupRootReady: batch.groupRootReady,
+    participants: batch.participants || [],
+    messages: batch.messages || [],
+  };
+  if (typeof batch.groupRootNodeId !== "string" || !batch.groupRootNodeId) {
+    throw new Error(`Telegram group ${batch.chatId} does not have a provisioned root.`);
+  }
+  const directRoots = [batch.groupRootNodeId, kennedyRootNodeId];
+  const referenceRootNodeIds = referencesForGroup(groupContext, directRoots);
+  const transcript = groupContext.messages.map(message => ({
+    role: message.sentByKennedy ? "kennedy" : "user",
+    content: message.sentByKennedy ? message.text : groupMessageContent(message),
+  }));
+  const messages = transcript.map(message => ({
+    role: message.role === "kennedy" ? "assistant" : "user",
+    content: message.content,
+  }));
+  const channel = {
+    kind: "telegram-group",
+    chatId: batch.chatId,
+    groupIngressBatchId: batch.id,
+    backgroundIngress: true,
+    groupContext,
+  };
+  const archive = {
+    format: "kennedy-chatend",
+    version: 2,
+    sessionType: "telegram-group",
+    channel,
+    rootNodeIds: directRoots,
+    referenceRootNodeIds,
+    startedAt: batch.createdAt,
+    provider,
+    model,
+    systemPrompt: "",
+    retained: messages,
+    transcript,
+    messages,
+    fullHistory: { segments: [] },
+    context: {},
+    tools: { loadCalls: 0, loadLimit: 0, log: [] },
+    usage: null,
+    media: [],
+  };
+  return {
+    stateVersion: 2,
+    sessionType: "telegram-group",
+    channel,
+    rootNodeIds: directRoots,
+    referenceRootNodeIds,
+    startedAt: batch.createdAt,
+    transcript,
+    archive,
+  };
+}
+
+async function syncGroupIngressBatches() {
+  if (!telegramRelayReady || !conversationHistoryReady) return;
+  await provisionDirectoryRoots();
+  const batches = (await telegramRelay.groupIngress()).batches || [];
+  for (const batch of batches) {
+    if (!batch.groupRootReady) {
+      const group = await provisionGroupRoot(batch.chatId);
+      batch.groupTitle = group.title;
+      batch.groupRootNodeId = group.rootNodeId;
+      batch.groupRootReady = group.rootReady;
+    }
+    let record = historyRecords.find(item =>
+      item.state?.channel?.groupIngressBatchId === batch.id
+      || item.state?.archive?.channel?.groupIngressBatchId === batch.id
+    );
+    if (!record) {
+      const state = groupIngressState(batch);
+      record = await conversationHistory.create({ started_at: state.startedAt, state });
+      upsertHistory(record);
+    }
+    if (record.phase === "active") {
+      record = await conversationHistory.requestIngress(record.id, { expected_version: record.version, state: record.state });
+      upsertHistory(record);
+      kickHistoryIngress();
+    } else if (record.phase === "complete") {
+      await telegramRelay.completeGroupIngress(batch.id);
+    }
+  }
+}
+
 async function pollTelegramEvents() {
+  await provisionDirectoryRoots();
+  await syncGroupIngressBatches();
   const events = (await telegramRelay.events()).events || [];
   if (ui.service_status.textContent === "Telegram relay unavailable") ui.service_status.textContent = `Ready · ${model}`;
   await Promise.all(events.map(async event => {
@@ -1346,7 +1545,7 @@ async function processAudioIngressPiece(initialPiece) {
     };
     await runHistoryIngress({
       kweb, intelligence, manuals, rootNodeIds, provenanceId: piece.provenance_id,
-      provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+      provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
       sourceSessionType: "audio",
       restoredArchive: piece.state?.historyIngress,
       checkpoint: persistIngress,
@@ -1407,12 +1606,15 @@ async function processIngressQueue() {
       if (record.phase === "ingress_pending") {
         const archive = record.state?.archive;
         if (archive?.format !== "kennedy-chatend") throw new Error("The queued conversation is missing its durable Chatend archive.");
+        const source = archive.sessionType === "telegram-group"
+          ? "telegram-group"
+          : archive.sessionType === "telegram" ? "telegram" : "conversation";
         stage = "provenance";
         const provenance = await kweb.createProvenance({
           data: JSON.stringify(archive, null, 2),
-          source: archive.sessionType === "telegram" ? "telegram" : "conversation",
+          source,
           source_created_at: record.started_at,
-          idempotency_key: `${archive.sessionType === "telegram" ? "telegram" : "conversation"}:${record.id}`,
+          idempotency_key: `${source}:${record.id}`,
         });
         stage = "claim";
         try {
@@ -1431,6 +1633,9 @@ async function processIngressQueue() {
       if (record.phase === "ingress_in_progress") {
         stage = "model_loop";
         if (!record.provenance_id) throw new Error("The queued conversation is missing its history provenance.");
+        const ingressRootNodeIds = rootsForRecord(record);
+        const ingressReferenceRootNodeIds = referencesForRecord(record, ingressRootNodeIds);
+        const ingressGroupContext = groupContextOf(record);
         const persistIngress = async archive => {
           const state = { ...record.state, historyIngress: archive };
           try {
@@ -1453,8 +1658,11 @@ async function processIngressQueue() {
         activeConversationIngressTurn = ingressTurn;
         try {
           await runHistoryIngress({
-            kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
-            provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+            kweb, intelligence, manuals, rootNodeIds: ingressRootNodeIds,
+            referenceRootNodeIds: ingressReferenceRootNodeIds,
+            groupContext: ingressGroupContext,
+            provenanceId: record.provenance_id,
+            provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
             sourceSessionType: record.state?.archive?.sessionType || "conversation",
             restoredArchive: record.state?.historyIngress,
             checkpoint: persistIngress,
@@ -1481,6 +1689,9 @@ async function processIngressQueue() {
         stage = "completion";
         record = await conversationHistory.ingressCompleted(record.id, { expected_version: record.version });
         upsertHistory(record);
+        const groupIngressBatchId = record.state?.channel?.groupIngressBatchId
+          || record.state?.archive?.channel?.groupIngressBatchId;
+        if (groupIngressBatchId) await telegramRelay.completeGroupIngress(groupIngressBatchId);
         activeIngressRecord = null;
         await refreshHistory();
       }
@@ -1576,14 +1787,27 @@ async function initialize() {
 
   try {
     const [health, user] = await Promise.all([kweb.health(), kweb.user()]);
-    rootNodeIds = [user.user_root_node_id || user.root_node_id, user.kennedy_root_node_id];
+    legacyUserRootNodeId = user.user_root_node_id || user.root_node_id;
+    kennedyRootNodeId = user.kennedy_root_node_id;
+    rootNodeIds = [legacyUserRootNodeId, kennedyRootNodeId];
     if (rootNodeIds.some(id => typeof id !== "string" || !id)) throw new Error("Kweb did not provide both required root nodes.");
-    explorer = new MemoryExplorer({ api: kweb, rootNodeIds, content: ui.memory_content, backButton: ui.memory_back, forwardButton: ui.memory_forward });
     kwebReady = true;
     ui.service_status.textContent = `${health.status} · memory ready`;
   } catch (error) {
     ui.service_status.textContent = "Kweb unavailable";
     showError(ui.error_banner, `Memory is unavailable: ${error.message}`);
+  }
+
+  if (kwebReady) {
+    try {
+      await telegramRelay.health();
+      telegramRelayReady = true;
+      await provisionDirectoryRoots();
+    } catch (error) {
+      telegramRelayReady = false;
+      showError(ui.error_banner, `Telegram identity routing is unavailable; the web UI is using its legacy root until it recovers: ${error.message}`);
+    }
+    explorer = new MemoryExplorer({ api: kweb, rootNodeIds, content: ui.memory_content, backButton: ui.memory_back, forwardButton: ui.memory_forward });
   }
 
   if (kwebReady) {
@@ -1596,6 +1820,7 @@ async function initialize() {
       conversationSession: "New and restored conversations are unavailable",
       historyIngressSession: "Conversation-history memory ingress is paused",
       audioIngressSession: "Audio preparation and history remain available, but audio memory ingress is paused",
+      codexHarness: "Codex-backed conversation and memory-ingress model sessions are unavailable",
       writeTools: "Conversation-history and audio memory ingress are paused",
     };
     for (const [key, message] of Object.entries(loaded.errors)) {
@@ -1626,11 +1851,13 @@ async function initialize() {
     provider = providers.default_provider;
     const selected = providers.providers.find(item => item.name === provider);
     if (!selected) throw new Error("The intelligence service did not provide its configured default provider.");
+    providerKind = selected.kind;
     model = selected.default_model;
     reasoningEffort = selected.reasoning_effort;
     const modelCapabilities = selected.model_capabilities?.[model] || {};
     inputModalities = modelCapabilities.input_modalities || selected.input_modalities || ["text"];
     transcriptionAvailable = Boolean(selected.transcription_available);
+    if (typeof providerKind !== "string" || !providerKind) throw new Error("The intelligence service did not identify the selected provider kind.");
     if (typeof reasoningEffort !== "string" || !reasoningEffort) throw new Error("The intelligence service did not provide the model thinking mode.");
     contextWindowTokens = Number(modelCapabilities.context_window_tokens ?? selected.context_window_tokens) || 0;
     maxInputTokens = Number(modelCapabilities.max_input_tokens ?? selected.max_input_tokens) || 0;
@@ -1643,6 +1870,7 @@ async function initialize() {
   if (chatRuntimeReady()) {
     const activeRecords = historyRecords.filter(record => record.phase === "active");
     for (const record of activeRecords) {
+      if (record.state?.channel?.backgroundIngress || record.state?.archive?.channel?.backgroundIngress) continue;
       try {
         await buildConversation(record);
       } catch (error) {
@@ -1668,15 +1896,7 @@ async function initialize() {
     selectedByView.conversation = selectedConversationId;
   }
 
-  if (chatRuntimeReady()) {
-    try {
-      await telegramRelay.health();
-      telegramRelayReady = true;
-      startTelegramBridge();
-    } catch (error) {
-      showError(ui.error_banner, `Telegram is unavailable: ${error.message}`);
-    }
-  }
+  if (chatRuntimeReady() && telegramRelayReady) startTelegramBridge();
 
   kickHistoryIngress();
   const readyFeatures = [

@@ -1,6 +1,6 @@
 import { Chatend } from "./chatend.js?v=20260717.5";
-import { KwebContext } from "./kweb_context.js?v=20260717.5";
-import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260717.2";
+import { KwebContext } from "./kweb_context.js?v=20260717.6";
+import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.5";
 import { ToolExecutor } from "./tools.js?v=20260717.5";
 import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.5";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
@@ -97,7 +97,7 @@ function modelReadableProvenance(data) {
   return [chatend, loadedNodes].filter(Boolean).join("\n\n────────────────────────\n\n");
 }
 
-export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate, signal = null, operationId = null, beforeMutation = async () => {} }) {
+export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], groupContext = null, provenanceId, provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate, signal = null, operationId = null, beforeMutation = async () => {} }) {
   const provenance = await kweb.provenance(provenanceId);
   rootNodeIds = rootNodeIds || [rootNodeId];
   const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
@@ -124,9 +124,16 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
       if (!rootNodeIds.includes(durableId) && !context.loadedNodeIds.includes(durableId)) await context.loadDurable(durableId);
     }
   }
+  const savedReferences = restoredArchive?.referenceRootNodeIds || referenceRootNodeIds;
+  referenceRootNodeIds = [...new Set((Array.isArray(savedReferences) ? savedReferences : []).filter(id => typeof id === "string" && id && !rootNodeIds.includes(id)))];
+  for (const durableId of referenceRootNodeIds) context.registerReference(durableId);
   const modelAttribution = formatModelAttribution(model, reasoningEffort);
   sourceSessionType = restoredArchive?.sourceSessionType || sourceSessionType;
-  const chatend = new Chatend(composePrompt(manuals, "ingress", { model, reasoningEffort, sourceSessionType }), context, retained);
+  groupContext = restoredArchive?.groupContext || groupContext;
+  const sessionContext = sourceSessionType === "telegram-group"
+    ? formatTelegramGroupContext(groupContext, context)
+    : "";
+  const chatend = new Chatend(composePrompt(manuals, "ingress", { providerKind, model, reasoningEffort, sourceSessionType, sessionContext }), context, retained);
   if (Array.isArray(archive?.messages)) {
     chatend.restoreMessages(jsonCopy(archive.messages), Array.isArray(archive.retained) ? jsonCopy(archive.retained) : retained);
   }
@@ -148,6 +155,9 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     version: 2,
     sessionType: "history-ingress",
     sourceSessionType,
+    rootNodeIds: [...rootNodeIds],
+    referenceRootNodeIds: [...referenceRootNodeIds],
+    groupContext: jsonCopy(groupContext),
     provenanceId,
     completed,
     provider,

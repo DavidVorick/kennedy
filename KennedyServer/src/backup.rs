@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const BACKUP_FORMAT_VERSION: u32 = 2;
+const BACKUP_FORMAT_VERSION: u32 = 3;
 const ARCHIVE_PREFIX: &str = "kennedy-backup";
 const BACKUP_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -40,6 +40,7 @@ pub(crate) struct BackupOptions {
     pub kmap_database: PathBuf,
     pub conversation_database: PathBuf,
     pub telegram_database: PathBuf,
+    pub user_database: PathBuf,
     pub audio_database: PathBuf,
     pub audio_media_directory: PathBuf,
     pub vault: PathBuf,
@@ -137,6 +138,7 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
     validate_database_source(&options.kmap_database, "Kmap")?;
     validate_database_source(&options.conversation_database, "conversation history")?;
     validate_database_source(&options.telegram_database, "Telegram relay")?;
+    validate_database_source(&options.user_database, "user directory")?;
     validate_database_source(&options.audio_database, "audio ingress")?;
     ensure!(
         options.audio_media_directory.is_dir(),
@@ -195,6 +197,12 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
                 &data_directory.join("audio-ingress.sqlite3"),
                 "data/audio-ingress.sqlite3",
                 "audio-ingress database",
+            )?,
+            snapshot_database(
+                &options.user_database,
+                &data_directory.join("users.sqlite3"),
+                "data/users.sqlite3",
+                "user directory database",
             )?,
             snapshot_database(
                 &options.telegram_database,
@@ -547,7 +555,7 @@ fn render_readme(manifest: &Manifest) -> String {
     readme.push_str(
         r#"
 
-All files are stored beneath one top-level archive directory. The four `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
+All files are stored beneath one top-level archive directory. The five `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
 
 ## Kmap data format
 
@@ -557,11 +565,15 @@ All files are stored beneath one top-level archive directory. The four `.sqlite3
 
 `data/conversations.sqlite3` stores one row per durable browser or Telegram conversation. `phase` is the recovery state machine, timestamps are RFC 3339 text, `provenance_id` is an optional hexadecimal Kmap provenance identifier, and `version` is an optimistic-concurrency counter rather than a file-format version. `ingress_failures_json` is a JSON array of bounded failure diagnostics.
 
-`state_json` is UTF-8 JSON owned by the frontend. Current top-level state has `stateVersion: 2`, `sessionType`, optional `channel`, `startedAt`, `transcript`, `media`, `loadedNodeIds`, `pendingTurn`, optional `pendingExternalEventId`, `lastContextWarningBand`, and `archive`. The nested archive has `format: "kennedy-chatend"` and `version: 2`; it preserves session/provider/model metadata, the system prompt, retained and complete message arrays, reset-history segments, Kmap context snapshot/diagnostics/restoration state, tool counters and logs, usage counters, pending external-event metadata, and serializable media. History-ingress archives use the same format marker/version, `sessionType: "history-ingress"`, and additionally preserve source-session type, provenance ID, completion state, and model-round count. Treat unknown JSON fields as data to preserve, not fields to discard.
+`state_json` is UTF-8 JSON owned by the frontend. Current top-level state has `stateVersion: 2`, `sessionType`, optional `channel`, direct `rootNodeIds`, optional unloaded `referenceRootNodeIds`, `startedAt`, `transcript`, `media`, `loadedNodeIds`, `pendingTurn`, optional `pendingExternalEventId`, `lastContextWarningBand`, and `archive`. Group channel state may contain its participant/root ledger, recent messages, and a durable background-batch ID. The nested archive has `format: "kennedy-chatend"` and `version: 2`; it preserves session/provider/model metadata, roots and channel context, the system prompt, retained and complete message arrays, reset-history segments, Kmap context snapshot/diagnostics/restoration state, tool counters and logs, usage counters, pending external-event metadata, and serializable media. History-ingress archives use the same format marker/version, `sessionType: "history-ingress"`, and additionally preserve source-session type, provenance ID, completion state, model-round count, referenced roots, and group context. Treat unknown JSON fields as data to preserve, not fields to discard.
 
 ## Telegram-relay data format
 
-`data/telegram.sqlite3` stores paired identities in `authorized_users` and ordered durable Telegram work in `telegram_events`. Telegram, chat, update, and message identifiers are SQLite integers; Kennedy event and conversation identifiers are text. Event `kind` distinguishes text, voice, document, and reset work. Original voice/document bytes are stored in `voice_bytes`; `mime_type` and `file_name` describe that media. `status` is the pending/processing/complete queue state. Transcription, model, conversation binding, creation time, and completion time are retained alongside the event.
+`data/telegram.sqlite3` stores ordered durable Telegram work in `telegram_events`, archived group messages, and queued 80-message background-ingress batches. `authorized_users` is retained only as private-DM transport state for active conversation pointers. Telegram, chat, update, and message identifiers are SQLite integers; Kennedy event and conversation identifiers are text. Event `kind` distinguishes text, voice, document, and reset work. Original voice/document bytes are stored in `voice_bytes`; `mime_type` and `file_name` describe that media. `status` is the pending/processing/complete queue state. Transcription, model, conversation binding, creation time, completion time, session kind, and dynamic group context are retained alongside the event.
+
+## User-directory data format
+
+`data/users.sqlite3` is the Telegram identity authority. `whitelist_entries` maps a normalized whitelisted handle to its reserved Kmap root and, after first observation, an immutable numeric Telegram user ID. It also records root-provisioning readiness and the administrator capability used by `/adduser`. `observed_identities` records first/last sightings. `telegram_groups` assigns each observed group a reserved Kmap root and root-readiness state alongside the complete membership ledger, cursors, and permanent blacklist decision; a blacklisted chat ID is never returned to an allowed state. `telegram_group_aliases` preserves logical group identity across Telegram chat-ID migration.
 
 ## Audio-ingress data format
 
@@ -606,8 +618,8 @@ The following DDL was read from each verified snapshot's `sqlite_schema`. It is 
 2. Recompute SHA-256 for every `data/` entry and compare it with `manifest.json`.
 3. Open each database with SQLite and run `PRAGMA integrity_check` and `PRAGMA foreign_key_check` before attempting a migration.
 4. Use the commit at the first line of this README as the primary behavioral reference. If that build was marked dirty or unavailable, use the exact schemas and JSON descriptions above to construct an explicit migration from copies of the files.
-5. Stop Kennedy. Place the four standalone databases, the complete audio-ingress media directory, and optional encrypted vault at the paths supplied to the target binary. Do not restore old `-wal` or `-shm` files.
-6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify both roots, several Kmap histories/connections, active and completed conversations, pending conversation/audio ingress, Telegram authorization/events, audio SHA lookups, and vault unlock.
+5. Stop Kennedy. Place the five standalone databases, the complete audio-ingress media directory, and optional encrypted vault at the paths supplied to the target binary. Do not restore old `-wal` or `-shm` files.
+6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify several user and Kennedy roots, Kmap histories/connections, active and completed conversations, pending conversation/audio/group ingress, Telegram TOFU bindings/group decisions/events, audio SHA lookups, and vault unlock.
 
 Tracked frontend assets, system prompts, source migrations, and external Codex/ChatGPT state are not duplicated here; the source commit identifies tracked assets, and the latter is not Kennedy-owned runtime persistence.
 "#,
@@ -759,6 +771,7 @@ mod tests {
             kmap_database: directory.path().join("kmap.sqlite3"),
             conversation_database: directory.path().join("conversations.sqlite3"),
             telegram_database: directory.path().join("telegram.sqlite3"),
+            user_database: directory.path().join("users.sqlite3"),
             audio_database: directory.path().join("audio.sqlite3"),
             audio_media_directory,
             vault: directory.path().join("secrets.age"),
@@ -772,6 +785,7 @@ mod tests {
         let kmap = database(&options.kmap_database, "memory in wal");
         let conversations = database(&options.conversation_database, "conversation in wal");
         let telegram = database(&options.telegram_database, "telegram in wal");
+        let users = database(&options.user_database, "user directory in wal");
         let audio = database(&options.audio_database, "audio queue in wal");
         fs::create_dir(options.audio_media_directory.join("originals")).unwrap();
         fs::write(
@@ -800,9 +814,9 @@ mod tests {
 
         let manifest: Value =
             serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["backup_format_version"], 2);
+        assert_eq!(manifest["backup_format_version"], 3);
         assert_eq!(manifest["snapshot_mode"], "offline-port-guard");
-        assert_eq!(manifest["files"].as_array().unwrap().len(), 6);
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 7);
         for file in manifest["files"].as_array().unwrap() {
             let path = root.join(file["path"].as_str().unwrap());
             assert_eq!(sha256(&path).unwrap(), file["sha256"]);
@@ -813,6 +827,7 @@ mod tests {
             ("kmap.sqlite3", "memory in wal"),
             ("conversations.sqlite3", "conversation in wal"),
             ("telegram.sqlite3", "telegram in wal"),
+            ("users.sqlite3", "user directory in wal"),
             ("audio-ingress.sqlite3", "audio queue in wal"),
         ] {
             let path = root.join("data").join(name);
@@ -833,7 +848,7 @@ mod tests {
             b"private audio"
         );
 
-        drop((kmap, conversations, telegram, audio));
+        drop((kmap, conversations, telegram, users, audio));
     }
 
     #[test]
@@ -852,6 +867,7 @@ mod tests {
         drop(database(&options.kmap_database, "kmap"));
         drop(database(&options.conversation_database, "conversations"));
         drop(database(&options.telegram_database, "telegram"));
+        drop(database(&options.user_database, "users"));
         drop(database(&options.audio_database, "audio"));
         let created_at = Utc.with_ymd_and_hms(2026, 7, 16, 12, 34, 56).unwrap();
         fs::create_dir(&options.backup_dir).unwrap();

@@ -51,12 +51,19 @@ processes.
 
 ## User Management
 
-For now, there is only one hardcoded Kmap user, and that user is David Vorick.
-Telegram transport identities map to separate conversations over this shared
-Kmap and do not add Kmap access control. A
-more complex user management system will be added later. We explicitly do not
-want to add access controls to the knowledge graph. This design is 'borg-like',
-all knowledge is shared between users. More safety can be added later.
+Each whitelisted Telegram identity has a distinct root node in the shared Kmap.
+A separate SQLite user directory maps normalized Telegram handles and their
+TOFU-pinned stable numeric IDs to those roots; none of that mapping belongs in
+the Kweb database. `@taek42` is the only initial unresolved whitelist entry and
+the web UI uses its root. Once observed, its numeric ID becomes authoritative.
+That privileged identity may add trusted friends with `/adduser @handle`, which
+immediately reserves a blank root without a registration or onboarding flow.
+
+We explicitly do not want access controls inside the knowledge graph. This
+design is 'borg-like': every trusted user and Kennedy can traverse any node,
+including another user's root. There are no confidentiality warnings in the
+static system prompts; user/session behavior is learned and managed through
+the Kmap.
 
 ## The Data Store
 
@@ -190,11 +197,13 @@ The call signature is simply LoadNode(shortIdentifier)
 
 A 'loaded node' is a node that has had 'LoadNode' called on it, which means
 that all of its active connections are also in the context. A call to LoadNode
-will fail if there are already 10 directly loaded nodes. The user's root and
-Kennedy's root are always directly loaded and share this limit; there is no
-fixed allocation between their graphs. Active-connection expansions do not
-count as direct loads. LoadNode and ResetContext share a budget of 20 calls per
-conversation turn; either tool consumes one call, including failed calls.
+will fail if there are already 10 directly loaded nodes. Every root declared by
+the current session is always directly loaded and shares this limit; web and
+private sessions declare the user and Kennedy roots, while a group invocation
+declares the invoking user, group, and Kennedy roots. Active-connection
+expansions do not count as direct loads. LoadNode and ResetContext share a
+budget of 20 calls per conversation turn; either tool consumes one call,
+including failed calls.
 
 ### ResetContext
 
@@ -203,10 +212,11 @@ the user will remain, along with any notes to self Kennedy supplied during prior
 resets, but non-root Kmap context will be fully unloaded. Kennedy may optionally
 supply a non-empty note to self of at most 400,000 characters to preserve ideas
 that would otherwise fall out of context. The latest note is added after prior
-conversation history and reset notes. Then, the user's root and Kennedy's root
-will be loaded automatically, followed by every node Kennedy passed to
-ResetContext. Neither root is passed explicitly, and at most eight other nodes
-may be retained. Each reset consumes one call from the shared 20-call
+conversation history and reset notes. Then, every session root is loaded
+automatically in its declared order, followed by every node Kennedy passed to
+ResetContext. Roots are not passed explicitly. At most eight other nodes may be
+retained in a two-root session and at most seven in a three-root group session.
+Each reset consumes one call from the shared 20-call
 LoadNode/ResetContext budget; the automatic node loads inside it consume no
 additional calls. The rebuilt Chatend contains a compact history of every
 successful reset, grouped by the names of requested nodes so that
@@ -397,6 +407,7 @@ Kennedy can be called using a few different session types:
 
 + Conversation
 + Telegram Conversation
++ Telegram Group Invocation
 + History Ingress
 + Self-Action
 
@@ -440,15 +451,19 @@ private-chat text, voice, supported document, and `/reset` events and sends Kenn
 conversational text; the browser remains responsible for prompt composition,
 short identifiers, tools, and the inspectable Chatend.
 
-The initial allowed identity is `@taek42`. A matching first message binds the
-stable numeric Telegram user ID, and all future checks use that ID. Each allowed
-user has a separate durable conversation visible under `TG Bot`. Telegram
-sessions do not expire after 24 hours. `/reset` ends the current session and
-queues its complete archive for ordinary history ingress; the ingress session
-explicitly knows that its source was Telegram. Each newly crossed 100,000-token
-current-context band produces a separate delivery notice containing current
-and maximum context usage and recommending `/reset`. That operational notice
-is not part of Kennedy's Chatend.
+The separate user directory initially whitelists `@taek42` without a numeric
+ID. The first matching observation pins that stable ID under TOFU, and future
+checks use the ID even if the handle changes. A different ID later presenting
+the pinned handle is refused. David may use `/adduser @handle`; that handle gets
+its reserved blank root immediately and pins on its first matching observation.
+Each allowed user has a separate durable private conversation visible under
+`TG Bot`. Private Telegram sessions do not expire after 24 hours. `/reset` ends
+the current private session and queues its complete archive for ordinary
+history ingress; the ingress session explicitly knows that its source was
+Telegram. Each newly crossed 100,000-token current-context band produces a
+separate delivery notice containing current and maximum context usage and
+recommending `/reset`. That operational notice is not part of Kennedy's
+Chatend.
 
 UI recordings and Telegram voice notes preserve their original audio. The
 intelligence backend publishes model input modalities and uses paid OpenAI
@@ -460,6 +475,32 @@ The browser composer and Telegram accept PDF, DOCX, spreadsheet, CSV, and text
 documents. Kennedy receives a bounded local text conversion together with the
 filename and format, and the original remains archived. Searchable PDFs are
 supported; scanned/image-only PDFs report that OCR is required.
+
+### Telegram Group Invocation
+
+Kennedy participates only in groups where she is an administrator, her member
+ledger is complete, and every member is a TOFU-valid whitelisted identity. Any
+unknown member, pinned-handle conflict, incomplete member ledger, or later loss
+of administrator monitoring permanently blacklists that chat ID. Whitelisting
+the person later does not revive the group; users must create a new one.
+Each observed group receives its own initially blank Kmap root. That assignment
+survives permanent blacklisting and Telegram chat-ID migration.
+
+Kennedy is invoked only by a direct bot-handle mention or a reply to one of her
+messages. Every invocation creates an independent `telegram-group` session and
+ends after Kennedy's reply, so `/reset` is private-DM-only. The invoker is the
+core user: that person's root, the group's root, and Kennedy's root are
+automatically loaded in that order. The dynamic Chatend lists the group root and
+every current participant with a session-local root identifier, and includes
+the most recent 50 group messages. Other participant roots remain unloaded
+references that Kennedy may load deliberately.
+
+When more than 100 group messages accumulate without an invocation, the oldest
+80 not yet covered by an invocation or background batch are sent through the
+same durable, sequential History Ingress pipeline. Because no user invoked
+Kennedy, these batches load the group root followed by Kennedy's root and keep
+all participant roots as unloaded references. Twenty messages remain as a
+buffer.
 
 ### Durable Vnote Ingress
 

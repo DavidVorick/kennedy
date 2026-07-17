@@ -1,6 +1,6 @@
 Kmap nodes have positive integer identifiers. An identifier is valid only in the current session and only until ResetContext is called. Do not use identifiers outside tool calls.
 
-The user's root and Kennedy's root are always loaded automatically. ResetContext preserves both roots even when they are not listed in the call.
+The session's root nodes are always loaded automatically in the order declared by the current Kmap context. ResetContext preserves every root even when it is not listed in the call.
 
 The tools documented below are the baseline tools for this session. Additional tools and their documentation may be available in the kmap; use the kmap to learn about those capabilities rather than expecting every instruction to be repeated in the system prompt.
 

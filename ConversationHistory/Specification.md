@@ -34,10 +34,14 @@ build that could recreate the v1 index after recording the v2 migration.
 
 The frontend state contains recovery metadata and versioned, opaque JSON
 archives for both the complete conversation Chatend and its history-ingress
-Chatend. The backend interprets `pendingTurn` and the top-level/archive
-`sessionType` when deciding whether an idle conversation is safe to close
-automatically. Telegram sessions never idle-close; `/reset` explicitly closes
-them. For legacy safety during
+Chatend. It may include the direct root IDs, referenced group-participant root
+IDs, and dynamic channel/group context; these remain opaque to this backend.
+The backend interprets `pendingTurn` and the top-level/archive `sessionType`
+when deciding whether an idle conversation is safe to close automatically.
+All session types beginning with `telegram` are protected from idle closure.
+Private Telegram sessions close through `/reset`; each `telegram-group`
+invocation and background batch is explicitly queued by the frontend as soon
+as its independent archive is ready. For legacy safety during
 unstarted-record cleanup, it also recognizes user-role entries in the stored
 conversation transcript before deleting a record whose activity timestamp is
 null.
@@ -57,7 +61,7 @@ active -> ingress_pending -> ingress_in_progress -> complete
   last user-message time. In the same transaction, other active conversations
   idle for more than 24 hours become `ingress_pending`, except records whose
   opaque state says Kennedy still owes a response (`pendingTurn: true`).
-  Records whose state identifies a Telegram session are also exempt.
+  Records whose state identifies any Telegram session are also exempt.
 - Explicitly ending a conversation checkpoints its final state and changes
   `active` to `ingress_pending` immediately.
 - The oldest queued conversation is selected by last user activity, falling
@@ -83,9 +87,10 @@ active -> ingress_pending -> ingress_in_progress -> complete
   user message in their stored conversation transcript are permanently
   discarded, regardless of phase. This also removes an untouched placeholder
   that was ended or processed without ever becoming a real conversation.
-  Every record containing a user message is ineligible. Telegram records are
-  also ineligible because they can be created and bound to a relay event just
-  before the first durable user-message checkpoint.
+  Every record containing a user message is ineligible. Telegram records,
+  including new group invocations/background batches, are also ineligible
+  because they can be created and bound or queued just before their first
+  durable checkpoint.
 
 Every mutation supplies `expected_version`. Stale browser tabs receive
 `409 state_conflict` rather than overwriting newer state. The unique in-progress

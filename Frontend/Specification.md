@@ -76,6 +76,11 @@ Live application state is held in JavaScript memory:
     webLock: "kennedy-telegram-bridge",
     inFlightEventIds: new Set()
   },
+  roots: {
+    webUserHandle: "taek42",
+    webUserRootNodeId: null,
+    kennedyRootNodeId: null
+  },
   ingressWorker: {
     running: false,
     activeRecord: null,
@@ -92,7 +97,10 @@ Live application state is held in JavaScript memory:
 Each `ConversationSession` owns its clean transcript, complete Chatend, Kweb
 context and short-ID maps, LoadNode counter, tool log, usage, continuation,
 start time, pending-turn flag, busy state, configured model and reasoning effort,
-and their combined model-attribution value.
+their combined model-attribution value, its own direct root IDs, and any
+unloaded group-participant root references. Root selection is durable session
+state rather than one application-global user root; group invocation records
+store user, group, and Kennedy roots in that order.
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. Instead it checkpoints an opaque recovery snapshot to
@@ -180,8 +188,8 @@ The frontend can rebuild a chatend from:
    requested nodes and active-connection expansions after direct loads.
 
 `ResetContext` first resolves all supplied short identifiers to durable IDs.
-It then clears loaded Kweb data and short-ID mappings, reloads the user and
-Kennedy roots followed by the supplied nodes, and rebuilds the chatend. When a
+It then clears loaded Kweb data and short-ID mappings, reloads every session
+root in its declared order followed by the supplied nodes, and rebuilds the chatend. When a
 `selfMessage` is supplied, the frontend retains it as an assistant-role note
 immediately before the new Kweb context. Before that note, it places the compact
 ResetContext history. Node names are used because short identifiers are rebuilt
@@ -286,11 +294,12 @@ fanout references were already visible from the current graph, omits repeated
 references, and emits a richer direct-fanout summary if a name-only indirect
 fanout later becomes a direct fanout.
 
-The user root and Kennedy root are directly loaded at session start, survive
-every reset, and both count toward the shared limit. In a fresh or reset
-context, they are loaded first in that order. Restoring a legacy one-root
-archive automatically materializes the missing Kennedy root and refreshes the
-archived system and Kmap context messages before generation.
+Every declared root is directly loaded at session start, survives every reset,
+and counts toward the shared limit. Web and private Telegram sessions declare
+the user root followed by Kennedy's root. Group invocations insert the group
+root between them; background group ingress declares the group root followed by
+Kennedy's root. In a fresh or reset context, roots are loaded first in their
+declared order.
 
 ## 7. Prompt Composition
 
@@ -303,7 +312,15 @@ The frontend fetches composable prompt assets from
 3. `KmapBasics.txt`,
 4. `ReadTools.txt`, containing the Kmap and web read-only tools,
 5. `WriteTools.txt` only for history and audio ingress,
-6. a dynamic runtime section with the configured model and thinking mode.
+6. `CodexHarness.txt` only when the frontend-selected provider kind is `codex`,
+7. a dynamic runtime section with the configured model and thinking mode.
+
+The frontend selects its inference provider from the intelligence backend's
+provider metadata before composing the prompt, so this condition uses the same
+provider choice sent with generation requests rather than inferring transport
+from a model name. The Codex-only layer concisely explains that Kennedy runs in
+an outer harness which catches her ordinary-text tool calls even if the inner
+Codex wrapper claims its APIs or tools are limited.
 
 The selected session asset contains only session purpose, mutability, and the
 context-loading budget. `KmapBasics.txt` is the single source for identifier
@@ -392,9 +409,11 @@ Text-protocol arguments:
 ```
 
 The frontend resolves the identifiers before clearing the old map, then reloads
-both roots followed by the supplied nodes in their given order. Neither root
-may appear in the argument list, and the resulting direct-load set must not
-exceed ten nodes; therefore the argument list contains at most eight IDs.
+all roots in their declared order followed by the supplied nodes in their given
+order. No root may appear in the argument list, and the resulting direct-load
+set must not exceed ten nodes. A private/web session has two roots and therefore
+accepts at most eight IDs; a group invocation has three roots and accepts at
+most seven.
 
 `selfMessage` is optional. When present, it must be a non-empty string of at
 most 400,000 Unicode characters. A successful reset adds it to retained session
@@ -685,7 +704,7 @@ conversation's Kweb tool history.
    formatted `messages` text into retained session content under `Archived
    Chatend`; do not place the serialized archive or its non-message fields into
    model context,
-4. load the user and Kennedy roots,
+4. load the direct roots preserved by the archived session,
 5. set the session LoadNode counter to zero,
 6. generate with the ingress prompt describing the shared read tools and
    ingress mutation tools,
@@ -923,15 +942,27 @@ The explorer does not edit durable data.
 The top navigation exposes `TG Bot` and `Audio Ingress` beside Conversation and
 Memory. The Telegram view reuses
 the conversation transcript and Chatend inspector but filters the sidebar to
-Telegram records and has no message composer: Telegram itself is the input
-surface. Each Telegram user maps to a separate `sessionType: telegram`
-Conversation History record and can run in parallel with other users and UI
-conversations. The record stores channel metadata, while the system prompt
-explicitly says `telegram session`. Ordinary browser records explicitly say
-`conversation session`.
+all `telegram*` records and has no message composer: Telegram itself is the
+input surface. Each private Telegram user maps to a separate `sessionType:
+telegram` Conversation History record and can run in parallel with other users
+and UI conversations. Group invocations and background group batches use
+`sessionType: telegram-group`. Every record stores direct and referenced root
+IDs plus channel metadata. Dynamic prompt composition distinguishes the web UI,
+private Telegram, one-invocation Telegram groups, and group-source history
+ingress. Shared prompt assets describe an arbitrary always-loaded root set;
+dynamic group context supplies the session-specific root roles and order.
+
+At startup the frontend reads the legacy user and Kennedy roots from Kweb,
+then asks the relay for unprovisioned whitelist entries and group roots. It maps
+the configured web handle `taek42` to the legacy user root, idempotently creates
+every other reserved root with `POST /api/v1/nodes/bootstrap`, and marks each
+directory entry ready. User roots start as `User Root`; group roots start as
+`Group Root`. This is the only David-specific mapping; neither backend uses a
+sentinel David ID. New `/adduser` entries and newly observed groups are
+discovered and provisioned by the same bridge loop before their events run.
 
 One browser tab holds the `kennedy-telegram-bridge` Web Lock. It polls the
-relay's durable per-user head events, binds each event to its Conversation
+relay's durable per-user/per-group head events, binds each event to its Conversation
 History ID, runs the normal read-only conversation session, and returns only
 Kennedy's final conversational output. Event IDs are stored on user and
 assistant transcript items so reload can resume generation or retry delivery
@@ -939,6 +970,23 @@ without regenerating a completed answer. A `/reset` event closes that user's
 active record, queues its full archive for history ingress, and leaves creation
 of the next Telegram record until the next message. History-ingress prompt
 composition and provenance source identify the source as Telegram or UI.
+
+A group event always creates a fresh Conversation History record. Its direct
+roots are the invoker's directory root, the group's reserved root, and Kennedy's
+root in that order. The frontend assigns short identifiers to every other
+participant root without loading it and adds dynamic context containing the
+group identity and root, participant/Telegram/root mapping, and the relay's
+most recent 50 messages. After delivery it immediately queues that
+one-invocation archive for normal history ingress. `/reset` is not a group
+operation and group binding never updates a private-DM session pointer.
+
+The bridge also polls durable 80-message group-ingress batches. It creates a
+recoverable `telegram-group` archive with the group root followed by Kennedy's
+root direct, registers all participant roots as references, and immediately
+queues it in Conversation History. There is no user root because nobody invoked
+Kennedy. A batch is acknowledged to the relay only after Conversation History
+reaches `complete`; a reload finds the batch ID in opaque record state and does
+not create duplicate work.
 
 The normal composer includes a microphone control implemented with
 `MediaRecorder`. Both browser recordings and Telegram voice notes are sent as
@@ -989,7 +1037,7 @@ Frontend tests may run directly in a browser or with lightweight Rust-served
 fixtures; they must not introduce a production build step. At minimum verify:
 
 - stable short-ID assignment and reset,
-- two-root initialization and reset survival,
+- two-root and three-root initialization and reset survival,
 - ten-direct-load enforcement,
 - conversation and ingress shared LoadNode/ResetContext budgets,
 - parsing and sequential execution of multiple text tool calls from one round,
@@ -1022,5 +1070,8 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - HTML escaping,
 - recovery from failed intelligence, Kweb, and conversation-history requests.
 - explicit conversation/Telegram prompt labels and source-aware history ingress,
+- per-user/group direct-root persistence, TOFU-root provisioning, independent
+  three-root group sessions with referenced participant roots, and durable
+  two-root 80-message group ingress,
 - paid multipart transcription and original-media persistence,
 - durable Telegram event correlation, reset, and context-warning delivery.

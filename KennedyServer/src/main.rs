@@ -39,6 +39,8 @@ struct Args {
     conversation_history_database: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-telegram.sqlite3")]
     telegram_database: PathBuf,
+    #[arg(long, global = true, default_value = "./kennedy-users.sqlite3")]
+    user_database: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-audio.sqlite3")]
     audio_ingress_database: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-audio-ingress")]
@@ -121,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
                 kmap_database: args.kweb_database,
                 conversation_database: args.conversation_history_database,
                 telegram_database: args.telegram_database,
+                user_database: args.user_database,
                 audio_database: args.audio_ingress_database,
                 audio_media_directory: args.audio_ingress_media,
                 vault: vault_path,
@@ -182,6 +185,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let telegram = kennedy_telegram_relay::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
+        user_database: args.user_database,
         allowed_origins: vec![args.frontend_origin.clone()],
         bot_token: telegram_bot_token,
         bootstrap_usernames: vec![args.telegram_bootstrap_username],
@@ -357,6 +361,7 @@ mod tests {
         let kmap = directory.join("kmap.sqlite3");
         let conversations = directory.join("conversations.sqlite3");
         let telegram = directory.join("telegram.sqlite3");
+        let users = directory.join("users.sqlite3");
         let audio = directory.join("audio.sqlite3");
         let audio_media = directory.join("audio-media");
         let args = Args {
@@ -371,6 +376,7 @@ mod tests {
             kweb_database: kmap.clone(),
             conversation_history_database: conversations.clone(),
             telegram_database: telegram.clone(),
+            user_database: users.clone(),
             audio_ingress_database: audio.clone(),
             audio_ingress_media: audio_media.clone(),
             frontend_dir: directory.join("frontend"),
@@ -388,6 +394,7 @@ mod tests {
         assert!(!kmap.exists());
         assert!(!conversations.exists());
         assert!(!telegram.exists());
+        assert!(!users.exists());
         assert!(!audio.exists());
         assert!(!audio_media.exists());
         std::fs::remove_dir_all(directory).unwrap();

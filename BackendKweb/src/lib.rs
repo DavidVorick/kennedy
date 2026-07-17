@@ -182,6 +182,13 @@ struct AssignTaskInput {
     model_attribution: String,
 }
 
+#[derive(Deserialize)]
+struct BootstrapNodeInput {
+    node_id: String,
+    #[serde(default)]
+    short_name: Option<String>,
+}
+
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     serve_with_listener(config, listener).await
@@ -227,6 +234,7 @@ pub async fn serve_with_listener(
         .route("/api/v1/nodes/{node_id}/context", get(get_node_context))
         .route("/api/v1/nodes/{node_id}/history", get(get_history))
         .route("/api/v1/nodes", post(create_node))
+        .route("/api/v1/nodes/bootstrap", post(bootstrap_node))
         .route("/api/v1/provenance", post(create_provenance))
         .route("/api/v1/provenance/{provenance_id}", get(get_provenance))
         .route(
@@ -360,7 +368,7 @@ fn bootstrap(db: &mut Connection) -> anyhow::Result<()> {
             "INSERT INTO data_provenance_nodes(id,data,source,source_created_at) VALUES(?1,?2,?3,?4)",
             params![
                 provenance_id,
-                "Initial local user and Kennedy root bootstrap.",
+                "Initial Kmap root bootstrap.",
                 "bootstrap",
                 Utc::now().to_rfc3339()
             ],
@@ -369,9 +377,9 @@ fn bootstrap(db: &mut Connection) -> anyhow::Result<()> {
             user_id = Some(insert_bootstrap_node(
                 &tx,
                 &provenance_id,
-                "David Vorick",
-                "The user Kennedy assists.",
-                "David Vorick is the user of this local Kennedy installation.",
+                "Initial User Root",
+                "",
+                "",
                 true,
             )?);
         }
@@ -451,11 +459,65 @@ async fn get_user(State(state): State<AppState>) -> Result<Json<serde_json::Valu
     let user_root_node_id = root("user")?;
     let kennedy_root_node_id = root("kennedy")?;
     Ok(Json(json!({
-        "name":"David Vorick",
+        "name":"Legacy local user root",
         "root_node_id":user_root_node_id,
         "user_root_node_id":user_root_node_id,
         "kennedy_root_node_id":kennedy_root_node_id
     })))
+}
+
+async fn bootstrap_node(
+    State(state): State<AppState>,
+    Json(input): Json<BootstrapNodeInput>,
+) -> Result<(StatusCode, Json<KnowledgeNode>), ApiError> {
+    let node_id = decode_id(&input.node_id)?;
+    let requested_name = input.short_name.unwrap_or_else(|| "User Root".into());
+    let (short_name, _) = validate_node_text(&requested_name, "", "")?;
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    match fetch_node(&db, &node_id) {
+        Ok(node) => return Ok((StatusCode::OK, Json(node))),
+        Err(error) if error.status != StatusCode::NOT_FOUND => return Err(error),
+        Err(_) => {}
+    }
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let provenance_id = new_id();
+    let history_id = new_id();
+    tx.execute(
+        "INSERT INTO data_provenance_nodes(id,data,source,source_created_at) VALUES(?1,?2,?3,?4)",
+        params![
+            provenance_id,
+            "Automatically provisioned blank Kmap root node.",
+            "system-bootstrap",
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(ApiError::internal)?;
+    tx.execute(
+        "INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root) VALUES(?1,?2,'','',0)",
+        params![node_id, short_name],
+    )
+    .map_err(|error| {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+            ApiError::conflict("The requested bootstrap node identifier already exists.")
+        } else {
+            ApiError::internal(error)
+        }
+    })?;
+    tx.execute(
+        "INSERT INTO data_history_nodes(id,knowledge_node_id,previous_history_id,provenance_id) VALUES(?1,?2,NULL,?3)",
+        params![history_id, node_id, provenance_id],
+    )
+    .map_err(ApiError::internal)?;
+    tx.execute(
+        "UPDATE knowledge_nodes SET history_head_id=?1 WHERE id=?2",
+        params![history_id, node_id],
+    )
+    .map_err(ApiError::internal)?;
+    set_model_attribution(&tx, std::slice::from_ref(&node_id), "system-bootstrap")
+        .map_err(ApiError::internal)?;
+    tx.commit().map_err(ApiError::internal)?;
+    let node = fetch_node(&db, &node_id)?;
+    Ok((StatusCode::CREATED, Json(node)))
 }
 
 fn fetch_summaries(
@@ -550,13 +612,7 @@ async fn get_node_context(
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     require_exists(&tx, "knowledge_nodes", &id, "Knowledge node")?;
-    enforce_connection_limits_in_tx(
-        &tx,
-        &id,
-        state.active_limit,
-        state.fanout_limit,
-        "LoadNode",
-    )?;
+    enforce_connection_limits_in_tx(&tx, &id, state.active_limit, state.fanout_limit, "LoadNode")?;
     tx.commit().map_err(ApiError::internal)?;
     let requested = fetch_node(&db, &id)?;
     let active_ids: Vec<Vec<u8>> = {
@@ -760,13 +816,7 @@ fn connect_in_tx(
         }
     }
     for source in ids {
-        enforce_connection_limits_in_tx(
-            tx,
-            source,
-            active_limit,
-            fanout_limit,
-            "ConnectNodes",
-        )?;
+        enforce_connection_limits_in_tx(tx, source, active_limit, fanout_limit, "ConnectNodes")?;
     }
     Ok(())
 }
@@ -1179,12 +1229,9 @@ mod tests {
         }
         let state = state(db);
 
-        let Json(payload) = get_node_context(
-            State(state.clone()),
-            Path(hex::encode(&source)),
-        )
-        .await
-        .unwrap();
+        let Json(payload) = get_node_context(State(state.clone()), Path(hex::encode(&source)))
+            .await
+            .unwrap();
 
         assert_eq!(
             payload["requested_node"]["active_connections"]
@@ -1305,6 +1352,48 @@ mod tests {
             response.0["user_root_node_id"],
             response.0["kennedy_root_node_id"]
         );
+    }
+
+    #[tokio::test]
+    async fn arbitrary_roots_are_bootstrapped_with_a_requested_label_and_idempotently() {
+        let state = state(db());
+        let node_id = hex::encode([0xabu8; 20]);
+        let first = bootstrap_node(
+            State(state.clone()),
+            Json(BootstrapNodeInput {
+                node_id: node_id.clone(),
+                short_name: Some("Group Root".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let second = bootstrap_node(
+            State(state.clone()),
+            Json(BootstrapNodeInput {
+                node_id: node_id.clone(),
+                short_name: Some("Group Root".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.0, StatusCode::CREATED);
+        assert_eq!(second.0, StatusCode::OK);
+        assert_eq!(first.1.id, node_id);
+        assert_eq!(first.1.short_name, "Group Root");
+        assert_eq!(first.1.short_description, "");
+        assert_eq!(first.1.long_description, "");
+        assert_eq!(first.1.last_modified_by, "system-bootstrap");
+        let count: i64 = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_nodes WHERE id=?1",
+                [[0xabu8; 20].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

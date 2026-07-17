@@ -48,9 +48,11 @@ hexadecimal characters at the API boundary.
 | `short_description` | Trimmed text, 0–200 characters |
 | `long_description` | Text, at most 1000 whitespace-delimited words |
 | `history_head_id` | Nullable reference to the newest data history node |
-| `is_user_root` | Internal marker for the single MVP user root |
+| `is_user_root` | Legacy marker for the original browser user root |
 
-Exactly one knowledge node has `is_user_root = true`.
+Exactly one knowledge node has `is_user_root = true` for compatibility with
+the original single-user database. Additional user roots are ordinary
+knowledge nodes whose identity mapping lives outside Kweb.
 
 `kmap_roots` maps the unique roles `user` and `kennedy` to distinct knowledge
 nodes. This role table lets existing databases retain their user-root marker
@@ -116,23 +118,31 @@ legacy databases simply return an empty task list until tasks are assigned.
 Connection rows are supporting structure, not an additional durable node type.
 
 Schema constraints enforce 20-byte IDs, valid connection tiers, non-self
-connections, required foreign keys, a single user root, and distinct user and
-Kennedy role roots. Foreign-key delete actions are restrictive; the MVP exposes
-no deletion path.
+connections, required foreign keys, the legacy root marker, and distinct
+legacy-user and Kennedy role roots. Foreign-key delete actions are restrictive;
+the MVP exposes no deletion path.
 
 ## 4. Bootstrap
 
-After migrations, the backend ensures both required roots exist. In one
-transaction it registers the existing user root or creates it when absent, and
-creates Kennedy's root when absent. Every newly created root receives:
+After migrations, the backend ensures the original compatibility user root and
+Kennedy's root exist. In one transaction it registers the existing user root or
+creates it when absent, and creates Kennedy's root when absent. Every newly
+created root receives:
 
 1. a bootstrap provenance node,
-2. a minimal knowledge node (`David Vorick` or `Kennedy's Root`),
+2. a minimal knowledge node (`Initial User Root` or `Kennedy's Root`),
 3. its first history node pointing to the bootstrap provenance node,
 4. the knowledge node's history-head reference.
 
 Bootstrap is therefore complete before the HTTP listener begins accepting
 requests. Newly bootstrapped nodes use `system-bootstrap` attribution.
+
+The identity directory may subsequently reserve arbitrary 20-byte IDs for new
+user roots. `POST /api/v1/nodes/bootstrap` idempotently materializes such an ID
+as a structurally valid but semantically blank, unconnected `User Root` node
+with empty descriptions, bootstrap provenance/history, and
+`system-bootstrap` attribution. Kweb stores no Telegram handle, numeric user
+ID, whitelist privilege, or group membership.
 
 ## 5. Graph Rules
 
@@ -252,7 +262,7 @@ Returns `503` if the database cannot be queried.
 
 ```json
 {
-  "name": "David Vorick",
+  "name": "Legacy local user root",
   "root_node_id": "0123456789abcdef0123456789abcdef01234567",
   "user_root_node_id": "0123456789abcdef0123456789abcdef01234567",
   "kennedy_root_node_id": "89abcdef0123456789abcdef0123456789abcdef"
@@ -260,6 +270,15 @@ Returns `503` if the database cannot be queried.
 ```
 
 `root_node_id` remains as a compatibility alias for `user_root_node_id`.
+
+#### `POST /api/v1/nodes/bootstrap`
+
+Accepts `{ "node_id": "<40 lowercase hexadecimal characters>" }` with an
+optional `short_name` containing 4 to 50 characters. The default short name is
+`User Root`; group provisioning supplies `Group Root`. It creates the exact
+reserved node ID and returns `201`, or returns the existing node with `200`.
+This endpoint does not register a global role or store an external-user or
+Telegram-group mapping.
 
 ### 8.3 Read a Knowledge Node
 
