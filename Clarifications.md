@@ -441,3 +441,7 @@ canonical documents; this file is not an append-only log.
   `AudioIngressSession.txt`.
 - Load prompt assets independently so a missing mode-specific file disables
   only the session type that requires it.
+- Expose a force-purge control for a conversation that remains live but cannot
+  be recovered or resumed. Purge must permanently delete its durable history
+  record without history ingress, so the stuck conversation neither reappears
+  in history nor updates the Kmap.

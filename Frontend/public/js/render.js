@@ -179,6 +179,8 @@ export function renderConversationHistory(container, records, {
   onSelect = () => {},
   retryingIds = new Set(),
   onRetryIngress = () => {},
+  purgingIds = new Set(),
+  onPurge = () => {},
   viewKey = "conversation-history",
 } = {}) {
   const viewState = captureViewState(container, viewKey);
@@ -209,14 +211,25 @@ export function renderConversationHistory(container, records, {
     button.append(element("span", "history-item-title", conversationTitle(record)), meta);
     button.addEventListener("click", () => onSelect(record.id));
     row.append(button);
+    const actions = element("div", "history-item-actions");
     if (record.phase === "ingress_failed") {
       const retry = element("button", "quiet history-item-retry", retryingIds.has(record.id) ? "Retrying…" : "Retry");
       retry.type = "button";
       retry.disabled = retryingIds.has(record.id);
       retry.setAttribute("aria-label", `Retry history ingress for ${conversationTitle(record, 100)}`);
       retry.addEventListener("click", () => onRetryIngress(record));
-      row.append(retry);
+      actions.append(retry);
     }
+    if (record.id === selectedId) {
+      const purging = purgingIds.has(record.id);
+      const purge = element("button", "quiet history-item-purge", purging ? "Purging…" : "Purge");
+      purge.type = "button";
+      purge.disabled = purging;
+      purge.setAttribute("aria-label", `Permanently purge ${conversationTitle(record, 100)}`);
+      purge.addEventListener("click", () => onPurge(record));
+      actions.append(purge);
+    }
+    if (actions.childNodes.length) row.append(actions);
     container.append(row);
   }
   restoreViewState(container, viewKey, viewState);

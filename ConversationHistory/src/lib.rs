@@ -190,7 +190,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/conversations/{conversation_id}",
-            get(get_conversation),
+            get(get_conversation).delete(purge_conversation),
         )
         .route(
             "/api/v1/conversations/{conversation_id}/checkpoint",
@@ -428,6 +428,44 @@ async fn get_conversation(
 ) -> Result<Json<ConversationRecord>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
     Ok(Json(fetch_record(&db, &id)?))
+}
+
+fn purge_record(db: &Connection, id: &str, expected_version: i64) -> Result<(), ApiError> {
+    validate_version(expected_version)?;
+    let changed = db
+        .execute(
+            "DELETE FROM conversations WHERE id=?1 AND version=?2",
+            params![id, expected_version],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 1 {
+        return Ok(());
+    }
+    let exists = db
+        .query_row("SELECT 1 FROM conversations WHERE id=?1", [id], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+        .map_err(ApiError::internal)?
+        .is_some();
+    if exists {
+        Err(ApiError::conflict(
+            "Conversation changed in another session before it could be purged.",
+        ))
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
+async fn purge_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<VersionedTransition>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    purge_record(&db, &id, input.expected_version)?;
+    tracing::info!(conversation_id = %id, "Conversation permanently purged");
+    Ok(Json(json!({"purged":true,"conversation_id":id})))
 }
 
 fn update_active(
@@ -812,6 +850,26 @@ mod tests {
                 .code,
             "state_conflict"
         );
+    }
+
+    #[test]
+    fn purge_permanently_removes_any_phase_without_queueing_ingress() {
+        let db = database();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('stuck','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"pendingTurn\":true}',4)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('claimed','ingress_in_progress','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',2)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_pending','2026-01-03T00:00:00Z','2026-01-03T00:00:00Z','{}',1)", []).unwrap();
+
+        assert_eq!(
+            purge_record(&db, "stuck", 3).unwrap_err().code,
+            "state_conflict"
+        );
+        assert_eq!(fetch_record(&db, "stuck").unwrap().phase, "active");
+        purge_record(&db, "stuck", 4).unwrap();
+        purge_record(&db, "claimed", 2).unwrap();
+
+        assert_eq!(fetch_record(&db, "stuck").unwrap_err().code, "not_found");
+        assert_eq!(fetch_record(&db, "claimed").unwrap_err().code, "not_found");
+        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
     }
 
     #[test]

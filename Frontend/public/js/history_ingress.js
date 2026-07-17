@@ -1,8 +1,8 @@
 import { Chatend } from "./chatend.js?v=20260715.8";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260717.2";
-import { ToolExecutor } from "./tools.js?v=20260717.2";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.2";
+import { ToolExecutor } from "./tools.js?v=20260717.3";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.3";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
@@ -95,7 +95,7 @@ function modelReadableProvenance(data) {
   return [chatend, loadedNodes].filter(Boolean).join("\n\n────────────────────────\n\n");
 }
 
-export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate }) {
+export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, provenanceId, provider, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate, signal = null, operationId = null, beforeMutation = async () => {} }) {
   const provenance = await kweb.provenance(provenanceId);
   rootNodeIds = rootNodeIds || [rootNodeId];
   const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
@@ -136,7 +136,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   let completed = Boolean(archive?.completed);
   let roundsUsed = Number.isInteger(archive?.roundsUsed) ? archive.roundsUsed : Number(archive?.usage?.requests) || 0;
   const snapshot = () => ({ chatend, context, executor, continuation, usage, completed, roundsUsed });
-  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, modelAttribution, provenanceId, loadLimit: 50, sessionType: "history-ingress", onUpdate: () => onUpdate(snapshot()) });
+  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, modelAttribution, provenanceId, loadLimit: 50, sessionType: "history-ingress", onUpdate: () => onUpdate(snapshot()), beforeMutation });
   if (archive?.tools) {
     executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
     executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
@@ -178,6 +178,8 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
         onUpdate: () => onUpdate(snapshot()),
         checkpoint: () => checkpoint(archiveSnapshot()),
         roundOffset: roundsUsed,
+        signal,
+        operationId,
         onRoundStart: async currentRound => {
           roundsUsed = currentRound;
           onUpdate(snapshot());

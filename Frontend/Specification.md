@@ -639,6 +639,17 @@ for more than 24 hours and the user successfully sends a message in a different
 conversation. Merely viewing or typing does not trigger expiry, and Kennedy's
 pending response is never timed out.
 
+The selected history row also exposes a confirmed `Purge` escape hatch. It is
+available even when an `active` record cannot be reconstructed into a live
+session. Purge cancels this tab's current conversation or ingress operation,
+then version-checks and permanently deletes the backend record without first
+requesting ingress. A deleted record cannot be selected by the history-ingress
+queue. Before every conversation-ingress Kmap mutation, the worker also checks
+that the record still exists in `ingress_in_progress`, which stops a worker in
+another tab from continuing after deletion. Purging an already running or
+completed ingress cannot roll back Kmap mutations that happened before purge,
+and the confirmation says so.
+
 ## 10. History-Ingress Flow
 
 History ingress has a new chatend and context. It does not reuse the ended
@@ -721,6 +732,11 @@ short title from its first user message, shows its phase/date and a clear live
 or closed indicator. Selecting a live entry restores its draft and continuable
 session; selecting a closed entry opens its clean transcript read-only. New
 always creates and selects another durable live conversation.
+
+The selected entry includes a destructive `Purge` control with an explicit
+irreversibility confirmation. It deletes the complete conversation record and
+its checkpoints, rather than treating deletion as an ordinary End that queues
+memory ingress.
 
 Conversation and Telegram sidebars group records automatically: live sessions
 first, records whose memory ingress is queued, running, or failed second, and

@@ -75,6 +75,10 @@ active -> ingress_pending -> ingress_in_progress -> complete
   fresh opaque state with the failed history-ingress checkpoint removed, the
   backend resets the consecutive-attempt count, preserves the diagnostic log
   and provenance ID, and returns the record to `ingress_pending`.
+- Any record can be explicitly purged with its expected version. Purge deletes
+  the row permanently without moving it through `ingress_pending`, so an active
+  or queued conversation cannot later be selected for history ingress. It is a
+  destructive escape hatch for stuck sessions, not a state-machine phase.
 - On frontend startup, records that have neither recorded user activity nor a
   user message in their stored conversation transcript are permanently
   discarded, regardless of phase. This also removes an untouched placeholder
@@ -96,6 +100,7 @@ index serializes memory updates even when several conversations close together.
 - `GET /api/v1/conversations/ingress/next`
 - `DELETE /api/v1/conversations/unstarted`
 - `GET /api/v1/conversations/{id}`
+- `DELETE /api/v1/conversations/{id}`
 - `PUT /api/v1/conversations/{id}/checkpoint`
 - `POST /api/v1/conversations/{id}/request-ingress`
 - `POST /api/v1/conversations/{id}/ingress-started`
@@ -106,13 +111,17 @@ index serializes memory updates even when several conversations close together.
 
 Create accepts `started_at` plus opaque `state`. Checkpoint accepts
 `expected_version`, `state`, and optional `user_activity`. The ingress queue
-endpoint returns `{ "conversation": null }` when empty. All successful
-record mutations return the complete updated record. Unstarted cleanup is
-idempotent and returns the count and IDs of discarded records.
+endpoint returns `{ "conversation": null }` when empty. Successful
+state-machine mutations return the complete updated record. Purge returns the
+deleted ID. Unstarted cleanup is idempotent and returns the count and IDs of
+discarded records.
 The failure endpoint accepts `expected_version`, stage, optional error code,
 message, round count, and optional context usage. It normalizes and bounds
 diagnostic text before atomically incrementing the attempt count.
 Retry accepts `expected_version` plus replacement opaque `state`.
+Purge accepts `expected_version`, deletes the complete conversation record in
+any phase, and returns its ID. A stale expected version returns
+`409 state_conflict` rather than deleting newer work.
 
 ## 5. Deployment and Isolation
 

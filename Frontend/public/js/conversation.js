@@ -1,8 +1,8 @@
 import { Chatend } from "./chatend.js?v=20260715.8";
 import { KwebContext } from "./kweb_context.js?v=20260714.7";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260717.2";
-import { ToolExecutor } from "./tools.js?v=20260717.2";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.2";
+import { ToolExecutor } from "./tools.js?v=20260717.3";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.3";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 
 function jsonCopy(value) {

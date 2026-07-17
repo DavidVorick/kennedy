@@ -95,6 +95,7 @@ export const ConversationHistoryAPI = (base) => ({
   nextIngress: () => requestJSON(base, "/api/v1/conversations/ingress/next"),
   discardUnstarted: () => requestJSON(base, "/api/v1/conversations/unstarted", { method: "DELETE" }),
   get: (id) => requestJSON(base, `/api/v1/conversations/${id}`),
+  purge: (id, body) => requestJSON(base, `/api/v1/conversations/${id}`, { method: "DELETE", body: JSON.stringify(body) }),
   create: (body) => requestJSON(base, "/api/v1/conversations", { method: "POST", body: JSON.stringify(body) }),
   checkpoint: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/checkpoint`, { method: "PUT", body: JSON.stringify(body) }),
   requestIngress: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/request-ingress`, { method: "POST", body: JSON.stringify(body) }),

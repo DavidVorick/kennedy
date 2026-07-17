@@ -98,6 +98,28 @@ test("conversation history client permanently discards unstarted records", async
   assert.equal(request.options.method, "DELETE");
 });
 
+test("conversation history client permanently purges one versioned record", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ purged: true, conversation_id: "stuck" }),
+    };
+  };
+  try {
+    const result = await ConversationHistoryAPI("http://history").purge("stuck", { expected_version: 7 });
+    assert.deepEqual(result, { purged: true, conversation_id: "stuck" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(request.url, "http://history/api/v1/conversations/stuck");
+  assert.equal(request.options.method, "DELETE");
+  assert.equal(request.options.body, '{"expected_version":7}');
+});
+
 test("conversation history client records ingress failures durably", async () => {
   const originalFetch = globalThis.fetch;
   let request = null;
@@ -275,6 +297,26 @@ test("ConnectNodes translates short IDs to durable IDs", async () => {
   assert.deepEqual(api.connected, [id(1), id(2)]);
   assert.equal(api.modelAttribution, "gpt-test-xhigh");
   assert.match(result.message.content, /Last modified by: gpt-test-xhigh/);
+});
+
+test("history ingress rechecks authorization before a Kmap mutation", async () => {
+  const api = new MockKweb([node(1), node(2)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  await context.loadDurable(id(2));
+  let checks = 0;
+  const executor = new ToolExecutor({
+    mode: "ingress", context, api, provenanceId: id(9), loadLimit: 50,
+    beforeMutation: async () => {
+      checks += 1;
+      throw Object.assign(new Error("Conversation was purged."), { code: "ingress_cancelled" });
+    },
+  });
+  await assert.rejects(
+    () => executor.execute({ name: "ConnectNodes", arguments: { identifiers: [1, 2] } }),
+    error => error.code === "ingress_cancelled",
+  );
+  assert.equal(checks, 1);
+  assert.equal(api.connected, null);
 });
 
 test("ConsolidateFanout and AssignTask translate short IDs and refresh task connections", async () => {
@@ -814,6 +856,23 @@ test("conversation sidebar distinguishes continuable and closed records", async 
   assert.match(render, /ingress_pending: "Closed · Memory queued"/);
   assert.match(render, /ingress_failed: "Closed · Memory failed"/);
   assert.match(render, /complete: "Saved · Read only"/);
+});
+
+test("the selected history row exposes a guarded force-purge action", async () => {
+  const [app, render] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(render, /record\.id === selectedId/);
+  assert.match(render, /Permanently purge/);
+  assert.match(app, /window\.confirm\(`Permanently purge this conversation/);
+  assert.match(app, /conversationHistory\.purge\(id, \{ expected_version: latest\.version \}\)/);
+  assert.match(app, /The conversation will not be sent through history ingress/);
+  assert.match(app, /beforeMutation: async \(\) =>/);
+  const select = app.match(/async function selectConversation\(id\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(select);
+  assert.ok(select.indexOf("selectedConversationId = id") < select.indexOf("await buildConversation(record)"));
+  assert.match(select, /You can still purge it/);
 });
 
 test("conversation history keeps live, finalizing, and finalized records in separate groups", () => {

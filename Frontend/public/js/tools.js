@@ -74,9 +74,10 @@ function nonemptyPreservedString(value, name, maximum) { string(value, name); if
 function choice(value, name, choices) { string(value, name); if (!choices.includes(value)) throw Object.assign(new Error(`${name} must be one of: ${choices.join(", ")}.`), { code: "invalid_arguments" }); return value; }
 
 export class ToolExecutor {
-  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {} }) {
+  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {} }) {
     this.mode = mode; this.context = context; this.api = api; this.intelligence = intelligence; this.provider = provider; this.model = model; this.provenanceId = provenanceId;
     this.modelAttribution = modelAttribution; this.loadLimit = loadLimit; this.sessionType = sessionType; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
+    this.beforeMutation = beforeMutation;
   }
 
   resetLoadCalls() { this.loadCalls = 0; }
@@ -145,7 +146,7 @@ export class ToolExecutor {
       this.record({ name: call.name, arguments: call.arguments, ok: true, durationMs });
       return { message, reset: Boolean(outcome.reset), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, previousContext: outcome.previousContext ?? null, durationMs };
     } catch (error) {
-      if (signal?.aborted || error?.name === "AbortError" || ["operation_cancelled", "turn_stopped"].includes(error?.code)) throw error;
+      if (signal?.aborted || error?.name === "AbortError" || ["operation_cancelled", "turn_stopped", "ingress_cancelled"].includes(error?.code)) throw error;
       const code = error.code || "tool_failed";
       const message = error.message || "Tool execution failed.";
       const durationMs = elapsedMs(started);
@@ -182,6 +183,7 @@ export class ToolExecutor {
   async connectNodes(args) {
     this.assertIngress(); validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers", 2);
     const durable = args.identifiers.map(id => this.fullDurable(id));
+    await this.beforeMutation();
     const payload = await this.api.connect(durable, this.modelAttribution);
     this.context.refresh(payload.nodes);
     return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
@@ -194,6 +196,7 @@ export class ToolExecutor {
     const parentId = this.fullDurable(args.parentIdentifier);
     const aggregatorId = this.fullDurable(args.aggregatorIdentifier);
     const fanoutIds = args.fanoutIdentifiers.map(id => this.context.resolve(id));
+    await this.beforeMutation();
     const payload = await this.api.consolidateFanout({ parent_node_id: parentId, aggregator_node_id: aggregatorId, fanout_node_ids: fanoutIds, model_attribution: this.modelAttribution });
     this.context.recordModelAttribution([parentId, aggregatorId, ...fanoutIds], this.modelAttribution);
     this.context.refresh(payload.nodes);
@@ -207,6 +210,7 @@ export class ToolExecutor {
     if (!["high", "medium", "low"].includes(args.priority)) throw Object.assign(new Error("priority must be high, medium, or low."), { code: "invalid_arguments" });
     const parentId = this.fullDurable(args.parentIdentifier);
     const childId = args.childIdentifier === "blank" ? null : this.fullDurable(args.childIdentifier);
+    await this.beforeMutation();
     const payload = await this.api.assignTask({ parent_node_id: parentId, child_node_id: childId, priority: args.priority, model_attribution: this.modelAttribution });
     const attributedIds = [parentId];
     if (childId) attributedIds.push(childId);
@@ -237,6 +241,7 @@ export class ToolExecutor {
     this.assertIngress(); validateObject(args, ["parentIdentifiers", "shortName", "shortDescription", "longDescription"]);
     integerArray(args.parentIdentifiers, "parentIdentifiers", 1);
     const parentIds = args.parentIdentifiers.map(id => this.fullDurable(id));
+    await this.beforeMutation();
     const payload = await this.api.createNode({ provenance_id: this.provenanceId, model_attribution: this.modelAttribution, parent_node_ids: parentIds, short_name: string(args.shortName, "shortName"), short_description: string(args.shortDescription, "shortDescription"), long_description: string(args.longDescription, "longDescription") });
     this.context.refresh(payload.nodes || [payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
@@ -245,6 +250,7 @@ export class ToolExecutor {
   async updateNode(args) {
     this.assertIngress(); validateObject(args, ["identifier", "newShortName", "newShortDescription", "newLongDescription"]);
     integer(args.identifier, "identifier"); const durable = this.fullDurable(args.identifier);
+    await this.beforeMutation();
     const payload = await this.api.updateNode(durable, { provenance_id: this.provenanceId, model_attribution: this.modelAttribution, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
     this.context.refresh([payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };

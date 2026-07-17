@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260716.5";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.1";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.2";
-import { ConversationSession } from "./conversation.js?v=20260717.2";
-import { runHistoryIngress } from "./history_ingress.js?v=20260717.2";
+import { ConversationSession } from "./conversation.js?v=20260717.3";
+import { runHistoryIngress } from "./history_ingress.js?v=20260717.3";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260716.7";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.1";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -45,6 +45,8 @@ let audioDetailErrors = new Map();
 let retryingAudioPieces = new Set();
 let retryingAudioRecordings = new Set();
 let retryingConversationIds = new Set();
+let purgingConversationIds = new Set();
+let purgedConversationIds = new Set();
 let activeView = "conversation";
 let liveSessions = new Map();
 let drafts = new Map();
@@ -54,6 +56,7 @@ let creatingConversation = false;
 let ingressWorkerRunning = false;
 let activeIngressRecord = null;
 let ingressDiagnostic = null;
+let activeConversationIngressTurn = null;
 let activeAudioIngressPiece = null;
 let inspectorMode = "main";
 let recorder = null;
@@ -359,6 +362,8 @@ function update() {
     onSelect: id => selectConversation(id).catch(error => showError(ui.error_banner, error.message)),
     retryingIds: retryingConversationIds,
     onRetryIngress: retryConversationIngress,
+    purgingIds: purgingConversationIds,
+    onPurge: forcePurgeConversation,
     viewKey: `sidebar:${activeView}`,
   });
   const currentDiagnostic = diagnostic();
@@ -732,6 +737,95 @@ async function retryConversationIngress(record) {
   }
 }
 
+function purgeWarning(record) {
+  const irreversible = "Its transcript and recovery checkpoints will be permanently deleted. This cannot be undone.";
+  if (record.phase === "ingress_in_progress") {
+    return `${irreversible}\n\nHistory ingress has already started. Kennedy will stop future work, but any Kmap changes already applied cannot be rolled back.`;
+  }
+  if (record.phase === "complete") {
+    return `${irreversible}\n\nHistory ingress already completed, so existing Kmap changes will not be rolled back.`;
+  }
+  return `${irreversible}\n\nThe conversation will not be sent through history ingress.`;
+}
+
+function removePurgedConversation(id) {
+  historyRecords = historyRecords.filter(record => record.id !== id);
+  liveSessions.delete(id);
+  drafts.delete(id);
+  voiceDrafts.delete(id);
+  attachmentDrafts.delete(id);
+  extractingAttachments.delete(id);
+  conversationErrors.delete(id);
+  endingIds.delete(id);
+  retryingConversationIds.delete(id);
+  if (activeIngressRecord?.id === id) {
+    activeIngressRecord = null;
+    ingressDiagnostic = null;
+  }
+  if (selectedConversationId === id) {
+    const replacement = recordsForView()[0]?.id || null;
+    selectedConversationId = replacement;
+    selectedByView[activeView] = replacement;
+    restoreDraft();
+  }
+}
+
+async function cancelConversationWork(id) {
+  const session = liveSessions.get(id);
+  if (session?.canStop) await session.stopPendingTurn();
+  const ingressTurn = activeConversationIngressTurn;
+  if (ingressTurn?.recordId !== id || ingressTurn.controller.signal.aborted) return;
+  ingressTurn.controller.abort();
+  await Promise.resolve(intelligence.cancelOperation(ingressTurn.operationId)).catch(() => null);
+}
+
+async function forcePurgeConversation(record) {
+  if (!record?.id || purgingConversationIds.has(record.id)) return;
+  if (!window.confirm(`Permanently purge this conversation?\n\n${purgeWarning(record)}`)) return;
+  const id = record.id;
+  purgingConversationIds.add(id);
+  update();
+  try {
+    await cancelConversationWork(id);
+
+    let deleted = false;
+    let lastError = null;
+    for (let attempt = 0; attempt < 3 && !deleted; attempt += 1) {
+      let latest;
+      try {
+        latest = await conversationHistory.get(id);
+      } catch (error) {
+        if (error.code === "not_found") {
+          deleted = true;
+          break;
+        }
+        throw error;
+      }
+      try {
+        await conversationHistory.purge(id, { expected_version: latest.version });
+        deleted = true;
+      } catch (error) {
+        if (error.code === "not_found") {
+          deleted = true;
+        } else if (error.code === "state_conflict") {
+          lastError = error;
+        } else {
+          throw error;
+        }
+      }
+    }
+    if (!deleted) throw lastError || new Error("The conversation kept changing while it was being purged.");
+    await cancelConversationWork(id);
+    purgedConversationIds.add(id);
+    removePurgedConversation(id);
+  } catch (error) {
+    showError(ui.error_banner, `Conversation could not be purged: ${error.message}`);
+  } finally {
+    purgingConversationIds.delete(id);
+    update();
+  }
+}
+
 async function persistSession(id, state, metadata = {}) {
   let record = historyRecords.find(item => item.id === id);
   if (!record || record.phase !== "active") throw new Error("This conversation is no longer live.");
@@ -800,9 +894,18 @@ async function selectConversation(id) {
   saveDraft();
   const record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
   upsertHistory(record);
-  if (record.phase === "active" && !liveSessions.has(id) && chatRuntimeReady()) await buildConversation(record);
   selectedConversationId = id;
   selectedByView[sessionTypeOf(record)] = id;
+  restoreDraft();
+  update();
+  if (record.phase === "active" && !liveSessions.has(id) && chatRuntimeReady()) {
+    try {
+      await buildConversation(record);
+    } catch (error) {
+      update();
+      throw new Error(`This live conversation could not be restored. You can still purge it: ${error.message}`);
+    }
+  }
   restoreDraft();
   update();
   ui.transcript.scrollTop = ui.transcript.scrollHeight;
@@ -1132,7 +1235,13 @@ function ingressFailureMetrics(record) {
 }
 
 async function recordIngressAttemptFailure(record, error, stage) {
-  const latest = await conversationHistory.get(record.id);
+  let latest;
+  try {
+    latest = await conversationHistory.get(record.id);
+  } catch (fetchError) {
+    if (fetchError.code === "not_found") return null;
+    throw fetchError;
+  }
   if (!["ingress_pending", "ingress_in_progress"].includes(latest.phase)) return latest;
   return conversationHistory.ingressFailure(latest.id, {
     expected_version: latest.version,
@@ -1336,14 +1445,38 @@ async function processIngressQueue() {
           upsertHistory(record);
           update();
         };
-        await runHistoryIngress({
-          kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
-          provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
-          sourceSessionType: record.state?.archive?.sessionType || "conversation",
-          restoredArchive: record.state?.historyIngress,
-          checkpoint: persistIngress,
-          onUpdate: value => { ingressDiagnostic = value; update(); },
-        });
+        const ingressTurn = {
+          recordId: record.id,
+          controller: new AbortController(),
+          operationId: crypto.randomUUID(),
+        };
+        activeConversationIngressTurn = ingressTurn;
+        try {
+          await runHistoryIngress({
+            kweb, intelligence, manuals, rootNodeIds, provenanceId: record.provenance_id,
+            provider, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+            sourceSessionType: record.state?.archive?.sessionType || "conversation",
+            restoredArchive: record.state?.historyIngress,
+            checkpoint: persistIngress,
+            onUpdate: value => { ingressDiagnostic = value; update(); },
+            signal: ingressTurn.controller.signal,
+            operationId: ingressTurn.operationId,
+            beforeMutation: async () => {
+              let latest;
+              try {
+                latest = await conversationHistory.get(record.id);
+              } catch (error) {
+                if (error.code !== "not_found") throw error;
+                throw Object.assign(new Error("This conversation was purged before the Kmap mutation."), { code: "ingress_cancelled" });
+              }
+              if (latest.phase !== "ingress_in_progress") {
+                throw Object.assign(new Error("This conversation is no longer approved for history ingress."), { code: "ingress_cancelled" });
+              }
+            },
+          });
+        } finally {
+          if (activeConversationIngressTurn === ingressTurn) activeConversationIngressTurn = null;
+        }
         ingressDiagnostic = null;
         stage = "completion";
         record = await conversationHistory.ingressCompleted(record.id, { expected_version: record.version });
@@ -1352,7 +1485,18 @@ async function processIngressQueue() {
         await refreshHistory();
       }
     } catch (error) {
+      if (purgingConversationIds.has(record.id) || purgedConversationIds.has(record.id)) {
+        ingressDiagnostic = null;
+        activeIngressRecord = null;
+        return;
+      }
       const failedRecord = await recordIngressAttemptFailure(record, error, stage);
+      if (!failedRecord) {
+        ingressDiagnostic = null;
+        activeIngressRecord = null;
+        await refreshHistory();
+        continue;
+      }
       upsertHistory(failedRecord);
       console.error("History ingress attempt failed", {
         conversationId: record.id,

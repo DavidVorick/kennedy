@@ -266,6 +266,9 @@ The backend atomically records concise ingress failure diagnostics. The fifth
 failure moves the record to `ingress_failed`, removes it from queue selection,
 and frees the worker to process the next conversation; failed records and all
 five logs remain queryable.
+An explicit, optimistic-version-checked purge permanently deletes a record in
+any phase without transitioning it into the ingress queue. The frontend uses
+this destructive path for stuck sessions and cancels locally owned work first.
 
 ### 4.5 Telegram Relay
 
