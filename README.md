@@ -188,7 +188,11 @@ finalized, stable recordings that Kennedy does not already know. It continues
 past files that are still changing or have unfinished WAV headers. It uses the
 recording-start epoch embedded by `vnote-start`; for other matching filenames
 it falls back to the file's modification time. Set `KENNEDY_AUDIO_API` to
-override the default loopback API URL.
+override the default loopback API URL. SHA-256 results are cached privately in
+`.vnote-ingress-sha256-cache-v1` beside the script. A cached digest is reused
+only while the file's device, inode, size, modification time, and change time
+still match, so later backlog scans do not reread unchanged large recordings.
+Deleting the cache is safe; the next scan simply rebuilds it.
 
 After acceptance, the server hashes and stores the original WAV, creates equal
 four-minute-or-shorter windows with fifteen seconds of neighboring overlap,

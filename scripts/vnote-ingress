@@ -7,6 +7,7 @@ AUDIO_API="${KENNEDY_AUDIO_API:-http://127.0.0.1:4325/api/v1/audio-ingress}"
 AUDIO_API="${AUDIO_API%/}"
 VNOTE_LIMIT=5
 VNOTE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CHECKSUM_CACHE="$VNOTE_DIR/.vnote-ingress-sha256-cache-v1"
 STABILITY_SECONDS=2
 
 die() {
@@ -28,6 +29,26 @@ recorded_epoch() {
 
 file_signature() {
     stat --format='%s:%y' -- "$1"
+}
+
+checksum_signature() {
+    # Device, inode, size, mtime, and ctime let unchanged files reuse a digest.
+    # Nanosecond timestamps keep same-size rapid rewrites from looking unchanged.
+    stat --format='%d:%i:%s:%y:%z' -- "$1"
+}
+
+remember_checksum() {
+    local signature="$1"
+    local sha256="$2"
+
+    if [[ -L "$CHECKSUM_CACHE" || ( -e "$CHECKSUM_CACHE" && ! -f "$CHECKSUM_CACHE" ) ]]; then
+        die "checksum cache is not a regular file: $CHECKSUM_CACHE"
+    fi
+    (
+        umask 077
+        printf '%s\t%s\n' "$signature" "$sha256" >>"$CHECKSUM_CACHE"
+    ) || die "could not update checksum cache $CHECKSUM_CACHE"
+    cached_sha256s["$signature"]="$sha256"
 }
 
 wav_is_finalized() {
@@ -70,6 +91,18 @@ uploaded_count=0
 response_file=""
 trap '[[ -z "$response_file" ]] || rm -f -- "$response_file"' EXIT
 
+declare -A cached_sha256s=()
+if [[ -L "$CHECKSUM_CACHE" || ( -e "$CHECKSUM_CACHE" && ! -f "$CHECKSUM_CACHE" ) ]]; then
+    die "checksum cache is not a regular file: $CHECKSUM_CACHE"
+elif [[ -f "$CHECKSUM_CACHE" ]]; then
+    while IFS=$'\t' read -r cached_signature cached_sha256 extra; do
+        if [[ -z "$extra" && -n "$cached_signature" &&
+            "$cached_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            cached_sha256s["$cached_signature"]="$cached_sha256"
+        fi
+    done <"$CHECKSUM_CACHE"
+fi
+
 declare -A initial_signatures=()
 while IFS= read -r -d '' vnote; do
     initial_signatures["$vnote"]="$(file_signature "$vnote")" ||
@@ -91,13 +124,24 @@ while IFS=$'\t' read -r -d '' epoch vnote; do
     fi
     ready_count=$((ready_count + 1))
 
-    sha256="$(sha256sum -- "$vnote")" ||
-        die "could not hash $vnote"
-    sha256="${sha256%% *}"
-    if [[ "$(file_signature "$vnote")" != "$READY_SIGNATURE" ]]; then
+    CHECKSUM_SIGNATURE="$(checksum_signature "$vnote")" ||
+        die "could not inspect $vnote"
+    sha256="${cached_sha256s[$CHECKSUM_SIGNATURE]-}"
+    checksum_was_cached=1
+    if [[ -z "$sha256" ]]; then
+        checksum_was_cached=0
+        sha256="$(sha256sum -- "$vnote")" ||
+            die "could not hash $vnote"
+        sha256="${sha256%% *}"
+    fi
+    if [[ "$(file_signature "$vnote")" != "$READY_SIGNATURE" ||
+        "$(checksum_signature "$vnote")" != "$CHECKSUM_SIGNATURE" ]]; then
         ready_count=$((ready_count - 1))
-        printf 'Changed while hashing; skipped: %s\n' "$(basename -- "$vnote")"
+        printf 'Changed while checking; skipped: %s\n' "$(basename -- "$vnote")"
         continue
+    fi
+    if (( ! checksum_was_cached )); then
+        remember_checksum "$CHECKSUM_SIGNATURE" "$sha256"
     fi
 
     if ! status="$(

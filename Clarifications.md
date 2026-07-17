@@ -29,6 +29,9 @@ canonical documents; this file is not an append-only log.
 
 ## Durable Vnote Audio Ingress
 
+- Historical `vnote-ingress` scans must cache local SHA-256 results and avoid
+  rereading unchanged large recordings; the cache must invalidate when file
+  identity or content-related metadata changes.
 - An i3 hotkey runs `arecord` directly into `/home/user/media/vnotes`. The stop
   hotkey ends `arecord`, then checks the five newest vnotes by SHA-256 and
   uploads any Kennedy has not accepted. Once Kennedy has durably accepted the
