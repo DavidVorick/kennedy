@@ -347,8 +347,11 @@ Execution:
 5. Add the requested durable ID to the directly loaded set.
 6. Mark the requested node and returned active-connection nodes as full.
 7. Assign short IDs to every newly seen node or connection summary.
-8. Convert the payload to in-context node shapes and return it as the tool
-   result.
+8. Convert newly full payloads to in-context node shapes and return them as the
+   tool result. Omit active-connection nodes that were already full before the
+   call. If the requested node was already full through an earlier active
+   expansion, report its identifier without repeating its full body; the call
+   still makes it directly loaded and returns any newly full active connections.
 
 Every model-requested LoadNode or ResetContext invocation consumes one call from
 the shared session or turn budget, including failed calls after basic argument

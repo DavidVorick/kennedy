@@ -49,11 +49,20 @@ export class KwebContext {
   async loadDurable(durableId) {
     if (this.loadedNodeIds.includes(durableId)) throw Object.assign(new Error("That node is already directly loaded."), { code: "already_loaded" });
     if (this.loadedNodeIds.length >= MAX_DIRECTLY_LOADED_NODES) throw Object.assign(new Error("Ten nodes are already directly loaded. Reset the context to continue."), { code: "loaded_node_limit" });
+    const previouslyFullNodeIds = new Set(this.fullNodeIds);
     const payload = await this.api.context(durableId);
     this.ingestNode(payload.requested_node, true, "direct");
     for (const node of payload.active_connection_nodes) this.ingestNode(node, true, "active");
     this.loadedNodeIds.push(durableId);
-    return { requestedNode: this.toContextNode(payload.requested_node), activeConnectionNodes: payload.active_connection_nodes.map(node => this.toContextNode(node)) };
+    const requestedNodeAlreadyLoaded = previouslyFullNodeIds.has(payload.requested_node.id);
+    return {
+      requestedNode: requestedNodeAlreadyLoaded ? null : this.toContextNode(payload.requested_node),
+      requestedNodeIdentifier: this.shortId(payload.requested_node.id),
+      requestedNodeAlreadyLoaded,
+      activeConnectionNodes: payload.active_connection_nodes
+        .filter(node => !previouslyFullNodeIds.has(node.id))
+        .map(node => this.toContextNode(node)),
+    };
   }
 
   async ensureRootsLoaded() {

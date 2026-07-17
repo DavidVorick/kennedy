@@ -108,7 +108,9 @@ export function formatToolResult(toolName, content) {
       return [
         "Memory load completed.",
         "",
-        formatNodes("Requested node", result.requestedNode ? [result.requestedNode] : []),
+        result.requestedNodeAlreadyLoaded
+          ? `Requested node: Node ${result.requestedNodeIdentifier} was already available in full context and is now directly loaded.`
+          : formatNodes("Requested node", result.requestedNode ? [result.requestedNode] : []),
         "",
         formatNodes("Newly available active-connection nodes", result.activeConnectionNodes),
       ].join("\n");

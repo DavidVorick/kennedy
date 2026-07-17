@@ -9,7 +9,7 @@ import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, sortConversationHistory } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
-import { formatKmapContext } from "../public/js/human_format.js";
+import { formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
@@ -207,6 +207,33 @@ test("Kmap snapshot distinguishes direct loads from active expansions", async ()
   await context.loadDurable(id(2));
   snapshot = context.snapshot();
   assert.deepEqual(snapshot.nodes.find(item => item.identifier === 2).contextSources, ["active", "direct"]);
+});
+
+test("LoadNode results omit nodes whose full bodies are already in context", async () => {
+  const context = new KwebContext(new MockKweb([
+    node(1, [3]),
+    node(2, [3]),
+    node(3, [4]),
+    node(4),
+  ]), id(1));
+  await context.initialize();
+
+  const overlappingLoad = await context.loadDurable(id(2));
+  assert.equal(overlappingLoad.requestedNode.shortName, "Node 2");
+  assert.equal(overlappingLoad.requestedNodeAlreadyLoaded, false);
+  assert.deepEqual(overlappingLoad.activeConnectionNodes, []);
+
+  const previouslyExpandedLoad = await context.loadDurable(id(3));
+  assert.equal(previouslyExpandedLoad.requestedNode, null);
+  assert.equal(previouslyExpandedLoad.requestedNodeAlreadyLoaded, true);
+  assert.equal(previouslyExpandedLoad.requestedNodeIdentifier, context.shortId(id(3)));
+  assert.deepEqual(previouslyExpandedLoad.activeConnectionNodes.map(item => item.shortName), ["Node 4"]);
+
+  const formatted = formatToolResult("LoadNode", { ok: true, result: previouslyExpandedLoad });
+  assert.match(formatted, /Node 2 was already available in full context and is now directly loaded/);
+  assert.doesNotMatch(formatted, /Details 3/);
+  assert.match(formatted, /Details 4/);
+  assert.equal(context.snapshot().nodes.filter(item => item.identifier === context.shortId(id(3))).length, 1);
 });
 
 test("legacy nodes without explicit task connections behave as though they have none", async () => {

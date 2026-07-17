@@ -1,7 +1,7 @@
 import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.1";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.2";
-import { ConversationSession } from "./conversation.js?v=20260717.3";
-import { runHistoryIngress } from "./history_ingress.js?v=20260717.3";
+import { ConversationSession } from "./conversation.js?v=20260717.4";
+import { runHistoryIngress } from "./history_ingress.js?v=20260717.4";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260714.7";
 import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.1";
 
