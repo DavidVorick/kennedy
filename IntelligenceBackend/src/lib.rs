@@ -1536,15 +1536,20 @@ fn parse_codex_turn(stdout: &str, stderr: &str, request_id: Uuid) -> Result<Code
             request_id,
         )
     })?;
-    let answer = answer
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            codex_failure(
-                codex_error_detail(stdout, stderr)
-                    .or_else(|| Some("Codex returned no assistant message.".into())),
-                request_id,
+    let answer = match answer.filter(|value| !value.trim().is_empty()) {
+        Some(answer) => answer,
+        None => {
+            if let Some(detail) = codex_error_detail(stdout, stderr) {
+                return Err(codex_failure(Some(detail), request_id));
+            }
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "empty_assistant_message",
+                "Codex turn failed: Codex returned no assistant message.",
             )
-        })?;
+            .with_request_id(request_id));
+        }
+    };
     Ok(CodexTurn {
         thread_id,
         answer,
@@ -3325,6 +3330,28 @@ mod tests {
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.reasoning_tokens, 5);
         assert!(usage.cumulative);
+    }
+
+    #[test]
+    fn codex_empty_assistant_message_has_a_retryable_error_code() {
+        let stdout = concat!(
+            r#"{"type":"thread.started","thread_id":"019f5ca7-020f-7b63-be2f-82785fb68c03"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":""}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":0}}"#,
+            "\n",
+        );
+        let error = match parse_codex_turn(stdout, "", Uuid::new_v4()) {
+            Err(error) => error,
+            Ok(_) => panic!("an empty assistant message must fail"),
+        };
+        assert_eq!(error.code, "empty_assistant_message");
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            "Codex turn failed: Codex returned no assistant message."
+        );
     }
 
     #[test]

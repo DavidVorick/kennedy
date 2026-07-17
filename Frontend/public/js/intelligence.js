@@ -120,7 +120,17 @@ function protocolFailureMessage(error) {
   };
 }
 
-export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {}, onResponse = async () => null, signal = null, operationId = null, requestTimeoutSeconds = null }) {
+async function checkpointContinuation(chatend, directive, timing, onUpdate, checkpoint) {
+  if (!directive?.continueWith) return false;
+  chatend.append(directive.continueWith);
+  onUpdate();
+  const checkpointStarted = performance.now();
+  await checkpoint();
+  addTimingStep(timing, "checkpoint", "Self-time continuation save", elapsedMs(checkpointStarted));
+  return true;
+}
+
+export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {}, onResponse = async () => null, onFinal = async () => null, onNoAnswer = async () => null, signal = null, operationId = null, requestTimeoutSeconds = null }) {
   for (let round = roundOffset; round < AGENT_LOOP_ROUND_LIMIT; round++) {
     throwIfCancelled(signal);
     const roundDirective = await onRoundStart(round + 1);
@@ -144,6 +154,10 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
         { signal, operationId },
       );
     } catch (error) {
+      if (error?.code === "empty_assistant_message") {
+        const directive = await onNoAnswer(round + 1);
+        if (await checkpointContinuation(chatend, directive, timing, onUpdate, checkpoint)) continue;
+      }
       if (error?.code === "stale_codex_thread" && continuation.previousResponseId) {
         continuation.reset();
         usage.resetThread();
@@ -158,7 +172,8 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     usage.record(response.usage, { continued });
     const content = response.message?.content;
     if (response.status !== "complete" || typeof content !== "string") throw new Error("The intelligence service returned an invalid text generation.");
-    chatend.append(response.message);
+    const emptyAnswer = !content.trim();
+    if (!emptyAnswer) chatend.append(response.message);
     continuation.accept(response.response_id, chatend.messages.length);
     const llmTimingMessage = timingMessage("LLM call", timing.steps.at(-1).durationMs);
     chatend.append(llmTimingMessage);
@@ -176,6 +191,12 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       return AGENT_LOOP_SESSION_ENDED;
     }
 
+    if (emptyAnswer) {
+      const directive = await onNoAnswer(round + 1);
+      if (await checkpointContinuation(chatend, directive, timing, onUpdate, checkpoint)) continue;
+      throw new Error("The intelligence service returned no assistant answer.");
+    }
+
     let calls;
     try { calls = parseToolCalls(content); }
     catch (error) {
@@ -187,6 +208,8 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       continue;
     }
     if (!calls) {
+      const directive = await onFinal(content, round + 1);
+      if (await checkpointContinuation(chatend, directive, timing, onUpdate, checkpoint)) continue;
       const summary = updateTimingSummary(timing);
       chatend.append(summary);
       onUpdate();

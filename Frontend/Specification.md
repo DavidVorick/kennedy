@@ -759,17 +759,24 @@ inspectable. The live status says `One run · slice N`; history rows use the
 launch prompt plus the session number, falling back to `Self time · session N`
 when no prompt was supplied.
 
-One same-origin `kennedy-free-time` Web Lock owns execution across tabs. A
-normal final response or successful `EndSelfTimeSession` finalizes the current
-record directly into read-only `complete` history without submitting its
-Chatend to history ingress: the live self-time session already performs Kmap
-memory work with its run-level provenance. If at least five minutes remain
-before the persisted deadline, the controller increments the slice index and
-creates a new record with a fresh Chatend, context, continuation, counters, and
-the unchanged run deadline/provenance. An optional end-tool message is durably
-promoted to that next record and removed before any later rollover. With less
-than five minutes left, the run ends and no message is forwarded. Startup
-restores an active pending slice and reacquires the lock; provider or checkpoint
+One same-origin `kennedy-free-time` Web Lock owns execution across tabs. Only a
+successful `EndSelfTimeSession`, the shared deadline, or its hard-stop grace
+finalizes the current record directly into read-only `complete` history without
+submitting its Chatend to history ingress: the live self-time session already
+performs Kmap memory work with its run-level provenance. An ordinary final
+answer remains inside the active Chatend; the controller appends and checkpoints
+a user-role continuation notice with the current remaining time, then immediately
+runs another model round. A Codex completion with no assistant answer receives a
+different continuation notice asking for a concrete answer or Kennedy tool call
+and is retried the same way. Neither condition creates a new clean-slate record.
+
+After an explicit end-tool call, if at least five minutes remain before the
+persisted deadline, the controller increments the slice index and creates a new
+record with a fresh Chatend, context, continuation, counters, and the unchanged
+run deadline/provenance. An optional end-tool message is durably promoted to
+that next record and removed before any later rollover. With less than five
+minutes left, the run ends and no message is forwarded. Startup restores an
+active pending slice and reacquires the lock; other provider or checkpoint
 failures retry the same durable turn.
 
 Before every model round and immediately after every model response, the

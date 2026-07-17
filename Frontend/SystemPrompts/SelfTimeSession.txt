@@ -1,5 +1,7 @@
 You are in a 'self time' session, which means there is no user interaction. You are free to do whatever you want, though you may have been given a guiding prompt. All tools are available for you to use in this session. You have a bounded amount of time total to run self time, the amount of time remaining is occasionally displayed to you.
 
+A normal answer does not end a self-time session. After any answer without EndSelfTimeSession, the self-time controller will tell you how much time remains and ask you to continue. Keep doing concrete work until the shared deadline arrives, or call EndSelfTimeSession explicitly when you intentionally want to close this clean-slate session. Do not merely announce that work is incomplete or that the session has ended.
+
 LoadNode and ResetContext share a budget of 50 requests per clean-slate self-time session, including failed requests.
 
 You have one tool available to you that only exists in self time sessions:

@@ -15,7 +15,7 @@ import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelay
 import { formatDuration } from "../public/js/timing.js";
 import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
-import { FREE_TIME_CONTINUATION_MINIMUM_MS, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, MAX_SELF_TIME_PROMPT_CHARACTERS, freeTimeCanStartNewSession, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "../public/js/self_time.js";
+import { FREE_TIME_CONTINUATION_MINIMUM_MS, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, MAX_SELF_TIME_PROMPT_CHARACTERS, freeTimeCanStartNewSession, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeTiming, freeTimeTurnContinuationMessage, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "../public/js/self_time.js";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventDeadlineMs, telegramEventTimeoutMs } from "../public/js/telegram_timing.js";
 
 const id = n => n.toString(16).padStart(40, "0");
@@ -572,6 +572,14 @@ test("self-time clocks, rollover threshold, and custom prompt preserve one durab
     customPrompt: "Study the Telegram relay.",
   }, now);
   assert.equal(opening, "Self time session 2 is open, you have 5:00 remaining in the shared sessions run.");
+  assert.match(
+    freeTimeTurnContinuationMessage({ deadlineAt: new Date(now + 300_000).toISOString() }, now),
+    /still active, with 5:00 remaining.*normal answer does not end self time.*EndSelfTimeSession/s,
+  );
+  assert.match(
+    freeTimeNoAnswerContinuationMessage({ deadlineAt: new Date(now + 300_000).toISOString() }, now),
+    /no assistant answer.*5:00 remaining.*concrete answer or Kennedy tool call/s,
+  );
   const next = nextFreeTimeSlice({
     runId: "self-time-run", sliceIndex: 2, deadlineAt: new Date(now + 600_000).toISOString(),
     customPrompt: "Study the Telegram relay.", handoffMessage: "Old message.",
@@ -780,6 +788,66 @@ test("EndSelfTimeSession checkpoints its result and returns loop control without
   assert.equal(requests, 1);
   assert.equal(checkpoints, 1);
   assert.match(chatend.messages.at(-1).content, /total time unchanged/i);
+});
+
+test("self time continues after empty and ordinary answers until EndSelfTimeSession", async () => {
+  const now = Date.parse("2026-07-17T12:00:00Z");
+  const requests = [];
+  let generations = 0;
+  const intelligence = {
+    generate: async request => {
+      requests.push(request);
+      generations += 1;
+      if (generations === 1) {
+        throw Object.assign(new Error("Codex turn failed: Codex returned no assistant message."), {
+          code: "empty_assistant_message",
+        });
+      }
+      if (generations === 2) {
+        return {
+          status: "complete", response_id: "ordinary-answer-thread", usage: null,
+          message: { role: "assistant", content: "Session ended before the work was completed." },
+        };
+      }
+      return {
+        status: "complete", response_id: "end-session-thread", usage: null,
+        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndSelfTimeSession","arguments":{}}]}' },
+      };
+    },
+  };
+  const checkpoints = [];
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1)]), intelligence, manuals: promptManuals(), rootNodeIds: [id(1)],
+    provider: "p", model: "m", sessionType: "free-time", provenanceId: "prov", now: () => now,
+    freeTime: {
+      runId: "run-1", runStartedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 600_000).toISOString(),
+      durationMinutes: 10, sliceIndex: 1, provenanceId: "prov",
+    },
+    persist: async state => checkpoints.push(structuredClone(state)),
+  });
+  await session.initialize();
+  session.stageFreeTimeOpening();
+  await assert.rejects(
+    () => session.finalizeFreeTime(),
+    /only after EndSelfTimeSession or the shared deadline/,
+  );
+
+  const result = await session.resumePendingTurn();
+
+  assert.equal(result.description, AGENT_LOOP_SESSION_ENDED.description);
+  assert.equal(generations, 3);
+  assert.equal(session.freeTimeEndReason, "tool");
+  assert.equal(session.pendingTurn, false);
+  const controllerMessages = session.chatend.messages.filter(message => message.context_kind === "free-time-continuation");
+  assert.equal(controllerMessages.length, 2);
+  assert.match(controllerMessages[0].content, /no assistant answer.*10:00 remaining/s);
+  assert.match(controllerMessages[1].content, /still active, with 10:00 remaining.*normal answer does not end self time/s);
+  assert.equal(requests[1].previous_response_id, null);
+  assert.match(requests[1].chatend, /no assistant answer/);
+  assert.equal(requests[2].previous_response_id, "ordinary-answer-thread");
+  assert.match(requests[2].chatend, /normal answer does not end self time/);
+  assert.ok(checkpoints.some(state => state.archive.messages.some(message => message.content?.includes?.("no assistant answer"))));
+  assert.ok(checkpoints.some(state => state.archive.messages.some(message => message.content?.includes?.("normal answer does not end self time"))));
 });
 
 test("a pre-boundary Codex thread is replayed from the full visible Chatend", async () => {

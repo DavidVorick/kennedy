@@ -2,9 +2,9 @@ import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260717.7";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
 import { ToolExecutor } from "./tools.js?v=20260717.9";
-import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.8";
+import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.9";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260717.1";
+import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeTurnContinuationMessage, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260717.2";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -299,6 +299,8 @@ export class ConversationSession {
         operationId: turn?.operationId,
         onRoundStart: () => this.prepareFreeTimeRound(),
         onResponse: () => this.prepareFreeTimeRound(),
+        onFinal: () => this.freeTimeContinuationDirective("final"),
+        onNoAnswer: () => this.freeTimeContinuationDirective("no-answer"),
         requestTimeoutSeconds: () => this.freeTimeRequestTimeoutSeconds(),
       });
       if (turn?.controller.signal.aborted) throw turnStoppedError();
@@ -490,6 +492,34 @@ export class ConversationSession {
     this.chatend.append(message);
   }
 
+  freeTimeContinuationDirective(kind) {
+    if (this.sessionType !== "free-time") return null;
+    const content = kind === "no-answer"
+      ? freeTimeNoAnswerContinuationMessage(this.freeTime, this.now())
+      : freeTimeTurnContinuationMessage(this.freeTime, this.now());
+    return {
+      continueWith: {
+        role: "user",
+        display_role: "Self time controller",
+        context_kind: "free-time-continuation",
+        content,
+      },
+    };
+  }
+
+  async continueFreeTimeAfterUnexpectedCompletion() {
+    if (this.sessionType !== "free-time" || this.pendingTurn || this.freeTimeEndReason) return false;
+    delete this.freeTime.sliceEndedReason;
+    delete this.freeTime.sliceEndedAt;
+    this.chatend.append(this.freeTimeContinuationDirective("final").continueWith);
+    this.pendingTurn = true;
+    this.pendingCheckpointed = false;
+    await this.persistSnapshot(this.snapshot());
+    this.pendingCheckpointed = true;
+    this.onUpdate();
+    return true;
+  }
+
   async prepareFreeTimeRound() {
     if (this.sessionType !== "free-time") return null;
     const timing = freeTimeTiming(this.freeTime, this.now());
@@ -510,9 +540,15 @@ export class ConversationSession {
     return null;
   }
 
-  async finalizeFreeTime(reason = this.freeTimeEndReason || "completed") {
+  async finalizeFreeTime(reason = this.freeTimeEndReason) {
     if (this.sessionType !== "free-time") return;
-    if (freeTimeTiming(this.freeTime, this.now()).expired && !this.freeTime.expiredNoticeAt) {
+    const timing = freeTimeTiming(this.freeTime, this.now());
+    const explicitToolEnd = reason === "tool" && this.freeTimeEndReason === "tool";
+    const timerEnd = ["deadline", "hard-stop"].includes(reason) && timing.expired;
+    if (!explicitToolEnd && !timerEnd) {
+      throw new Error("Self time can finalize only after EndSelfTimeSession or the shared deadline.");
+    }
+    if (timing.expired && !this.freeTime.expiredNoticeAt) {
       this.freeTime.expiredNoticeAt = new Date(this.now()).toISOString();
       this.appendFreeTimeTimerMessage(freeTimeExpiredMessage());
     }

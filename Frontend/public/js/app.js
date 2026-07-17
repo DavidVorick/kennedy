@@ -1,10 +1,10 @@
 import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.7";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
-import { ConversationSession } from "./conversation.js?v=20260717.14";
+import { ConversationSession } from "./conversation.js?v=20260717.15";
 import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260717.3";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260717.8";
 import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260717.12";
-import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260717.1";
+import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260717.2";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventTimeoutMs } from "./telegram_timing.js?v=20260717.1";
 
 const CONFIG = {
@@ -1283,7 +1283,8 @@ async function runFreeTimeRecord(id) {
     renderSelfTimeControls();
     if (session.canStop) Promise.resolve(session.stopPendingTurn()).catch(() => {});
   });
-  let reason = session.freeTime?.sliceEndedReason || null;
+  const savedReason = session.freeTime?.sliceEndedReason;
+  let reason = ["tool", "deadline", "hard-stop"].includes(savedReason) ? savedReason : null;
   let lastRetryError = null;
   try {
     while (!reason) {
@@ -1299,8 +1300,12 @@ async function runFreeTimeRecord(id) {
         session.pendingCheckpointed = true;
       }
       if (!session.pendingTurn) {
-        reason = session.freeTimeEndReason || (currentTiming.expired ? "deadline" : "completed");
-        break;
+        if (session.freeTimeEndReason || currentTiming.expired) {
+          reason = session.freeTimeEndReason || "deadline";
+          break;
+        }
+        await session.continueFreeTimeAfterUnexpectedCompletion();
+        continue;
       }
       try {
         await session.resumePendingTurn();

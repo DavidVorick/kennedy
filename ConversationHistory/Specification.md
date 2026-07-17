@@ -76,9 +76,10 @@ active -> ingress_pending -> ingress_in_progress -> complete
 - Explicitly ending a conversation checkpoints its final state and changes
   `active` to `ingress_pending` immediately.
 - Completing a `free-time` record checkpoints its final state and changes it
-  directly from `active` to `complete`; both the direct-completion transition
-  and queue selection verify its stored session type. Existing queued or failed
-  self-time records are migrated to `complete`.
+  directly from `active` to `complete`; the submitted state must record a
+  `tool`, `deadline`, or `hard-stop` slice-ending reason. Both the
+  direct-completion transition and queue selection verify its stored session
+  type. Existing queued or failed self-time records are migrated to `complete`.
 - The oldest eligible queued conversation is selected by last user activity,
   falling back to its start time. An actively claimed `ingress_in_progress`
   record wins; deferred records are skipped until their next-attempt time.
@@ -128,7 +129,8 @@ index serializes memory updates even when several conversations close together.
 - `DELETE /api/v1/conversations/{id}`
 - `PUT /api/v1/conversations/{id}/checkpoint`
 - `POST /api/v1/conversations/{id}/request-ingress`
-- `POST /api/v1/conversations/{id}/complete` (self time only; no ingress)
+- `POST /api/v1/conversations/{id}/complete` (self time only; requires an
+  explicit end-tool or deadline reason and does not start ingress)
 - `POST /api/v1/conversations/{id}/ingress-started`
 - `PUT /api/v1/conversations/{id}/ingress-checkpoint`
 - `POST /api/v1/conversations/{id}/ingress-completed`

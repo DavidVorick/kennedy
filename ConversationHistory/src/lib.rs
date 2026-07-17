@@ -696,6 +696,14 @@ fn complete_self_time(
             "Only self-time records can complete without history ingress.",
         ));
     }
+    let ended_reason = state
+        .pointer("/freeTime/sliceEndedReason")
+        .and_then(Value::as_str);
+    if !matches!(ended_reason, Some("tool" | "deadline" | "hard-stop")) {
+        return Err(ApiError::bad(
+            "Self time can complete only after EndSelfTimeSession or the shared deadline.",
+        ));
+    }
     update_active(db, id, expected_version, state, "complete")
 }
 
@@ -1039,13 +1047,23 @@ mod tests {
     #[test]
     fn self_time_completes_directly_without_entering_the_ingress_queue() {
         let db = database();
-        let state = json!({
+        let active_state = json!({
             "sessionType":"free-time",
             "archive":{"format":"kennedy-chatend","sessionType":"free-time"}
         });
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1,1)", [serde_json::to_string(&state).unwrap()]).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1,1)", [serde_json::to_string(&active_state).unwrap()]).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('conversation','active','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{\"sessionType\":\"conversation\"}',1)", []).unwrap();
 
+        let unfinished = complete_self_time(&db, "self-time", 1, &active_state).unwrap_err();
+        assert_eq!(unfinished.code, "invalid_request");
+        assert!(unfinished.message.contains("EndSelfTimeSession"));
+        assert_eq!(fetch_record(&db, "self-time").unwrap().phase, "active");
+
+        let state = json!({
+            "sessionType":"free-time",
+            "freeTime":{"sliceEndedReason":"tool"},
+            "archive":{"format":"kennedy-chatend","sessionType":"free-time"}
+        });
         let completed = complete_self_time(&db, "self-time", 1, &state).unwrap();
         assert_eq!(completed.phase, "complete");
         assert_eq!(completed.version, 2);
