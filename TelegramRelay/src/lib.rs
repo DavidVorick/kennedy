@@ -24,7 +24,9 @@ use teloxide::{
     payloads::SendMessageSetters,
     prelude::*,
     requests::Request,
-    types::{AllowedUpdate, ChatMemberKind, Message, MessageEntityKind, Update, UpdateKind},
+    types::{
+        AllowedUpdate, ChatMemberKind, Message, MessageEntityKind, MessageKind, Update, UpdateKind,
+    },
 };
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -1650,6 +1652,20 @@ fn migrate_group_identity(
     directory_group_by_id(db, new_chat_id)?.context("reading migrated Telegram group")
 }
 
+fn migrate_group_from_message(db: &Connection, message: &Message) -> anyhow::Result<bool> {
+    let chat_id = message.chat.id.0;
+    let title = message.chat.title().unwrap_or("Telegram group");
+    if let Some(new_chat_id) = message.migrate_to_chat_id() {
+        migrate_group_identity(db, chat_id, new_chat_id.0, title)?;
+        return Ok(true);
+    }
+    if let Some(old_chat_id) = message.migrate_from_chat_id() {
+        migrate_group_identity(db, old_chat_id.0, chat_id, title)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn blacklist_group(db: &Connection, chat_id: i64, reason: &str) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
     db.execute(
@@ -1699,6 +1715,82 @@ fn upsert_group_member(
     Ok(())
 }
 
+#[derive(Debug)]
+struct GroupMessageAuthor {
+    telegram_user_id: Option<i64>,
+    username: Option<String>,
+    display_name: String,
+    authorized: bool,
+    group_authored: bool,
+}
+
+fn is_group_authored_message(message: &Message) -> bool {
+    message
+        .sender_chat
+        .as_ref()
+        .is_some_and(|sender| sender.id == message.chat.id)
+        || message
+            .from
+            .as_ref()
+            .is_some_and(|user| user.is_anonymous())
+}
+
+fn observe_group_message_author(
+    db: &Connection,
+    chat_id: i64,
+    message: &Message,
+) -> anyhow::Result<Option<GroupMessageAuthor>> {
+    if is_group_authored_message(message) {
+        return Ok(Some(GroupMessageAuthor {
+            telegram_user_id: None,
+            username: None,
+            display_name: message
+                .author_signature()
+                .unwrap_or("Anonymous group administrator")
+                .to_owned(),
+            authorized: true,
+            group_authored: true,
+        }));
+    }
+    let Some(user) = message.from.as_ref() else {
+        return Ok(None);
+    };
+    let telegram_user_id =
+        i64::try_from(user.id.0).context("Telegram user ID exceeds SQLite range")?;
+    let outcome = observe_identity(
+        db,
+        telegram_user_id,
+        user.username.as_deref(),
+        &user.full_name(),
+    )?;
+    upsert_group_member(
+        db,
+        chat_id,
+        telegram_user_id,
+        user.username.as_deref(),
+        &user.full_name(),
+        "member",
+    )?;
+    let authorized = matches!(
+        outcome,
+        TofuOutcome::Whitelisted | TofuOutcome::UnresolvedHandleClaimed
+    );
+    if !authorized {
+        blacklist_group(
+            db,
+            chat_id,
+            "A group message came from a non-whitelisted or TOFU-conflicting identity.",
+        )?;
+    }
+    Ok(Some(GroupMessageAuthor {
+        telegram_user_id: Some(telegram_user_id),
+        username: user.username.clone(),
+        display_name: user.full_name(),
+        authorized,
+        group_authored: false,
+    }))
+}
+
 fn process_group_membership(
     state: &AppState,
     change: teloxide::types::ChatMemberUpdated,
@@ -1712,7 +1804,8 @@ fn process_group_membership(
     let target_id = i64::try_from(target.id.0).context("Telegram user ID exceeds SQLite range")?;
     let (membership, active) = member_status(&change.new_chat_member.kind);
     let is_kennedy = state.bot_user_id == Some(target_id);
-    let outcome = if is_kennedy || !active {
+    let is_group_anonymous_bot = target.is_anonymous();
+    let outcome = if is_kennedy || is_group_anonymous_bot || !active {
         None
     } else {
         let db = state
@@ -1732,6 +1825,9 @@ fn process_group_membership(
         .map_err(|_| anyhow::anyhow!("locking user directory"))?;
     ensure_group(&db, chat_id, title)?;
     if group_state(&db, chat_id)?.as_deref() == Some("blacklisted") {
+        return Ok(());
+    }
+    if is_group_anonymous_bot {
         return Ok(());
     }
     if is_kennedy {
@@ -1979,53 +2075,28 @@ async fn process_group_message(
 ) -> anyhow::Result<()> {
     let chat_id = message.chat.id.0;
     let title = message.chat.title().unwrap_or("Telegram group");
-    if let Some(new_chat_id) = message.migrate_to_chat_id() {
+    {
         let db = state
             .users
             .lock()
             .map_err(|_| anyhow::anyhow!("locking user directory"))?;
-        migrate_group_identity(&db, chat_id, new_chat_id.0, title)?;
-        return Ok(());
+        if migrate_group_from_message(&db, &message)? {
+            return Ok(());
+        }
     }
-    let Some(user) = message.from.as_ref() else {
-        return Ok(());
-    };
-    let telegram_user_id =
-        i64::try_from(user.id.0).context("Telegram user ID exceeds SQLite range")?;
-    let outcome = {
+    let author = {
         let db = state
             .users
             .lock()
             .map_err(|_| anyhow::anyhow!("locking user directory"))?;
         ensure_group(&db, chat_id, title)?;
-        let outcome = observe_identity(
-            &db,
-            telegram_user_id,
-            user.username.as_deref(),
-            &user.full_name(),
-        )?;
-        upsert_group_member(
-            &db,
-            chat_id,
-            telegram_user_id,
-            user.username.as_deref(),
-            &user.full_name(),
-            "member",
-        )?;
-        if !matches!(
-            outcome,
-            TofuOutcome::Whitelisted | TofuOutcome::UnresolvedHandleClaimed
-        ) {
-            blacklist_group(
-                &db,
-                chat_id,
-                "A group message came from a non-whitelisted or TOFU-conflicting identity.",
-            )?;
-        }
+        let Some(author) = observe_group_message_author(&db, chat_id, &message)? else {
+            return Ok(());
+        };
         for member in message.new_chat_members().unwrap_or_default() {
             let member_id =
                 i64::try_from(member.id.0).context("Telegram user ID exceeds SQLite range")?;
-            if state.bot_user_id == Some(member_id) {
+            if state.bot_user_id == Some(member_id) || member.is_anonymous() {
                 continue;
             }
             let member_outcome = observe_identity(
@@ -2056,7 +2127,7 @@ async fn process_group_message(
         if let Some(member) = message.left_chat_member() {
             let member_id =
                 i64::try_from(member.id.0).context("Telegram user ID exceeds SQLite range")?;
-            if state.bot_user_id != Some(member_id) {
+            if state.bot_user_id != Some(member_id) && !member.is_anonymous() {
                 upsert_group_member(
                     &db,
                     chat_id,
@@ -2067,13 +2138,15 @@ async fn process_group_message(
                 )?;
             }
         }
-        outcome
+        author
     };
-    if !matches!(
-        outcome,
-        TofuOutcome::Whitelisted | TofuOutcome::UnresolvedHandleClaimed
-    ) || !validate_group_membership(bot, state, chat_id).await?
-    {
+    if !author.authorized {
+        return Ok(());
+    }
+    if author.group_authored && !matches!(&message.kind, MessageKind::Common(_)) {
+        return Ok(());
+    }
+    if !validate_group_membership(bot, state, chat_id).await? {
         return Ok(());
     }
     let text = message
@@ -2092,7 +2165,7 @@ async fn process_group_message(
             "INSERT INTO telegram_group_messages(chat_id,message_id,update_id,telegram_user_id,username,display_name,text,reply_to_message_id,created_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(chat_id,message_id) DO UPDATE SET text=excluded.text,username=excluded.username,display_name=excluded.display_name,reply_to_message_id=excluded.reply_to_message_id",
-            params![chat_id, i64::from(message.id.0), update_id, telegram_user_id, user.username, user.full_name(), text, reply_to, message.date.to_rfc3339()],
+            params![chat_id, i64::from(message.id.0), update_id, author.telegram_user_id, author.username.as_deref(), &author.display_name, text, reply_to, message.date.to_rfc3339()],
         )?;
     }
     if edited {
@@ -2101,7 +2174,8 @@ async fn process_group_message(
     let Some(bot_user_id) = state.bot_user_id else {
         return Ok(());
     };
-    let invoked = group_invokes_kennedy(&message, bot_user_id, state.bot_username.as_deref());
+    let invoked = !author.group_authored
+        && group_invokes_kennedy(&message, bot_user_id, state.bot_username.as_deref());
     let users = state
         .users
         .lock()
@@ -2119,6 +2193,9 @@ async fn process_group_message(
         .lock()
         .map_err(|_| anyhow::anyhow!("locking Telegram database"))?;
     if invoked {
+        let telegram_user_id = author
+            .telegram_user_id
+            .context("an invoking Telegram group message must have an identified user")?;
         let messages = recent_group_messages(&db, chat_id, i64::from(message.id.0), 50)?;
         let context = json!({
             "groupTitle":title, "chatId":chat_id, "invokingTelegramUserId":telegram_user_id,
@@ -2128,7 +2205,7 @@ async fn process_group_message(
         db.execute(
             "INSERT INTO telegram_events(id,update_id,message_id,telegram_user_id,chat_id,username,display_name,kind,text,status,created_at,session_kind,group_context_json)
              VALUES(?1,?2,?3,?4,?5,?6,?7,'text',?8,'pending',?9,'group',?10) ON CONFLICT(update_id) DO NOTHING",
-            params![Uuid::new_v4().to_string(), update_id, i64::from(message.id.0), telegram_user_id, chat_id, user.username, user.full_name(), text, message.date.to_rfc3339(), serde_json::to_string(&context)?],
+            params![Uuid::new_v4().to_string(), update_id, i64::from(message.id.0), telegram_user_id, chat_id, author.username.as_deref(), &author.display_name, text, message.date.to_rfc3339(), serde_json::to_string(&context)?],
         )?;
         drop(db);
         let users = state
@@ -2322,6 +2399,117 @@ mod tests {
             )
             .unwrap();
         assert_eq!(members, 1);
+    }
+
+    #[test]
+    fn group_anonymous_bot_is_group_authored_transport_not_an_identity() {
+        let (_, users) = databases();
+        ensure_group(&users, -1001555296434, "Friends").unwrap();
+        let message: Message = serde_json::from_str(
+            r#"{
+                "message_id": 7,
+                "date": 1629404938,
+                "from": {
+                    "id": 1087968824,
+                    "is_bot": true,
+                    "first_name": "Group",
+                    "username": "GroupAnonymousBot"
+                },
+                "author_signature": "Anonymous Admin",
+                "sender_chat": {
+                    "id": -1001555296434,
+                    "title": "Friends",
+                    "type": "supergroup"
+                },
+                "chat": {
+                    "id": -1001555296434,
+                    "title": "Friends",
+                    "type": "supergroup"
+                },
+                "text": "hello"
+            }"#,
+        )
+        .unwrap();
+
+        let author = observe_group_message_author(&users, -1001555296434, &message)
+            .unwrap()
+            .unwrap();
+        assert!(author.authorized);
+        assert!(author.group_authored);
+        assert_eq!(author.telegram_user_id, None);
+        assert_eq!(author.username, None);
+        assert_eq!(author.display_name, "Anonymous Admin");
+        assert_eq!(
+            group_state(&users, -1001555296434).unwrap().as_deref(),
+            Some("validating")
+        );
+        let observed: i64 = users
+            .query_row(
+                "SELECT COUNT(*) FROM observed_identities WHERE telegram_user_id=1087968824",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let members: i64 = users
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_group_members WHERE chat_id=-1001555296434",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observed, 0);
+        assert_eq!(members, 0);
+    }
+
+    #[test]
+    fn group_anonymous_bot_migrate_from_update_only_migrates_the_group() {
+        let (_, users) = databases();
+        let old = ensure_group(&users, -599075523, "Friends").unwrap();
+        let message: Message = serde_json::from_str(
+            r#"{
+                "message_id": 1,
+                "date": 1629404938,
+                "from": {
+                    "id": 1087968824,
+                    "is_bot": true,
+                    "first_name": "Group",
+                    "username": "GroupAnonymousBot"
+                },
+                "migrate_from_chat_id": -599075523,
+                "sender_chat": {
+                    "id": -1001555296434,
+                    "title": "Friends",
+                    "type": "supergroup"
+                },
+                "chat": {
+                    "id": -1001555296434,
+                    "title": "Friends",
+                    "type": "supergroup"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(migrate_group_from_message(&users, &message).unwrap());
+        let migrated = directory_group_by_id(&users, -1001555296434)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.root_node_id, old.root_node_id);
+        assert_eq!(migrated.state, "validating");
+        let observed: i64 = users
+            .query_row("SELECT COUNT(*) FROM observed_identities", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let members: i64 = users
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_group_members WHERE chat_id=-1001555296434",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observed, 0);
+        assert_eq!(members, 0);
     }
 
     #[tokio::test]

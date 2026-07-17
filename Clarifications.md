@@ -480,6 +480,13 @@ canonical documents; this file is not an append-only log.
   of administrator monitoring after activation, or incomplete membership
   ledger permanently blacklists that chat ID. Later whitelisting or membership
   changes never revive it; users must create a new group.
+- Treat Telegram's canonical `GroupAnonymousBot` sender, or a `sender_chat`
+  equal to the current group, as group-authored transport rather than a member
+  identity. It must never enter TOFU, the whitelist, or the member ledger and
+  must not cause blacklisting. Preserve ordinary anonymous-admin messages in
+  group context and background ingress, but do not let them invoke Kennedy
+  because they have no identifiable invoking-user root. Handle both halves of
+  Telegram group-to-supergroup migration as service updates, not user traffic.
 - Invoke Kennedy in an allowed group only when a message mentions her bot
   handle or replies to one of her messages. Every invocation is an independent
   `telegram-group` session. Assign every observed group its own reserved blank
