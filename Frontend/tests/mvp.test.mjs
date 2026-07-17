@@ -17,7 +17,7 @@ import { formatChatend, formatContextWindowProgress } from "../public/js/chatend
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
-const node = (n, active = [], fanout = [], tasks = [], lastModifiedBy = "legacy-unknown") => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}`, long_description: `Details ${n}`, last_modified_by: lastModifiedBy, task_connections: tasks.map(([task, priority]) => ({ ...summary(task), priority })), active_connections: active.map(summary), fanout_connections: fanout.map(summary), history_head_id: id(100 + n) });
+const node = (n, active = [], fanout = [], fixed = [], lastModifiedBy = "legacy-unknown") => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}`, long_description: `Details ${n}`, last_modified_by: lastModifiedBy, owner_root_node_id: id(1), fixed_connections: fixed.map(([target, slot]) => ({ ...summary(target), slot })), active_connections: active.map(summary), fanout_connections: fanout.map(summary), history_head_id: id(100 + n) });
 const promptManuals = (label = "Shared") => ({
   identity: `${label} identity`,
   conversationSession: `${label} conversation session`,
@@ -271,12 +271,12 @@ test("LoadNode classifies and deduplicates direct and indirect fanout references
   assert.doesNotMatch(formatted, /Summary: Summary 8/);
 });
 
-test("legacy nodes without explicit task connections behave as though they have none", async () => {
+test("legacy nodes without explicit fixed connections behave as though they have none", async () => {
   const legacy = node(1);
-  delete legacy.task_connections;
+  delete legacy.fixed_connections;
   const context = new KwebContext(new MockKweb([legacy]), id(1));
   await context.initialize();
-  assert.deepEqual(context.snapshot().nodes[0].taskConnections, []);
+  assert.deepEqual(context.snapshot().nodes[0].fixedConnections, []);
 });
 
 test("Kmap archives restore raw nodes and short identifiers exactly", async () => {
@@ -381,7 +381,7 @@ test("history ingress rechecks authorization before a Kmap mutation", async () =
   assert.equal(api.connected, null);
 });
 
-test("ConsolidateFanout and AssignTask translate short IDs and refresh task connections", async () => {
+test("ConsolidateFanout and SetFixedConnection translate short IDs and refresh fixed connections", async () => {
   const api = new MockKweb([node(1, [], [2, 3, 4]), node(2), node(3), node(4)]);
   const context = new KwebContext(api, id(1)); await context.initialize();
   await context.loadDurable(id(2));
@@ -389,9 +389,9 @@ test("ConsolidateFanout and AssignTask translate short IDs and refresh task conn
     api.consolidated = body;
     return { nodes: [node(1, [], [2], [], body.model_attribution), node(2, [], [3, 4], [], body.model_attribution)] };
   };
-  api.assignTask = async body => {
+  api.setFixedConnection = async body => {
     api.assigned = body;
-    return { node: body.child_node_id ? node(1, [], [3, 4], [[2, body.priority]], body.model_attribution) : node(1, [], [3, 4], [], body.model_attribution), replaced_task: null };
+    return { node: body.child_node_id ? node(1, [], [3, 4], [[2, body.slot]], body.model_attribution) : node(1, [], [3, 4], [], body.model_attribution), replaced_fixed_connection: null };
   };
   const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", modelAttribution: "gpt-test-xhigh", loadLimit: 20 });
   const consolidated = await executor.execute({ id: "a", name: "ConsolidateFanout", arguments: { parentIdentifier: 1, aggregatorIdentifier: 2, fanoutIdentifiers: [3, 4] } });
@@ -399,14 +399,14 @@ test("ConsolidateFanout and AssignTask translate short IDs and refresh task conn
   assert.deepEqual(api.consolidated, { parent_node_id: id(1), aggregator_node_id: id(2), fanout_node_ids: [id(3), id(4)], model_attribution: "gpt-test-xhigh" });
   assert.deepEqual(context.diagnostics().fullNodeIds.sort(), [id(1), id(2)].sort());
 
-  const assigned = await executor.execute({ id: "b", name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: 2, priority: "high" } });
-  assert.match(assigned.message.content, /Task connection assigned/);
-  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: id(2), priority: "high", model_attribution: "gpt-test-xhigh" });
-  assert.equal(context.snapshot().nodes.find(item => item.identifier === 1).taskConnections[0].priority, "high");
+  const assigned = await executor.execute({ id: "b", name: "SetFixedConnection", arguments: { parentIdentifier: 1, childIdentifier: 2, slot: 1 } });
+  assert.match(assigned.message.content, /Fixed connection assigned/);
+  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: id(2), slot: 1, model_attribution: "gpt-test-xhigh" });
+  assert.equal(context.snapshot().nodes.find(item => item.identifier === 1).fixedConnections[0].slot, 1);
 
-  const cleared = await executor.execute({ id: "c", name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: "blank", priority: "high" } });
-  assert.match(cleared.message.content, /Task slot cleared/);
-  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: null, priority: "high", model_attribution: "gpt-test-xhigh" });
+  const cleared = await executor.execute({ id: "c", name: "SetFixedConnection", arguments: { parentIdentifier: 1, childIdentifier: "blank", slot: 1 } });
+  assert.match(cleared.message.content, /Fixed connection slot cleared/);
+  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: null, slot: 1, model_attribution: "gpt-test-xhigh" });
 });
 
 test("CreateNode and UpdateNode add model attribution outside Kennedy's arguments", async () => {
@@ -422,13 +422,13 @@ test("CreateNode and UpdateNode add model attribution outside Kennedy's argument
     return { node: node(2, [], [], [], body.model_attribution) };
   };
   const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", modelAttribution: "gpt-5.6-sol-xhigh", loadLimit: 20 });
-  const createArguments = { parentIdentifiers: [1], shortName: "New Memory", shortDescription: "Summary.", longDescription: "Details." };
+  const createArguments = { parentIdentifiers: [1], ownerIdentifier: 1, shortName: "New Memory", shortDescription: "Summary.", longDescription: "Details." };
   const created = await executor.execute({ id: "create", name: "CreateNode", arguments: createArguments });
   assert.equal(api.created.model_attribution, "gpt-5.6-sol-xhigh");
   assert.equal("model_attribution" in createArguments, false);
   assert.match(created.message.content, /Last modified by: gpt-5.6-sol-xhigh/);
 
-  const updateArguments = { identifier: 2, newShortName: "Updated Memory", newShortDescription: "Updated.", newLongDescription: "Updated details." };
+  const updateArguments = { identifier: 2, ownerIdentifier: 1, newShortName: "Updated Memory", newShortDescription: "Updated.", newLongDescription: "Updated details." };
   await executor.execute({ id: "update", name: "UpdateNode", arguments: updateArguments });
   assert.equal(api.updated[0], id(2));
   assert.equal(api.updated[1].model_attribution, "gpt-5.6-sol-xhigh");
@@ -477,9 +477,9 @@ test("live conversations cannot mutate the Kmap", async () => {
   for (const call of [
     { name: "ConnectNodes", arguments: { identifiers: [1, 2] } },
     { name: "ConsolidateFanout", arguments: { parentIdentifier: 1, aggregatorIdentifier: 2, fanoutIdentifiers: [2] } },
-    { name: "AssignTask", arguments: { parentIdentifier: 1, childIdentifier: 2, priority: "high" } },
-    { name: "CreateNode", arguments: { parentIdentifiers: [1], shortName: "Task", shortDescription: "Task.", longDescription: "Task." } },
-    { name: "UpdateNode", arguments: { identifier: 1, newShortName: "Root", newShortDescription: "Root.", newLongDescription: "Root." } },
+    { name: "SetFixedConnection", arguments: { parentIdentifier: 1, childIdentifier: 2, slot: 1 } },
+    { name: "CreateNode", arguments: { parentIdentifiers: [1], ownerIdentifier: 1, shortName: "Memory", shortDescription: "Memory.", longDescription: "Memory." } },
+    { name: "UpdateNode", arguments: { identifier: 1, ownerIdentifier: 1, newShortName: "Root", newShortDescription: "Root.", newLongDescription: "Root." } },
   ]) {
     const result = await executor.execute({ id: call.name, ...call });
     assert.match(result.message.content, /only available during history ingress/);
@@ -1440,13 +1440,15 @@ test("Kmap context uses compact role-based node and fanout representations", () 
     nodes: [
       {
         identifier: 1, shortName: "Direct Node", shortDescription: "Direct summary", longDescription: "Direct details", lastModifiedBy: "model-a",
-        taskConnections: [{ identifier: 4, shortName: "Direct Task", shortDescription: "Direct task summary", priority: "high" }],
+        ownerIdentifier: 1,
+        fixedConnections: [{ identifier: 4, shortName: "Pinned Node", shortDescription: "Pinned node summary", slot: 1 }],
         activeConnections: [{ identifier: 2, shortName: "Active Node", shortDescription: "Active summary" }],
         fanoutConnections: [{ identifier: 3, shortName: "Direct Fanout", shortDescription: "Direct fanout summary" }],
       },
       {
         identifier: 2, shortName: "Active Node", shortDescription: "ACTIVE SHORT DESCRIPTION MUST BE OMITTED", longDescription: "Active details", lastModifiedBy: "model-b",
-        taskConnections: [{ identifier: 7, shortName: "Nested Task", shortDescription: "Nested task summary", priority: "low" }],
+        ownerIdentifier: 1,
+        fixedConnections: [{ identifier: 7, shortName: "Nested Fixed", shortDescription: "Nested fixed summary", slot: 3 }],
         activeConnections: [{ identifier: 5, shortName: "Nested Active", shortDescription: "Nested active summary" }],
         fanoutConnections: [
           { identifier: 3, shortName: "Direct Fanout", shortDescription: "Direct fanout summary" },
@@ -1457,11 +1459,11 @@ test("Kmap context uses compact role-based node and fanout representations", () 
   });
   assert.match(formatted, /Current Kmap context/);
   assert.match(formatted, /Directly loaded nodes[\s\S]*Node 1: Direct Node[\s\S]*Summary: Direct summary[\s\S]*Details:\n  Direct details/);
-  assert.match(formatted, /Task connection identifiers: high: 4/);
+  assert.match(formatted, /Fixed connection identifiers: slot 1: 4/);
   assert.match(formatted, /Active connection identifiers: 2/);
   assert.match(formatted, /Fanout connection identifiers: 3/);
   assert.match(formatted, /Full active-connection nodes[\s\S]*Node 2: Active Node[\s\S]*Details:\n  Active details/);
-  assert.doesNotMatch(formatted, /ACTIVE SHORT DESCRIPTION MUST BE OMITTED|Nested Task|Nested Active/);
+  assert.doesNotMatch(formatted, /ACTIVE SHORT DESCRIPTION MUST BE OMITTED|Nested Fixed|Nested Active/);
   assert.match(formatted, /Fanout nodes of directly loaded nodes[\s\S]*3: Direct Fanout[\s\S]*Summary: Direct fanout summary/);
   assert.match(formatted, /Fanout nodes only of active-connection nodes[\s\S]*6: Indirect Fanout/);
   assert.doesNotMatch(formatted, /INDIRECT SHORT DESCRIPTION MUST BE OMITTED/);
@@ -1481,7 +1483,7 @@ test("compact Kmap projection materially reduces dense loaded-node context", () 
     shortDescription: "Node summary ".repeat(10),
     longDescription: "Durable details ".repeat(80),
     lastModifiedBy: "model-x",
-    taskConnections: [],
+    fixedConnections: [],
     activeConnections: Array.from({ length: 8 }, (_, index) => connection(10_000 + identifier * 10 + index, "Active")),
     fanoutConnections: Array.from({ length: 64 }, (_, index) => connection(20_000 + identifier * 100 + index, "Fanout")),
   });
@@ -1618,7 +1620,7 @@ test("layered prompt assets separate session, shared read, web, and write contra
   assert.match(readTools, /WebSearch\n  Call:/);
   assert.match(readTools, /WebFetch\n  Call:/);
   assert.match(writeTools, /ConsolidateFanout\n  Call:/);
-  assert.match(writeTools, /AssignTask\n  Call:/);
+  assert.match(writeTools, /SetFixedConnection\n  Call:/);
   assert.match(writeTools, /Use the string "blank" as childIdentifier/);
   assert.doesNotMatch(writeTools, /WebSearch\n  Call:|WebFetch\n  Call:/);
   for (const manual of [conversation, history, audio, readTools, writeTools]) {
@@ -1689,11 +1691,11 @@ test("chatend inspector exposes text tool requests and readable results", () => 
 test("main inspector keeps conversation visible and turns context activity into disclosure entries", () => {
   const direct = {
     identifier: 3, shortName: "Project", shortDescription: "Project summary", longDescription: "Project details", lastModifiedBy: "model-thinking",
-    taskConnections: [], activeConnections: [{ identifier: 4, shortName: "Related", shortDescription: "Related summary" }], fanoutConnections: [],
+    fixedConnections: [], activeConnections: [{ identifier: 4, shortName: "Related", shortDescription: "Related summary" }], fanoutConnections: [],
   };
   const active = {
     identifier: 4, shortName: "Related", shortDescription: "Related summary", longDescription: "Related details", lastModifiedBy: "model-thinking",
-    taskConnections: [], activeConnections: [{ identifier: 5, shortName: "Distant", shortDescription: "Summary only" }], fanoutConnections: [],
+    fixedConnections: [], activeConnections: [{ identifier: 5, shortName: "Distant", shortDescription: "Summary only" }], fanoutConnections: [],
   };
   const diagnostic = {
     chatend: [
@@ -1920,13 +1922,55 @@ test("Telegram group sessions load the invoker, group, and Kennedy roots while r
   await session.initialize();
   assert.deepEqual(session.context.loadedNodeIds, [id(1), id(2), id(3)]);
   assert.equal(session.context.resolve(4), id(4));
-  assert.match(session.chatend.systemPrompt, /independent one-invocation session/);
+  assert.match(session.chatend.systemPrompt, /persistent session scoped to one participant and one group/);
   assert.match(session.chatend.systemPrompt, /invoking participant's root \(1\), the group root \(2\), and Kennedy's root \(3\)/);
   assert.match(session.chatend.systemPrompt, /leaving room for 7 additional directly loaded nodes/);
   assert.match(session.chatend.systemPrompt, /Friend · @friend · Telegram user ID 77 · root node identifier 4/);
   assert.match(session.chatend.systemPrompt, /Telegram messages supplied as context \(2\)/);
   assert.deepEqual(session.archive().rootNodeIds, [id(1), id(2), id(3)]);
   assert.deepEqual(session.archive().referenceRootNodeIds, [id(4)]);
+});
+
+test("persistent Telegram group sessions append only unseen context and scope warnings to one user", async () => {
+  const initialContext = {
+    groupTitle: "Trusted friends", chatId: -100, invokingTelegramUserId: 42, groupRootNodeId: id(2),
+    participants: [{ telegramUserId: 42, username: "taek42", displayName: "David", rootNodeId: id(1) }],
+    messages: [{ messageId: 10, telegramUserId: 42, username: "taek42", displayName: "David", text: "Earlier invocation", sentByKennedy: false }],
+  };
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1), node(2), node(3), node(4)]),
+    intelligence: { generate: async () => ({
+      status: "complete", response_id: "group-response",
+      message: { role: "assistant", content: "Group answer." },
+      usage: { input_tokens: 100001, output_tokens: 20, cached_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0 },
+    }) },
+    manuals: promptManuals("Shared"), rootNodeIds: [id(1), id(2), id(3)],
+    provider: "p", model: "m", contextWindowTokens: 400000, sessionType: "telegram-group",
+    channel: { kind: "telegram-group", telegramUserId: 42, username: "taek42", displayName: "David", chatId: -100, groupRootNodeId: id(2), groupContext: initialContext, lastGroupContextMessageId: 10 },
+    persist: async () => {}, onUpdate: () => {},
+  });
+  await session.initialize();
+  session.refreshTelegramGroupContext({
+    ...initialContext,
+    participants: [
+      ...initialContext.participants,
+      { telegramUserId: 77, username: "friend", displayName: "Friend", rootNodeId: id(4) },
+    ],
+    messages: [
+      ...initialContext.messages,
+      { messageId: 11, telegramUserId: 77, username: "friend", displayName: "Friend", text: "New group context", sentByKennedy: false },
+      { messageId: 12, telegramUserId: 42, username: "taek42", displayName: "David", text: "Current invocation", sentByKennedy: false },
+    ],
+  }, 12);
+  const contextUpdate = session.chatend.retained.find(message => message.content.includes("Updated Telegram group context"));
+  assert.match(contextUpdate.content, /New group context/);
+  assert.doesNotMatch(contextUpdate.content, /Current invocation/);
+  assert.equal(session.context.resolve(4), id(4));
+  await session.send("Current invocation", { externalEventId: "group-event" });
+  const answer = session.answerForExternalEvent("group-event");
+  assert.match(answer.contextWarning, /@taek42, your Kennedy session in this group/);
+  assert.match(answer.contextWarning, /This applies only to @taek42; other members have separate sessions/);
+  assert.equal(session.archive().channel.lastGroupContextMessageId, 12);
 });
 
 test("background Telegram group ingress directly loads the group and Kennedy roots", async () => {

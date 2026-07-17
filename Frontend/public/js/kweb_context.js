@@ -1,5 +1,16 @@
 export const MAX_DIRECTLY_LOADED_NODES = 10;
 
+function normalizeNode(node) {
+  const legacySlots = { high: 1, medium: 2, low: 3 };
+  const fixedConnections = Array.isArray(node?.fixed_connections)
+    ? node.fixed_connections
+    : (node?.task_connections || []).map(connection => ({
+      ...connection,
+      slot: connection.slot || legacySlots[connection.priority] || 0,
+    }));
+  return { ...node, fixed_connections: fixedConnections };
+}
+
 function rawConnectionIds(nodesById, nodeIds, fields) {
   const identifiers = new Set();
   for (const nodeId of nodeIds) {
@@ -61,8 +72,10 @@ export class KwebContext {
   }
 
   ingestNode(node, full = true, origin = "context") {
+    node = normalizeNode(node);
     this.shortId(node.id);
-    for (const connection of [...(node.task_connections || []), ...(node.active_connections || []), ...(node.fanout_connections || [])]) this.shortId(connection.id);
+    if (node.owner_root_node_id) this.shortId(node.owner_root_node_id);
+    for (const connection of [...(node.fixed_connections || []), ...(node.active_connections || []), ...(node.fanout_connections || [])]) this.shortId(connection.id);
     if (full) {
       this.nodesById.set(node.id, node); this.fullNodeIds.add(node.id);
       if (!this.nodeOrigins.has(node.id)) this.nodeOrigins.set(node.id, new Set());
@@ -76,7 +89,7 @@ export class KwebContext {
     if (this.loadedNodeIds.length >= MAX_DIRECTLY_LOADED_NODES) throw Object.assign(new Error("Ten nodes are already directly loaded. Reset the context to continue."), { code: "loaded_node_limit" });
     const previouslyFullNodeIds = new Set(this.fullNodeIds);
     const previouslyDirectNodeIds = new Set(this.loadedNodeIds);
-    const previousDirectConnectionIds = rawConnectionIds(this.nodesById, previouslyDirectNodeIds, ["task_connections", "active_connections", "fanout_connections"]);
+    const previousDirectConnectionIds = rawConnectionIds(this.nodesById, previouslyDirectNodeIds, ["fixed_connections", "active_connections", "fanout_connections"]);
     const previousDirectFanoutIds = rawConnectionIds(this.nodesById, previouslyDirectNodeIds, ["fanout_connections"]);
     const previouslyActiveNodeIds = [...previouslyFullNodeIds].filter(id => !previouslyDirectNodeIds.has(id));
     const previousIndirectFanoutIds = rawConnectionIds(this.nodesById, previouslyActiveNodeIds, ["fanout_connections"]);
@@ -89,7 +102,7 @@ export class KwebContext {
     this.loadedNodeIds.push(durableId);
     const requestedNodeAlreadyLoaded = previouslyFullNodeIds.has(payload.requested_node.id);
     const newlyFullActiveNodes = payload.active_connection_nodes.filter(node => !previouslyFullNodeIds.has(node.id));
-    const currentDirectConnectionIds = rawConnectionIds(this.nodesById, this.loadedNodeIds, ["task_connections", "active_connections", "fanout_connections"]);
+    const currentDirectConnectionIds = rawConnectionIds(this.nodesById, this.loadedNodeIds, ["fixed_connections", "active_connections", "fanout_connections"]);
     const directFanoutNodes = uniqueRawConnections(
       payload.requested_node.fanout_connections,
       connection => !this.fullNodeIds.has(connection.id) && !previousDirectFanoutIds.has(connection.id),
@@ -153,7 +166,8 @@ export class KwebContext {
       shortDescription: node.short_description,
       longDescription: node.long_description,
       lastModifiedBy: node.last_modified_by || "legacy-unknown",
-      taskConnections: (node.task_connections || []).map(c => ({ ...this.summary(c), priority: c.priority })),
+      ownerIdentifier: node.owner_root_node_id ? this.shortId(node.owner_root_node_id) : "unowned",
+      fixedConnections: (node.fixed_connections || []).map(c => ({ ...this.summary(c), slot: c.slot })),
       activeConnections: (node.active_connections || []).map(c => this.summary(c)),
       fanoutConnections: (node.fanout_connections || []).map(c => this.summary(c)),
     };

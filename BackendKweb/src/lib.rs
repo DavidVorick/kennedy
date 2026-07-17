@@ -25,10 +25,11 @@ const PROVENANCE_IDEMPOTENCY_MIGRATION: &str =
     include_str!("../migrations/002_provenance_idempotency.sql");
 const SYSTEM_ROOTS_MIGRATION: &str = include_str!("../migrations/003_system_roots.sql");
 const MODEL_ATTRIBUTION_MIGRATION: &str = include_str!("../migrations/004_model_attribution.sql");
+const NODE_OWNERSHIP_MIGRATION: &str = include_str!("../migrations/005_node_ownership.sql");
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
-const TASK_HIGH_ORDER: i64 = -1;
-const TASK_MEDIUM_ORDER: i64 = -2;
-const TASK_LOW_ORDER: i64 = -3;
+const FIXED_SLOT_1_ORDER: i64 = -1;
+const FIXED_SLOT_2_ORDER: i64 = -2;
+const FIXED_SLOT_3_ORDER: i64 = -3;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: String,
@@ -112,11 +113,11 @@ struct ConnectionSummary {
 }
 
 #[derive(Clone, Serialize)]
-struct TaskConnectionSummary {
+struct FixedConnectionSummary {
     id: String,
     short_name: String,
     short_description: String,
-    priority: String,
+    slot: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -126,7 +127,8 @@ struct KnowledgeNode {
     short_description: String,
     long_description: String,
     last_modified_by: String,
-    task_connections: Vec<TaskConnectionSummary>,
+    owner_root_node_id: Option<String>,
+    fixed_connections: Vec<FixedConnectionSummary>,
     active_connections: Vec<ConnectionSummary>,
     fanout_connections: Vec<ConnectionSummary>,
     history_head_id: Option<String>,
@@ -149,6 +151,7 @@ struct CreateNodeInput {
     short_name: String,
     short_description: String,
     long_description: String,
+    owner_root_node_id: String,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +161,7 @@ struct UpdateNodeInput {
     short_name: String,
     short_description: String,
     long_description: String,
+    owner_root_node_id: String,
 }
 
 #[derive(Deserialize)]
@@ -175,7 +179,15 @@ struct ConsolidateFanoutInput {
 }
 
 #[derive(Deserialize)]
-struct AssignTaskInput {
+struct SetFixedConnectionInput {
+    parent_node_id: String,
+    child_node_id: Option<String>,
+    slot: i64,
+    model_attribution: String,
+}
+
+#[derive(Deserialize)]
+struct LegacyAssignTaskInput {
     parent_node_id: String,
     child_node_id: Option<String>,
     priority: String,
@@ -219,6 +231,7 @@ pub async fn serve_with_listener(
     connection
         .execute_batch(MODEL_ATTRIBUTION_MIGRATION)
         .context("applying model attribution migration")?;
+    migrate_node_ownership(&connection).context("applying node ownership migration")?;
     bootstrap(&mut connection)?;
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
@@ -242,7 +255,8 @@ pub async fn serve_with_listener(
             post(consolidate_fanout),
         )
         .route("/api/v1/connections", post(connect_nodes))
-        .route("/api/v1/tasks", post(assign_task))
+        .route("/api/v1/fixed-connections", post(set_fixed_connection))
+        .route("/api/v1/tasks", post(assign_task_compatibility))
         .route("/system-prompts/{filename}", get(get_prompt))
         .fallback_service(ServeDir::new(config.frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -256,6 +270,24 @@ pub async fn serve_with_listener(
 
 fn configure_database(db: &Connection) -> anyhow::Result<()> {
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+    Ok(())
+}
+
+fn migrate_node_ownership(db: &Connection) -> anyhow::Result<()> {
+    let columns = db
+        .prepare("PRAGMA table_info(knowledge_nodes)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "owner_root_node_id") {
+        db.execute_batch(NODE_OWNERSHIP_MIGRATION)?;
+    }
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS knowledge_nodes_by_owner ON knowledge_nodes(owner_root_node_id);",
+    )?;
+    db.execute(
+        "UPDATE knowledge_nodes SET owner_root_node_id=id WHERE id IN (SELECT knowledge_node_id FROM kmap_roots) AND owner_root_node_id IS NULL",
+        [],
+    )?;
     Ok(())
 }
 
@@ -333,7 +365,7 @@ fn insert_bootstrap_node(
     let node_id = new_id();
     let history_id = new_id();
     tx.execute(
-        "INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root) VALUES(?1,?2,?3,?4,?5)",
+        "INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root,owner_root_node_id) VALUES(?1,?2,?3,?4,?5,?1)",
         params![node_id, short_name, short_description, long_description, is_user_root],
     )?;
     tx.execute("INSERT INTO data_history_nodes(id,knowledge_node_id,previous_history_id,provenance_id) VALUES(?1,?2,NULL,?3)", params![history_id, node_id, provenance_id])?;
@@ -475,7 +507,14 @@ async fn bootstrap_node(
     let (short_name, _) = validate_node_text(&requested_name, "", "")?;
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     match fetch_node(&db, &node_id) {
-        Ok(node) => return Ok((StatusCode::OK, Json(node))),
+        Ok(_) => {
+            db.execute(
+                "UPDATE knowledge_nodes SET owner_root_node_id=id WHERE id=?1 AND owner_root_node_id IS NULL",
+                [&node_id],
+            )
+            .map_err(ApiError::internal)?;
+            return Ok((StatusCode::OK, Json(fetch_node(&db, &node_id)?)));
+        }
         Err(error) if error.status != StatusCode::NOT_FOUND => return Err(error),
         Err(_) => {}
     }
@@ -493,7 +532,7 @@ async fn bootstrap_node(
     )
     .map_err(ApiError::internal)?;
     tx.execute(
-        "INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root) VALUES(?1,?2,'','',0)",
+        "INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root,owner_root_node_id) VALUES(?1,?2,'','',0,?1)",
         params![node_id, short_name],
     )
     .map_err(|error| {
@@ -541,44 +580,54 @@ fn fetch_summaries(
     .collect()
 }
 
-fn task_priority(order: i64) -> Option<&'static str> {
+fn fixed_slot(order: i64) -> Option<i64> {
     match order {
-        TASK_HIGH_ORDER => Some("high"),
-        TASK_MEDIUM_ORDER => Some("medium"),
-        TASK_LOW_ORDER => Some("low"),
+        FIXED_SLOT_1_ORDER => Some(1),
+        FIXED_SLOT_2_ORDER => Some(2),
+        FIXED_SLOT_3_ORDER => Some(3),
         _ => None,
     }
 }
 
-fn task_order(priority: &str) -> Result<i64, ApiError> {
-    match priority {
-        "high" => Ok(TASK_HIGH_ORDER),
-        "medium" => Ok(TASK_MEDIUM_ORDER),
-        "low" => Ok(TASK_LOW_ORDER),
-        _ => Err(ApiError::bad("Task priority must be high, medium, or low.")),
+fn fixed_order(slot: i64) -> Result<i64, ApiError> {
+    match slot {
+        1 => Ok(FIXED_SLOT_1_ORDER),
+        2 => Ok(FIXED_SLOT_2_ORDER),
+        3 => Ok(FIXED_SLOT_3_ORDER),
+        _ => Err(ApiError::bad("Fixed connection slot must be 1, 2, or 3.")),
     }
 }
 
-fn fetch_task_summaries(
+fn fetch_fixed_summaries(
     db: &Connection,
     source: &[u8],
-) -> rusqlite::Result<Vec<TaskConnectionSummary>> {
+) -> rusqlite::Result<Vec<FixedConnectionSummary>> {
     let mut stmt = db.prepare("SELECT n.id,n.short_name,n.short_description,c.activation_order FROM knowledge_connections c JOIN knowledge_nodes n ON n.id=c.target_node_id WHERE c.source_node_id=?1 AND c.tier='fanout' AND c.activation_order BETWEEN ?2 AND ?3 ORDER BY c.activation_order DESC")?;
-    stmt.query_map(params![source, TASK_LOW_ORDER, TASK_HIGH_ORDER], |row| {
-        let order = row.get::<_, i64>(3)?;
-        Ok(TaskConnectionSummary {
-            id: hex::encode(row.get::<_, Vec<u8>>(0)?),
-            short_name: row.get(1)?,
-            short_description: row.get(2)?,
-            priority: task_priority(order).unwrap_or("unknown").to_string(),
-        })
-    })?
+    stmt.query_map(
+        params![source, FIXED_SLOT_3_ORDER, FIXED_SLOT_1_ORDER],
+        |row| {
+            let order = row.get::<_, i64>(3)?;
+            Ok(FixedConnectionSummary {
+                id: hex::encode(row.get::<_, Vec<u8>>(0)?),
+                short_name: row.get(1)?,
+                short_description: row.get(2)?,
+                slot: fixed_slot(order).unwrap_or(0),
+            })
+        },
+    )?
     .collect()
 }
 
 fn fetch_node(db: &Connection, id: &[u8]) -> Result<KnowledgeNode, ApiError> {
-    let core = db.query_row("SELECT n.short_name,n.short_description,n.long_description,n.history_head_id,COALESCE(a.last_modified_by,'legacy-unknown') FROM knowledge_nodes n LEFT JOIN knowledge_node_model_attribution a ON a.knowledge_node_id=n.id WHERE n.id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<Vec<u8>>>(3)?,r.get::<_,String>(4)?))).optional().map_err(ApiError::internal)?;
-    let Some((short_name, short_description, long_description, history, last_modified_by)) = core
+    let core = db.query_row("SELECT n.short_name,n.short_description,n.long_description,n.history_head_id,COALESCE(a.last_modified_by,'legacy-unknown'),n.owner_root_node_id FROM knowledge_nodes n LEFT JOIN knowledge_node_model_attribution a ON a.knowledge_node_id=n.id WHERE n.id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<Vec<u8>>>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<Vec<u8>>>(5)?))).optional().map_err(ApiError::internal)?;
+    let Some((
+        short_name,
+        short_description,
+        long_description,
+        history,
+        last_modified_by,
+        owner_root_node_id,
+    )) = core
     else {
         return Err(ApiError::not_found("Knowledge node not found."));
     };
@@ -588,7 +637,8 @@ fn fetch_node(db: &Connection, id: &[u8]) -> Result<KnowledgeNode, ApiError> {
         short_description,
         long_description,
         last_modified_by,
-        task_connections: fetch_task_summaries(db, id).map_err(ApiError::internal)?,
+        owner_root_node_id: owner_root_node_id.map(hex::encode),
+        fixed_connections: fetch_fixed_summaries(db, id).map_err(ApiError::internal)?,
         active_connections: fetch_summaries(db, id, "active").map_err(ApiError::internal)?,
         fanout_connections: fetch_summaries(db, id, "fanout").map_err(ApiError::internal)?,
         history_head_id: history.map(hex::encode),
@@ -723,6 +773,22 @@ fn require_exists(
         .map_err(ApiError::internal)?;
     if !exists {
         return Err(ApiError::not_found(format!("{label} not found.")));
+    }
+    Ok(())
+}
+
+fn require_owner_root(tx: &Transaction<'_>, id: &[u8]) -> Result<(), ApiError> {
+    let self_owned: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_nodes WHERE id=?1 AND owner_root_node_id=id)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    if !self_owned {
+        return Err(ApiError::bad(
+            "owner_root_node_id must identify a self-owned Kennedy, user, or group root.",
+        ));
     }
     Ok(())
 }
@@ -953,59 +1019,89 @@ async fn consolidate_fanout(
     Ok(Json(json!({"nodes":nodes})))
 }
 
-async fn assign_task(
+async fn set_fixed_connection(
     State(state): State<AppState>,
-    Json(input): Json<AssignTaskInput>,
+    Json(input): Json<SetFixedConnectionInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let parent = decode_id(&input.parent_node_id)?;
     let child = input.child_node_id.as_deref().map(decode_id).transpose()?;
-    let priority_order = task_order(&input.priority)?;
+    let slot_order = fixed_order(input.slot)?;
     let model_attribution = validate_model_attribution(&input.model_attribution)?;
     if child.as_deref() == Some(parent.as_slice()) {
-        return Err(ApiError::bad("A node cannot be its own task connection."));
+        return Err(ApiError::bad("A node cannot be its own fixed connection."));
     }
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     require_exists(&tx, "knowledge_nodes", &parent, "Parent knowledge node")?;
     if let Some(child) = child.as_deref() {
-        require_exists(&tx, "knowledge_nodes", child, "Task knowledge node")?;
+        require_exists(
+            &tx,
+            "knowledge_nodes",
+            child,
+            "Fixed-connection knowledge node",
+        )?;
     }
-    let mut replaced = fetch_task_summaries(&tx, &parent)
+    let mut replaced = fetch_fixed_summaries(&tx, &parent)
         .map_err(ApiError::internal)?
         .into_iter()
-        .find(|task| task.priority == input.priority);
-    if replaced
-        .as_ref()
-        .is_some_and(|task| child.as_ref().is_some_and(|id| task.id == hex::encode(id)))
-    {
+        .find(|connection| connection.slot == input.slot);
+    if replaced.as_ref().is_some_and(|connection| {
+        child
+            .as_ref()
+            .is_some_and(|id| connection.id == hex::encode(id))
+    }) {
         replaced = None;
     }
     let mut affected = vec![parent.clone()];
     if let Some(child) = child.as_ref() {
         affected.push(child.clone());
     }
-    if let Some(replaced_task) = replaced.as_ref() {
-        let replaced_id = decode_id(&replaced_task.id)?;
+    if let Some(replaced_connection) = replaced.as_ref() {
+        let replaced_id = decode_id(&replaced_connection.id)?;
         if !affected.contains(&replaced_id) {
             affected.push(replaced_id);
         }
     }
     tx.execute(
         "DELETE FROM knowledge_connections WHERE source_node_id=?1 AND tier='fanout' AND activation_order=?2",
-        params![parent, priority_order],
+        params![parent, slot_order],
     )
     .map_err(ApiError::internal)?;
     if let Some(child) = child {
         tx.execute(
             "INSERT INTO knowledge_connections(source_node_id,target_node_id,tier,activation_order) VALUES(?1,?2,'fanout',?3) ON CONFLICT(source_node_id,target_node_id) DO UPDATE SET tier='fanout',activation_order=excluded.activation_order",
-            params![parent, child, priority_order],
+            params![parent, child, slot_order],
         )
         .map_err(ApiError::internal)?;
     }
     set_model_attribution(&tx, &affected, &model_attribution).map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
     let node = fetch_node(&db, &parent)?;
-    Ok(Json(json!({"node":node,"replaced_task":replaced})))
+    Ok(Json(
+        json!({"node":node,"replaced_fixed_connection":replaced}),
+    ))
+}
+
+async fn assign_task_compatibility(
+    state: State<AppState>,
+    Json(input): Json<LegacyAssignTaskInput>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let slot = match input.priority.as_str() {
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => return Err(ApiError::bad("Task priority must be high, medium, or low.")),
+    };
+    set_fixed_connection(
+        state,
+        Json(SetFixedConnectionInput {
+            parent_node_id: input.parent_node_id,
+            child_node_id: input.child_node_id,
+            slot,
+            model_attribution: input.model_attribution,
+        }),
+    )
+    .await
 }
 
 async fn create_node(
@@ -1013,6 +1109,7 @@ async fn create_node(
     Json(input): Json<CreateNodeInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let provenance = decode_id(&input.provenance_id)?;
+    let owner_root = decode_id(&input.owner_root_node_id)?;
     let model_attribution = validate_model_attribution(&input.model_attribution)?;
     let parents = validate_distinct_ids(&input.parent_node_ids, 1, "CreateNode parent list")?;
     let (name, short) = validate_node_text(
@@ -1025,10 +1122,11 @@ async fn create_node(
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     require_exists(&tx, "data_provenance_nodes", &provenance, "Provenance node")?;
+    require_owner_root(&tx, &owner_root)?;
     for parent in &parents {
         require_exists(&tx, "knowledge_nodes", parent, "Parent knowledge node")?;
     }
-    tx.execute("INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root) VALUES(?1,?2,?3,?4,0)",params![node_id,name,short,input.long_description]).map_err(ApiError::internal)?;
+    tx.execute("INSERT INTO knowledge_nodes(id,short_name,short_description,long_description,is_user_root,owner_root_node_id) VALUES(?1,?2,?3,?4,0,?5)",params![node_id,name,short,input.long_description,owner_root]).map_err(ApiError::internal)?;
     tx.execute("INSERT INTO data_history_nodes(id,knowledge_node_id,previous_history_id,provenance_id) VALUES(?1,?2,NULL,?3)",params![history_id,node_id,provenance]).map_err(ApiError::internal)?;
     tx.execute(
         "UPDATE knowledge_nodes SET history_head_id=?1 WHERE id=?2",
@@ -1058,6 +1156,7 @@ async fn update_node(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = decode_id(&node_id)?;
     let provenance = decode_id(&input.provenance_id)?;
+    let owner_root = decode_id(&input.owner_root_node_id)?;
     let model_attribution = validate_model_attribution(&input.model_attribution)?;
     let (name, short) = validate_node_text(
         &input.short_name,
@@ -1068,6 +1167,7 @@ async fn update_node(
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     require_exists(&tx, "data_provenance_nodes", &provenance, "Provenance node")?;
+    require_owner_root(&tx, &owner_root)?;
     let previous: Option<Vec<u8>> = tx
         .query_row(
             "SELECT history_head_id FROM knowledge_nodes WHERE id=?1",
@@ -1078,7 +1178,7 @@ async fn update_node(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("Knowledge node not found."))?;
     tx.execute("INSERT INTO data_history_nodes(id,knowledge_node_id,previous_history_id,provenance_id) VALUES(?1,?2,?3,?4)",params![history_id,id,previous,provenance]).map_err(ApiError::internal)?;
-    tx.execute("UPDATE knowledge_nodes SET short_name=?1,short_description=?2,long_description=?3,history_head_id=?4 WHERE id=?5",params![name,short,input.long_description,history_id,id]).map_err(ApiError::internal)?;
+    tx.execute("UPDATE knowledge_nodes SET short_name=?1,short_description=?2,long_description=?3,history_head_id=?4,owner_root_node_id=?5 WHERE id=?6",params![name,short,input.long_description,history_id,owner_root,id]).map_err(ApiError::internal)?;
     set_model_attribution(&tx, std::slice::from_ref(&id), &model_attribution)
         .map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
@@ -1126,6 +1226,7 @@ mod tests {
         db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
         db.execute_batch(SYSTEM_ROOTS_MIGRATION).unwrap();
         db.execute_batch(MODEL_ATTRIBUTION_MIGRATION).unwrap();
+        migrate_node_ownership(&db).unwrap();
         bootstrap(&mut db).unwrap();
         db
     }
@@ -1311,6 +1412,7 @@ mod tests {
         db.execute_batch(PROVENANCE_IDEMPOTENCY_MIGRATION).unwrap();
         db.execute_batch(SYSTEM_ROOTS_MIGRATION).unwrap();
         db.execute_batch(MODEL_ATTRIBUTION_MIGRATION).unwrap();
+        migrate_node_ownership(&db).unwrap();
         let tx = db.transaction().unwrap();
         let provenance_id = new_id();
         tx.execute(
@@ -1383,6 +1485,10 @@ mod tests {
         assert_eq!(first.1.short_description, "");
         assert_eq!(first.1.long_description, "");
         assert_eq!(first.1.last_modified_by, "system-bootstrap");
+        assert_eq!(
+            first.1.owner_root_node_id.as_deref(),
+            Some(node_id.as_str())
+        );
         let count: i64 = state
             .db
             .lock()
@@ -1437,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_nodes_have_no_task_connections_without_a_schema_upgrade() {
+    fn roots_self_own_while_legacy_non_roots_remain_unowned() {
         let db = db();
         let root: Vec<u8> = db
             .query_row(
@@ -1447,8 +1553,11 @@ mod tests {
             )
             .unwrap();
         let node = fetch_node(&db, &root).unwrap();
-        assert!(node.task_connections.is_empty());
+        assert!(node.fixed_connections.is_empty());
+        assert_eq!(node.owner_root_node_id, Some(hex::encode(&root)));
         assert_eq!(node.last_modified_by, "system-bootstrap");
+        let legacy = insert_node(&db, "Legacy Memory");
+        assert_eq!(fetch_node(&db, &legacy).unwrap().owner_root_node_id, None);
     }
 
     #[tokio::test]
@@ -1492,6 +1601,7 @@ mod tests {
                 provenance_id: hex::encode(&provenance),
                 model_attribution: "gpt-5.6-sol-high".into(),
                 parent_node_ids: vec![hex::encode(&parent)],
+                owner_root_node_id: hex::encode(&parent),
                 short_name: "Created Memory".into(),
                 short_description: "Created by a model.".into(),
                 long_description: "Durable model-attributed knowledge.".into(),
@@ -1515,6 +1625,7 @@ mod tests {
             Json(UpdateNodeInput {
                 provenance_id: hex::encode(provenance),
                 model_attribution: "gpt-5.6-sol-xhigh".into(),
+                owner_root_node_id: hex::encode(&parent),
                 short_name: "Updated Memory".into(),
                 short_description: "Updated by a model.".into(),
                 long_description: "Updated durable model-attributed knowledge.".into(),
@@ -1526,7 +1637,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_slots_can_be_assigned_replaced_and_cleared() {
+    async fn fixed_slots_can_be_assigned_replaced_and_cleared() {
         let db = db();
         let parent: Vec<u8> = db
             .query_row(
@@ -1535,29 +1646,26 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let first = insert_node(&db, "First Task");
-        let second = insert_node(&db, "Second Task");
+        let first = insert_node(&db, "First Fixed Node");
+        let second = insert_node(&db, "Second Fixed Node");
         let state = state(db);
 
-        let assigned = assign_task(
+        let assigned = set_fixed_connection(
             State(state.clone()),
-            Json(AssignTaskInput {
+            Json(SetFixedConnectionInput {
                 parent_node_id: hex::encode(&parent),
                 child_node_id: Some(hex::encode(&first)),
-                priority: "high".into(),
+                slot: 1,
                 model_attribution: "gpt-test-low".into(),
             }),
         )
         .await
         .unwrap();
         assert_eq!(
-            assigned.0["node"]["task_connections"][0]["id"],
+            assigned.0["node"]["fixed_connections"][0]["id"],
             hex::encode(&first)
         );
-        assert_eq!(
-            assigned.0["node"]["task_connections"][0]["priority"],
-            "high"
-        );
+        assert_eq!(assigned.0["node"]["fixed_connections"][0]["slot"], 1);
         assert_eq!(assigned.0["node"]["fanout_connections"], json!([]));
         assert_eq!(assigned.0["node"]["last_modified_by"], "gpt-test-low");
         assert_eq!(
@@ -1567,20 +1675,23 @@ mod tests {
             "gpt-test-low"
         );
 
-        let replaced = assign_task(
+        let replaced = set_fixed_connection(
             State(state.clone()),
-            Json(AssignTaskInput {
+            Json(SetFixedConnectionInput {
                 parent_node_id: hex::encode(&parent),
                 child_node_id: Some(hex::encode(&second)),
-                priority: "high".into(),
+                slot: 1,
                 model_attribution: "gpt-test-high".into(),
             }),
         )
         .await
         .unwrap();
-        assert_eq!(replaced.0["replaced_task"]["id"], hex::encode(&first));
         assert_eq!(
-            replaced.0["node"]["task_connections"][0]["id"],
+            replaced.0["replaced_fixed_connection"]["id"],
+            hex::encode(&first)
+        );
+        assert_eq!(
+            replaced.0["node"]["fixed_connections"][0]["id"],
             hex::encode(&second)
         );
         assert_eq!(replaced.0["node"]["last_modified_by"], "gpt-test-high");
@@ -1597,19 +1708,22 @@ mod tests {
             "gpt-test-high"
         );
 
-        let cleared = assign_task(
+        let cleared = set_fixed_connection(
             State(state.clone()),
-            Json(AssignTaskInput {
+            Json(SetFixedConnectionInput {
                 parent_node_id: hex::encode(parent),
                 child_node_id: None,
-                priority: "high".into(),
+                slot: 1,
                 model_attribution: "gpt-test-xhigh".into(),
             }),
         )
         .await
         .unwrap();
-        assert_eq!(cleared.0["replaced_task"]["id"], hex::encode(&second));
-        assert_eq!(cleared.0["node"]["task_connections"], json!([]));
+        assert_eq!(
+            cleared.0["replaced_fixed_connection"]["id"],
+            hex::encode(&second)
+        );
+        assert_eq!(cleared.0["node"]["fixed_connections"], json!([]));
         assert_eq!(cleared.0["node"]["last_modified_by"], "gpt-test-xhigh");
         assert_eq!(
             fetch_node(&state.db.lock().unwrap(), &second)

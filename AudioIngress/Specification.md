@@ -38,6 +38,8 @@ Provider or transport failure retains the current stage, concise error, attempt
 count, and next-attempt time. Delay grows exponentially to one hour. A killed
 process can repeat the current idempotent stage but cannot lose an accepted
 original, completed chunk transcript, final transcript, or ingress checkpoint.
+Structurally invalid or truncated WAV input is terminal instead of being
+retried forever; its accepted original and diagnostic remain available.
 
 Only WAV input is processed. Windows are equalized for the whole recording,
 are at most 240 seconds, and overlap their neighbors by 15 seconds. Each window
@@ -66,11 +68,15 @@ Every piece stores its text, index, total-piece relationship, estimated tokens,
 optimistic version, provenance ID, complete history-ingress archive, and its
 concise failure history. The queue returns an in-progress piece first, then the
 oldest recording and lowest piece index. At most one audio piece can be in
-progress in this database. A failed Kennedy turn is retried after durable
-delays of one, five, fifteen, and sixty minutes instead of consuming all five
-attempts during a short provider outage. The fifth consecutive failure remains
-terminal, but the UI can explicitly requeue the preserved piece; doing so keeps
-the old diagnostics while resetting the consecutive-failure counter.
+progress in this database. A failed Kennedy turn is eligible for retry after a
+durable 15-second delay. Every nonterminal failure returns the piece to pending
+before scheduling its retry, releasing the single-piece claim so eligible work
+from other recordings can continue during that delay. The fifth consecutive
+failure remains terminal, but the UI can explicitly requeue the preserved
+piece; doing so keeps the old diagnostics while resetting the
+consecutive-failure counter. A provider input-size rejection is known to be
+non-retryable for an unchanged checkpoint, so it becomes terminal immediately
+instead of repeating the same oversized request five times.
 
 The frontend creates provenance with source `audio-vnote`, the piece-specific
 idempotency key `audio:{sha256}:piece:{index}`, and `source_created_at` equal to

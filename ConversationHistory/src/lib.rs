@@ -25,7 +25,10 @@ const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const MULTIPLE_LIVE_MIGRATION: &str =
     include_str!("../migrations/002_multiple_live_conversations.sql");
 const INGRESS_FAILURES_MIGRATION: &str = include_str!("../migrations/003_ingress_failures.sql");
+const INGRESS_RETRY_SCHEDULE_MIGRATION: &str =
+    include_str!("../migrations/004_ingress_retry_schedule.sql");
 const INGRESS_FAILURE_LIMIT: i64 = 5;
+const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -101,6 +104,7 @@ struct ConversationRecord {
     ended_at: Option<String>,
     ingress_failure_count: i64,
     ingress_failures: Value,
+    ingress_next_attempt_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -241,6 +245,9 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     if version < 3 {
         connection.execute_batch(INGRESS_FAILURES_MIGRATION)?;
     }
+    if version < 4 {
+        connection.execute_batch(INGRESS_RETRY_SCHEDULE_MIGRATION)?;
+    }
     // An early v2 build re-ran the v1 migration on every launch. That could recreate
     // this legacy singleton index after user_version had already advanced to 2, at
     // which point the normal v2 migration no longer ran. Repair that state
@@ -297,12 +304,23 @@ fn row_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRecord> {
         ended_at: row.get(8)?,
         ingress_failure_count: row.get(9)?,
         ingress_failures,
+        ingress_next_attempt_at: row.get(11)?,
     })
 }
 
+fn conversation_select() -> &'static str {
+    "SELECT id,phase,started_at,updated_at,state_json,provenance_id,version,last_user_message_at,ended_at,ingress_failure_count,ingress_failures_json,ingress_next_attempt_at FROM conversations"
+}
+
 fn fetch_record(db: &Connection, id: &str) -> Result<ConversationRecord, ApiError> {
-    db.query_row("SELECT id,phase,started_at,updated_at,state_json,provenance_id,version,last_user_message_at,ended_at,ingress_failure_count,ingress_failures_json FROM conversations WHERE id=?1", [id], row_record)
-        .optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)
+    db.query_row(
+        &format!("{} WHERE id=?1", conversation_select()),
+        [id],
+        row_record,
+    )
+    .optional()
+    .map_err(ApiError::internal)?
+    .ok_or_else(ApiError::not_found)
 }
 
 async fn create_conversation(
@@ -321,7 +339,12 @@ async fn create_conversation(
 
 async fn list_conversations(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
-    let mut statement = db.prepare("SELECT id,phase,started_at,updated_at,state_json,provenance_id,version,last_user_message_at,ended_at,ingress_failure_count,ingress_failures_json FROM conversations ORDER BY updated_at DESC").map_err(ApiError::internal)?;
+    let mut statement = db
+        .prepare(&format!(
+            "{} ORDER BY updated_at DESC",
+            conversation_select()
+        ))
+        .map_err(ApiError::internal)?;
     let records = statement
         .query_map([], row_record)
         .map_err(ApiError::internal)?
@@ -406,7 +429,17 @@ async fn discard_unstarted_conversations(
 
 async fn current_conversation(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
-    let record = db.query_row("SELECT id,phase,started_at,updated_at,state_json,provenance_id,version,last_user_message_at,ended_at,ingress_failure_count,ingress_failures_json FROM conversations WHERE phase='active' ORDER BY updated_at DESC LIMIT 1", [], row_record).optional().map_err(ApiError::internal)?;
+    let record = db
+        .query_row(
+            &format!(
+                "{} WHERE phase='active' ORDER BY updated_at DESC LIMIT 1",
+                conversation_select()
+            ),
+            [],
+            row_record,
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
     Ok(Json(json!({"conversation":record})))
 }
 
@@ -417,7 +450,7 @@ async fn next_ingress(State(state): State<AppState>) -> Result<Json<Value>, ApiE
 
 fn fetch_next_ingress(db: &Connection) -> Result<Option<ConversationRecord>, ApiError> {
     db.query_row(
-        "SELECT id,phase,started_at,updated_at,state_json,provenance_id,version,last_user_message_at,ended_at,ingress_failure_count,ingress_failures_json FROM conversations WHERE phase='ingress_in_progress' OR phase='ingress_pending' ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END, datetime(COALESCE(last_user_message_at,started_at)), datetime(started_at), id LIMIT 1",
+        &format!("{} WHERE phase IN ('ingress_in_progress','ingress_pending') AND (ingress_next_attempt_at IS NULL OR datetime(ingress_next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END, datetime(COALESCE(last_user_message_at,started_at)), datetime(started_at), id LIMIT 1", conversation_select()),
         [],
         row_record,
     ).optional().map_err(ApiError::internal)
@@ -607,7 +640,7 @@ async fn ingress_started(
             "Another conversation is already undergoing history ingress.",
         ));
     }
-    let changed = db.execute("UPDATE conversations SET phase='ingress_in_progress',provenance_id=?1,updated_at=?2,version=version+1 WHERE id=?3 AND phase='ingress_pending' AND version=?4", params![input.provenance_id,Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
+    let changed = db.execute("UPDATE conversations SET phase='ingress_in_progress',provenance_id=?1,ingress_next_attempt_at=NULL,updated_at=?2,version=version+1 WHERE id=?3 AND phase='ingress_pending' AND version=?4", params![input.provenance_id,Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
             "Conversation is not ready to start history ingress.",
@@ -679,7 +712,8 @@ fn record_ingress_failure(
     }
 
     let attempt = existing.ingress_failure_count + 1;
-    let terminal = attempt >= INGRESS_FAILURE_LIMIT;
+    let terminal =
+        input.code.as_deref() == Some("input_too_large") || attempt >= INGRESS_FAILURE_LIMIT;
     let stage = concise_failure_text(&input.stage, 80, "unknown");
     let code = input
         .code
@@ -712,13 +746,16 @@ fn record_ingress_failure(
     let next_phase = if terminal {
         "ingress_failed"
     } else {
-        existing.phase.as_str()
+        "ingress_pending"
     };
-    let now = Utc::now().to_rfc3339();
+    let now_time = Utc::now();
+    let now = now_time.to_rfc3339();
+    let next_attempt_at = (!terminal)
+        .then(|| (now_time + ChronoDuration::seconds(INGRESS_RETRY_DELAY_SECONDS)).to_rfc3339());
     let changed = tx
         .execute(
-            "UPDATE conversations SET phase=?1,updated_at=?2,ingress_failure_count=?3,ingress_failures_json=?4,version=version+1 WHERE id=?5 AND phase IN ('ingress_pending','ingress_in_progress') AND version=?6",
-            params![next_phase, now, attempt, failures_json, id, input.expected_version],
+            "UPDATE conversations SET phase=?1,ingress_next_attempt_at=?2,updated_at=?3,ingress_failure_count=?4,ingress_failures_json=?5,version=version+1 WHERE id=?6 AND phase IN ('ingress_pending','ingress_in_progress') AND version=?7",
+            params![next_phase, next_attempt_at, now, attempt, failures_json, id, input.expected_version],
         )
         .map_err(ApiError::internal)?;
     if changed == 0 {
@@ -768,7 +805,7 @@ fn retry_failed_ingress(
     let tx = db.transaction().map_err(ApiError::internal)?;
     let changed = tx
         .execute(
-            "UPDATE conversations SET phase='ingress_pending',state_json=?1,updated_at=?2,ingress_failure_count=0,version=version+1 WHERE id=?3 AND phase='ingress_failed' AND version=?4",
+            "UPDATE conversations SET phase='ingress_pending',state_json=?1,ingress_next_attempt_at=NULL,updated_at=?2,ingress_failure_count=0,version=version+1 WHERE id=?3 AND phase='ingress_failed' AND version=?4",
             params![state_json, Utc::now().to_rfc3339(), id, input.expected_version],
         )
         .map_err(ApiError::internal)?;
@@ -801,7 +838,7 @@ async fn ingress_completed(
     if existing.phase == "complete" {
         return Ok(Json(existing));
     }
-    let changed = db.execute("UPDATE conversations SET phase='complete',updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3", params![Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
+    let changed = db.execute("UPDATE conversations SET phase='complete',ingress_next_attempt_at=NULL,updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3", params![Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
             "Conversation is not in the expected ingress state.",
@@ -818,6 +855,28 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         apply_migrations(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn migration_releases_a_failed_legacy_conversation_claim() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(INITIAL_MIGRATION).unwrap();
+        db.execute_batch(MULTIPLE_LIVE_MIGRATION).unwrap();
+        db.execute_batch(INGRESS_FAILURES_MIGRATION).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,ingress_failure_count,ingress_failures_json) VALUES('stranded','ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',7,2,'[]')", []).unwrap();
+
+        apply_migrations(&db).unwrap();
+
+        let record = fetch_record(&db, "stranded").unwrap();
+        assert_eq!(record.phase, "ingress_pending");
+        assert_eq!(record.version, 8);
+        assert!(record.ingress_next_attempt_at.is_some());
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_in_progress','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
     }
 
     #[test]
@@ -974,7 +1033,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('new','active','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
     }
@@ -1040,8 +1099,14 @@ mod tests {
                 attempt as usize
             );
             if attempt < INGRESS_FAILURE_LIMIT {
-                assert_eq!(record.phase, "ingress_in_progress");
-                assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "poisoned");
+                assert_eq!(record.phase, "ingress_pending");
+                assert!(record.ingress_next_attempt_at.is_some());
+                assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
+                db.execute(
+                    "UPDATE conversations SET phase='ingress_in_progress',ingress_next_attempt_at=NULL WHERE id='poisoned'",
+                    [],
+                )
+                .unwrap();
             }
         }
 
@@ -1052,6 +1117,32 @@ mod tests {
             record.ingress_failures[4]["message"],
             "Attempt 5 failed with details"
         );
+        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
+    }
+
+    #[test]
+    fn oversized_conversation_ingress_is_terminal_without_repeating_the_same_request() {
+        let mut db = database();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('oversized','ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).unwrap();
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
+
+        let failed = record_ingress_failure(
+            &mut db,
+            "oversized",
+            &RecordIngressFailure {
+                expected_version: 1,
+                stage: "generation".into(),
+                code: Some("input_too_large".into()),
+                message: "input exceeds the provider limit".into(),
+                rounds_used: Some(1),
+                context_tokens: None,
+                context_window_tokens: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(failed.phase, "ingress_failed");
+        assert_eq!(failed.ingress_failure_count, 1);
         assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
     }
 
@@ -1079,6 +1170,7 @@ mod tests {
 
         assert_eq!(retried.phase, "ingress_pending");
         assert_eq!(retried.ingress_failure_count, 0);
+        assert!(retried.ingress_next_attempt_at.is_none());
         assert_eq!(retried.state.get("historyIngress"), None);
         assert_eq!(retried.ingress_failures[0]["message"], "context exhausted");
     }

@@ -251,6 +251,11 @@ canonical documents; this file is not an append-only log.
 - Queue closed conversations oldest-user-activity-first and run history ingress
   sequentially, with at most one Kmap-mutating ingress session at a time. Live
   conversation reads remain available during Kmap updates.
+- A failed ingress attempt must release its in-progress claim before waiting
+  for an automatic retry, so other eligible conversation or audio jobs keep the
+  pipeline moving. Retry failed ingress after roughly 15 seconds; do not shorten
+  the normal Codex generation timeout. Terminal failures may be retried
+  manually from their preserved checkpoints.
 - Mark sidebar records clearly as live/continuable or closed/read-only.
 - Hide the entire message composer when a closed/read-only conversation is
   selected; do not show a disabled textarea for an unavailable action.
@@ -505,3 +510,27 @@ canonical documents; this file is not an append-only log.
 - Do not add static prompt warnings, confidentiality partitions, or Kmap access
   controls. These users are trusted and Kennedy may load any participant's
   root. Group membership/session facts belong to dynamic Chatend context.
+
+## Node Ownership, Fixed Connections, and Persistent Group Sessions
+
+- Every knowledge node has a nullable owner-root field. Valid owners are the
+  self-owned Kennedy root, a user root, or a group root. Existing non-root rows
+  with no owner remain `unowned`; Kennedy sees that state and must assign an
+  owner when updating the node. Newly created nodes require an owner.
+- Replace task-connection terminology and priority semantics with three
+  arbitrary numbered fixed-connection slots. Kennedy may set, replace, or clear
+  slots 1, 2, and 3. Preserve the existing reserved connection-order storage so
+  no edge rewrite is required.
+- Supersede the independent one-invocation group-session rule above. Keep one
+  active session per `(group root, Telegram user)`, distinct from that user's
+  DMs and sessions in other groups. The session remains open after replies and
+  `/reset` closes and queues only that exact session for history ingress.
+- Group context warnings must identify the relevant `@username` and explicitly
+  say that other members have separate context. Refresh a retained session with
+  unseen group messages and participant roots without duplicating the current
+  invoking message.
+- Give invoked group voice notes and supported documents the same durable media,
+  transcription, and extraction behavior as DMs. Voice notes invoke by replying
+  to Kennedy; documents may invoke by bot mention in their caption or by reply.
+  Queue heads are isolated per group user so one stuck session does not block
+  other participants.

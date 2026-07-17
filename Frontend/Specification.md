@@ -99,7 +99,7 @@ context and short-ID maps, LoadNode counter, tool log, usage, continuation,
 start time, pending-turn flag, busy state, configured model and reasoning effort,
 their combined model-attribution value, its own direct root IDs, and any
 unloaded group-participant root references. Root selection is durable session
-state rather than one application-global user root; group invocation records
+state rather than one application-global user root; group-session records
 store user, group, and Kennedy roots in that order.
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
@@ -247,8 +247,9 @@ Kennedy into an in-context node:
   "shortDescription": "Short description.",
   "longDescription": "Long description.",
   "lastModifiedBy": "gpt-5.6-sol-xhigh",
-  "taskConnections": [
-    {"identifier": 5, "shortName": "Outstanding Task", "priority": "high"}
+  "ownerIdentifier": 1,
+  "fixedConnections": [
+    {"identifier": 5, "shortName": "Pinned Memory", "slot": 1}
   ],
   "activeConnections": [
     {"identifier": 4, "shortName": "Related Node"}
@@ -256,6 +257,9 @@ Kennedy into an in-context node:
   "fanoutConnections": []
 }
 ```
+
+`ownerIdentifier` is a root-node short identifier, or the literal `unowned`
+when a legacy database row has no owner.
 
 Short identifiers are positive integers allocated in first-seen order. A
 durable node receives one short identifier per context, even if it appears in
@@ -470,7 +474,7 @@ nodes refresh the context.
 The frontend records the current model attribution for the parent, aggregator,
 and moved nodes without promoting summary-only nodes to full context.
 
-### 8.5 `AssignTask`
+### 8.5 `SetFixedConnection`
 
 Available only during history ingress.
 
@@ -478,15 +482,15 @@ Available only during history ingress.
 {
   "parentIdentifier": 2,
   "childIdentifier": 3,
-  "priority": "high"
+  "slot": 1
 }
 ```
 
-The parent and child must be full nodes and priority is `high`, `medium`, or
-`low`. The string `blank` in `childIdentifier` clears the selected slot. The
-frontend calls `POST /api/v1/tasks`, refreshes the parent, and reports any
-displaced task. Kennedy is instructed to assign a task only when there is a
-clear need for concrete work represented by that node to be completed.
+The parent and child must be full nodes and slot is 1, 2, or 3. The string
+`blank` in `childIdentifier` clears the selected slot. The frontend calls
+`POST /api/v1/fixed-connections`, refreshes the parent, and reports any
+displaced node. Fixed connections are arbitrary Kennedy-controlled placements
+with no priority or task meaning.
 
 The frontend attributes the parent, assigned child, and displaced child
 automatically without adding an argument to Kennedy's tool contract.
@@ -498,14 +502,15 @@ Available only during history ingress.
 ```json
 {
   "parentIdentifiers": [2, 3],
+  "ownerIdentifier": 1,
   "shortName": "New Memory",
   "shortDescription": "Short description.",
   "longDescription": "Long description."
 }
 ```
 
-The frontend resolves the parents and calls `POST /api/v1/nodes`, supplying the
-current provenance ID. The created node is assigned a short identifier and
+The frontend resolves the parents and root owner and calls `POST /api/v1/nodes`,
+supplying the current provenance ID. The created node is assigned a short identifier and
 marked as full before it is returned to Kennedy. Creation does not make the
 node directly loaded unless a later LoadNode call loads it.
 The frontend supplies the current model attribution automatically and refreshes
@@ -518,14 +523,15 @@ Available only during history ingress.
 ```json
 {
   "identifier": 3,
+  "ownerIdentifier": 1,
   "newShortName": "Updated Memory",
   "newShortDescription": "Updated description.",
   "newLongDescription": "Updated long description."
 }
 ```
 
-The frontend resolves the node and calls `PUT /api/v1/nodes/{durable_id}` with
-the current provenance ID. It refreshes the in-context representation and
+The frontend resolves the node and root owner and calls
+`PUT /api/v1/nodes/{durable_id}` with the current provenance ID. It refreshes the in-context representation and
 returns the updated node. The backend request also receives the frontend's
 current model attribution automatically.
 
@@ -729,9 +735,12 @@ CreateNode or UpdateNode calls is valid.
 Provider, checkpoint, provenance, and completion errors count toward the same
 five-attempt outer-session failure allowance. Each retry restores the last
 durable ingress archive. Conversation retries are scheduled by the browser
-worker; audio retries additionally use the recording's durable next-attempt
-timestamp so a transient outage cannot consume all five attempts in a few
-minutes.
+worker after the backend's short durable defer; audio retries use the
+recording's durable 15-second next-attempt timestamp. A failed job releases its
+durable claim before waiting, allowing the shared worker to select another
+eligible conversation or recording. Ingress uses the normal Codex generation
+timeout. An input-size rejection stops that record immediately for manual
+intervention instead of repeating an identical oversized request five times.
 
 ### 10.1 Audio-ingress pieces
 
@@ -948,7 +957,7 @@ telegram` Conversation History record and can run in parallel with other users
 and UI conversations. Group invocations and background group batches use
 `sessionType: telegram-group`. Every record stores direct and referenced root
 IDs plus channel metadata. Dynamic prompt composition distinguishes the web UI,
-private Telegram, one-invocation Telegram groups, and group-source history
+private Telegram, persistent per-user Telegram groups, and group-source history
 ingress. Shared prompt assets describe an arbitrary always-loaded root set;
 dynamic group context supplies the session-specific root roles and order.
 
@@ -962,7 +971,7 @@ sentinel David ID. New `/adduser` entries and newly observed groups are
 discovered and provisioned by the same bridge loop before their events run.
 
 One browser tab holds the `kennedy-telegram-bridge` Web Lock. It polls the
-relay's durable per-user/per-group head events, binds each event to its Conversation
+relay's durable per-private-user/per-group-user head events, binds each event to its Conversation
 History ID, runs the normal read-only conversation session, and returns only
 Kennedy's final conversational output. Event IDs are stored on user and
 assistant transcript items so reload can resume generation or retry delivery
@@ -971,14 +980,15 @@ active record, queues its full archive for history ingress, and leaves creation
 of the next Telegram record until the next message. History-ingress prompt
 composition and provenance source identify the source as Telegram or UI.
 
-A group event always creates a fresh Conversation History record. Its direct
-roots are the invoker's directory root, the group's reserved root, and Kennedy's
-root in that order. The frontend assigns short identifiers to every other
-participant root without loading it and adds dynamic context containing the
-group identity and root, participant/Telegram/root mapping, and the relay's
-most recent 50 messages. After delivery it immediately queues that
-one-invocation archive for normal history ingress. `/reset` is not a group
-operation and group binding never updates a private-DM session pointer.
+A group event reuses the active Conversation History record keyed by the stable
+group root and invoking Telegram user. Its direct roots are that user's
+directory root, the group's reserved root, and Kennedy's root in that order.
+The frontend assigns short identifiers to every other participant root without
+loading it. The first invocation includes up to 50 recent messages; later
+invocations append only unseen group messages and omit the current invoking
+message from the contextual copy. The record remains active after delivery.
+`/reset` closes and queues only that group-user record, while group binding
+never updates a private-DM or another group-user session pointer.
 
 The bridge also polls durable 80-message group-ingress batches. It creates a
 recoverable `telegram-group` archive with the group root followed by Kennedy's
@@ -996,16 +1006,20 @@ and clearly labeled inside the Chatend. Original bytes, content type, size, and
 transcription model are retained in the archive; Telegram originals also
 remain in the relay. History provenance retains those originals, but its
 model-facing history-ingress text replaces base64 audio with bounded metadata
-because this transport cannot consume it as audio. For a Telegram turn, crossing a new 100,000-token current-
-context band attaches a separate delivery warning to the answer. The warning
+because this transport cannot consume it as audio. For a Telegram turn,
+crossing a new 100,000-token current-context band attaches a separate delivery
+warning to the answer. A group warning names the relevant `@username` and says
+that other members have separate sessions. The warning
 is sent after the answer and never inserted into the Chatend.
 
 The normal composer also accepts up to five PDF, DOCX, XLSX/XLS/XLSB/ODS,
 CSV/TSV, or plain-text-family files totaling at most 20 MiB. The intelligence
 backend converts each file locally to at most 1,000,000 readable characters;
 the user may send attachments without typing a message. An explicit `Upload
-PDF` button opens this document picker. Telegram document
-events use the same conversion path and may include a caption. Searchable PDFs
+PDF` button opens this document picker. Private and invoked-group Telegram
+document events use the same conversion path and may include a caption. Group
+voice notes invoke by replying to Kennedy; group documents invoke by a bot
+mention in the caption or by reply. Searchable PDFs
 are supported; a scanned or image-only PDF with no extractable text returns an
 explicit OCR-required error. Original bytes and file metadata are archived,
 while extracted text enters the Chatend once and is not duplicated in media.

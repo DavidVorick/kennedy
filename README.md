@@ -277,8 +277,10 @@ Kennedy's strategy for using her harness is intentionally learned and stored in
 her own Kmap graph rather than embedded in static prompts. The frontend composes
 identity, session type, Kmap basics, read-only tools, optional write tools, and
 the current runtime in that order. Web and private Telegram sessions start with
-the user and Kennedy roots loaded; group invocations additionally load the
-group root.
+the user and Kennedy roots loaded; persistent group-user sessions additionally
+load the group root. Full nodes identify their Kennedy, user, or group owner;
+legacy null owners are shown as unowned. Three arbitrary numbered fixed
+connections replace the former priority/task terminology.
 
 Kennedy's local tools use a text protocol documented once in `KmapBasics.txt`,
 so tool requests and results are visible in the chatend. Every session can read
@@ -295,16 +297,18 @@ of loaded Kmap memory.
 The browser fetches these files at session startup. Edit them and reload the
 page; no compilation is required.
 
-The `TG Bot` view shows private conversations and independent Telegram-group
-invocations. The
+The `TG Bot` view shows private conversations and persistent Telegram-group
+sessions scoped to one user in one group. The
 browser must be open to run Kennedy, but Telegram messages remain durably
 queued while it is closed. `/reset` closes the current Telegram session and
 queues its full Chatend for the same history-ingress flow as an ended UI
-conversation; it is private-DM-only because each mentioned/replied-to group
-invocation already ends after one reply. Each allowed group has its own blank
+conversation. In a group, `/reset` closes only the invoking user's session for
+that group. Each allowed group has its own blank
 Kmap root. Kennedy loads the invoker's root, the group root, and her own root,
 lists every other participant's root as a loadable reference, and receives the
-latest 50 messages. More than 100 uninvoked group messages queues the oldest 80
+latest 50 messages initially and unseen messages on later invocations. Voice
+notes sent as replies and supported documents sent by caption mention or reply
+use the same transcription/extraction paths as DMs. More than 100 uninvoked group messages queues the oldest 80
 for background ingress with the group and Kennedy roots loaded. Groups require Kennedy to be an
 administrator and are permanently blacklisted on an unknown/conflicting member
 or incomplete membership ledger. The browser composer also has a microphone button; both sources

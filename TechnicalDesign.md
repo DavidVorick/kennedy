@@ -269,9 +269,9 @@ It does not call the Kweb or intelligence APIs or validate their identifiers.
 It permits multiple `active` and `ingress_pending` records while enforcing one
 `ingress_in_progress` record. A user-activity checkpoint also closes other
 active conversations idle for more than 24 hours, unless Kennedy still owes a
-  response in that record. All Telegram session types are exempt from idle
-closure. Private sessions remain active until `/reset`; independent group
-invocations and background batches are explicitly queued immediately.
+response in that record. All Telegram session types are exempt from idle
+closure. Private sessions and per-group-user sessions remain active until
+`/reset`; only background group batches are explicitly queued immediately.
 The backend atomically records concise ingress failure diagnostics. The fifth
 failure moves the record to `ingress_failed`, removes it from queue selection,
 and frees the worker to process the next conversation; failed records and all
@@ -294,8 +294,11 @@ an administrator and the observed active-member ledger must exactly match the
 Telegram member count with every identity whitelisted. Unknown/conflicting
 members, an incomplete ledger, or loss of monitoring after activation
 permanently blacklists the chat ID. Each observed group keeps a stable root even
-after blacklisting or a Telegram chat-ID migration. Mentions and replies queue
-fresh invocations with 50 messages of context; more than 100 uninvoked messages
+after blacklisting or a Telegram chat-ID migration. Mentions, replies, and
+scoped group resets queue work onto a persistent `(group root, user)` session
+with up to 50 messages of initial context; voice notes and supported documents
+use the same media path as DMs. Queue heads are isolated by group user. More
+than 100 uninvoked messages
 queue the oldest 80 for background ingress. The browser provisions reserved roots, binds each
 event to Conversation History, runs the Chatend/tool loop, and returns only
 Kennedy's final text. The relay never receives the rest of the Chatend.
@@ -382,8 +385,8 @@ provenance node stores the complete recovery JSON for
 durability, but ingress parses it and formats only its `messages`; recovery
 counters, diagnostics, media data URLs, and the JSON envelope do not enter
 Kennedy's context.
-Kennedy may navigate the kweb, connect nodes, reorganize fanout, manage task
-slots, create or update knowledge nodes, and use WebSearch or WebFetch when
+Kennedy may navigate the kweb, connect nodes, reorganize fanout, manage fixed
+slots, create or update owned knowledge nodes, and use WebSearch or WebFetch when
 external evidence would help. The current provenance identifier is held by the
 frontend and supplied implicitly when it translates CreateNode and UpdateNode
 tool calls into Kweb API requests.
@@ -429,12 +432,16 @@ ingress extracts its canonical Chatend text. Each time current context crosses a
 the relay sends a separate operational notice with current and maximum tokens
 and suggests `/reset`; the notice is not added to the Chatend.
 
-Each group invocation instead ends after its one reply. Its direct roots are
-the invoker's reserved user root, the group's reserved root, and Kennedy's root
+Each group user retains a separate session within each group until that user
+runs `/reset`. Its direct roots are the user's reserved root, the group's
+reserved root, and Kennedy's root
 in that order. Every other member root receives a session-local short identifier
 without being loaded, so Kennedy may load it deliberately. Dynamic context
 lists the group root, all participants/root identifiers, and the latest 50
-messages. Background 80-message archives have no invoker, so they load the
+messages initially; later turns append unseen group messages without duplicating
+the invoking message. Context warnings name the relevant `@username` and state
+that other participants have separate sessions. Background 80-message archives
+have no invoker, so they load the
 group root followed by Kennedy's root and register all participant roots before
 ordinary sequential history ingress. Group-root assignments are created when a
 group is first observed and survive permanent blacklisting and Telegram chat-ID
@@ -450,7 +457,9 @@ ordinary text Chatend.
 Browser and Telegram document uploads share a local intelligence-backend
 extraction endpoint. Searchable PDFs use PDF text extraction, DOCX uses its
 OpenXML document body, spreadsheets become sheet-labeled tabular text, and
-plain-text formats are normalized directly. Extracted text is bounded and
+plain-text formats are normalized directly. Group voice notes invoke by replying
+to Kennedy; group documents may use a bot mention in their caption or a reply.
+Extracted text is bounded and
 placed once in the Chatend; original bytes and metadata remain in conversation
 media. Image-only PDFs fail with an explicit OCR-required message.
 
@@ -504,23 +513,28 @@ bottom follows appended content.
 
 SQLite stores exactly the three durable node types from the user specification:
 
-- **Knowledge node**: the current human-readable memory and its connection
-  lists, with a pointer to the newest history node.
+- **Knowledge node**: the current human-readable memory, nullable owner root,
+  and connection lists, with a pointer to the newest history node.
 - **Data provenance node**: immutable source material, its source, and its
   source creation time.
 - **Data history node**: an append-only link from one knowledge node to one
   provenance node and the previous history node.
 
 Connections are represented in a relational table as an implementation detail
-of knowledge nodes. Each directed connection has an active, fanout, or task
-role and a deterministic order. Task priority slots use reserved negative order
+of knowledge nodes. Each directed connection has an active, fanout, or fixed
+role and a deterministic order. Fixed numbered slots use reserved negative order
 values in the existing connection schema, so legacy databases need no migration
-and nodes without assigned tasks expose an empty task list. `ConnectNodes`
+and nodes without assigned fixed connections expose an empty fixed list. `ConnectNodes`
 promotes every ordered pair in the supplied set. If a source exceeds the active
 limit, its least recently active connections are demoted unless that would
 exceed the fanout limit. `ConsolidateFanout` moves selected fanout references
-under an existing aggregator. `AssignTask` replaces or clears one directional
-high, medium, or low task slot.
+under an existing aggregator. `SetFixedConnection` replaces or clears one
+directional slot numbered 1, 2, or 3 without assigning priority semantics.
+
+`knowledge_nodes.owner_root_node_id` is nullable for compatibility. Null is
+exposed as `unowned`; valid owner targets are self-owned Kennedy, user, or group
+roots. Root bootstrap establishes or repairs self-ownership, while legacy
+non-root nodes remain unowned until Kennedy updates them.
 
 The default limits are eight active and 64 ordinary fanout connections. A
 LoadNode context read transactionally applies the same oldest-first demotion to

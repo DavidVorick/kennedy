@@ -30,6 +30,8 @@ use tower_http::{
 use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+const RELEASE_DEFERRED_INGRESS_MIGRATION: &str =
+    include_str!("../migrations/002_release_deferred_ingress.sql");
 const GEMINI_INTERACTIONS_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 const GEMINI_FILES_UPLOAD_URL: &str =
@@ -46,6 +48,7 @@ const ESTIMATED_CHARACTERS_PER_TOKEN: u64 = 4;
 const MAX_CONCURRENT_GEMINI_CHUNKS: usize = 4;
 const INGRESS_BREAK: &str = "<!-- KENNEDY_INGRESS_BREAK -->";
 const INGRESS_FAILURE_LIMIT: i64 = 5;
+const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -351,6 +354,9 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
         connection.execute_batch(INITIAL_MIGRATION)?;
+    }
+    if version < 2 {
+        connection.execute_batch(RELEASE_DEFERRED_INGRESS_MIGRATION)?;
     }
     Ok(())
 }
@@ -808,11 +814,49 @@ async fn process_next_recording(state: &AppState) -> anyhow::Result<bool> {
     match result {
         Ok(()) => Ok(true),
         Err(error) => {
-            record_processing_failure(state, &recording_id, &stage, &error.to_string())?;
-            tracing::warn!(%recording_id, %stage, error=%error, "Audio processing will retry");
+            if terminal_processing_failure(&stage, &error) {
+                record_terminal_processing_failure(
+                    state,
+                    &recording_id,
+                    &stage,
+                    &error.to_string(),
+                )?;
+                tracing::error!(%recording_id, %stage, error=%error, "Audio processing failed permanently");
+            } else {
+                record_processing_failure(state, &recording_id, &stage, &error.to_string())?;
+                tracing::warn!(%recording_id, %stage, error=%error, "Audio processing will retry");
+            }
             Ok(true)
         }
     }
+}
+
+fn terminal_processing_failure(stage: &str, error: &anyhow::Error) -> bool {
+    matches!(stage, "uploaded" | "chunking")
+        && error
+            .chain()
+            .any(|cause| cause.to_string().starts_with("invalid WAV recording"))
+}
+
+fn record_terminal_processing_failure(
+    state: &AppState,
+    recording_id: &str,
+    stage: &str,
+    error: &str,
+) -> anyhow::Result<()> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
+    let concise = format!(
+        "{stage}: {}",
+        concise_text(error, 2_000, "invalid WAV recording")
+    );
+    db.execute(
+        "UPDATE audio_recordings SET status='failed',attempt_count=attempt_count+1,next_attempt_at=NULL,last_error=?1,updated_at=?2 WHERE id=?3",
+        params![concise,Utc::now().to_rfc3339(),recording_id],
+    )?;
+    Ok(())
 }
 
 fn fetch_work_recording(db: &Connection) -> anyhow::Result<Option<WorkRecording>> {
@@ -947,18 +991,26 @@ fn split_wav(
     relative_prefix: &str,
 ) -> anyhow::Result<Vec<GeneratedChunk>> {
     let reader = WavReader::open(source)
-        .with_context(|| format!("opening WAV recording {}", source.display()))?;
+        .with_context(|| format!("invalid WAV recording: opening {}", source.display()))?;
     let spec = reader.spec();
     ensure!(
         spec.sample_rate > 0 && spec.channels > 0,
-        "WAV has invalid audio metadata"
+        "invalid WAV recording: audio metadata is invalid"
+    );
+    let complete_file_bytes = fs::metadata(source)?.len();
+    let declared_audio_bytes = u64::from(reader.duration())
+        .saturating_mul(u64::from(spec.channels))
+        .saturating_mul(u64::from(spec.bits_per_sample).div_ceil(8));
+    ensure!(
+        declared_audio_bytes <= complete_file_bytes,
+        "invalid WAV recording: header declares {declared_audio_bytes} audio bytes but the complete file has only {complete_file_bytes} bytes"
     );
     let duration_ms = (u64::from(reader.duration()) * 1_000).div_ceil(u64::from(spec.sample_rate));
     drop(reader);
     let boundaries = chunk_boundaries(duration_ms);
     ensure!(
         !boundaries.is_empty(),
-        "WAV recording contains no audio samples"
+        "invalid WAV recording: file contains no audio samples"
     );
     if chunk_directory.exists() {
         fs::remove_dir_all(chunk_directory)
@@ -969,7 +1021,8 @@ fn split_wav(
     for (index, (start_ms, end_ms)) in boundaries.into_iter().enumerate() {
         let name = format!("chunk-{index:05}.wav");
         let path = chunk_directory.join(&name);
-        copy_wav_interval(source, &path, start_ms, end_ms)?;
+        copy_wav_interval(source, &path, start_ms, end_ms)
+            .context("invalid WAV recording while reading declared samples")?;
         set_private_file(&path)?;
         sync_file(&path)?;
         generated.push(GeneratedChunk {
@@ -1748,9 +1801,17 @@ async fn ingress_failure(
     AxumPath(id): AxumPath<String>,
     Json(input): Json<RecordIngressFailure>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
-    validate_version(input.expected_version)?;
     let mut db = state.db.lock().map_err(ApiError::internal)?;
-    let existing = fetch_piece(&db, &id)?;
+    Ok(Json(record_piece_ingress_failure(&mut db, &id, &input)?))
+}
+
+fn record_piece_ingress_failure(
+    db: &mut Connection,
+    id: &str,
+    input: &RecordIngressFailure,
+) -> Result<IngressPieceRecord, ApiError> {
+    validate_version(input.expected_version)?;
+    let existing = fetch_piece(db, id)?;
     if !matches!(
         existing.phase.as_str(),
         "ingress_pending" | "ingress_in_progress"
@@ -1761,7 +1822,8 @@ async fn ingress_failure(
         ));
     }
     let consecutive_attempt = existing.ingress_failure_count + 1;
-    let terminal = consecutive_attempt >= INGRESS_FAILURE_LIMIT;
+    let non_retryable = input.code.as_deref() == Some("input_too_large");
+    let terminal = non_retryable || consecutive_attempt >= INGRESS_FAILURE_LIMIT;
     let mut failures = existing
         .ingress_failures
         .as_array()
@@ -1778,13 +1840,24 @@ async fn ingress_failure(
     let next_phase = if terminal {
         "ingress_failed"
     } else {
-        existing.phase.as_str()
+        "ingress_pending"
     };
     let now = Utc::now().to_rfc3339();
     let tx = db.transaction().map_err(ApiError::internal)?;
     tx.execute("UPDATE audio_ingress_pieces SET phase=?1,ingress_failure_count=?2,ingress_failures_json=?3,updated_at=?4,version=version+1 WHERE id=?5 AND version=?6",params![next_phase,consecutive_attempt,serde_json::to_string(&failures).map_err(ApiError::internal)?,now,id,input.expected_version]).map_err(ApiError::internal)?;
     if terminal {
-        tx.execute("UPDATE audio_recordings SET status='ingress_failed',next_attempt_at=NULL,last_error=?1,updated_at=?2 WHERE id=?3",params![format!("Transcript piece {} exhausted its ingress attempts",existing.piece_index + 1),now,existing.recording_id]).map_err(ApiError::internal)?;
+        let failure_summary = if non_retryable {
+            format!(
+                "Transcript piece {} requires manual ingress retry after a non-retryable input error",
+                existing.piece_index + 1
+            )
+        } else {
+            format!(
+                "Transcript piece {} exhausted its ingress attempts",
+                existing.piece_index + 1
+            )
+        };
+        tx.execute("UPDATE audio_recordings SET status='ingress_failed',next_attempt_at=NULL,last_error=?1,updated_at=?2 WHERE id=?3",params![failure_summary,now,existing.recording_id]).map_err(ApiError::internal)?;
     } else {
         let next_attempt_at = (Utc::now()
             + ChronoDuration::seconds(ingress_retry_delay_seconds(consecutive_attempt)))
@@ -1805,16 +1878,11 @@ async fn ingress_failure(
         .map_err(ApiError::internal)?;
     }
     tx.commit().map_err(ApiError::internal)?;
-    Ok(Json(fetch_piece(&db, &id)?))
+    fetch_piece(db, id)
 }
 
-fn ingress_retry_delay_seconds(consecutive_attempt: i64) -> i64 {
-    match consecutive_attempt {
-        i64::MIN..=1 => 60,
-        2 => 5 * 60,
-        3 => 15 * 60,
-        _ => 60 * 60,
-    }
+fn ingress_retry_delay_seconds(_consecutive_attempt: i64) -> i64 {
+    INGRESS_RETRY_DELAY_SECONDS
 }
 
 async fn retry_ingress(
@@ -1885,6 +1953,42 @@ mod tests {
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         apply_migrations(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn migration_releases_a_deferred_legacy_audio_claim() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(INITIAL_MIGRATION).unwrap();
+        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning,next_attempt_at) VALUES('r',?1,'note.wav','audio/wav',10,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','originals/x.wav','ingressing',?2,?3,?4,'2099-01-01T00:00:00Z')",params!["a".repeat(64),GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
+        db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,version,created_at,updated_at) VALUES('stranded','r',0,'text',1,'ingress_in_progress',7,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
+
+        apply_migrations(&db).unwrap();
+
+        let (phase, version): (String, i64) = db
+            .query_row(
+                "SELECT phase,version FROM audio_ingress_pieces WHERE id='stranded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "ingress_pending");
+        assert_eq!(version, 8);
+        assert_eq!(
+            db.query_row(
+                "SELECT datetime(next_attempt_at)<=datetime('now','+16 seconds') FROM audio_recordings WHERE id='r'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES('next','r',1,'text',1,'ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
     }
 
     #[test]
@@ -1995,11 +2099,116 @@ mod tests {
     }
 
     #[test]
-    fn kennedy_ingress_retries_back_off_to_one_hour() {
-        assert_eq!(ingress_retry_delay_seconds(1), 60);
-        assert_eq!(ingress_retry_delay_seconds(2), 5 * 60);
-        assert_eq!(ingress_retry_delay_seconds(3), 15 * 60);
-        assert_eq!(ingress_retry_delay_seconds(4), 60 * 60);
+    fn truncated_wav_is_rejected_as_a_terminal_input_error() {
+        let root = std::env::temp_dir().join(format!("kennedy-audio-test-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("truncated.wav");
+        let mut writer = WavWriter::create(
+            &source,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 8_000,
+                bits_per_sample: 16,
+                sample_format: SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..8_000 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(100)
+            .unwrap();
+
+        let error = split_wav(&source, &root.join("chunks"), "chunks").unwrap_err();
+        assert!(error.to_string().starts_with("invalid WAV recording"));
+        assert!(terminal_processing_failure("chunking", &error));
+        assert!(!terminal_processing_failure("transcribing", &error));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kennedy_ingress_retries_after_fifteen_seconds() {
+        assert_eq!(ingress_retry_delay_seconds(1), 15);
+        assert_eq!(ingress_retry_delay_seconds(2), 15);
+        assert_eq!(ingress_retry_delay_seconds(3), 15);
+        assert_eq!(ingress_retry_delay_seconds(4), 15);
+    }
+
+    #[test]
+    fn failed_attempt_releases_the_audio_claim_while_its_retry_is_deferred() {
+        let mut db = database();
+        let now = Utc::now().to_rfc3339();
+        for (recording, piece, source) in [
+            ("first", "p1", "2026-01-01T00:00:00Z"),
+            ("second", "p2", "2026-01-02T00:00:00Z"),
+        ] {
+            db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES(?1,?2,'note.wav','audio/wav',10,?3,?3,?4,'originals/x.wav','ingressing',?5,?6,?7)",params![recording,if recording == "first" { "a".repeat(64) } else { "b".repeat(64) },source,now,GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
+            db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES(?1,?2,0,'text',1,?3,?4,?4)",params![piece,recording,if recording == "first" { "ingress_in_progress" } else { "ingress_pending" },now]).unwrap();
+        }
+
+        let failed = record_piece_ingress_failure(
+            &mut db,
+            "p1",
+            &RecordIngressFailure {
+                expected_version: 1,
+                stage: "model_loop".into(),
+                code: Some("provider_error".into()),
+                message: "temporary failure".into(),
+                rounds_used: Some(1),
+                context_tokens: None,
+                context_window_tokens: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(failed.phase, "ingress_pending");
+        assert_eq!(fetch_next_ingress_piece(&db).unwrap().unwrap().id, "p2");
+        assert!(
+            db.execute(
+                "UPDATE audio_ingress_pieces SET phase='ingress_in_progress' WHERE id='p2'",
+                []
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn oversized_audio_ingress_is_terminal_without_repeating_the_same_request() {
+        let mut db = database();
+        let now = Utc::now().to_rfc3339();
+        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES('r',?1,'note.wav','audio/wav',10,?2,?2,?2,'originals/x.wav','ingressing',?3,?4,?5)",params!["a".repeat(64),now,GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
+        db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES('p','r',0,'text',1,'ingress_in_progress',?1,?1)",[&now]).unwrap();
+
+        let failed = record_piece_ingress_failure(
+            &mut db,
+            "p",
+            &RecordIngressFailure {
+                expected_version: 1,
+                stage: "model_loop".into(),
+                code: Some("input_too_large".into()),
+                message: "input exceeds the provider limit".into(),
+                rounds_used: Some(1),
+                context_tokens: None,
+                context_window_tokens: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(failed.phase, "ingress_failed");
+        assert_eq!(failed.ingress_failure_count, 1);
+        assert!(fetch_next_ingress_piece(&db).unwrap().is_none());
+        assert!(
+            fetch_recording(&db, "r")
+                .unwrap()
+                .last_error
+                .unwrap()
+                .contains("manual ingress retry")
+        );
     }
 
     #[test]

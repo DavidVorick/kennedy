@@ -28,6 +28,12 @@ in the relay archive. `/reset` is an event: the browser closes the corresponding
 Telegram conversation, requests history ingress, and acknowledges the reset only
 after that transition is durable.
 
+Private active pointers remain in `authorized_users`. Group pointers live in
+`telegram_group_user_sessions`, keyed by stable group-root ID and Telegram user
+ID, and `telegram_events.group_root_node_id` makes that identity durable across
+chat-ID migration. A pending group event inherits its pair's current pointer;
+binding updates only that pair.
+
 For groups, Kennedy requests `chat_member` updates and must be an administrator
 before processing messages. Adding and then promoting Kennedy may be two
 actions; the group remains inert in `validating` between them. The relay keeps
@@ -48,24 +54,30 @@ each join is observed. Dropping Kennedy into a pre-existing group whose full
 membership was not observed produces a count mismatch and permanent blacklist,
 which is the fail-closed behavior required by this policy.
 
-An allowed group message queues Kennedy only when it mentions her bot handle or
-replies to one of her messages. The event carries the group root, the complete
+An allowed group message queues Kennedy when it mentions her bot handle,
+replies to one of her messages, or is a scoped `/reset`. Voice notes therefore
+invoke by reply; supported documents may invoke by caption mention or reply.
+The event carries the group root, the complete
 current member ledger with reserved user-root IDs, and the latest 50 archived
 group messages. It is
-marked `sessionKind: group`; the browser creates a fresh independent session
-and never changes the invoker's private-DM conversation pointer. Group `/reset`
-has no transport meaning. More than 100 non-invocation messages after the last
+marked `sessionKind: group`; the relay binds it to a persistent session keyed
+by `(group root, Telegram user)` and never changes the invoker's private-DM or
+other-group conversation pointer. Group `/reset` clears only that binding.
+More than 100 non-invocation messages after the last
 covered cursor queues the oldest 80 as one durable background-ingress batch,
 leaving 20 messages unbatched. The relay stores Kennedy's group replies in the
 same message archive.
 
-The browser may fetch one head-of-line event per user, bind it to a Conversation
+The browser may fetch one head-of-line event per private user or group-user
+pair, bind it to a Conversation
 History ID, store a voice note's paid transcription, fetch original media bytes,
 locally extract bounded document text through the intelligence backend, and
 submit a final reply. A document that is corrupt, image-only, or otherwise not
 readable, or whose extraction otherwise fails, receives a clear Telegram error
 and is completed instead of retrying forever and blocking that user's later
-events. Reply bodies contain Kennedy's conversational output only, plus an
+events. Group voice and document events retain the same bytes, MIME type,
+filename/caption, and duration metadata as private events. Reply bodies contain
+Kennedy's conversational output only, plus an
 optional separate context-window notice. Long messages are split safely below
 Telegram's message limit.
 

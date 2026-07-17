@@ -1,7 +1,7 @@
 import { Chatend } from "./chatend.js?v=20260717.5";
-import { KwebContext } from "./kweb_context.js?v=20260717.6";
-import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.5";
-import { ToolExecutor } from "./tools.js?v=20260717.5";
+import { KwebContext } from "./kweb_context.js?v=20260717.7";
+import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.6";
+import { ToolExecutor } from "./tools.js?v=20260717.6";
 import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.5";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 
@@ -155,6 +155,9 @@ export class ConversationSession {
     this.pendingExternalEventId = state.pendingExternalEventId || archive.pendingExternalEventId || null;
     this.lastContextWarningBand = Number(state.lastContextWarningBand ?? archive.lastContextWarningBand) || 0;
     this.media = jsonCopy(state.media || archive.media || []);
+    this.channel = jsonCopy(state.channel || archive.channel || this.channel);
+    this.referenceRootNodeIds = [...new Set((state.referenceRootNodeIds || archive.referenceRootNodeIds || this.referenceRootNodeIds)
+      .filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
     this.pendingCheckpointed = this.pendingTurn;
     this.chatend.restoreMessages(jsonCopy(archive.messages), jsonCopy(archive.retained || this.retainedTranscript()));
     this.chatend.restoreFullHistory(archive.fullHistory?.segments);
@@ -162,6 +165,37 @@ export class ConversationSession {
     this.executor.loadCalls = Number.isInteger(archive.tools?.loadCalls) ? archive.tools.loadCalls : 0;
     this.executor.toolLog = jsonCopy(archive.tools?.log || []);
     this.usage.restore(archive.usage);
+  }
+
+  refreshTelegramGroupContext(groupContext, currentMessageId = null) {
+    if (this.sessionType !== "telegram-group" || !groupContext) return;
+    const previousMessageId = Number(this.channel?.lastGroupContextMessageId) || 0;
+    const messages = Array.isArray(groupContext.messages) ? groupContext.messages : [];
+    const newestMessageId = messages.reduce((latest, message) => Math.max(latest, Number(message.messageId) || 0), previousMessageId);
+    const unseenMessages = messages.filter(message => {
+      const messageId = Number(message.messageId) || 0;
+      return messageId > previousMessageId && String(message.messageId) !== String(currentMessageId);
+    });
+    this.channel = {
+      ...(this.channel || {}),
+      username: groupContext.invokingUsername || this.channel?.username || null,
+      groupContext: jsonCopy({
+        ...groupContext,
+        messages: messages.filter(message => String(message.messageId) !== String(currentMessageId)),
+      }),
+      lastGroupContextMessageId: newestMessageId,
+    };
+    for (const participant of groupContext.participants || []) {
+      const rootNodeId = participant?.rootNodeId;
+      if (typeof rootNodeId !== "string" || !rootNodeId || this.rootNodeIds.includes(rootNodeId)) continue;
+      if (!this.referenceRootNodeIds.includes(rootNodeId)) this.referenceRootNodeIds.push(rootNodeId);
+      this.context.registerReference(rootNodeId);
+    }
+    if (!unseenMessages.length) return;
+    const update = formatTelegramGroupContext({ ...groupContext, messages: unseenMessages }, this.context);
+    const content = `Updated Telegram group context since this user's previous invocation:\n\n${update}`;
+    this.chatend.retained.push({ role: "user", content });
+    this.chatend.append({ role: "user", content });
   }
 
   reportTurnTiming(timing, status) {
@@ -231,10 +265,18 @@ export class ConversationSession {
       const response = { role: "kennedy", content: answer };
       if (this.pendingExternalEventId) response.externalEventId = this.pendingExternalEventId;
       const usage = this.usage.snapshot();
-      if (this.sessionType === "telegram" && usage.contextWindowTokens) {
+      if (["telegram", "telegram-group"].includes(this.sessionType) && usage.contextWindowTokens) {
         const band = Math.floor(usage.contextTokens / 100000);
         if (band > this.lastContextWarningBand) {
-          response.contextWarning = `${usage.contextTokens.toLocaleString("en-US")} out of ${usage.contextWindowTokens.toLocaleString("en-US")} context tokens used. Consider resetting with /reset.`;
+          if (this.sessionType === "telegram-group") {
+            const username = String(this.channel?.username || "").replace(/^@/, "");
+            const identity = username
+              ? `@${username}`
+              : `${this.channel?.displayName || "This participant"} (Telegram user ${this.channel?.telegramUserId})`;
+            response.contextWarning = `${identity}, your Kennedy session in this group is using ${usage.contextTokens.toLocaleString("en-US")} out of ${usage.contextWindowTokens.toLocaleString("en-US")} context tokens. This applies only to ${identity}; other members have separate sessions. Use /reset to begin a new session.`;
+          } else {
+            response.contextWarning = `${usage.contextTokens.toLocaleString("en-US")} out of ${usage.contextWindowTokens.toLocaleString("en-US")} context tokens used. Consider resetting with /reset.`;
+          }
         }
         this.lastContextWarningBand = band;
       }

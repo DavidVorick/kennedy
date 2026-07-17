@@ -1,4 +1,5 @@
 pub(crate) const MAX_REQUEST_BYTES: usize = 26 * 1024 * 1024;
+pub(crate) const MAX_CODEX_INPUT_CHARACTERS: usize = 1_048_576;
 
 pub(crate) const DEFAULT_PROVIDER_NAME: &str = "primary";
 pub(crate) const CODEX_PROVIDER_KIND: &str = "codex";

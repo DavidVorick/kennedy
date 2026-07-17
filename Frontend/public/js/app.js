@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.3";
-import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.5";
-import { ConversationSession } from "./conversation.js?v=20260717.7";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.4";
+import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.6";
+import { ConversationSession } from "./conversation.js?v=20260717.8";
 import { runHistoryIngress } from "./history_ingress.js?v=20260717.7";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260717.5";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.6";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260717.6";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.7";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -120,6 +120,22 @@ function groupContextOf(record) {
     || record?.state?.archive?.channel?.groupContext
     || record?.state?.historyIngress?.groupContext
     || null;
+}
+
+function channelOf(record) {
+  return record?.state?.channel || record?.state?.archive?.channel || null;
+}
+
+function groupSessionMatches(record, event) {
+  if (sessionTypeOf(record) !== "telegram-group") return false;
+  const channel = channelOf(record);
+  const sameUser = String(channel?.telegramUserId) === String(event.telegramUserId);
+  const eventGroupRoot = event.groupRootNodeId || event.groupContext?.groupRootNodeId;
+  const channelGroupRoot = channel?.groupRootNodeId || channel?.groupContext?.groupRootNodeId;
+  const sameGroup = eventGroupRoot && channelGroupRoot
+    ? eventGroupRoot === channelGroupRoot
+    : String(channel?.chatId) === String(event.chatId);
+  return sameUser && sameGroup;
 }
 
 function rootsForRecord(record) {
@@ -1089,7 +1105,11 @@ async function createTelegramConversation(event) {
   const sessionRoots = directoryGroup
     ? [directoryUser.rootNodeId, directoryGroup.rootNodeId, kennedyRootNodeId]
     : [directoryUser.rootNodeId, kennedyRootNodeId];
-  const groupContext = sessionType === "telegram-group" ? event.groupContext : null;
+  const latestGroupMessageId = (event.groupContext?.messages || [])
+    .reduce((latest, message) => Math.max(latest, Number(message.messageId) || 0), 0);
+  const groupContext = sessionType === "telegram-group" && event.groupContext
+    ? { ...event.groupContext, messages: (event.groupContext.messages || []).filter(message => String(message.messageId) !== String(event.messageId)) }
+    : null;
   const referenceRootNodeIds = referencesForGroup(groupContext, sessionRoots);
   const channel = {
     kind: sessionType,
@@ -1097,7 +1117,9 @@ async function createTelegramConversation(event) {
     chatId: event.chatId,
     username: event.username || null,
     displayName: event.displayName,
+    groupRootNodeId: directoryGroup?.rootNodeId || event.groupRootNodeId || null,
     groupContext,
+    lastGroupContextMessageId: latestGroupMessageId,
   };
   const session = new ConversationSession({
     kweb, intelligence, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort,
@@ -1116,29 +1138,50 @@ async function telegramConversationFor(event) {
   let record = event.conversationId
     ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
     : null;
+  if (record && group && !groupSessionMatches(record, event)) record = null;
   if (!record && !group) {
     record = historyRecords.find(item => item.phase === "active"
       && sessionTypeOf(item) === "telegram"
       && String(item.state?.channel?.telegramUserId) === String(event.telegramUserId));
   }
+  if (!record && group) {
+    record = historyRecords.find(item => item.phase === "active" && groupSessionMatches(item, event));
+  }
   let session = record?.phase === "active" ? liveSessions.get(record.id) : null;
   if (record?.phase === "active" && !session) session = await buildConversation(record);
-  if (!record || record.phase !== "active") ({ record, session } = await createTelegramConversation(event));
+  let created = false;
+  if (!record || record.phase !== "active") {
+    ({ record, session } = await createTelegramConversation(event));
+    created = true;
+  }
   if (event.conversationId !== record.id) await telegramRelay.bind(event.id, record.id);
+  if (group && !created) {
+    session.channel = {
+      ...(session.channel || {}),
+      username: event.username || null,
+      displayName: event.displayName,
+      groupRootNodeId: event.groupRootNodeId || event.groupContext?.groupRootNodeId || session.channel?.groupRootNodeId || null,
+    };
+    session.refreshTelegramGroupContext(event.groupContext, event.messageId);
+    await session.persistSnapshot(session.snapshot());
+  }
   return { record, session };
 }
 
 async function processTelegramReset(event) {
-  if (event.sessionKind === "group") throw new Error("Telegram group sessions are independent and cannot be reset.");
+  const group = event.sessionKind === "group";
   let record = event.conversationId
     ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
     : null;
+  if (record && group && !groupSessionMatches(record, event)) record = null;
   if (!record || record.phase !== "active") {
-    record = historyRecords.find(item => item.phase === "active" && sessionTypeOf(item) === "telegram"
-      && String(item.state?.channel?.telegramUserId) === String(event.telegramUserId));
+    record = historyRecords.find(item => item.phase === "active" && (group
+      ? groupSessionMatches(item, event)
+      : sessionTypeOf(item) === "telegram" && String(channelOf(item)?.telegramUserId) === String(event.telegramUserId)));
   }
   if (!record || record.phase !== "active") {
-    await telegramRelay.resetCompleted(event.id, "There is no active Telegram session to reset. Your next message will begin one.");
+    const scope = group ? " for you in this group" : "";
+    await telegramRelay.resetCompleted(event.id, `There is no active Telegram session${scope} to reset. Your next message will begin one.`);
     return;
   }
   let session = liveSessions.get(record.id);
@@ -1151,7 +1194,8 @@ async function processTelegramReset(event) {
   liveSessions.delete(record.id);
   if (selectedConversationId === record.id) update();
   kickHistoryIngress();
-  await telegramRelay.resetCompleted(event.id, "Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session.");
+  const scope = group ? "Your session in this group" : "The Telegram session";
+  await telegramRelay.resetCompleted(event.id, `Conversation reset. ${scope} has been queued for memory ingress; your next message will begin a new session.`);
 }
 
 async function telegramVoiceInput(event) {
@@ -1258,13 +1302,6 @@ async function processTelegramEvent(event) {
     }
     if (!response) throw new Error("Kennedy completed the turn without a recoverable Telegram response.");
     if (response.content) await telegramRelay.reply(event.id, record.id, response.content, response.contextWarning || null);
-    if (event.sessionKind === "group") {
-      const latest = historyRecords.find(item => item.id === record.id) || record;
-      const closed = await conversationHistory.requestIngress(record.id, { expected_version: latest.version, state: session.snapshot() });
-      upsertHistory(closed);
-      liveSessions.delete(record.id);
-      kickHistoryIngress();
-    }
   }
   const processingDurationMs = Math.max(0, Math.round(performance.now() - processingStarted));
   const receivedAt = Date.parse(event.createdAt);
@@ -1581,9 +1618,10 @@ async function processAudioIngressPiece(initialPiece) {
       showError(ui.error_banner, `Audio transcript ingress stopped after ${failed.ingress_failure_count} failed attempts. Recording ${failed.recording_id} remains preserved for inspection.`);
       return;
     }
-    activeAudioIngressPiece = failed;
-    const failureMessage = failed.ingress_failures?.at?.(-1)?.message || "No error detail was recorded.";
-    throw new Error(`Audio ingress attempt ${failed.ingress_failure_count}/${INGRESS_FAILURE_LIMIT} failed during ${stage}: ${failureMessage}`);
+    ingressDiagnostic = null;
+    activeAudioIngressPiece = null;
+    await refreshAudioHistory(activeView === "audio");
+    return;
   }
 }
 
@@ -1730,8 +1768,10 @@ async function processIngressQueue() {
         await refreshHistory();
         continue;
       }
-      const failureMessage = failedRecord.ingress_failures?.at?.(-1)?.message || "No error detail was recorded.";
-      throw new Error(`History ingress attempt ${failedRecord.ingress_failure_count}/${INGRESS_FAILURE_LIMIT} failed during ${stage}: ${failureMessage}`);
+      ingressDiagnostic = null;
+      activeIngressRecord = null;
+      await refreshHistory();
+      continue;
     }
   }
 }

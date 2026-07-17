@@ -1,4 +1,4 @@
-import { element } from "./render.js?v=20260717.5";
+import { element } from "./render.js?v=20260717.7";
 
 export class MemoryExplorer {
   constructor({ api, rootNodeIds, content, backButton, forwardButton }) {
@@ -27,9 +27,15 @@ export class MemoryExplorer {
 
   renderNode(node, history) {
     const root = document.createDocumentFragment();
-    root.append(element("h2", "", node.short_name), element("p", "node-description", node.short_description || "No short description."), element("p", "node-attribution", `Last modified by: ${node.last_modified_by || "legacy-unknown"}`), element("div", "long-description", node.long_description || "No long description."));
+    root.append(
+      element("h2", "", node.short_name),
+      element("p", "node-description", node.short_description || "No short description."),
+      element("p", "node-attribution", `Last modified by: ${node.last_modified_by || "legacy-unknown"}`),
+      element("p", "node-attribution", `Owner root: ${node.owner_root_node_id || "unowned"}`),
+      element("div", "long-description", node.long_description || "No long description."),
+    );
     const grid = element("div", "connection-grid");
-    grid.append(this.connectionList("Task connections", node.task_connections || [], true), this.connectionList("Active connections", node.active_connections), this.connectionList("Fanout connections", node.fanout_connections));
+    grid.append(this.connectionList("Fixed connections", node.fixed_connections || node.task_connections || [], true), this.connectionList("Active connections", node.active_connections), this.connectionList("Fanout connections", node.fanout_connections));
     root.append(grid);
     const historySection = element("section", "history"); historySection.append(element("h3", "", "Source history"));
     if (!history.length) historySection.append(element("p", "", "No history entries."));
@@ -47,7 +53,8 @@ export class MemoryExplorer {
     if (!connections.length) section.append(element("p", "", "None yet."));
     for (const connection of connections) {
       const button = element("button", "connection"); button.type = "button";
-      button.append(element("strong", "", showPriority ? `${connection.priority} · ${connection.short_name}` : connection.short_name), element("small", "", connection.short_description || "No description."));
+      const slot = connection.slot || ({ high: 1, medium: 2, low: 3 })[connection.priority] || "?";
+      button.append(element("strong", "", showPriority ? `Slot ${slot} · ${connection.short_name}` : connection.short_name), element("small", "", connection.short_description || "No description."));
       button.addEventListener("click", () => this.open(connection.id)); section.append(button);
     }
     return section;

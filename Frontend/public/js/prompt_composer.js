@@ -55,7 +55,7 @@ export function formatModelAttribution(model, reasoningEffort) {
 function sessionDetail(mode, sessionType, sourceSessionType) {
   if (mode === "conversation") {
     if (sessionType === "telegram-group") {
-      return "Channel: Telegram group. This is an independent one-invocation session. The invoking participant is the core user for this session; other participant roots are references that you may load if useful.";
+      return "Channel: Telegram group. This is a persistent session scoped to one participant and one group. Only that participant's invocations accumulate in this session; other participants have separate sessions. Other participant roots are references that you may load if useful.";
     }
     if (sessionType === "telegram") {
       return "Channel: Telegram private message. The final conversational response is relayed to the user; the visible Chatend and tool loop still run in Kennedy's browser UI.";
@@ -89,7 +89,7 @@ export function formatTelegramGroupContext(groupContext, context) {
   const additionalCapacity = Math.max(0, 10 - context.rootNodeIds.length);
   const participants = groupContext.participants.map(participant => {
     const identifier = context.registerReference(participant.rootNodeId);
-    const core = String(participant.telegramUserId) === String(invokerId) ? " · core user for this invocation" : "";
+    const core = String(participant.telegramUserId) === String(invokerId) ? " · user for this persistent group session" : "";
     return `- ${participantName(participant)} · Telegram user ID ${participant.telegramUserId} · root node identifier ${identifier}${core}`;
   });
   const messages = groupContext.messages.map(message => {
@@ -104,7 +104,7 @@ export function formatTelegramGroupContext(groupContext, context) {
       : invokerId == null
         ? `This is background group-chat ingress. No participant is designated as the core user. The group root (${groupRootIdentifier}) and Kennedy's root (${kennedyRootIdentifier}) are loaded automatically, leaving room for ${additionalCapacity} additional directly loaded nodes.`
         : `The invoking Telegram user ID is ${invokerId}. The invoking participant's root (${invokerRootIdentifier}), the group root (${groupRootIdentifier}), and Kennedy's root (${kennedyRootIdentifier}) are loaded automatically in that order, leaving room for ${additionalCapacity} additional directly loaded nodes.`,
-    "Participant root identifiers are registered in this session. The invoking participant's root is loaded in an invocation session; other participant roots are not automatically loaded:",
+    "Participant root identifiers are registered in this session. The session participant's root is loaded; other participant roots are not automatically loaded:",
     ...participants,
     "",
     `Telegram messages supplied as context (${messages.length}):`,

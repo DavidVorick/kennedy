@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260717.5";
+import { formatKmapContext } from "./human_format.js?v=20260717.6";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
@@ -844,7 +844,7 @@ function connectionLeaf(connection, kind, nodeByIdentifier, directlyLoaded) {
     element("span", "memory-connection-name", connection.shortName),
     badge(kind === "fanout" ? "summary only" : target ? "full context" : "summary only", kind === "fanout" || !target ? "summary" : "expanded"),
   );
-  if (kind === "task") row.append(badge(`${connection.priority} priority`, "task"));
+  if (kind === "fixed") row.append(badge(`slot ${connection.slot}`, "task"));
   if (directlyLoaded.has(connection.identifier)) row.append(badge("also directly loaded", "direct"));
   if (connection.shortDescription) row.append(element("span", "memory-connection-description", connection.shortDescription));
   return row;
@@ -891,9 +891,10 @@ function memoryNode(node, relation, nodeByIdentifier, directlyLoaded, path, dept
   const body = element("div", "memory-node-body");
   if (node.shortDescription) body.append(element("p", "memory-node-short", node.shortDescription));
   body.append(element("p", "memory-node-attribution", `Last modified by: ${node.lastModifiedBy || "legacy-unknown"}`));
+  body.append(element("p", "memory-node-attribution", `Owner: ${Number.isInteger(node.ownerIdentifier) ? `Node ${node.ownerIdentifier}` : "unowned"}`));
   body.append(element("p", "memory-node-long", node.longDescription || "No detailed description."));
   body.append(
-    connectionGroup("Task connections", node.taskConnections || [], "task", nodeByIdentifier, directlyLoaded, path, depth, openKeys, key),
+    connectionGroup("Fixed connections", node.fixedConnections || [], "fixed", nodeByIdentifier, directlyLoaded, path, depth, openKeys, key),
     connectionGroup("Active connections", node.activeConnections || [], "active", nodeByIdentifier, directlyLoaded, path, depth, openKeys, key),
     connectionGroup("Fanout references", node.fanoutConnections || [], "fanout", nodeByIdentifier, directlyLoaded, path, depth, openKeys, key),
   );
@@ -913,7 +914,7 @@ function nodeContentCharacters(node) {
     node?.shortName,
     node?.shortDescription,
     node?.longDescription,
-    ...(node?.taskConnections || []).flatMap(connection => [connection.shortName, connection.shortDescription]),
+    ...(node?.fixedConnections || []).flatMap(connection => [connection.shortName, connection.shortDescription]),
     ...(node?.activeConnections || []).flatMap(connection => [connection.shortName, connection.shortDescription]),
     ...(node?.fanoutConnections || []).flatMap(connection => [connection.shortName, connection.shortDescription]),
   ].filter(Boolean).join("\n"));

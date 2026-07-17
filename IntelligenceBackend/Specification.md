@@ -127,6 +127,11 @@ Generation asks the `codex-safe` launcher to run `codex exec --json` with:
   automatically compact Kennedy's Chatend;
 - a bounded total deadline and child termination on timeout.
 
+History and audio ingress use the normal provider generation timeout; their
+short retry delay does not shorten a Codex turn. Oversized Chatends are rejected
+locally with `input_too_large` before starting Codex, and known launcher
+warnings are excluded from provider failure details.
+
 These settings minimize every exposed Codex layer the deployment can control.
 The canonical Chatend is the exact application-controlled plaintext sent to
 Codex; forced CLI/provider system content or structured metadata may still be

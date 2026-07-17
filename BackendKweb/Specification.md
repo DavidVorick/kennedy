@@ -49,10 +49,13 @@ hexadecimal characters at the API boundary.
 | `long_description` | Text, at most 1000 whitespace-delimited words |
 | `history_head_id` | Nullable reference to the newest data history node |
 | `is_user_root` | Legacy marker for the original browser user root |
+| `owner_root_node_id` | Nullable self-reference to the Kennedy, user, or group root that owns this node |
 
 Exactly one knowledge node has `is_user_root = true` for compatibility with
 the original single-user database. Additional user roots are ordinary
 knowledge nodes whose identity mapping lives outside Kweb.
+An owner value is valid only when the referenced node owns itself. Roots are
+self-owned; legacy non-root nodes remain null and are returned as unowned.
 
 `kmap_roots` maps the unique roles `user` and `kennedy` to distinct knowledge
 nodes. This role table lets existing databases retain their user-root marker
@@ -98,7 +101,7 @@ its newest entry; following `previous_history_id` reaches older entries.
 
 ### 3.4 Directed Connections
 
-`knowledge_connections` is a normalized implementation of the task, active,
+`knowledge_connections` is a normalized implementation of the fixed, active,
 and fanout lists on knowledge nodes. It contains:
 
 | Column | Meaning |
@@ -106,15 +109,15 @@ and fanout lists on knowledge nodes. It contains:
 | `source_node_id` | Node containing the outgoing connection |
 | `target_node_id` | Destination node |
 | `tier` | `active` or `fanout` |
-| `activation_order` | Nonnegative recency value, or a reserved task-slot value |
+| `activation_order` | Nonnegative recency value, or a reserved fixed-slot value |
 
 The primary key is `(source_node_id, target_node_id)`. Self-connections are
 forbidden. A connection exists in only one role. Ordinary active and fanout
 connections use nonnegative activation orders. To remain compatible with the
-existing schema, task slots use `tier = fanout` with reserved activation orders
-`-1`, `-2`, and `-3` for high, medium, and low priority. Ordinary fanout reads
+existing schema, fixed slots use `tier = fanout` with reserved activation orders
+`-1`, `-2`, and `-3` for slots 1, 2, and 3. Ordinary fanout reads
 exclude those reserved rows. This requires no schema migration or backfill;
-legacy databases simply return an empty task list until tasks are assigned.
+legacy databases simply return an empty fixed list until slots are assigned.
 Connection rows are supporting structure, not an additional durable node type.
 
 Schema constraints enforce 20-byte IDs, valid connection tiers, non-self
@@ -133,6 +136,9 @@ created root receives:
 2. a minimal knowledge node (`Initial User Root` or `Kennedy's Root`),
 3. its first history node pointing to the bootstrap provenance node,
 4. the knowledge node's history-head reference.
+
+Every root owns itself. Re-running arbitrary-root bootstrap also repairs a
+previously provisioned root whose owner is null.
 
 Bootstrap is therefore complete before the HTTP listener begins accepting
 requests. Newly bootstrapped nodes use `system-bootstrap` attribution.
@@ -172,9 +178,11 @@ selected nodes are distinct. The aggregator and selected nodes must already be
 in the parent's fanout, and the operation fails atomically if the aggregator
 would exceed the fanout limit.
 
-`AssignTask` replaces one directional high, medium, or low task slot. Supplying
-no child clears that slot. A child cannot be the parent itself. Assigning a
-connection to a task slot removes its prior active, fanout, or other task role
+`SetFixedConnection` replaces one directional numbered slot from 1 through 3.
+Fixed slots are arbitrary placements under Kennedy's control and carry no
+priority or task semantics. Supplying no child clears that slot. A child cannot
+be the parent itself. Assigning a connection to a fixed slot removes its prior
+active, fanout, or other fixed role
 for that parent because a directed pair has one connection role.
 
 ## 6. HTTP and Static Files
@@ -210,12 +218,13 @@ not permit arbitrary filesystem paths.
   "short_description": "Short description.",
   "long_description": "Long description.",
   "last_modified_by": "gpt-5.6-sol-xhigh",
-  "task_connections": [
+  "owner_root_node_id": "0123456789abcdef0123456789abcdef01234567",
+  "fixed_connections": [
     {
       "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "short_name": "Outstanding Task",
-      "short_description": "Task summary.",
-      "priority": "high"
+      "short_name": "Pinned Memory",
+      "short_description": "Pinned-memory summary.",
+      "slot": 1
     }
   ],
   "active_connections": [],
@@ -224,10 +233,10 @@ not permit arbitrary filesystem paths.
 }
 ```
 
-Task connections are ordered high, medium, then low. Active and fanout arrays
+Fixed connections are ordered by slot number. Active and fanout arrays
 contain connection summaries in descending activation order. Every full node
 includes `last_modified_by`; legacy data without a stored row reads as
-`legacy-unknown`.
+`legacy-unknown`. `owner_root_node_id` is null for an unowned legacy node.
 
 ### 7.3 Error
 
@@ -364,13 +373,15 @@ Request:
   "parent_node_ids": [
     "0123456789abcdef0123456789abcdef01234567"
   ],
+  "owner_root_node_id": "0123456789abcdef0123456789abcdef01234567",
   "short_name": "New Memory",
   "short_description": "Short description.",
   "long_description": "Long description."
 }
 ```
 
-The parent list must be non-empty and contain distinct existing nodes. In one
+The parent list must be non-empty and contain distinct existing nodes. The
+owner must identify a self-owned Kennedy, user, or group root. In one
 transaction the backend creates the knowledge node, creates its first history
 node, updates its history head, and applies `ConnectNodes` to the new node and
 all parents. The new node and every parent receive the supplied attribution.
@@ -397,13 +408,15 @@ Request:
 {
   "provenance_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "model_attribution": "gpt-5.6-sol-xhigh",
+  "owner_root_node_id": "0123456789abcdef0123456789abcdef01234567",
   "short_name": "Updated Memory",
   "short_description": "Updated description.",
   "long_description": "Updated long description."
 }
 ```
 
-All three mutable text fields are replaced. In one transaction the backend
+All three mutable text fields and the owner are replaced. The owner must be a
+self-owned root. In one transaction the backend
 creates a history node pointing to the supplied provenance and previous history
 head, updates the knowledge node, moves its history head to the new entry, and
 records the supplied attribution on that node.
@@ -457,22 +470,22 @@ parent and aggregator nodes in a `nodes` array. The parent, aggregator, and
 every moved node receive the supplied attribution; moved nodes are deliberately
 not expanded into the response because callers may know them only as summaries.
 
-### 8.11 Assign or Clear a Task Connection
+### 8.11 Set or Clear a Fixed Connection
 
-#### `POST /api/v1/tasks`
+#### `POST /api/v1/fixed-connections`
 
 ```json
 {
   "parent_node_id": "0123456789abcdef0123456789abcdef01234567",
   "child_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "priority": "high",
+  "slot": 1,
   "model_attribution": "gpt-5.6-sol-xhigh"
 }
 ```
 
-`priority` is `high`, `medium`, or `low`. `child_node_id` may be null to clear
+`slot` is 1, 2, or 3. `child_node_id` may be null to clear
 the selected slot. The response contains the refreshed parent as `node` and
-the displaced task summary as `replaced_task`, or null when none was displaced.
+the displaced summary as `replaced_fixed_connection`, or null when none was displaced.
 The parent, assigned child, and displaced child all receive the supplied
 attribution when present.
 
@@ -504,7 +517,7 @@ The following are single SQLite write transactions:
 - knowledge-node update and history append,
 - connection promotion and demotion,
 - fanout consolidation,
-- task assignment or clearing,
+- fixed-connection assignment or clearing,
 - provenance creation.
 
 Any failure rolls back the entire operation. Reads never return an intermediate

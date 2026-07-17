@@ -55,7 +55,7 @@ export const KwebAPI = (base) => ({
   updateNode: (id, body) => requestJSON(base, `/api/v1/nodes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   connect: (nodeIds, modelAttribution) => requestJSON(base, "/api/v1/connections", { method: "POST", body: JSON.stringify({ node_ids: nodeIds, model_attribution: modelAttribution }) }),
   consolidateFanout: (body) => requestJSON(base, "/api/v1/connections/consolidate-fanout", { method: "POST", body: JSON.stringify(body) }),
-  assignTask: (body) => requestJSON(base, "/api/v1/tasks", { method: "POST", body: JSON.stringify(body) }),
+  setFixedConnection: (body) => requestJSON(base, "/api/v1/fixed-connections", { method: "POST", body: JSON.stringify(body) }),
 });
 
 export const IntelligenceAPI = (base) => ({

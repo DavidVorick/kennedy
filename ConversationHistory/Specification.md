@@ -21,7 +21,8 @@ Each conversation record contains:
 - monotonically increasing version for optimistic concurrency.
 - durable history-ingress failure count and a concise JSON log of all attempts
   (at most five), including timestamp, stage, code/message, model-round count,
-  and measured context occupancy when available.
+  and measured context occupancy when available,
+- optional next-attempt time for a deferred automatic ingress retry.
 
 SQLite permits any number of `active` and `ingress_pending` records but at most
 one `ingress_in_progress` record. Completed and failed records remain available
@@ -39,9 +40,9 @@ IDs, and dynamic channel/group context; these remain opaque to this backend.
 The backend interprets `pendingTurn` and the top-level/archive `sessionType`
 when deciding whether an idle conversation is safe to close automatically.
 All session types beginning with `telegram` are protected from idle closure.
-Private Telegram sessions close through `/reset`; each `telegram-group`
-invocation and background batch is explicitly queued by the frontend as soon
-as its independent archive is ready. For legacy safety during
+Private Telegram sessions and persistent `(group root, Telegram user)` sessions
+close through `/reset`; background group batches are explicitly queued by the
+frontend as soon as their independent archive is ready. For legacy safety during
 unstarted-record cleanup, it also recognizes user-role entries in the stored
 conversation transcript before deleting a record whose activity timestamp is
 null.
@@ -64,16 +65,20 @@ active -> ingress_pending -> ingress_in_progress -> complete
   Records whose state identifies any Telegram session are also exempt.
 - Explicitly ending a conversation checkpoints its final state and changes
   `active` to `ingress_pending` immediately.
-- The oldest queued conversation is selected by last user activity, falling
-  back to its start time. An existing `ingress_in_progress` record always wins.
+- The oldest eligible queued conversation is selected by last user activity,
+  falling back to its start time. An actively claimed `ingress_in_progress`
+  record wins; deferred records are skipped until their next-attempt time.
 - The frontend creates or retrieves idempotent Kweb provenance, records its ID,
   and changes the selected record to `ingress_in_progress`.
 - Only successful history ingress changes the record to `complete`.
 - The frontend records a failed ingress attempt atomically. Attempts one
-  through four leave the record queued or in progress; attempt five changes it
-  to terminal `ingress_failed`, releases the single-worker slot, and excludes
-  the record from future queue selection. Failed records remain queryable with
-  their diagnostic logs.
+  through four return the record to `ingress_pending`, release the
+  single-worker claim, and defer that record for 15 seconds so other eligible
+  conversations or audio pieces can proceed. Attempt five changes it to
+  terminal `ingress_failed` and excludes it from future queue selection.
+  A provider input-size rejection is terminal on its first attempt because the
+  unchanged checkpoint cannot make it smaller. Failed records remain queryable
+  with their diagnostic logs.
 - New and existing active conversations are independent of this queue.
 - A terminal failed record can be explicitly retried. The frontend supplies a
   fresh opaque state with the failed history-ingress checkpoint removed, the
@@ -88,7 +93,7 @@ active -> ingress_pending -> ingress_in_progress -> complete
   discarded, regardless of phase. This also removes an untouched placeholder
   that was ended or processed without ever becoming a real conversation.
   Every record containing a user message is ineligible. Telegram records,
-  including new group invocations/background batches, are also ineligible
+  including new group sessions/background batches, are also ineligible
   because they can be created and bound or queued just before their first
   durable checkpoint.
 
@@ -143,4 +148,5 @@ repair of a v2 database containing the legacy singleton index, the
 single-ingress-worker invariant, 24-hour expiry plus pending-response and
 Telegram-session protection,
 structured archives, safe unstarted-record cleanup, and phase-restricted ingress
-checkpoints, plus terminal fifth-failure behavior and queue advancement.
+checkpoints, plus deferred retry claim release, terminal fifth-failure
+behavior, and queue advancement.

@@ -6,14 +6,14 @@ ConsolidateFanout
   Call: {"parentIdentifier":2,"aggregatorIdentifier":3,"fanoutIdentifiers":[8,9]}
   Requires complete parent and aggregator nodes. The aggregator and every moved node must be distinct current fanout connections of the parent. It keeps the aggregator under the parent and moves the listed fanout connections under the aggregator. The mutation fails atomically if the aggregator's fanout limit would be exceeded.
 
-AssignTask
-  Call: {"parentIdentifier":2,"childIdentifier":3,"priority":"high"}
-  Requires complete parent and child nodes and a priority of high, medium, or low. It replaces that directional task slot. Use the string "blank" as childIdentifier to clear the slot.
+SetFixedConnection
+  Call: {"parentIdentifier":2,"childIdentifier":3,"slot":1}
+  Requires complete parent and child nodes and a numbered slot of 1, 2, or 3. Fixed connections are arbitrary placements under Kennedy's control and have no priority or task meaning. It replaces that directional slot. Use the string "blank" as childIdentifier to clear the slot.
 
 CreateNode
-  Call: {"parentIdentifiers":[2,3],"shortName":"New Memory","shortDescription":"Short description.","longDescription":"Complete durable knowledge."}
-  Requires one or more distinct, fully available parent nodes. It creates a node, connects it to all supplied parents, and returns the new node in full context. The short name is 4–50 characters, the short description is at most 200 characters, and the long description is at most 1000 words.
+  Call: {"parentIdentifiers":[2,3],"ownerIdentifier":1,"shortName":"New Memory","shortDescription":"Short description.","longDescription":"Complete durable knowledge."}
+  Requires one or more distinct, fully available parent nodes and a fully available Kennedy, user, or group root owner. It creates a node, assigns that owner, connects it to all supplied parents, and returns the new node in full context. The short name is 4–50 characters, the short description is at most 200 characters, and the long description is at most 1000 words.
 
 UpdateNode
-  Call: {"identifier":3,"newShortName":"Updated Memory","newShortDescription":"Updated description.","newLongDescription":"Complete updated durable knowledge."}
-  Requires a fully available node. It replaces all three descriptive fields, appends the current provenance to node history, and returns the updated node. The same field limits as CreateNode apply; omitted prior text is removed.
+  Call: {"identifier":3,"ownerIdentifier":1,"newShortName":"Updated Memory","newShortDescription":"Updated description.","newLongDescription":"Complete updated durable knowledge."}
+  Requires a fully available node and a fully available Kennedy, user, or group root owner. It replaces all three descriptive fields and the owner, appends the current provenance to node history, and returns the updated node. Nodes shown as unowned must be assigned an owner when updated. The same field limits as CreateNode apply; omitted prior text is removed.

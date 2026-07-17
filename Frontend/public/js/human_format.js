@@ -19,25 +19,27 @@ function connectionLines(title, connections) {
   ];
 }
 
-function taskConnectionLines(connections) {
-  if (!connections?.length) return ["Task connections: none"];
+function fixedConnectionLines(connections) {
+  if (!connections?.length) return ["Fixed connections: none"];
   return [
-    "Task connections:",
+    "Fixed connections:",
     ...connections.flatMap(connection => [
-      `  - ${connection.priority}: ${connection.identifier}: ${text(connection.shortName)}`,
+      `  - slot ${connection.slot}: ${connection.identifier}: ${text(connection.shortName)}`,
       `    Summary: ${text(connection.shortDescription)}`,
     ]),
   ];
 }
 
 export function formatContextNode(node) {
+  const owner = Number.isInteger(node.ownerIdentifier) ? `Node ${node.ownerIdentifier}` : "unowned";
   return [
     `Node ${node.identifier}: ${text(node.shortName)}`,
     `Summary: ${text(node.shortDescription)}`,
     `Last modified by: ${text(node.lastModifiedBy, "legacy-unknown")}`,
+    `Owner: ${owner}`,
     "Details:",
     indented(node.longDescription),
-    ...taskConnectionLines(node.taskConnections),
+    ...fixedConnectionLines(node.fixedConnections),
     ...connectionLines("Active connections", node.activeConnections),
     ...connectionLines("Fanout connections", node.fanoutConnections),
   ].join("\n");
@@ -47,20 +49,22 @@ function connectionIdentifiers(connections) {
   return connections?.length ? connections.map(connection => connection.identifier).join(", ") : "none";
 }
 
-function taskConnectionIdentifiers(connections) {
+function fixedConnectionIdentifiers(connections) {
   return connections?.length
-    ? connections.map(connection => `${connection.priority}: ${connection.identifier}`).join(", ")
+    ? connections.map(connection => `slot ${connection.slot}: ${connection.identifier}`).join(", ")
     : "none";
 }
 
 function formatCompactFullNode(node, includeShortDescription) {
+  const owner = Number.isInteger(node.ownerIdentifier) ? `Node ${node.ownerIdentifier}` : "unowned";
   return [
     `Node ${node.identifier}: ${text(node.shortName)}`,
     ...(includeShortDescription ? [`Summary: ${text(node.shortDescription)}`] : []),
     `Last modified by: ${text(node.lastModifiedBy, "legacy-unknown")}`,
+    `Owner: ${owner}`,
     "Details:",
     indented(node.longDescription),
-    `Task connection identifiers: ${taskConnectionIdentifiers(node.taskConnections)}`,
+    `Fixed connection identifiers: ${fixedConnectionIdentifiers(node.fixedConnections)}`,
     `Active connection identifiers: ${connectionIdentifiers(node.activeConnections)}`,
     `Fanout connection identifiers: ${connectionIdentifiers(node.fanoutConnections)}`,
   ].join("\n");
@@ -79,7 +83,7 @@ function uniqueConnections(nodes, select, excluded = new Set()) {
 function fanoutReferenceGroups(directNodes, activeNodes) {
   const fullIdentifiers = new Set([...directNodes, ...activeNodes].map(node => node.identifier));
   const directConnectionIdentifiers = new Set(directNodes.flatMap(node => [
-    ...(node.taskConnections || []),
+    ...(node.fixedConnections || []),
     ...(node.activeConnections || []),
     ...(node.fanoutConnections || []),
   ]).map(connection => connection.identifier));
@@ -189,12 +193,12 @@ export function formatToolResult(toolName, content) {
       return ["Memory connections updated.", "", formatNodes("Affected nodes", result.nodes)].join("\n");
     case "ConsolidateFanout":
       return ["Fanout connections consolidated.", "", formatNodes("Affected nodes", result.nodes)].join("\n");
-    case "AssignTask":
+    case "SetFixedConnection":
       return [
-        result.cleared ? "Task slot cleared." : "Task connection assigned.",
+        result.cleared ? "Fixed connection slot cleared." : "Fixed connection assigned.",
         "",
         formatNodes("Updated parent node", result.node ? [result.node] : []),
-        ...(result.replacedTask ? ["", `Replaced task: ${result.replacedTask.priority} · ${result.replacedTask.identifier}: ${text(result.replacedTask.shortName)}`] : []),
+        ...(result.replacedFixedConnection ? ["", `Replaced fixed connection: slot ${result.replacedFixedConnection.slot} · ${result.replacedFixedConnection.identifier}: ${text(result.replacedFixedConnection.shortName)}`] : []),
       ].join("\n");
     case "CreateNode":
       return ["Memory node created.", "", formatNodes("Created node", result.node ? [result.node] : [])].join("\n");

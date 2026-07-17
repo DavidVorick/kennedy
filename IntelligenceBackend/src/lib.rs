@@ -1014,6 +1014,15 @@ fn validate_request(request: &GenerateRequest) -> Result<(), ApiError> {
     if request.chatend.trim().is_empty() {
         return Err(ApiError::invalid("chatend must not be empty."));
     }
+    if request.chatend.chars().count() > MAX_CODEX_INPUT_CHARACTERS {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "input_too_large",
+            format!(
+                "The Codex input exceeds the {MAX_CODEX_INPUT_CHARACTERS}-character limit. Reset to a smaller Kmap context before retrying."
+            ),
+        ));
+    }
     if request
         .previous_response_id
         .as_deref()
@@ -1247,7 +1256,9 @@ fn codex_error_detail(stdout: &str, stderr: &str) -> Option<String> {
             .lines()
             .rev()
             .find(|line| {
-                !line.trim().is_empty() && !line.contains("Reading additional input from stdin")
+                !line.trim().is_empty()
+                    && !line.contains("Reading additional input from stdin")
+                    && !line.contains("This entire directory will be writable by Codex")
             })
             .map(str::to_owned)
     })?;
@@ -1271,13 +1282,19 @@ fn codex_error_detail(stdout: &str, stderr: &str) -> Option<String> {
 fn codex_failure(detail: Option<String>, request_id: Uuid) -> ApiError {
     let detail = detail.unwrap_or_else(|| "Codex did not complete the model turn.".into());
     let lowercase = detail.to_ascii_lowercase();
-    let (status, code) = if lowercase.contains("login") || lowercase.contains("authentication") {
+    let (status, code) = if lowercase.contains("input exceeds the maximum length")
+        || lowercase.contains("input_too_large")
+    {
+        (StatusCode::PAYLOAD_TOO_LARGE, "input_too_large")
+    } else if lowercase.contains("login") || lowercase.contains("authentication") {
         (StatusCode::UNAUTHORIZED, "provider_auth_failed")
     } else if lowercase.contains("usage limit")
         || lowercase.contains("rate limit")
         || lowercase.contains("quota")
     {
         (StatusCode::TOO_MANY_REQUESTS, "provider_rate_limited")
+    } else if lowercase.contains("model is at capacity") {
+        (StatusCode::SERVICE_UNAVAILABLE, "provider_capacity")
     } else {
         (StatusCode::BAD_GATEWAY, "provider_error")
     };
@@ -2871,6 +2888,12 @@ mod tests {
         assert!(validate_request(&request("  ")).is_err());
         assert!(validate_request(&request("David\n\nhi")).is_ok());
 
+        let oversized = request(&"x".repeat(MAX_CODEX_INPUT_CHARACTERS + 1));
+        assert_eq!(
+            validate_request(&oversized).unwrap_err().code,
+            "input_too_large"
+        );
+
         let mut continued = request("David\n\nhi");
         continued.previous_response_id = Some("resp_legacy_openai".into());
         assert_eq!(
@@ -2879,6 +2902,27 @@ mod tests {
         );
         continued.previous_response_id = Some("019f5ca7-020f-7b63-be2f-82785fb68c03".into());
         assert!(validate_request(&continued).is_ok());
+    }
+
+    #[test]
+    fn codex_failures_ignore_launcher_warnings_and_classify_actionable_errors() {
+        assert_eq!(
+            codex_error_detail("", "This entire directory will be writable by Codex.\n"),
+            None
+        );
+        let input = codex_failure(
+            Some("Input exceeds the maximum length of 1048576 characters.".into()),
+            Uuid::new_v4(),
+        );
+        assert_eq!(input.code, "input_too_large");
+        assert_eq!(input.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let capacity = codex_failure(
+            Some("Selected model is at capacity. Please try a different model.".into()),
+            Uuid::new_v4(),
+        );
+        assert_eq!(capacity.code, "provider_capacity");
+        assert_eq!(capacity.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

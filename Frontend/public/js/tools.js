@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260717.5";
+import { formatToolResult } from "./human_format.js?v=20260717.6";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
@@ -134,7 +134,7 @@ export class ToolExecutor {
         case "ResetContext": outcome = await this.resetContext(call.arguments); break;
         case "ConnectNodes": outcome = await this.connectNodes(call.arguments); break;
         case "ConsolidateFanout": outcome = await this.consolidateFanout(call.arguments); break;
-        case "AssignTask": outcome = await this.assignTask(call.arguments); break;
+        case "SetFixedConnection": outcome = await this.setFixedConnection(call.arguments); break;
         case "CreateNode": outcome = await this.createNode(call.arguments); break;
         case "UpdateNode": outcome = await this.updateNode(call.arguments); break;
         case "WebSearch": outcome = await this.webSearch(call.arguments, { signal, operationId }); break;
@@ -203,22 +203,24 @@ export class ToolExecutor {
     return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
   }
 
-  async assignTask(args) {
-    this.assertIngress(); validateObject(args, ["parentIdentifier", "childIdentifier", "priority"]);
+  async setFixedConnection(args) {
+    this.assertIngress(); validateObject(args, ["parentIdentifier", "childIdentifier", "slot"]);
     integer(args.parentIdentifier, "parentIdentifier");
     if (args.childIdentifier !== "blank") integer(args.childIdentifier, "childIdentifier");
-    if (!["high", "medium", "low"].includes(args.priority)) throw Object.assign(new Error("priority must be high, medium, or low."), { code: "invalid_arguments" });
+    if (![1, 2, 3].includes(args.slot)) throw Object.assign(new Error("slot must be 1, 2, or 3."), { code: "invalid_arguments" });
     const parentId = this.fullDurable(args.parentIdentifier);
     const childId = args.childIdentifier === "blank" ? null : this.fullDurable(args.childIdentifier);
     await this.beforeMutation();
-    const payload = await this.api.assignTask({ parent_node_id: parentId, child_node_id: childId, priority: args.priority, model_attribution: this.modelAttribution });
+    const payload = await this.api.setFixedConnection({ parent_node_id: parentId, child_node_id: childId, slot: args.slot, model_attribution: this.modelAttribution });
     const attributedIds = [parentId];
     if (childId) attributedIds.push(childId);
-    if (payload.replaced_task?.id) attributedIds.push(payload.replaced_task.id);
+    if (payload.replaced_fixed_connection?.id) attributedIds.push(payload.replaced_fixed_connection.id);
     this.context.recordModelAttribution(attributedIds, this.modelAttribution);
     this.context.refresh([payload.node]);
-    const replacedTask = payload.replaced_task ? { ...this.context.summary(payload.replaced_task), priority: payload.replaced_task.priority } : null;
-    return { result: { node: this.context.toContextNode(payload.node), replacedTask, cleared: childId === null } };
+    const replacedFixedConnection = payload.replaced_fixed_connection
+      ? { ...this.context.summary(payload.replaced_fixed_connection), slot: payload.replaced_fixed_connection.slot }
+      : null;
+    return { result: { node: this.context.toContextNode(payload.node), replacedFixedConnection, cleared: childId === null } };
   }
 
   assertIngress() { if (this.mode !== "ingress" || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" }); }
@@ -238,20 +240,23 @@ export class ToolExecutor {
   }
 
   async createNode(args) {
-    this.assertIngress(); validateObject(args, ["parentIdentifiers", "shortName", "shortDescription", "longDescription"]);
+    this.assertIngress(); validateObject(args, ["parentIdentifiers", "ownerIdentifier", "shortName", "shortDescription", "longDescription"]);
     integerArray(args.parentIdentifiers, "parentIdentifiers", 1);
     const parentIds = args.parentIdentifiers.map(id => this.fullDurable(id));
+    integer(args.ownerIdentifier, "ownerIdentifier");
+    const ownerRootId = this.fullDurable(args.ownerIdentifier);
     await this.beforeMutation();
-    const payload = await this.api.createNode({ provenance_id: this.provenanceId, model_attribution: this.modelAttribution, parent_node_ids: parentIds, short_name: string(args.shortName, "shortName"), short_description: string(args.shortDescription, "shortDescription"), long_description: string(args.longDescription, "longDescription") });
+    const payload = await this.api.createNode({ provenance_id: this.provenanceId, model_attribution: this.modelAttribution, parent_node_ids: parentIds, owner_root_node_id: ownerRootId, short_name: string(args.shortName, "shortName"), short_description: string(args.shortDescription, "shortDescription"), long_description: string(args.longDescription, "longDescription") });
     this.context.refresh(payload.nodes || [payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
   }
 
   async updateNode(args) {
-    this.assertIngress(); validateObject(args, ["identifier", "newShortName", "newShortDescription", "newLongDescription"]);
+    this.assertIngress(); validateObject(args, ["identifier", "ownerIdentifier", "newShortName", "newShortDescription", "newLongDescription"]);
     integer(args.identifier, "identifier"); const durable = this.fullDurable(args.identifier);
+    integer(args.ownerIdentifier, "ownerIdentifier"); const ownerRootId = this.fullDurable(args.ownerIdentifier);
     await this.beforeMutation();
-    const payload = await this.api.updateNode(durable, { provenance_id: this.provenanceId, model_attribution: this.modelAttribution, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
+    const payload = await this.api.updateNode(durable, { provenance_id: this.provenanceId, model_attribution: this.modelAttribution, owner_root_node_id: ownerRootId, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
     this.context.refresh([payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
   }
