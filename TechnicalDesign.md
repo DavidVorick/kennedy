@@ -162,6 +162,14 @@ system-prompt-only, and expandable Kmap-memory views. The memory view derives
 node provenance from the Kweb context snapshot so direct loads, task edges,
 active-edge expansions, and summary-only fanout references remain visually distinct.
 Token, context-window, and cache telemetry is displayed in the Chatend header.
+
+The canonical Kmap formatter normalizes memory by role instead of repeating
+connection summaries inside every full node. Direct nodes keep both
+descriptions and identifier-only edges. Active expansions appear once with
+their long descriptions and identifier-only edges. Direct fanouts are unique
+name-and-summary references, while fanouts found only one level below an active
+expansion are unique name-only references. The structured snapshot remains
+richer for recovery and the interactive memory tree.
 The canonical request and Full inspector end with the terse line
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
 It uses the previous completed response's exact provider usage; fresh/reset
@@ -491,6 +499,12 @@ limit, its least recently active connections are demoted unless that would
 exceed the fanout limit. `ConsolidateFanout` moves selected fanout references
 under an existing aggregator. `AssignTask` replaces or clears one directional
 high, medium, or low task slot.
+
+The default limits are eight active and 64 ordinary fanout connections. A
+LoadNode context read transactionally applies the same oldest-first demotion to
+the requested node before materializing it. This lazily converts nodes at the
+former 12-active/60-fanout limits without a schema migration or database-wide
+backfill.
 
 ## 7. API Conventions
 

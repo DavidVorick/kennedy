@@ -43,6 +43,83 @@ export function formatContextNode(node) {
   ].join("\n");
 }
 
+function connectionIdentifiers(connections) {
+  return connections?.length ? connections.map(connection => connection.identifier).join(", ") : "none";
+}
+
+function taskConnectionIdentifiers(connections) {
+  return connections?.length
+    ? connections.map(connection => `${connection.priority}: ${connection.identifier}`).join(", ")
+    : "none";
+}
+
+function formatCompactFullNode(node, includeShortDescription) {
+  return [
+    `Node ${node.identifier}: ${text(node.shortName)}`,
+    ...(includeShortDescription ? [`Summary: ${text(node.shortDescription)}`] : []),
+    `Last modified by: ${text(node.lastModifiedBy, "legacy-unknown")}`,
+    "Details:",
+    indented(node.longDescription),
+    `Task connection identifiers: ${taskConnectionIdentifiers(node.taskConnections)}`,
+    `Active connection identifiers: ${connectionIdentifiers(node.activeConnections)}`,
+    `Fanout connection identifiers: ${connectionIdentifiers(node.fanoutConnections)}`,
+  ].join("\n");
+}
+
+function uniqueConnections(nodes, select, excluded = new Set()) {
+  const unique = new Map();
+  for (const node of nodes || []) {
+    for (const connection of select(node) || []) {
+      if (!excluded.has(connection.identifier) && !unique.has(connection.identifier)) unique.set(connection.identifier, connection);
+    }
+  }
+  return [...unique.values()];
+}
+
+function fanoutReferenceGroups(directNodes, activeNodes) {
+  const fullIdentifiers = new Set([...directNodes, ...activeNodes].map(node => node.identifier));
+  const directConnectionIdentifiers = new Set(directNodes.flatMap(node => [
+    ...(node.taskConnections || []),
+    ...(node.activeConnections || []),
+    ...(node.fanoutConnections || []),
+  ]).map(connection => connection.identifier));
+  const directFanoutNodes = uniqueConnections(directNodes, node => node.fanoutConnections, fullIdentifiers);
+  const indirectExcluded = new Set([...fullIdentifiers, ...directConnectionIdentifiers]);
+  const indirectFanoutNodes = uniqueConnections(activeNodes, node => node.fanoutConnections, indirectExcluded);
+  return { directFanoutNodes, indirectFanoutNodes };
+}
+
+function formatCompactMemorySections({ directNodes = [], activeNodes = [], directFanoutNodes, indirectFanoutNodes }) {
+  const fallback = fanoutReferenceGroups(directNodes, activeNodes);
+  const directFanouts = Array.isArray(directFanoutNodes) ? directFanoutNodes : fallback.directFanoutNodes;
+  const indirectFanouts = Array.isArray(indirectFanoutNodes) ? indirectFanoutNodes : fallback.indirectFanoutNodes;
+  const sections = [];
+  if (directNodes.length) {
+    sections.push(`Directly loaded nodes\n\n${directNodes.map(node => formatCompactFullNode(node, true)).join("\n\n")}`);
+  }
+  if (activeNodes.length) {
+    sections.push(`Full active-connection nodes\n\n${activeNodes.map(node => formatCompactFullNode(node, false)).join("\n\n")}`);
+  }
+  if (directFanouts.length) {
+    sections.push([
+      "Fanout nodes of directly loaded nodes",
+      "",
+      ...directFanouts.flatMap(connection => [
+        `${connection.identifier}: ${text(connection.shortName)}`,
+        `  Summary: ${text(connection.shortDescription)}`,
+      ]),
+    ].join("\n"));
+  }
+  if (indirectFanouts.length) {
+    sections.push([
+      "Fanout nodes only of active-connection nodes",
+      "",
+      ...indirectFanouts.map(connection => `${connection.identifier}: ${text(connection.shortName)}`),
+    ].join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
 export function formatKmapContext(snapshot) {
   const roots = snapshot.rootIdentifiers?.length
     ? snapshot.rootIdentifiers.join(", ")
@@ -50,22 +127,11 @@ export function formatKmapContext(snapshot) {
   const identifiers = snapshot.directlyLoadedIdentifiers?.length
     ? snapshot.directlyLoadedIdentifiers.join(", ")
     : "none";
-  const rootOrder = new Map((snapshot.rootIdentifiers || []).map((identifier, index) => [identifier, index]));
-  const directOrder = new Map((snapshot.directlyLoadedIdentifiers || []).map((identifier, index) => [identifier, index]));
-  const nodes = snapshot.nodes?.length
-    ? [...snapshot.nodes]
-      .sort((left, right) => {
-        const rank = node => rootOrder.has(node.identifier)
-          ? [0, rootOrder.get(node.identifier)]
-          : directOrder.has(node.identifier)
-            ? [1, directOrder.get(node.identifier)]
-            : [2, 0];
-        const leftRank = rank(left);
-        const rightRank = rank(right);
-        return leftRank[0] - rightRank[0] || leftRank[1] - rightRank[1];
-      })
-      .map(formatContextNode).join("\n\n")
-    : "No memory nodes are currently loaded.";
+  const directIdentifiers = new Set(snapshot.directlyLoadedIdentifiers || []);
+  const nodeByIdentifier = new Map((snapshot.nodes || []).map(node => [node.identifier, node]));
+  const directNodes = (snapshot.directlyLoadedIdentifiers || []).map(identifier => nodeByIdentifier.get(identifier)).filter(Boolean);
+  const activeNodes = (snapshot.nodes || []).filter(node => !directIdentifiers.has(node.identifier));
+  const nodes = formatCompactMemorySections({ directNodes, activeNodes }) || "No memory nodes are currently loaded.";
   return [
     "Current Kmap context",
     "",
@@ -107,13 +173,16 @@ export function formatToolResult(toolName, content) {
     case "LoadNode":
       return [
         "Memory load completed.",
-        "",
         result.requestedNodeAlreadyLoaded
           ? `Requested node: Node ${result.requestedNodeIdentifier} was already available in full context and is now directly loaded.`
-          : formatNodes("Requested node", result.requestedNode ? [result.requestedNode] : []),
-        "",
-        formatNodes("Newly available active-connection nodes", result.activeConnectionNodes),
-      ].join("\n");
+          : null,
+        formatCompactMemorySections({
+          directNodes: result.requestedNode ? [result.requestedNode] : [],
+          activeNodes: result.activeConnectionNodes || [],
+          directFanoutNodes: result.directFanoutNodes,
+          indirectFanoutNodes: result.indirectFanoutNodes,
+        }),
+      ].filter(Boolean).join("\n\n");
     case "ResetContext":
       return ["Memory context reset completed.", "", formatKmapContext(result.context || {})].join("\n");
     case "ConnectNodes":

@@ -26,8 +26,8 @@ line flags.
 | SQLite file | `--kweb-database` | `./kennedy.sqlite3` |
 | Frontend directory | `--frontend-dir` | `./Frontend/public` |
 | System prompts directory | `--system-prompts-dir` | `./Frontend/SystemPrompts` |
-| Active connection limit | `--active-limit` | `12` |
-| Fanout connection limit | `--fanout-limit` | `60` |
+| Active connection limit | `--active-limit` | `8` |
+| Fanout connection limit | `--fanout-limit` | `64` |
 
 ## 3. SQLite Model
 
@@ -148,6 +148,12 @@ If it has more active connections than the configured limit, its oldest active
 connections are demoted to fanout until it is within the limit. A demotion from
 `a` to `b` does not change the connection from `b` to `a`. The whole operation
 fails atomically if those demotions would exceed the configured fanout limit.
+
+The context-load endpoint applies the same rule transactionally to its
+requested node before reading it. This lazily normalizes databases created with
+the former 12-active limit: the four oldest overflow connections become
+fanout, while the new default fanout limit of 64 accommodates nodes already at
+the former 60-fanout limit. No schema migration or eager backfill is required.
 
 `ConsolidateFanout` keeps one existing aggregator in a parent's fanout, removes
 selected ordinary fanout connections from that parent, and adds them as
@@ -277,7 +283,10 @@ active connections:
 ```
 
 All objects use the knowledge-node shape. The requested node appears only in
-`requested_node`; duplicate active destinations are impossible.
+`requested_node`; duplicate active destinations are impossible. Before reading
+the response, the backend atomically demotes the requested node's oldest active
+overflow to fanout so the returned node and expansion respect the configured
+limits.
 
 ### 8.5 Create a Provenance Node
 

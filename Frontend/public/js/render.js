@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260715.7";
+import { formatKmapContext } from "./human_format.js?v=20260717.5";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;

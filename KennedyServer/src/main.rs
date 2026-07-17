@@ -47,9 +47,9 @@ struct Args {
     frontend_dir: PathBuf,
     #[arg(long, default_value = "./Frontend/SystemPrompts")]
     system_prompts_dir: PathBuf,
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = 8)]
     active_limit: usize,
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 64)]
     fanout_limit: usize,
     #[arg(long, default_value = "@taek42")]
     telegram_bootstrap_username: String,
@@ -375,8 +375,8 @@ mod tests {
             audio_ingress_media: audio_media.clone(),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
-            active_limit: 12,
-            fanout_limit: 60,
+            active_limit: 8,
+            fanout_limit: 64,
             telegram_bootstrap_username: "@test".to_owned(),
             telegram_max_voice_bytes: 1024,
             audio_ingress_max_upload_bytes: 1024,

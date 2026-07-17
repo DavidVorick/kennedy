@@ -267,6 +267,25 @@ A directly loaded node is one for which the frontend executed the LoadNode
 operation. Active connections returned alongside it are in context and receive
 short identifiers, but do not count toward the ten-directly-loaded-node limit.
 
+The structured snapshot above remains available to frontend rendering and
+recovery, but the canonical model-readable Kmap text is a compact projection:
+
+1. Directly loaded nodes retain short and long descriptions. Their task,
+   active, and fanout edges contain identifiers only.
+2. Full active-connection nodes are emitted once globally with their names and
+   long descriptions; short descriptions are omitted. Their task, active, and
+   fanout edges also contain identifiers only.
+3. Non-full fanout nodes directly referenced by any directly loaded node are
+   emitted once with identifier, name, and short description.
+4. Non-full fanout nodes referenced only by full active-connection nodes are
+   emitted once with identifier and name. Nodes already represented in full or
+   through a direct-node connection are not repeated in this fourth tier.
+
+The same projection formats LoadNode results. The context glue derives which
+fanout references were already visible from the current graph, omits repeated
+references, and emits a richer direct-fanout summary if a name-only indirect
+fanout later becomes a direct fanout.
+
 The user root and Kennedy root are directly loaded at session start, survive
 every reset, and both count toward the shared limit. In a fresh or reset
 context, they are loaded first in that order. Restoring a legacy one-root
@@ -347,11 +366,13 @@ Execution:
 5. Add the requested durable ID to the directly loaded set.
 6. Mark the requested node and returned active-connection nodes as full.
 7. Assign short IDs to every newly seen node or connection summary.
-8. Convert newly full payloads to in-context node shapes and return them as the
-   tool result. Omit active-connection nodes that were already full before the
-   call. If the requested node was already full through an earlier active
-   expansion, report its identifier without repeating its full body; the call
-   still makes it directly loaded and returns any newly full active connections.
+8. Convert newly full payloads to the compact role-based projection and return
+   them as the tool result. Omit active-connection nodes that were already full
+   before the call. Deduplicate direct and indirect fanout references against
+   the current context. If the requested node was already full through an
+   earlier active expansion, report its identifier without repeating its full
+   body; the call still makes it directly loaded, upgrades newly direct fanout
+   summaries where needed, and returns any newly full active connections.
 
 Every model-requested LoadNode or ResetContext invocation consumes one call from
 the shared session or turn budget, including failed calls after basic argument
@@ -950,8 +971,10 @@ History ingress does not replay full Kmap node bodies from the archived source
 Chatend. It removes the archived Kmap-context and memory-tool-result bodies and
 their matching memory-only tool requests, drops source-session timing noise,
 and supplies a deduplicated list containing only each encountered node's title
-and short description. Kennedy's live ingress Kmap context and tools remain
-unchanged, so she can navigate and load relevant nodes herself.
+and the detail that was model-visible in the source session. Ordinary and
+direct-fanout references retain their short descriptions; indirect fanouts
+that were name-only remain name-only. Kennedy's live ingress Kmap context and
+tools remain unchanged, so she can navigate and load relevant nodes herself.
 
 A terminal conversation-history ingress exposes Retry beside its failed status
 in the history column and in an action panel at the top of the central view.

@@ -1,8 +1,8 @@
-import { Chatend } from "./chatend.js?v=20260715.8";
-import { KwebContext } from "./kweb_context.js?v=20260717.4";
+import { Chatend } from "./chatend.js?v=20260717.5";
+import { KwebContext } from "./kweb_context.js?v=20260717.5";
 import { composePrompt, formatModelAttribution } from "./prompt_composer.js?v=20260717.2";
-import { ToolExecutor } from "./tools.js?v=20260717.4";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.3";
+import { ToolExecutor } from "./tools.js?v=20260717.5";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.5";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
@@ -10,24 +10,24 @@ function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-function nodeSummary(node) {
+function nodeSummary(node, includeShortDescription = true) {
   const rawName = node?.shortName ?? node?.short_name;
   const rawDescription = node?.shortDescription ?? node?.short_description;
   const shortName = typeof rawName === "string" ? rawName.trim() : "";
   const shortDescription = typeof rawDescription === "string" ? rawDescription.trim() : "";
-  if (!shortName && !shortDescription) return null;
+  if (!shortName && (!includeShortDescription || !shortDescription)) return null;
   return {
     shortName: shortName || "Unnamed memory",
-    shortDescription: shortDescription || "(no short description)",
+    shortDescription: includeShortDescription ? shortDescription || "(no short description)" : null,
   };
 }
 
 function collectNodeSummaries(archive) {
   const summaries = new Map();
-  const add = node => {
-    const summary = nodeSummary(node);
+  const add = (node, includeShortDescription = true) => {
+    const summary = nodeSummary(node, includeShortDescription);
     if (!summary) return;
-    summaries.set(`${summary.shortName}\u0000${summary.shortDescription}`, summary);
+    summaries.set(`${summary.shortName}\u0000${summary.shortDescription || ""}`, summary);
   };
   const addSnapshot = snapshot => {
     for (const node of snapshot?.nodes || []) add(node);
@@ -35,6 +35,8 @@ function collectNodeSummaries(archive) {
   const addToolResult = result => {
     add(result?.requestedNode);
     for (const node of result?.activeConnectionNodes || []) add(node);
+    for (const node of result?.directFanoutNodes || []) add(node);
+    for (const node of result?.indirectFanoutNodes || []) add(node, false);
     for (const node of result?.nodes || []) add(node);
     add(result?.node);
     addSnapshot(result?.context);
@@ -45,7 +47,7 @@ function collectNodeSummaries(archive) {
   for (const message of archive?.messages || []) addToolResult(message?.tool_result?.result);
   return [...summaries.values()].sort((left, right) =>
     left.shortName.localeCompare(right.shortName) ||
-    left.shortDescription.localeCompare(right.shortDescription)
+    (left.shortDescription || "").localeCompare(right.shortDescription || "")
   );
 }
 
@@ -88,7 +90,7 @@ function modelReadableProvenance(data) {
       "",
       ...summaries.flatMap(summary => [
         `- ${summary.shortName}`,
-        `  ${summary.shortDescription}`,
+        ...(summary.shortDescription ? [`  ${summary.shortDescription}`] : []),
       ]),
     ].join("\n")
     : "";

@@ -547,7 +547,17 @@ async fn get_node_context(
     Path(node_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = decode_id(&node_id)?;
-    let db = state.db.lock().map_err(ApiError::internal)?;
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    require_exists(&tx, "knowledge_nodes", &id, "Knowledge node")?;
+    enforce_connection_limits_in_tx(
+        &tx,
+        &id,
+        state.active_limit,
+        state.fanout_limit,
+        "LoadNode",
+    )?;
+    tx.commit().map_err(ApiError::internal)?;
     let requested = fetch_node(&db, &id)?;
     let active_ids: Vec<Vec<u8>> = {
         let mut stmt = db.prepare("SELECT target_node_id FROM knowledge_connections WHERE source_node_id=?1 AND tier='active' ORDER BY activation_order DESC").map_err(ApiError::internal)?;
@@ -684,6 +694,46 @@ fn validate_distinct_ids(
     Ok(ids)
 }
 
+fn enforce_connection_limits_in_tx(
+    tx: &Transaction<'_>,
+    source: &[u8],
+    active_limit: usize,
+    fanout_limit: usize,
+    operation: &str,
+) -> Result<usize, ApiError> {
+    let active_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='active'",
+            [source],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    let overflow = (active_count as usize).saturating_sub(active_limit);
+    if overflow == 0 {
+        return Ok(0);
+    }
+
+    let fanout_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='fanout' AND activation_order>=0",
+            [source],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    if fanout_count as usize + overflow > fanout_limit {
+        return Err(ApiError::conflict(format!(
+            "{operation} would exceed the fanout connection limit of {fanout_limit}."
+        )));
+    }
+
+    tx.execute(
+        "UPDATE knowledge_connections SET tier='fanout' WHERE source_node_id=?1 AND target_node_id IN (SELECT target_node_id FROM knowledge_connections WHERE source_node_id=?1 AND tier='active' ORDER BY activation_order ASC LIMIT ?2)",
+        params![source, overflow as i64],
+    )
+    .map_err(ApiError::internal)?;
+    Ok(overflow)
+}
+
 fn connect_in_tx(
     tx: &Transaction<'_>,
     ids: &[Vec<u8>],
@@ -710,17 +760,13 @@ fn connect_in_tx(
         }
     }
     for source in ids {
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='active'", [source], |r| r.get(0)).map_err(ApiError::internal)?;
-        let count = count as usize;
-        if count > active_limit {
-            let fanout_count: i64 = tx.query_row("SELECT COUNT(*) FROM knowledge_connections WHERE source_node_id=?1 AND tier='fanout' AND activation_order>=0", [source], |r| r.get(0)).map_err(ApiError::internal)?;
-            if fanout_count as usize + (count - active_limit) > fanout_limit {
-                return Err(ApiError::conflict(format!(
-                    "ConnectNodes would exceed the fanout connection limit of {fanout_limit}."
-                )));
-            }
-            tx.execute("UPDATE knowledge_connections SET tier='fanout' WHERE source_node_id=?1 AND target_node_id IN (SELECT target_node_id FROM knowledge_connections WHERE source_node_id=?1 AND tier='active' ORDER BY activation_order ASC LIMIT ?2)", params![source,(count-active_limit) as i64]).map_err(ApiError::internal)?;
-        }
+        enforce_connection_limits_in_tx(
+            tx,
+            source,
+            active_limit,
+            fanout_limit,
+            "ConnectNodes",
+        )?;
     }
     Ok(())
 }
@@ -1038,8 +1084,8 @@ mod tests {
         AppState {
             db: Arc::new(Mutex::new(db)),
             prompts_dir: PathBuf::new(),
-            active_limit: 12,
-            fanout_limit: 60,
+            active_limit: 8,
+            fanout_limit: 64,
         }
     }
 
@@ -1106,6 +1152,71 @@ mod tests {
         .unwrap();
         let error = connect_in_tx(&tx, &ids, 1, 1).unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn load_context_lazily_normalizes_legacy_active_overflow() {
+        let db = db();
+        let source = insert_node(&db, "Legacy Source");
+        let active = (0..12)
+            .map(|index| {
+                let target = insert_node(&db, &format!("Active Node {index}"));
+                db.execute(
+                    "INSERT INTO knowledge_connections(source_node_id,target_node_id,tier,activation_order) VALUES(?1,?2,'active',?3)",
+                    params![source, target, index + 1],
+                )
+                .unwrap();
+                target
+            })
+            .collect::<Vec<_>>();
+        for index in 0..60 {
+            let target = insert_node(&db, &format!("Fanout Node {index}"));
+            db.execute(
+                "INSERT INTO knowledge_connections(source_node_id,target_node_id,tier,activation_order) VALUES(?1,?2,'fanout',?3)",
+                params![source, target, index + 100],
+            )
+            .unwrap();
+        }
+        let state = state(db);
+
+        let Json(payload) = get_node_context(
+            State(state.clone()),
+            Path(hex::encode(&source)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            payload["requested_node"]["active_connections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            payload["requested_node"]["fanout_connections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            payload["active_connection_nodes"].as_array().unwrap().len(),
+            8
+        );
+
+        let db = state.db.lock().unwrap();
+        let mut stmt = db
+            .prepare(
+                "SELECT target_node_id FROM knowledge_connections WHERE source_node_id=?1 AND tier='active' ORDER BY activation_order ASC",
+            )
+            .unwrap();
+        let remaining = stmt
+            .query_map([&source], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, active[4..]);
     }
 
     #[test]

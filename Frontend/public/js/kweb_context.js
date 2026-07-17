@@ -1,5 +1,25 @@
 export const MAX_DIRECTLY_LOADED_NODES = 10;
 
+function rawConnectionIds(nodesById, nodeIds, fields) {
+  const identifiers = new Set();
+  for (const nodeId of nodeIds) {
+    const node = nodesById.get(nodeId);
+    if (!node) continue;
+    for (const field of fields) {
+      for (const connection of node[field] || []) identifiers.add(connection.id);
+    }
+  }
+  return identifiers;
+}
+
+function uniqueRawConnections(connections, include) {
+  const unique = new Map();
+  for (const connection of connections || []) {
+    if (include(connection) && !unique.has(connection.id)) unique.set(connection.id, connection);
+  }
+  return [...unique.values()];
+}
+
 export class KwebContext {
   constructor(api, rootNodeIds) {
     this.api = api;
@@ -50,18 +70,38 @@ export class KwebContext {
     if (this.loadedNodeIds.includes(durableId)) throw Object.assign(new Error("That node is already directly loaded."), { code: "already_loaded" });
     if (this.loadedNodeIds.length >= MAX_DIRECTLY_LOADED_NODES) throw Object.assign(new Error("Ten nodes are already directly loaded. Reset the context to continue."), { code: "loaded_node_limit" });
     const previouslyFullNodeIds = new Set(this.fullNodeIds);
+    const previouslyDirectNodeIds = new Set(this.loadedNodeIds);
+    const previousDirectConnectionIds = rawConnectionIds(this.nodesById, previouslyDirectNodeIds, ["task_connections", "active_connections", "fanout_connections"]);
+    const previousDirectFanoutIds = rawConnectionIds(this.nodesById, previouslyDirectNodeIds, ["fanout_connections"]);
+    const previouslyActiveNodeIds = [...previouslyFullNodeIds].filter(id => !previouslyDirectNodeIds.has(id));
+    const previousIndirectFanoutIds = rawConnectionIds(this.nodesById, previouslyActiveNodeIds, ["fanout_connections"]);
+    for (const id of [...previousIndirectFanoutIds]) {
+      if (previouslyFullNodeIds.has(id) || previousDirectConnectionIds.has(id)) previousIndirectFanoutIds.delete(id);
+    }
     const payload = await this.api.context(durableId);
     this.ingestNode(payload.requested_node, true, "direct");
     for (const node of payload.active_connection_nodes) this.ingestNode(node, true, "active");
     this.loadedNodeIds.push(durableId);
     const requestedNodeAlreadyLoaded = previouslyFullNodeIds.has(payload.requested_node.id);
+    const newlyFullActiveNodes = payload.active_connection_nodes.filter(node => !previouslyFullNodeIds.has(node.id));
+    const currentDirectConnectionIds = rawConnectionIds(this.nodesById, this.loadedNodeIds, ["task_connections", "active_connections", "fanout_connections"]);
+    const directFanoutNodes = uniqueRawConnections(
+      payload.requested_node.fanout_connections,
+      connection => !this.fullNodeIds.has(connection.id) && !previousDirectFanoutIds.has(connection.id),
+    );
+    const indirectFanoutNodes = uniqueRawConnections(
+      newlyFullActiveNodes.flatMap(node => node.fanout_connections || []),
+      connection => !this.fullNodeIds.has(connection.id)
+        && !currentDirectConnectionIds.has(connection.id)
+        && !previousIndirectFanoutIds.has(connection.id),
+    );
     return {
       requestedNode: requestedNodeAlreadyLoaded ? null : this.toContextNode(payload.requested_node),
       requestedNodeIdentifier: this.shortId(payload.requested_node.id),
       requestedNodeAlreadyLoaded,
-      activeConnectionNodes: payload.active_connection_nodes
-        .filter(node => !previouslyFullNodeIds.has(node.id))
-        .map(node => this.toContextNode(node)),
+      activeConnectionNodes: newlyFullActiveNodes.map(node => this.toContextNode(node)),
+      directFanoutNodes: directFanoutNodes.map(node => this.summary(node)),
+      indirectFanoutNodes: indirectFanoutNodes.map(node => this.summary(node)),
     };
   }
 

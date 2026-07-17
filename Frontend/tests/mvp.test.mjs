@@ -9,7 +9,7 @@ import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, sortConversationHistory } from "../public/js/render.js";
 import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
-import { formatKmapContext, formatToolResult } from "../public/js/human_format.js";
+import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
@@ -234,6 +234,28 @@ test("LoadNode results omit nodes whose full bodies are already in context", asy
   assert.doesNotMatch(formatted, /Details 3/);
   assert.match(formatted, /Details 4/);
   assert.equal(context.snapshot().nodes.filter(item => item.identifier === context.shortId(id(3))).length, 1);
+});
+
+test("LoadNode classifies and deduplicates direct and indirect fanout references", async () => {
+  const context = new KwebContext(new MockKweb([
+    node(1, [2], [5]),
+    node(2, [], [5, 6]),
+    node(3, [4], [6, 7]),
+    node(4, [], [7, 8]),
+  ]), id(1));
+  await context.initialize();
+
+  const loaded = await context.loadDurable(id(3));
+  assert.deepEqual(loaded.directFanoutNodes.map(item => item.shortName), ["Node 6", "Node 7"]);
+  assert.deepEqual(loaded.indirectFanoutNodes.map(item => item.shortName), ["Node 8"]);
+
+  const formatted = formatToolResult("LoadNode", { ok: true, result: loaded });
+  assert.match(formatted, /Directly loaded nodes[\s\S]*Node 3/);
+  assert.match(formatted, /Full active-connection nodes[\s\S]*Node 4/);
+  assert.doesNotMatch(formatted, /Summary: Summary 4/);
+  assert.match(formatted, /Fanout nodes of directly loaded nodes[\s\S]*Summary: Summary 6[\s\S]*Summary: Summary 7/);
+  assert.match(formatted, /Fanout nodes only of active-connection nodes[\s\S]*Node 8/);
+  assert.doesNotMatch(formatted, /Summary: Summary 8/);
 });
 
 test("legacy nodes without explicit task connections behave as though they have none", async () => {
@@ -746,7 +768,10 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
     { role: "user", content: "Archived words." },
     { role: "system", display_role: "Kmap context", context_kind: "memory", content: "FULL NODE DETAILS MUST NOT BE INGRESSED" },
     { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' },
-    { role: "user", display_role: "Memory tool result", tool_name: "LoadNode", content: "ANOTHER FULL NODE COPY" },
+    {
+      role: "user", display_role: "Memory tool result", tool_name: "LoadNode", content: "ANOTHER FULL NODE COPY",
+      tool_result: { ok: true, result: { indirectFanoutNodes: [{ shortName: "Distant title", shortDescription: "DISTANT DESCRIPTION MUST BE OMITTED" }] } },
+    },
     { role: "system", display_role: "Latency", context_kind: "timing", content: "SOURCE TIMING NOISE" },
   ];
   kweb.provenance = async () => ({
@@ -789,6 +814,8 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   assert.match(checkpoints.at(-1).retained[0].content, /Loaded Kmap node summaries from the archived session/);
   assert.match(checkpoints.at(-1).retained[0].content, /Roadmap\n  Current product direction\./);
   assert.match(checkpoints.at(-1).retained[0].content, /Launch notes\n  Historical launch decisions\./);
+  assert.match(checkpoints.at(-1).retained[0].content, /- Distant title/);
+  assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /DISTANT DESCRIPTION MUST BE OMITTED/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /FULL NODE DETAILS MUST NOT BE INGRESSED/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /ANOTHER FULL NODE COPY/);
   assert.doesNotMatch(checkpoints.at(-1).retained[0].content, /KENNEDY_TOOL_CALLS/);
@@ -1391,16 +1418,62 @@ test("retry persists an initially failed pending checkpoint before generation", 
   assert.deepEqual(events, ["persist-pending", "persist-pending", "generate", "persist-complete"]);
 });
 
-test("Kmap context is readable text rather than JSON", async () => {
-  const context = new KwebContext(new MockKweb([node(1, [2], [], [[2, "high"]]), node(2)]), id(1));
-  await context.initialize();
-  const formatted = formatKmapContext(context.snapshot());
+test("Kmap context uses compact role-based node and fanout representations", () => {
+  const formatted = formatKmapContext({
+    rootIdentifiers: [1],
+    directlyLoadedIdentifiers: [1],
+    nodes: [
+      {
+        identifier: 1, shortName: "Direct Node", shortDescription: "Direct summary", longDescription: "Direct details", lastModifiedBy: "model-a",
+        taskConnections: [{ identifier: 4, shortName: "Direct Task", shortDescription: "Direct task summary", priority: "high" }],
+        activeConnections: [{ identifier: 2, shortName: "Active Node", shortDescription: "Active summary" }],
+        fanoutConnections: [{ identifier: 3, shortName: "Direct Fanout", shortDescription: "Direct fanout summary" }],
+      },
+      {
+        identifier: 2, shortName: "Active Node", shortDescription: "ACTIVE SHORT DESCRIPTION MUST BE OMITTED", longDescription: "Active details", lastModifiedBy: "model-b",
+        taskConnections: [{ identifier: 7, shortName: "Nested Task", shortDescription: "Nested task summary", priority: "low" }],
+        activeConnections: [{ identifier: 5, shortName: "Nested Active", shortDescription: "Nested active summary" }],
+        fanoutConnections: [
+          { identifier: 3, shortName: "Direct Fanout", shortDescription: "Direct fanout summary" },
+          { identifier: 6, shortName: "Indirect Fanout", shortDescription: "INDIRECT SHORT DESCRIPTION MUST BE OMITTED" },
+        ],
+      },
+    ],
+  });
   assert.match(formatted, /Current Kmap context/);
-  assert.match(formatted, /Node 1: Node 1/);
-  assert.match(formatted, /Last modified by: legacy-unknown/);
-  assert.match(formatted, /Task connections:\n  - high: 2: Node 2/);
-  assert.match(formatted, /Active connections:\n  - 2: Node 2/);
+  assert.match(formatted, /Directly loaded nodes[\s\S]*Node 1: Direct Node[\s\S]*Summary: Direct summary[\s\S]*Details:\n  Direct details/);
+  assert.match(formatted, /Task connection identifiers: high: 4/);
+  assert.match(formatted, /Active connection identifiers: 2/);
+  assert.match(formatted, /Fanout connection identifiers: 3/);
+  assert.match(formatted, /Full active-connection nodes[\s\S]*Node 2: Active Node[\s\S]*Details:\n  Active details/);
+  assert.doesNotMatch(formatted, /ACTIVE SHORT DESCRIPTION MUST BE OMITTED|Nested Task|Nested Active/);
+  assert.match(formatted, /Fanout nodes of directly loaded nodes[\s\S]*3: Direct Fanout[\s\S]*Summary: Direct fanout summary/);
+  assert.match(formatted, /Fanout nodes only of active-connection nodes[\s\S]*6: Indirect Fanout/);
+  assert.doesNotMatch(formatted, /INDIRECT SHORT DESCRIPTION MUST BE OMITTED/);
+  assert.equal((formatted.match(/3: Direct Fanout/g) || []).length, 1);
   assert.equal(formatted.includes('{'), false);
+});
+
+test("compact Kmap projection materially reduces dense loaded-node context", () => {
+  const connection = (identifier, prefix) => ({
+    identifier,
+    shortName: `${prefix} ${identifier}`,
+    shortDescription: "Connection summary ".repeat(8),
+  });
+  const denseNode = identifier => ({
+    identifier,
+    shortName: `Dense Node ${identifier}`,
+    shortDescription: "Node summary ".repeat(10),
+    longDescription: "Durable details ".repeat(80),
+    lastModifiedBy: "model-x",
+    taskConnections: [],
+    activeConnections: Array.from({ length: 8 }, (_, index) => connection(10_000 + identifier * 10 + index, "Active")),
+    fanoutConnections: Array.from({ length: 64 }, (_, index) => connection(20_000 + identifier * 100 + index, "Fanout")),
+  });
+  const nodes = Array.from({ length: 9 }, (_, index) => denseNode(index + 1));
+  const legacyCharacters = nodes.map(formatContextNode).join("\n\n").length;
+  const compactCharacters = formatKmapContext({ rootIdentifiers: [1], directlyLoadedIdentifiers: [1], nodes }).length;
+  assert.ok(compactCharacters < legacyCharacters / 2, `${compactCharacters} compact characters versus ${legacyCharacters} legacy characters`);
 });
 
 test("system prompt composition uses readable sections rather than markup wrappers", () => {

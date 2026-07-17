@@ -75,6 +75,12 @@ canonical documents; this file is not an append-only log.
   response IDs, credentials, and non-context bookkeeping.
 - Organize system instructions as prose sections and loaded Kmap nodes and tool
   results as clear YAML-like text rather than serialized JSON.
+- Keep model-readable Kmap text compact and role-based. Direct nodes retain
+  their descriptions but refer to connections by identifier. Emit each full
+  active-connection node once with its long description and no short
+  description. Emit direct-node fanouts once with name and short description,
+  and fanouts found only beneath active nodes once by name alone. Richer
+  structured summaries may remain in recovery state and the memory UI.
 - Provide Full, System Prompts, Tool Calls, and expandable Memory Tree views.
   The Tool Calls view contains each transparent tool request and its readable
   response in chronological order. Distinguish directly loaded nodes, full

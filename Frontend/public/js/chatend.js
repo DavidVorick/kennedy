@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260715.7";
+import { formatKmapContext } from "./human_format.js?v=20260717.5";
 
 const RESET_HISTORY_KIND = "reset-history";
 

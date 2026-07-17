@@ -79,8 +79,8 @@ These are the fields for the knowledge node:
 + Long Description (Up to 1000 words)
 + Latest modifying model and thinking mode
 + List of up to 3 unique identifiers as 'task connections'
-+ List of up to 12 unique identifiers as 'active connections'
-+ List of up to 60 unique identifiers as 'fanout connections'
++ List of up to 8 unique identifiers as 'active connections'
++ List of up to 64 unique identifiers as 'fanout connections'
 + Unique Identifier of a data history node
 
 The unique identifier is the key for the data history node within the SQLite
@@ -126,14 +126,23 @@ different knowledge nodes.
 
 ### In-Context Knowledge Node
 
-+ Short Name (4-50 characters)
-+ Short Description (0-200 characters)
-+ Short Identifier (a small number)
-+ Long Description (Up to 1000 words)
-+ Latest modifying model and thinking mode
-+ List of short names with short identifiers as 'task connections'
-+ List of short names with short identifiers as 'active connections'
-+ List of short names with short identifiers as 'fanout connections'
+The model-readable projection is role-based to avoid repeating connection
+metadata:
+
++ A directly loaded node includes its short identifier, short name, short and
+  long descriptions, latest modifying model and thinking mode, and identifier-
+  only task, active, and fanout connection lists.
++ Each full node pulled in through an active connection appears once in a later
+  section. It includes its short identifier, short name, long description, and
+  latest modifying model and thinking mode, but omits its short description.
+  Its task, active, and fanout connections are identifier-only.
++ Fanout nodes directly connected to a loaded node appear once with identifier,
+  name, and short description, unless that node is already represented in full.
++ Fanout nodes reached only from an active-connection node appear once with
+  identifier and name. Their short and long descriptions are omitted.
+
+The frontend may retain richer structured connection summaries for rendering
+and recovery; those repeated names and descriptions are not sent to the model.
 
 ## The Context Glue
 
@@ -166,6 +175,12 @@ LoadNode will fetch the provided knowledge node. It will load:
 
 + The full in-context knowledge node for the selected node
 + The full in-context knowledge node for all of the selected node's active connections
+
+The readable result uses the compact role-based projection above. Direct nodes
+refer to connections by short identifier, full active-connection nodes are
+listed once rather than nested under every direct node, and fanout references
+receive only the detail appropriate to their distance from a directly loaded
+node.
 
 Because the on-disk representation does not have the short names for the active
 connections and fanout connections, those names will need to be fetched from
@@ -207,11 +222,17 @@ will update the nodes so that they all become active connections of each other.
 
 The call signature is ConnectNodes(shortIdentifier[])
 
-Because each node is only allowed to have 12 active connections, some active
+Because each node is only allowed to have 8 active connections, some active
 connections may need to be demoted to fanout connections. The
 least-recently-active connections are always the ones that become fanout
 connections. If this would cause the number of fanout connections to exceed the
 maximum allowed number of fanout connections, then the call fails.
+
+Legacy databases need no migration. When LoadNode encounters a requested node
+with more than 8 active connections, it atomically demotes the oldest overflow
+connections to fanout before returning the node and its active expansion. The
+64-connection fanout limit accommodates the four possible demotions from the
+previous 12-active/60-fanout limits.
 
 Demotions are not bidirectional, one node demoting an active connection does
 not mean that the opposing node needs to implement a demotion.
