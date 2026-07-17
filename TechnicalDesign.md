@@ -412,9 +412,12 @@ a run-level Kweb provenance and a backward-compatible `free-time` Conversation
 History record containing an absolute deadline and clean-slate slice number.
 Kennedy's prompt tells her to have fun and includes the shared read/web manuals
 plus the Kmap write manual. The self-time executor therefore permits every
-baseline Kennedy tool and adds `EndSelfTimeSession`, whose loop-control result closes the
-current record and opens a fresh slice without changing the run deadline only
-when at least five minutes remain. Below that threshold, yielding ends the run.
+baseline Kennedy tool and adds `EndSelfTimeSession`, whose loop-control result
+closes the current record and opens a fresh slice without changing the run
+deadline only when at least five minutes remain. Its optional, bounded message
+is checkpointed on the ending record, promoted into that next slice as a
+user-role handoff, and then consumed so it cannot leak into later slices. Below
+the rollover threshold, yielding ends the run and no message is forwarded.
 
 The controller immediately exposes one pending start promise, owns a cross-tab
 Web Lock, restores pending work after reload, and sends every closed slice

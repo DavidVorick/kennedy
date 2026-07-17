@@ -343,7 +343,7 @@ files in this order:
 
 1. `KennedyIdentity.txt` defines who Kennedy is.
 2. Exactly one session file describes the current work:
-   `ConversationSession.txt`, `FreeTimeSession.txt`, `HistoryIngressSession.txt`, or
+   `ConversationSession.txt`, `SelfTimeSession.txt`, `HistoryIngressSession.txt`, or
    `AudioIngressSession.txt`.
 3. `KmapBasics.txt` defines temporary node identifiers, always-loaded roots,
    and the exact text protocol for tool calls. It also tells Kennedy that the
@@ -566,7 +566,9 @@ minutes by default. It accepts an optional custom prompt, stores that prompt in
 the run metadata, and gives it to Kennedy in every clean-slate slice. The start
 control visibly enters `Starting…` and disables itself immediately; repeat
 clicks share that one start, and the history backend refuses a second active
-`free-time` record from another browser context. The duration field accepts
+`free-time` record from another browser context. Self-time history titles use
+the custom prompt and session number so separate sessions are recognizable in
+the sidebar. The duration field accepts
 fractional minutes for short tests and up to seven days for long or overnight
 runs. The run stores one absolute deadline in Conversation History, so reload
 recovery and every clean-slate rollover use the same remaining allowance.
@@ -574,11 +576,14 @@ recovery and every clean-slate rollover use the same remaining allowance.
 Kennedy is told to have fun, follow her own interests, and not wait for user
 work. Self time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
 Kmap write tools. A run-level provenance record is supplied automatically for
-memory mutations. `EndSelfTimeSession({})` is available only in this mode and
-must be called alone. It closes and archives the current session without
-reducing the shared allowance; if at least five minutes remain, a fresh
-self-time Chatend opens immediately. With less than five minutes left, the run
-ends instead. Returning ordinary final text uses the same rollover threshold.
+memory mutations. `EndSelfTimeSession({})` or
+`EndSelfTimeSession({"message":"A message for the next self time session."})`
+is available only in this mode and must be called alone. The optional message
+is a non-empty string of at most 400,000 characters. The call closes and
+archives the current session without reducing the shared allowance; if at least
+five minutes remain, a fresh self-time Chatend opens immediately and receives
+the message. With less than five minutes left, the run ends and the message is
+not forwarded. Returning ordinary final text uses the same rollover threshold.
 
 When less than three minutes remain, the harness injects one timer notification
 into the current Chatend. At the deadline all tools except the end control are

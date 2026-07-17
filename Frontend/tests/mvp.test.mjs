@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
-import { MAX_RESET_SELF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
+import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, reconcileConversationHistory, sortConversationHistory } from "../public/js/render.js";
@@ -15,7 +15,7 @@ import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelay
 import { formatDuration } from "../public/js/timing.js";
 import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
-import { FREE_TIME_CONTINUATION_MINIMUM_MS, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, MAX_SELF_TIME_PROMPT_CHARACTERS, freeTimeCanStartNewSession, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "../public/js/free_time.js";
+import { FREE_TIME_CONTINUATION_MINIMUM_MS, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, MAX_SELF_TIME_PROMPT_CHARACTERS, freeTimeCanStartNewSession, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "../public/js/self_time.js";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventDeadlineMs, telegramEventTimeoutMs } from "../public/js/telegram_timing.js";
 
 const id = n => n.toString(16).padStart(40, "0");
@@ -494,18 +494,27 @@ test("self time authorizes Kmap writes and exposes its clean-slate end tool only
   const api = new MockKweb([node(1, [2]), node(2)]);
   const context = new KwebContext(api, id(1)); await context.initialize();
   let endCalls = 0;
+  let forwardedMessage = null;
   const executor = new ToolExecutor({
     mode: "free-time", context, api, provenanceId: "free-time-provenance", loadLimit: 50,
-    endSession: async () => { endCalls += 1; return { totalTimeReduced: false, remaining: "12:00" }; },
+    endSession: async message => { endCalls += 1; forwardedMessage = message; return { totalTimeReduced: false, remaining: "12:00", messageForwarded: Boolean(message) }; },
   });
   const connected = await executor.execute({ id: "connect", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
   assert.equal(connected.message.tool_result.ok, true);
   assert.deepEqual(api.connected, [id(1), id(2)]);
 
-  const ended = await executor.execute({ id: "end", name: "EndSelfTimeSession", arguments: {} });
+  const ended = await executor.execute({ id: "end", name: "EndSelfTimeSession", arguments: { message: "Continue with node 7." } });
   assert.equal(ended.endSession, true);
   assert.equal(ended.message.tool_result.result.totalTimeReduced, false);
+  assert.equal(ended.message.tool_result.result.messageForwarded, true);
+  assert.equal(forwardedMessage, "Continue with node 7.");
   assert.equal(endCalls, 1);
+
+  const invalidMessage = await executor.execute({ id: "invalid-end", name: "EndSelfTimeSession", arguments: { message: "" } });
+  assert.equal(invalidMessage.message.tool_result.ok, false);
+  assert.match(invalidMessage.message.content, /message must contain between 1 and 400000 characters/);
+  assert.equal(endCalls, 1);
+  assert.equal(MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, 400_000);
 
   const conversation = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
   const unavailable = await conversation.execute({ id: "end", name: "EndFreeTimeSession", arguments: {} });
@@ -538,8 +547,47 @@ test("self-time clocks, rollover threshold, and custom prompt preserve one durab
     deadlineAt: new Date(now + 300_000).toISOString(),
     customPrompt: "Study the Telegram relay.",
   }, now);
-  assert.match(opening, /Self-time session 2 is open/);
-  assert.match(opening, /User-provided focus for this self-time run:\nStudy the Telegram relay\./);
+  assert.equal(opening, "Self time session 2 is open, you have 5:00 remaining in the shared sessions run.");
+  const next = nextFreeTimeSlice({
+    runId: "self-time-run", sliceIndex: 2, deadlineAt: new Date(now + 600_000).toISOString(),
+    customPrompt: "Study the Telegram relay.", handoffMessage: "Old message.",
+    nextSessionMessage: "Continue with node 7.", warningNoticeAt: "now", sliceEndedAt: "now", sliceEndedReason: "tool",
+  });
+  assert.equal(next.sliceIndex, 3);
+  assert.equal(next.customPrompt, "Study the Telegram relay.");
+  assert.equal(next.handoffMessage, "Continue with node 7.");
+  assert.equal("nextSessionMessage" in next, false);
+  assert.equal("warningNoticeAt" in next, false);
+});
+
+test("self-time opening keeps the automatic, launch, and handoff messages distinct", async () => {
+  let now = Date.parse("2026-07-17T12:00:00Z");
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1)]), intelligence: {}, manuals: promptManuals(), rootNodeIds: [id(1)],
+    provider: "p", model: "m", sessionType: "free-time", provenanceId: "prov", now: () => now,
+    freeTime: {
+      runId: "run-1", runStartedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 600_000).toISOString(),
+      durationMinutes: 10, sliceIndex: 3, provenanceId: "prov", customPrompt: "Study the Telegram relay.",
+      handoffMessage: "Continue from node 7.\nKeep the uncertainty.",
+    },
+  });
+  await session.initialize();
+  assert.equal(session.stageFreeTimeOpening(), true);
+  assert.deepEqual(session.transcript.map(item => item.content), [
+    "Self time session 3 is open, you have 10:00 remaining in the shared sessions run.",
+    "Study the Telegram relay.",
+    "Message passed from the previous self time session:\n\nContinue from node 7.\nKeep the uncertainty.",
+  ]);
+
+  const ended = await session.executor.execute({ id: "end", name: "EndSelfTimeSession", arguments: { message: "Inspect node 11 next." } });
+  assert.equal(ended.message.tool_result.result.messageForwarded, true);
+  assert.equal(session.freeTime.nextSessionMessage, "Inspect node 11 next.");
+  assert.equal(session.snapshot().archive.freeTime.nextSessionMessage, "Inspect node 11 next.");
+
+  now += 360_001;
+  const noNext = await session.executor.execute({ id: "end-late", name: "EndSelfTimeSession", arguments: { message: "This cannot be forwarded." } });
+  assert.equal(noNext.message.tool_result.result.messageForwarded, false);
+  assert.equal("nextSessionMessage" in session.freeTime, false);
 });
 
 test("web tools reject extra retrieval knobs and remain available during ingress", async () => {
@@ -1060,8 +1108,14 @@ test("conversation history titles use the first durable user message", () => {
 
 test("self-time history titles identify clean-slate slices", () => {
   assert.equal(conversationTitle({
-    state: { sessionType: "free-time", freeTime: { sliceIndex: 4 }, transcript: [] },
-  }), "Self time · slice 4");
+    state: { sessionType: "free-time", freeTime: { sliceIndex: 4, customPrompt: "  Explore   memory ownership  " }, transcript: [] },
+  }), "Explore memory ownership · session 4");
+  assert.equal(conversationTitle({
+    state: { sessionType: "free-time", freeTime: { sliceIndex: 2 }, transcript: [] },
+  }), "Self time · session 2");
+  assert.equal(conversationTitle({
+    state: { sessionType: "free-time", freeTime: { sliceIndex: 4, customPrompt: "Explore memory ownership and provenance carefully" }, transcript: [] },
+  }, 32), "Explore memory owne… · session 4");
 });
 
 test("audio history titles use the durable original filename", () => {
@@ -1771,11 +1825,11 @@ test("system prompt loader requests every composable prompt layer", async () => 
     "/base/system-prompts/AudioIngressSession.txt",
     "/base/system-prompts/CodexHarness.txt",
     "/base/system-prompts/ConversationSession.txt",
-    "/base/system-prompts/FreeTimeSession.txt",
     "/base/system-prompts/HistoryIngressSession.txt",
     "/base/system-prompts/KennedyIdentity.txt",
     "/base/system-prompts/KmapBasics.txt",
     "/base/system-prompts/ReadTools.txt",
+    "/base/system-prompts/SelfTimeSession.txt",
     "/base/system-prompts/WriteTools.txt",
   ]);
   assert.equal(loaded.errors.audioIngressSession, undefined);
@@ -2076,7 +2130,7 @@ test("the browser exposes self time in a dedicated tab with a durable custom pro
   const [html, app, manual] = await Promise.all([
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
-    readFile(new URL("../SystemPrompts/FreeTimeSession.txt", import.meta.url), "utf8"),
+    readFile(new URL("../SystemPrompts/SelfTimeSession.txt", import.meta.url), "utf8"),
   ]);
   assert.match(html, /id="self-time-tab"[^>]*>Self Time<\/button>/);
   assert.match(html, /id="self-time-panel"/);
@@ -2091,12 +2145,13 @@ test("the browser exposes self time in a dedicated tab with a durable custom pro
   assert.match(app, /freeTimeStarting = true;\s+update\(\);\s+const work = startFreeTimeCoordinated\(\)/);
   assert.match(app, /error\?\.code !== "free_time_already_active"/);
   assert.match(app, /FREE_TIME_HARD_STOP_GRACE_MS/);
-  assert.match(app, /if \(freeTimeCanStartNewSession\(metadata\) && !purgedConversationIds\.has\(id\)\)/);
+  assert.match(app, /if \(freeTimeCanStartNewSession\(finalMetadata\) && !purgedConversationIds\.has\(id\)\)/);
   assert.match(app, /if \(!freeTimeCanStartNewSession\(freeTime\)\) \{\s+finishRun\(\)/);
   assert.match(app, /session\.stageFreeTimeOpening\(\)/);
   assert.match(app, /chatRuntimeReady\(\) \|\| freeTimeRuntimeReady\(\)/);
   assert.match(manual, /free to do whatever you want/i);
   assert.match(manual, /EndSelfTimeSession/);
+  assert.match(manual, /\{\} or \{"message":"A message for the next self time session\."\}/);
   assert.match(manual, /allocating all remaining time/);
 });
 

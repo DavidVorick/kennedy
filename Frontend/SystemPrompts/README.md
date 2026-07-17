@@ -9,7 +9,7 @@ rebuild is needed.
   strategy lives in the kmap rather than in static harness instructions.
 - `CodexHarness.txt` corrects Codex wrapper capability claims, and is included
   only when the frontend-selected inference provider has kind `codex`.
-- `ConversationSession.txt`, `FreeTimeSession.txt`, `HistoryIngressSession.txt`,
+- `ConversationSession.txt`, `SelfTimeSession.txt`, `HistoryIngressSession.txt`,
   and `AudioIngressSession.txt` are mutually exclusive, minimal descriptions of
   the current session and its context-loading budget.
 - `KmapBasics.txt` defines identifier lifetime, the session's automatic root
@@ -17,7 +17,7 @@ rebuild is needed.
   documentation may be available through the kmap.
 - `ReadTools.txt` defines all shared read-only tools, including kmap reads and
   web research.
-- `WriteTools.txt` defines the kmap mutation tools included in ingress and free
+- `WriteTools.txt` defines the kmap mutation tools included in ingress and self
   time.
 
 The browser composes the identity first, then the selected session type, kmap

@@ -563,8 +563,8 @@ canonical documents; this file is not an append-only log.
 - Present autonomous self time in its own browser category tab, alongside
   Conversation, TG Bot, and Audio Ingress. Its start panel accepts an optional
   user prompt, persists it with the run, and repeats it in every clean-slate
-  slice. Retain `free-time` as the durable internal session type for existing
-  records.
+  slice. Use that prompt and the session number for sidebar titles. Retain
+  `free-time` as the durable internal session type for existing records.
 - In self time Kennedy is broadly told to have fun and may use the complete
   read, web, and Kmap write tool set.
 - Default a run to 30 minutes while allowing a manually entered duration for
@@ -573,7 +573,9 @@ canonical documents; this file is not an append-only log.
   the remaining time.
 - Provide `EndSelfTimeSession` only during self time. Kennedy calls it alone to
   archive the current session and immediately open a new clean Chatend if time
-  remains. A normal final response has the same rollover behavior.
+  remains. It may include an optional non-empty `message` of at most 400,000
+  characters; checkpoint and deliver that message to the next session only. A
+  normal final response has the same rollover behavior.
 - Inject a Chatend timer notice once a live session enters its final three
   minutes. At the deadline block further tools and allow one wrap-up response;
   abort any remaining intelligence operation two minutes later, with each

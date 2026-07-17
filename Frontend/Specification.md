@@ -19,7 +19,7 @@ Frontend/
   SystemPrompts/
     KennedyIdentity.txt
     ConversationSession.txt
-    FreeTimeSession.txt
+    SelfTimeSession.txt
     HistoryIngressSession.txt
     AudioIngressSession.txt
     KmapBasics.txt
@@ -34,7 +34,7 @@ Frontend/
       app.js
       chatend.js
       conversation.js
-      free_time.js
+      self_time.js
       history_ingress.js
       intelligence.js
       kweb_context.js
@@ -322,7 +322,7 @@ The frontend fetches composable prompt assets from
 `/system-prompts/{filename}`. It assembles every session in this order:
 
 1. `KennedyIdentity.txt`,
-2. exactly one of `ConversationSession.txt`, `FreeTimeSession.txt`,
+2. exactly one of `ConversationSession.txt`, `SelfTimeSession.txt`,
    `HistoryIngressSession.txt`, or `AudioIngressSession.txt`,
 3. `KmapBasics.txt`,
 4. `ReadTools.txt`, containing the Kmap and web read-only tools,
@@ -587,11 +587,16 @@ blocked, JavaScript-dependent, or otherwise unsupported.
 
 ### 8.10 `EndSelfTimeSession`
 
-`EndSelfTimeSession` accepts exactly an empty object, is available only when
-the tool executor is in `free-time` mode, and must appear alone in its tool
-envelope. Its readable result confirms that total time is unchanged. The agent
-loop checkpoints that result and returns a control sentinel to the self-time
-controller instead of requesting another response in the same Chatend.
+`EndSelfTimeSession` accepts `{}` or `{"message":"A message for the next self
+time session."}`. The optional `message` must be a non-empty string of at most
+400,000 characters. The tool is available only when the executor is in
+`free-time` mode and must appear alone in its tool envelope. Its readable
+result confirms that total time is unchanged and, when another session can
+open, that the message was saved. The agent loop checkpoints the result and
+the pending handoff before returning a control sentinel to the self-time
+controller instead of requesting another response in the same Chatend. The
+rollover promotes the handoff into the next slice only; with less than five
+minutes remaining there is no next slice and no message is forwarded.
 `EndFreeTimeSession` remains accepted as a compatibility alias for already
 archived durable turns, but new prompts expose only the self-time name.
 
@@ -744,21 +749,26 @@ deadline, slice index, trimmed custom prompt, and an
 idempotent run-level Kweb provenance ID. The backend rejects creation if a
 free-time record is already active; the frontend then adopts that existing
 record instead of creating an overlap. The initial autonomous instruction is
-checkpointed as a pending turn before generation begins and repeats the custom
-prompt in every clean-slate slice. The composer is
-hidden for these records, while their transcript, Chatend, tool traffic,
-countdown, and history phases remain inspectable. The live status says
-`One run · slice N`, and history rows say `Self time · slice N`, so intentional
-clean-slate rollovers are not presented as separate button-started runs.
+checkpointed as a pending turn before generation begins. Its first user-role
+message says only which self-time session opened and how much of the shared run
+remains. The optional launch prompt follows as its own user-role message in
+every clean-slate session, as does a one-session handoff supplied by the
+previous session. The composer is hidden for these records, while their
+transcript, Chatend, tool traffic, countdown, and history phases remain
+inspectable. The live status says `One run · slice N`; history rows use the
+launch prompt plus the session number, falling back to `Self time · session N`
+when no prompt was supplied.
 
 One same-origin `kennedy-free-time` Web Lock owns execution across tabs. A
 normal final response or successful `EndSelfTimeSession` finalizes the current
 record into `ingress_pending`. If at least five minutes remain before the
 persisted deadline, the controller increments the slice index and creates a
 new record with a fresh Chatend, context, continuation, counters, and the
-unchanged run deadline/provenance. With less than five minutes left, it ends
-the run instead. Startup restores an active pending slice and reacquires the
-lock; provider or checkpoint failures retry the same durable turn.
+unchanged run deadline/provenance. An optional end-tool message is durably
+promoted to that next record and removed before any later rollover. With less
+than five minutes left, the run ends and no message is forwarded. Startup
+restores an active pending slice and reacquires the lock; provider or checkpoint
+failures retry the same durable turn.
 
 Before every model round and immediately after every model response, the
 session compares wall-clock time with the deadline. At or below three minutes

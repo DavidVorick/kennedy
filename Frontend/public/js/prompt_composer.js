@@ -1,7 +1,7 @@
 export const PROMPT_FILES = {
   identity: "KennedyIdentity.txt",
   conversationSession: "ConversationSession.txt",
-  freeTimeSession: "FreeTimeSession.txt",
+  freeTimeSession: "SelfTimeSession.txt",
   historyIngressSession: "HistoryIngressSession.txt",
   audioIngressSession: "AudioIngressSession.txt",
   codexHarness: "CodexHarness.txt",

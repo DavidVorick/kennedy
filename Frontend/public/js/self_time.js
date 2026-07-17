@@ -67,13 +67,24 @@ export function freeTimeScheduleText(freeTime, now = Date.now()) {
 
 export function freeTimeOpeningMessage(freeTime, now = Date.now()) {
   const timing = freeTimeTiming(freeTime, now);
-  const customPrompt = parseSelfTimePrompt(freeTime?.customPrompt);
-  return [
-    `Self-time session ${freeTime.sliceIndex} is open.`,
-    `You currently have ${formatFreeTimeRemaining(timing.remainingMs)} left in the shared self-time run.`,
-    ...(customPrompt ? ["", "User-provided focus for this self-time run:", customPrompt] : []),
-    "", "Your time begins now, you have plenty of time remaining.",
-  ].join("\n");
+  return `Self time session ${freeTime.sliceIndex} is open, you have ${formatFreeTimeRemaining(timing.remainingMs)} remaining in the shared sessions run.`;
+}
+
+export function nextFreeTimeSlice(freeTime) {
+  const {
+    warningNoticeAt: _warningNoticeAt,
+    expiredNoticeAt: _expiredNoticeAt,
+    sliceEndedAt: _sliceEndedAt,
+    sliceEndedReason: _sliceEndedReason,
+    handoffMessage: _handoffMessage,
+    nextSessionMessage,
+    ...shared
+  } = freeTime;
+  return {
+    ...shared,
+    sliceIndex: Number(freeTime.sliceIndex || 0) + 1,
+    ...(nextSessionMessage ? { handoffMessage: nextSessionMessage } : {}),
+  };
 }
 
 export function freeTimeWarningMessage(freeTime, now = Date.now()) {

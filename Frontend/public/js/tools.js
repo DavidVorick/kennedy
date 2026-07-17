@@ -3,6 +3,7 @@ import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 export const MAX_RESET_SELF_MESSAGE_CHARACTERS = 400_000;
+export const MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS = 400_000;
 
 function splitToolEnvelope(value) {
   if (!value.startsWith("{")) throw Object.assign(new Error("The tool request must contain one JSON object immediately after the marker."), { code: "invalid_tool_protocol" });
@@ -266,11 +267,14 @@ export class ToolExecutor {
   }
 
   async endSelfTimeSession(args) {
-    validateObject(args, []);
+    validateObject(args, [], ["message"]);
+    const message = Object.hasOwn(args, "message")
+      ? nonemptyPreservedString(args.message, "message", MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS)
+      : null;
     if (this.mode !== "free-time" || typeof this.endSession !== "function") {
       throw Object.assign(new Error("This tool is only available during self time."), { code: "tool_unavailable" });
     }
-    const result = await this.endSession();
+    const result = await this.endSession(message);
     return { result, endSession: true };
   }
 }

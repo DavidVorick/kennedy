@@ -145,7 +145,15 @@ export function conversationTitle(record, limit = 54) {
   const sessionType = record?.state?.sessionType || record?.state?.archive?.sessionType;
   if (sessionType === "free-time") {
     const freeTime = record?.state?.freeTime || record?.state?.archive?.freeTime || {};
-    return `Self time · slice ${freeTime.sliceIndex || 1}`;
+    const customPrompt = String(freeTime.customPrompt || "").replace(/\s+/g, " ").trim();
+    const suffix = ` · session ${freeTime.sliceIndex || 1}`;
+    if (!customPrompt) return `Self time${suffix}`;
+    const title = `${customPrompt}${suffix}`;
+    if (title.length <= limit) return title;
+    const promptLimit = limit - suffix.length;
+    return promptLimit > 1
+      ? `${customPrompt.slice(0, promptLimit - 1).trimEnd()}…${suffix}`
+      : `Self time${suffix}`;
   }
   if (sessionType === "telegram-group") {
     const channel = record?.state?.channel || record?.state?.archive?.channel || {};

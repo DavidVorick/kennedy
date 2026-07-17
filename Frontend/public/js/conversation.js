@@ -1,10 +1,10 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260717.7";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260717.8";
+import { ToolExecutor } from "./tools.js?v=20260717.9";
 import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.8";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeWarningMessage, formatFreeTimeRemaining } from "./free_time.js?v=20260717.5";
+import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260717.1";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -98,7 +98,7 @@ export class ConversationSession {
       onUpdate: this.onUpdate,
       beforeMutation: () => this.assertFreeTimeToolAllowed("Kmap write"),
       toolGate: name => this.assertFreeTimeToolAllowed(name),
-      endSession: () => this.requestFreeTimeSessionEnd(),
+      endSession: message => this.requestFreeTimeSessionEnd(message),
       requestTimeoutSeconds: () => this.freeTimeRequestTimeoutSeconds(),
     });
     if (archive?.tools) {
@@ -439,6 +439,12 @@ export class ConversationSession {
     if (this.sessionType !== "free-time" || !this.freeTime) throw new Error("This is not a self-time session.");
     if (this.transcript.length || this.pendingTurn) return false;
     if (!this.stageUserInput(freeTimeOpeningMessage(this.freeTime, this.now()))) return false;
+    const customPrompt = String(this.freeTime.customPrompt || "").trim();
+    if (customPrompt) this.stageUserInput(customPrompt);
+    const handoffMessage = String(this.freeTime.handoffMessage || "");
+    if (handoffMessage.trim()) {
+      this.stageUserInput(`Message passed from the previous self time session:\n\n${handoffMessage}`);
+    }
     this.pendingTurn = true;
     this.pendingCheckpointed = false;
     this.onUpdate();
@@ -457,16 +463,19 @@ export class ConversationSession {
     }
   }
 
-  requestFreeTimeSessionEnd() {
+  requestFreeTimeSessionEnd(message = null) {
     if (this.sessionType !== "free-time") throw Object.assign(new Error("This is not a self-time session."), { code: "tool_unavailable" });
     this.freeTimeEndReason = "tool";
     const now = this.now();
     const remaining = freeTimeTiming(this.freeTime, now).remainingMs;
     const willContinue = freeTimeCanStartNewSession(this.freeTime, now);
+    delete this.freeTime.nextSessionMessage;
+    if (willContinue && message) this.freeTime.nextSessionMessage = message;
     return {
       sessionEnding: true,
       totalTimeReduced: false,
       remaining: formatFreeTimeRemaining(remaining),
+      messageForwarded: Boolean(willContinue && message),
       next: willContinue
         ? "A new clean-slate self-time session will open with the same deadline."
         : remaining > 0

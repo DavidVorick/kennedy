@@ -209,6 +209,7 @@ export function formatToolResult(toolName, content) {
       return [
         "The current self-time session is ending with the total time unchanged.",
         `Remaining self time: ${text(result.remaining)}`,
+        result.messageForwarded ? "The message was saved for the next self-time session." : null,
         text(result.next),
       ].filter(Boolean).join("\n");
     case "WebSearch":

@@ -337,8 +337,10 @@ the conversation into the normal history-ingress queue.
 The dedicated **Self Time** tab starts an autonomous run with a duration in
 minutes (30 by default, fractional values allowed for tests) and an optional
 user prompt that carries into every clean-slate slice. Kennedy receives the
-full read/web/Kmap-write tool set and can call `EndSelfTimeSession({})` to choose
-a fresh Chatend without giving up any remaining time. Self-time records survive
+full read/web/Kmap-write tool set and can call `EndSelfTimeSession({})`, or pass
+the next session a note with
+`EndSelfTimeSession({"message":"Continue this investigation."})`, to choose a
+fresh Chatend without giving up any remaining time. Self-time records survive
 a reload and roll through normal history ingress. A notice is injected for the
 last three minutes; the deadline allows one tool-free wrap-up response and a
 hard cancellation follows two minutes later. Start feedback is immediate and

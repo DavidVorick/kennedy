@@ -1,10 +1,10 @@
 import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.6";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
-import { ConversationSession } from "./conversation.js?v=20260717.13";
+import { ConversationSession } from "./conversation.js?v=20260717.14";
 import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260717.3";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260717.8";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260717.11";
-import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./free_time.js?v=20260717.5";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260717.12";
+import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260717.1";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventTimeoutMs } from "./telegram_timing.js?v=20260717.1";
 
 const CONFIG = {
@@ -1102,17 +1102,6 @@ async function closeFreeTimeSession(id, session) {
   return record;
 }
 
-function nextFreeTimeSlice(freeTime) {
-  const {
-    warningNoticeAt: _warningNoticeAt,
-    expiredNoticeAt: _expiredNoticeAt,
-    sliceEndedAt: _sliceEndedAt,
-    sliceEndedReason: _sliceEndedReason,
-    ...shared
-  } = freeTime;
-  return { ...shared, sliceIndex: Number(freeTime.sliceIndex || 0) + 1 };
-}
-
 async function createFreeTimeSlice(freeTime, { select = false } = {}) {
   const session = new ConversationSession({
     kweb, intelligence, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort,
@@ -1331,11 +1320,12 @@ async function runFreeTimeRecord(id) {
       }
     }
     await session.finalizeFreeTime(reason);
+    const finalMetadata = session.freeTime || metadata;
     const selectNext = selectedConversationId === id;
     await closeFreeTimeSession(id, session);
-    if (freeTimeCanStartNewSession(metadata) && !purgedConversationIds.has(id)) {
-      scheduleFreeTimeContinuation(nextFreeTimeSlice(metadata), selectNext);
-    } else if (freeTimeRun?.runId === metadata.runId) {
+    if (freeTimeCanStartNewSession(finalMetadata) && !purgedConversationIds.has(id)) {
+      scheduleFreeTimeContinuation(nextFreeTimeSlice(finalMetadata), selectNext);
+    } else if (freeTimeRun?.runId === finalMetadata.runId) {
       freeTimeRun = null;
       update();
     }
