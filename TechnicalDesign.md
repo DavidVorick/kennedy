@@ -55,6 +55,10 @@ The frontend appends the provider-reported current model and thinking mode.
 
 - The frontend is the single authority for each live session's chatend and
   in-memory draft.
+- Frontend orchestration has explicit boundaries: `app.js` connects UI and
+  transports, `ConversationSession` owns one live Chatend, and
+  `MemoryIngressCoordinator` owns serialized conversation/audio ingress
+  selection, claims, checkpoints, retries, cancellation, and completion.
 - The Kweb backend is the single authority for durable memory.
 - The conversation history backend is the single authority for unfinished and
   completed conversation records.
@@ -229,10 +233,10 @@ The intelligence backend owns:
 - validating the canonical plaintext generation request,
 - passing canonical plaintext and continuation controls into bounded,
   read-only non-interactive Codex turns,
-- minimizing exposed Codex overhead through terse inline instructions,
-  suppressed optional instruction/tool/plugin features, and a probed slim
-  catalog derived from live model metadata without changing advertised model
-  limits,
+- enforcing an empty non-Chatend prompt boundary through empty developer
+  instructions, suppressed optional instruction/tool/plugin features, a
+  mandatory sanitized catalog with blank provider prompt fields, and a startup
+  model-visible prompt probe,
 - suppressing Codex auto-compaction beyond every reachable context so Kmap
   material is never silently summarized,
 - translating Codex text, thread IDs, errors, and detailed token usage
@@ -245,14 +249,14 @@ The intelligence backend owns:
 
 It stores no local LLM session and never parses Kennedy's tool envelopes. The
 normal generation path has no enabled shell, file-mutation, app, multi-agent,
-or internet capability. Stock Codex still emits its irreducible `update_plan`
-and environment-backed `view_image` schemas, which the inline instruction
-forbids Kennedy from using. The frontend recognizes WebSearch and WebFetch text
-calls, invokes the corresponding intelligence API, then appends their readable
-results to the main conversation chain. Quality and balanced search runs are
-fresh ephemeral Codex threads; fast search is a stateless Gemini 3.1 Flash-Lite
-interaction with Google Search grounding. None can alter the conversation
-continuation chain.
+or internet capability. Codex still emits its irreducible `update_plan` and
+environment-backed `view_image` schemas despite their exposed switches being
+false, but Kennedy receives no invisible instruction about them. The frontend
+recognizes WebSearch and WebFetch text calls, invokes the corresponding
+intelligence API, then appends their readable results to the main conversation
+chain. Quality and balanced search runs are fresh ephemeral Codex threads; fast
+search is a stateless Gemini 3.1 Flash-Lite interaction with Google Search
+grounding. None can alter the conversation continuation chain.
 
 ### 4.4 Conversation History Backend
 
@@ -271,7 +275,9 @@ It permits multiple `active` and `ingress_pending` records while enforcing one
 active conversations idle for more than 24 hours, unless Kennedy still owes a
 response in that record. All Telegram session types are exempt from idle
 closure. Private sessions and per-group-user sessions remain active until
-`/reset`; only background group batches are explicitly queued immediately.
+`/reset`; per-group-user sessions also close after the relay reports more than
+50 messages without that user's invocation. Only background group batches are
+explicitly queued immediately.
 The backend atomically records concise ingress failure diagnostics. The fifth
 failure moves the record to `ingress_failed`, removes it from queue selection,
 and frees the worker to process the next conversation; failed records and all
@@ -295,10 +301,15 @@ Telegram member count with every identity whitelisted. Unknown/conflicting
 members, an incomplete ledger, or loss of monitoring after activation
 permanently blacklists the chat ID. Each observed group keeps a stable root even
 after blacklisting or a Telegram chat-ID migration. Mentions, replies, and
-scoped group resets queue work onto a persistent `(group root, user)` session
-with up to 50 messages of initial context; voice notes and supported documents
-use the same media path as DMs. Queue heads are isolated by group user. More
-than 100 uninvoked messages
+scoped group resets queue response work onto a persistent `(group root, user)`
+session with up to 50 messages of initial context. Every allowed group message
+is also archived once and exposed as a durable passive-context stream to every
+open session in the group, including voice notes, supported documents, and
+Kennedy replies produced for another user. Passive delivery advances a
+per-session cursor and never runs the model. Queue heads are isolated by group
+user. A session whose user has not invoked Kennedy for more than 50 group
+messages is detached and silently queued for history ingress after its pending
+passive context is checkpointed. More than 100 uninvoked messages
 queue the oldest 80 for background ingress. The browser provisions reserved roots, binds each
 event to Conversation History, runs the Chatend/tool loop, and returns only
 Kennedy's final text. The relay never receives the rest of the Chatend.
@@ -368,15 +379,37 @@ both.
 
 Explicitly ending a conversation transitions its durable record to
 `ingress_pending`; starting a new conversation does not end existing live ones.
+A separate `Send & end` path first checkpoints one final user message into the
+Chatend without starting a model turn, then performs the same transition so
+history ingress sees that message.
 A successful user-message checkpoint in another conversation also queues active
 records idle for more than 24 hours, except pending Kennedy turns. The frontend
-worker processes queued records oldest-activity-first, creates idempotent data
+`MemoryIngressCoordinator` processes conversation and audio queues through one
+serialized worker. It resumes already-claimed work first, otherwise chooses
+the oldest source timestamp, creates idempotent data
 provenance from each complete recovery archive, transitions exactly one record
 to `ingress_in_progress`, and completes it before claiming the next. Live
 conversations remain usable throughout. Completed records and both archives
 remain queryable from the sidebar.
 
-### 5.2 History Ingress
+### 5.2 Autonomous Free Time
+
+Free time is a durable autonomous browser session family. The top-bar control
+creates a run-level Kweb provenance and a `free-time` Conversation History
+record containing an absolute deadline and clean-slate slice number. Kennedy's
+prompt tells her to have fun and includes the shared read/web manuals plus the
+Kmap write manual. The free-time executor therefore permits every baseline
+Kennedy tool and adds `EndFreeTimeSession`, whose loop-control result closes the
+current record and opens a fresh slice without changing the run deadline.
+
+The controller owns a cross-tab Web Lock, restores pending work after reload,
+and sends every closed slice through normal history ingress. It checks the
+clock before requests and after responses, durably injects a warning inside the
+last three minutes, blocks tools at expiry, and grants one wrap-up response.
+Provider request timeouts are clamped to the remaining two-minute shutdown
+grace; a browser cancellation timer enforces the same hard stop.
+
+### 5.3 History Ingress
 
 History ingress uses a separate chatend composed from identity, the history
 session description, Kmap basics, read tools, and write tools, followed by the
@@ -420,7 +453,7 @@ and pending-turn flag. Pending user queries resume from fresh Codex threads.
 Queued ingress resumes independently and sequentially without disabling any
 live composer.
 
-### 5.3 Telegram and Conversational Audio
+### 5.4 Telegram and Conversational Audio
 
 Conversation records declare `sessionType: conversation`, `telegram`, or
 `telegram-group`. Prompt composition tells Kennedy which one she is in;
@@ -433,13 +466,19 @@ the relay sends a separate operational notice with current and maximum tokens
 and suggests `/reset`; the notice is not added to the Chatend.
 
 Each group user retains a separate session within each group until that user
-runs `/reset`. Its direct roots are the user's reserved root, the group's
+runs `/reset` or goes more than 50 group messages without invoking Kennedy. Its direct roots are the user's reserved root, the group's
 reserved root, and Kennedy's root
 in that order. Every other member root receives a session-local short identifier
 without being loaded, so Kennedy may load it deliberately. Dynamic context
 lists the group root, all participants/root identifiers, and the latest 50
-messages initially; later turns append unseen group messages without duplicating
-the invoking message. Context warnings name the relevant `@username` and state
+messages initially. Thereafter the relay exposes every message through a
+per-session cursor and the browser checkpoints it into all open group-user
+Chatends without generating a response. This includes messages by other users,
+voice-note transcriptions, extracted attachment text, and Kennedy replies from
+other sessions; a session's own invocation and response are excluded from its
+context copy because they already appear in its transcript. An invocation
+catches up any pending context before generation, and `/reset` catches it up
+before closure. Context warnings name the relevant `@username` and state
 that other participants have separate sessions. Background 80-message archives
 have no invoker, so they load the
 group root followed by Kennedy's root and register all participant roots before
@@ -463,7 +502,7 @@ Extracted text is bounded and
 placed once in the Chatend; original bytes and metadata remain in conversation
 media. Image-only PDFs fail with an explicit OCR-required message.
 
-### 5.4 Durable Vnote Audio Ingress
+### 5.5 Durable Vnote Audio Ingress
 
 The i3 start script runs `arecord` directly into `/home/user/media/vnotes` and
 puts the recording-start Unix timestamp in the filename. The stop script ends

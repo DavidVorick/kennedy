@@ -41,6 +41,8 @@ const GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
 const RECONCILIATION_MODEL: &str = "gpt-5.6-sol";
 const RECONCILIATION_REASONING: &str = "xhigh";
 const CODEX_EXECUTABLE: &str = "codex-safe";
+const CODEX_PROMPT_BOUNDARY_SENTINEL: &str =
+    "KENNEDY_AUDIO_CODEX_PROMPT_BOUNDARY_SENTINEL_4A92E1D7";
 const MAX_CHUNK_MILLISECONDS: u64 = 4 * 60 * 1_000;
 const CHUNK_OVERLAP_MILLISECONDS: u64 = 15 * 1_000;
 const MAX_INGRESS_TOKENS: u64 = 50_000;
@@ -65,6 +67,7 @@ struct AppState {
     config: Arc<Config>,
     db: Arc<Mutex<Connection>>,
     client: Client,
+    codex_model_catalog: Arc<PathBuf>,
 }
 
 struct TemporaryUpload(PathBuf);
@@ -262,6 +265,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         config.max_upload_bytes > 0,
         "audio upload limit must be positive"
     );
+    let codex_model_catalog = prepare_sanitized_codex_model_catalog().await?;
+    probe_codex_prompt_boundary(&codex_model_catalog).await?;
     ensure_private_directory(&config.media_directory)?;
     let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
@@ -292,6 +297,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         config: Arc::new(config),
         db: Arc::new(Mutex::new(connection)),
         client,
+        codex_model_catalog: Arc::new(codex_model_catalog),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -1405,13 +1411,13 @@ async fn reconcile_recording(state: &AppState, recording: &WorkRecording) -> any
         "recording has incomplete transcription chunks"
     );
     let prompt = reconciliation_prompt(recording, &chunks);
-    let mut transcript = run_sol(&prompt).await?;
+    let mut transcript = run_sol(&state.codex_model_catalog, &prompt).await?;
     let mut pieces = parse_ingress_pieces(&transcript);
     if pieces
         .iter()
         .any(|piece| estimate_tokens(piece) > MAX_INGRESS_TOKENS)
     {
-        transcript = run_sol(&split_prompt(&transcript)).await?;
+        transcript = run_sol(&state.codex_model_catalog, &split_prompt(&transcript)).await?;
         pieces = parse_ingress_pieces(&transcript);
     }
     ensure!(!pieces.is_empty(), "Sol returned an empty final transcript");
@@ -1489,7 +1495,7 @@ fn estimate_tokens(value: &str) -> u64 {
     (value.chars().count() as u64).div_ceil(ESTIMATED_CHARACTERS_PER_TOKEN)
 }
 
-async fn run_sol(prompt: &str) -> anyhow::Result<String> {
+async fn run_sol(model_catalog: &Path, prompt: &str) -> anyhow::Result<String> {
     let mut command = Command::new(CODEX_EXECUTABLE);
     command
         .args([
@@ -1507,7 +1513,7 @@ async fn run_sol(prompt: &str) -> anyhow::Result<String> {
         .arg("-C")
         .arg(std::env::temp_dir())
         .args(["--sandbox", "read-only"]);
-    add_codex_config(&mut command);
+    add_codex_config(&mut command, model_catalog);
     command
         .arg("-")
         .stdin(Stdio::piped())
@@ -1540,33 +1546,316 @@ async fn run_sol(prompt: &str) -> anyhow::Result<String> {
     parse_codex_answer(&stdout).context("Sol returned no final transcript")
 }
 
-fn add_codex_config(command: &mut Command) {
+fn catalog_context_limits(output: &[u8]) -> anyhow::Result<Vec<(String, u64, u64)>> {
+    let catalog: Value =
+        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .context("Codex model catalog has no models array")?;
+    let mut limits = models
+        .iter()
+        .map(|model| {
+            Ok((
+                model
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .context("Codex model has no slug")?
+                    .to_owned(),
+                model
+                    .get("context_window")
+                    .and_then(Value::as_u64)
+                    .context("Codex model has no context window")?,
+                model
+                    .get("effective_context_window_percent")
+                    .and_then(Value::as_u64)
+                    .context("Codex model has no effective context percentage")?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    limits.sort_unstable();
+    Ok(limits)
+}
+
+fn sanitize_codex_model_catalog(output: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut catalog: Value =
+        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .context("Codex model catalog has no models array")?;
+    for model in models {
+        let model = model
+            .as_object_mut()
+            .context("Codex model catalog contains a non-object model")?;
+        model.remove("tool_mode");
+        model.remove("multi_agent_version");
+        model.remove("apply_patch_tool_type");
+        model.remove("model_messages");
+        model.insert("base_instructions".into(), Value::String(String::new()));
+        model.insert(
+            "include_skills_usage_instructions".into(),
+            Value::Bool(false),
+        );
+    }
+    serde_json::to_vec(&catalog).context("serializing the sanitized Codex model catalog")
+}
+
+fn verify_sanitized_codex_model_catalog(output: &[u8]) -> anyhow::Result<()> {
+    let catalog: Value =
+        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .context("Codex model catalog has no models array")?;
+    for model in models {
+        let model = model
+            .as_object()
+            .context("Codex model catalog contains a non-object model")?;
+        let slug = model
+            .get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown model");
+        ensure!(
+            model.get("base_instructions").and_then(Value::as_str) == Some(""),
+            "Codex retained base instructions for {slug}"
+        );
+        ensure!(
+            !model.contains_key("model_messages"),
+            "Codex retained model messages for {slug}"
+        );
+        ensure!(
+            model
+                .get("include_skills_usage_instructions")
+                .and_then(Value::as_bool)
+                == Some(false),
+            "Codex retained skill usage instructions for {slug}"
+        );
+    }
+    Ok(())
+}
+
+fn model_catalog_config(path: &Path) -> String {
+    format!(
+        "model_catalog_json={}",
+        serde_json::to_string(path.to_string_lossy().as_ref())
+            .expect("serializing a path string cannot fail")
+    )
+}
+
+async fn prepare_sanitized_codex_model_catalog() -> anyhow::Result<PathBuf> {
+    let source = Command::new(CODEX_EXECUTABLE)
+        .args(["debug", "models"])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .output()
+        .await
+        .context("discovering Codex models for audio reconciliation")?;
+    ensure!(
+        source.status.success(),
+        "Codex model discovery failed for audio reconciliation"
+    );
+    let catalog = sanitize_codex_model_catalog(&source.stdout)?;
+    let directory = std::env::temp_dir().join("kennedy-codex-catalogs");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .context("creating the audio Codex model catalog directory")?;
+    let path = directory.join(format!("audio-models-{}.json", Uuid::new_v4()));
+    tokio::fs::write(&path, catalog)
+        .await
+        .context("writing the sanitized audio Codex model catalog")?;
+    let probe = Command::new(CODEX_EXECUTABLE)
+        .arg("-c")
+        .arg(model_catalog_config(&path))
+        .args(["debug", "models"])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .output()
+        .await
+        .context("probing the sanitized audio Codex model catalog")?;
+    let verification = (|| -> anyhow::Result<()> {
+        ensure!(
+            probe.status.success(),
+            "codex-safe cannot read the sanitized audio model catalog"
+        );
+        ensure!(
+            catalog_context_limits(&probe.stdout)? == catalog_context_limits(&source.stdout)?,
+            "sanitized audio Codex catalog changed advertised model context limits"
+        );
+        verify_sanitized_codex_model_catalog(&probe.stdout)
+    })();
+    if let Err(error) = verification {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error)
+            .context("refusing to start audio ingress with hidden Codex model instructions");
+    }
+    Ok(path)
+}
+
+fn add_codex_config(command: &mut Command, model_catalog: &Path) {
     command
-        .arg("-c").arg(format!("model_reasoning_effort=\"{RECONCILIATION_REASONING}\""))
-        .arg("-c").arg("instructions=\"Follow the supplied transcript-processing prompt exactly. Do not use Codex tools.\"")
-        .arg("-c").arg("personality=\"none\"")
-        .arg("-c").arg("project_doc_max_bytes=0")
-        .arg("-c").arg("approval_policy=\"never\"")
-        .arg("-c").arg("sandbox_mode=\"read-only\"")
-        .arg("-c").arg("include_permissions_instructions=false")
-        .arg("-c").arg("include_apps_instructions=false")
-        .arg("-c").arg("include_collaboration_mode_instructions=false")
-        .arg("-c").arg("include_environment_context=false")
-        .arg("-c").arg("skills.include_instructions=false")
-        .arg("-c").arg("features.multi_agent=false")
-        .arg("-c").arg("features.apps=false")
-        .arg("-c").arg("features.shell_tool=false")
-        .arg("-c").arg("features.unified_exec=false")
-        .arg("-c").arg("features.code_mode=false")
-        .arg("-c").arg("features.goals=false")
-        .arg("-c").arg("features.plugins=false")
-        .arg("-c").arg("features.browser_use=false")
-        .arg("-c").arg("features.image_generation=false")
-        .arg("-c").arg("features.default_mode_request_user_input=false")
-        .arg("-c").arg("tools.experimental_request_user_input.enabled=false")
-        .arg("-c").arg("features.remote_compaction_v2=false")
-        .arg("-c").arg("web_search=\"disabled\"")
-        .arg("-c").arg(format!("model_auto_compact_token_limit={}", i64::MAX));
+        .arg("-c")
+        .arg(format!(
+            "model_reasoning_effort=\"{RECONCILIATION_REASONING}\""
+        ))
+        .arg("-c")
+        .arg("instructions=\"\"")
+        .arg("-c")
+        .arg("developer_instructions=\"\"")
+        .arg("-c")
+        .arg("personality=\"none\"")
+        .arg("-c")
+        .arg("project_doc_max_bytes=0")
+        .arg("-c")
+        .arg("approval_policy=\"never\"")
+        .arg("-c")
+        .arg("sandbox_mode=\"read-only\"")
+        .arg("-c")
+        .arg("include_permissions_instructions=false")
+        .arg("-c")
+        .arg("include_apps_instructions=false")
+        .arg("-c")
+        .arg("include_collaboration_mode_instructions=false")
+        .arg("-c")
+        .arg("include_environment_context=false")
+        .arg("-c")
+        .arg("skills.include_instructions=false")
+        .arg("-c")
+        .arg("features.multi_agent=false")
+        .arg("-c")
+        .arg("features.multi_agent_v2=false")
+        .arg("-c")
+        .arg("features.apps=false")
+        .arg("-c")
+        .arg("features.shell_tool=false")
+        .arg("-c")
+        .arg("features.unified_exec=false")
+        .arg("-c")
+        .arg("features.code_mode=false")
+        .arg("-c")
+        .arg("features.code_mode_host=false")
+        .arg("-c")
+        .arg("features.code_mode_only=false")
+        .arg("-c")
+        .arg("features.current_time_reminder=false")
+        .arg("-c")
+        .arg("features.goals=false")
+        .arg("-c")
+        .arg("features.hooks=false")
+        .arg("-c")
+        .arg("features.plugins=false")
+        .arg("-c")
+        .arg("features.remote_plugin=false")
+        .arg("-c")
+        .arg("features.plugin_sharing=false")
+        .arg("-c")
+        .arg("features.personality=false")
+        .arg("-c")
+        .arg("features.browser_use=false")
+        .arg("-c")
+        .arg("features.browser_use_external=false")
+        .arg("-c")
+        .arg("features.browser_use_full_cdp_access=false")
+        .arg("-c")
+        .arg("features.computer_use=false")
+        .arg("-c")
+        .arg("features.in_app_browser=false")
+        .arg("-c")
+        .arg("features.image_generation=false")
+        .arg("-c")
+        .arg("features.memories=false")
+        .arg("-c")
+        .arg("features.mentions_v2=false")
+        .arg("-c")
+        .arg("features.request_permissions_tool=false")
+        .arg("-c")
+        .arg("features.tool_suggest=false")
+        .arg("-c")
+        .arg("features.workspace_dependencies=false")
+        .arg("-c")
+        .arg("features.shell_snapshot=false")
+        .arg("-c")
+        .arg("features.skill_mcp_dependency_install=false")
+        .arg("-c")
+        .arg("features.guardian_approval=false")
+        .arg("-c")
+        .arg("features.auth_elicitation=false")
+        .arg("-c")
+        .arg("features.tool_call_mcp_elicitation=false")
+        .arg("-c")
+        .arg("features.terminal_visualization_instructions=false")
+        .arg("-c")
+        .arg("features.use_agent_identity=false")
+        .arg("-c")
+        .arg("tools.experimental_request_user_input.enabled=false")
+        .arg("-c")
+        .arg("tools.view_image=false")
+        .arg("-c")
+        .arg("tools_view_image=false")
+        .arg("-c")
+        .arg("features.default_mode_request_user_input=false")
+        .arg("-c")
+        .arg("features.remote_compaction_v2=false")
+        .arg("-c")
+        .arg("web_search=\"disabled\"")
+        .arg("-c")
+        .arg(format!("model_auto_compact_token_limit={}", i64::MAX))
+        .arg("-c")
+        .arg(model_catalog_config(model_catalog));
+}
+
+fn verify_codex_prompt_input(output: &[u8]) -> anyhow::Result<()> {
+    let inputs: Vec<Value> =
+        serde_json::from_slice(output).context("Codex returned invalid prompt-input JSON")?;
+    ensure!(
+        inputs.len() == 1,
+        "Codex reported {} model-visible prompt items instead of the supplied transcript prompt",
+        inputs.len()
+    );
+    let input = inputs[0]
+        .as_object()
+        .context("Codex prompt-input item is not an object")?;
+    let content = input
+        .get("content")
+        .and_then(Value::as_array)
+        .context("Codex prompt-input item has no content array")?;
+    ensure!(
+        input.get("type").and_then(Value::as_str) == Some("message")
+            && input.get("role").and_then(Value::as_str) == Some("user")
+            && content.len() == 1
+            && content[0].get("type").and_then(Value::as_str) == Some("input_text")
+            && content[0].get("text").and_then(Value::as_str)
+                == Some(CODEX_PROMPT_BOUNDARY_SENTINEL),
+        "Codex altered the supplied transcript prompt item"
+    );
+    Ok(())
+}
+
+async fn probe_codex_prompt_boundary(model_catalog: &Path) -> anyhow::Result<()> {
+    let mut command = Command::new(CODEX_EXECUTABLE);
+    command
+        .args(["debug", "prompt-input"])
+        .arg("-c")
+        .arg(format!(
+            "model={}",
+            serde_json::to_string(RECONCILIATION_MODEL)
+                .expect("serializing a model name cannot fail")
+        ));
+    add_codex_config(&mut command, model_catalog);
+    let output = command
+        .arg(CODEX_PROMPT_BOUNDARY_SENTINEL)
+        .current_dir(std::env::temp_dir())
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .output()
+        .await
+        .context("starting the audio Codex prompt-boundary probe")?;
+    ensure!(
+        output.status.success(),
+        "audio Codex prompt-boundary probe failed"
+    );
+    verify_codex_prompt_input(&output.stdout)
+        .context("audio reconciliation exposed model-visible content outside its supplied prompt")
 }
 
 fn parse_codex_answer(stdout: &str) -> Option<String> {
@@ -1953,6 +2242,61 @@ mod tests {
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         apply_migrations(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn audio_codex_catalog_and_config_remove_hidden_prompts() {
+        let source = br#"{
+            "models":[{
+                "slug":"gpt-5.6-sol",
+                "context_window":272000,
+                "effective_context_window_percent":95,
+                "base_instructions":"provider instructions",
+                "model_messages":{"instructions_template":"more provider instructions"},
+                "include_skills_usage_instructions":true,
+                "tool_mode":"code_mode_only",
+                "multi_agent_version":"v2",
+                "apply_patch_tool_type":"freeform"
+            }]
+        }"#;
+        let sanitized = sanitize_codex_model_catalog(source).unwrap();
+        verify_sanitized_codex_model_catalog(&sanitized).unwrap();
+        assert_eq!(
+            catalog_context_limits(&sanitized).unwrap(),
+            catalog_context_limits(source).unwrap()
+        );
+
+        let mut command = Command::new("codex-safe");
+        let catalog = Path::new("/tmp/kennedy-codex-catalogs/audio-models.json");
+        add_codex_config(&mut command, catalog);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments.contains(&"instructions=\"\"".into()));
+        assert!(arguments.contains(&"developer_instructions=\"\"".into()));
+        assert!(arguments.contains(&model_catalog_config(catalog)));
+        assert!(arguments.contains(&"tools.view_image=false".into()));
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| argument.starts_with("instructions="))
+                .collect::<Vec<_>>(),
+            vec![&"instructions=\"\"".to_owned()]
+        );
+    }
+
+    #[test]
+    fn audio_codex_prompt_boundary_rejects_extra_model_visible_items() {
+        let exact = format!(
+            r#"[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{CODEX_PROMPT_BOUNDARY_SENTINEL}"}}]}}]"#
+        );
+        verify_codex_prompt_input(exact.as_bytes()).unwrap();
+        let hidden = format!(
+            r#"[{{"type":"message","role":"developer","content":[{{"type":"input_text","text":"hidden"}}]}},{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{CODEX_PROMPT_BOUNDARY_SENTINEL}"}}]}}]"#
+        );
+        assert!(verify_codex_prompt_input(hidden.as_bytes()).is_err());
     }
 
     #[test]

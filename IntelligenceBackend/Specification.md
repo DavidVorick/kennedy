@@ -88,15 +88,18 @@ same absolute path, read-only. A persistent container must be recreated when
 adding this mount. The backend creates the host directory before its first
 launcher call.
 
-At startup the backend runs `codex-safe debug models`, reads each model's
+At startup the backend runs `codex-safe debug models` and `codex-safe debug
+prompt-input`; the launcher must forward both commands. It reads each model's
 `context_window` and `effective_context_window_percent`, and exposes their
 product as the usable context and input window. The selected model must be
 present with valid advertised values or startup fails. There is no hardcoded
-fallback window. The backend also writes a derived catalog that removes only
-`tool_mode`, `multi_agent_version`, and `apply_patch_tool_type`, then probes it
-through `codex-safe debug models`. It uses that catalog only if the probe works
-and every model's effective context limit exactly matches the original live
-catalog; otherwise it removes the file, warns, and uses the stock catalog.
+fallback window. The backend also writes a sanitized catalog that blanks every
+model's `base_instructions`, removes `model_messages`, disables model-selected
+skill instructions, and removes `tool_mode`, `multi_agent_version`, and
+`apply_patch_tool_type`. It probes that catalog through `codex-safe debug
+models`, requiring the sanitized prompt fields and every advertised effective
+context limit to match expectations. Failure removes the file and aborts
+startup; Kennedy never falls back to the stock instruction-bearing catalog.
 
 The native-audio model list is empty for the `gpt-5.6-sol` Codex transport. A
 model belongs in that list only when its active Kennedy transport can actually
@@ -111,21 +114,28 @@ Generation asks the `codex-safe` launcher to run `codex exec --json` with:
 - the selected model and configured reasoning effort (`gpt-5.6-sol`, `xhigh`);
 - saved CLI authentication but ignored user/project configuration and rules;
 - approval policy `never` and a read-only sandbox;
-- a terse inline instruction to follow the supplied Chatend without using
-  Codex tools, with personality, project documents, skills, permission, app,
-  collaboration, and environment instruction blocks suppressed;
+- empty Codex runtime, developer, and model-base instructions, with personality, project
+  documents, skills, permission, app, collaboration, and environment
+  instruction blocks suppressed;
 - optional multi-agent, app, shell, unified-exec, code-mode, goal, hook, plugin,
   browser/computer, image-generation, elicitation, and related tool scaffolding
   disabled, including the separately configured experimental
   `request_user_input` tool, along with web search on ordinary Kennedy turns;
-- the verified slim live model catalog when the launcher can read it, reducing
-  model-selected agent tools without altering advertised context limits;
+- the mandatory verified sanitized live model catalog, removing provider prompt
+  templates and model-selected agent tools without altering advertised context
+  limits;
 - the canonical plaintext Chatend passed unchanged through stdin rather than
   command-line arguments or a JSON prompt envelope;
 - `model_auto_compact_token_limit` set to the largest signed 64-bit value,
   beyond every reachable advertised context window, so Codex does not
   automatically compact Kennedy's Chatend;
 - a bounded total deadline and child termination on timeout.
+
+Generation and web-search requests may additionally supply a positive
+`timeout_seconds`. The backend clamps it to the configured provider/search
+profile timeout rather than allowing a caller to lengthen work. Free time uses
+this field to bound each operation to its persisted deadline plus the
+two-minute graceful-shutdown window.
 
 History and audio ingress use the normal provider generation timeout; their
 short retry delay does not shorten a Codex turn. Oversized Chatends are rejected
@@ -134,16 +144,24 @@ warnings are excluded from provider failure details.
 
 These settings minimize every exposed Codex layer the deployment can control.
 The canonical Chatend is the exact application-controlled plaintext sent to
-Codex; forced CLI/provider system content or structured metadata may still be
-added downstream and is not falsely represented in the Full inspector. Stock
-Codex 0.144.1 still registers its unconditional `update_plan` schema and the
-`view_image` schema for environment-backed turns; no supported configuration
-removes those final core schemas, and the inline instruction forbids their use.
+Codex. At startup, `codex-safe debug prompt-input` must report exactly one
+model-visible message containing an application sentinel; any additional or
+altered prompt item aborts startup. Codex or its upstream provider may still
+attach forced structured metadata downstream. Codex still registers its
+unconditional `update_plan` and environment-backed `view_image` schemas even
+when every exposed switch for them is false; transport testing confirms that no
+supported setting removes those final core schemas. Kennedy adds no invisible
+instruction concerning them.
 
 The first call starts a persisted Codex thread. Later calls use
 `codex exec resume <thread-id>` and contain only newly appended normalized
 messages. `ResetContext` is implemented by the frontend: it omits the old
 thread ID and sends the rebuilt full Chatend to a new thread.
+The backend keeps an in-memory set of thread IDs created after its startup
+prompt-boundary verification. A continuation ID outside that set receives
+`stale_codex_thread`; the frontend then resends the complete Chatend without the
+old ID. Thus deploying or restarting this boundary cannot resume a thread that
+contained older hidden instructions.
 
 Codex JSONL may contain intermediate agent messages. Only the last completed
 `agent_message` is Kennedy's response. `thread.started` supplies
@@ -154,8 +172,9 @@ rounds. Cache-write tokens are reported as zero because Codex JSONL does not
 expose that measurement.
 
 `quality` and `balanced` web search start a new ephemeral Codex thread with
-`--search`, retain the same read-only/no-shell restrictions, use a distinct
-terse research instruction, and retain the required hosted search capability.
+`--search`, retain the same read-only/no-shell restrictions, and retain the
+required hosted search capability. Their complete research instruction is the
+ordinary supplied prompt, with no additional Codex developer or base prompt.
 The mode selects the fixed model, reasoning effort, Codex web-search context
 size, deadline, source cap, and focused or thorough research prompt.
 
@@ -207,7 +226,7 @@ tone, pauses, music, and background audio. Audio content and API keys are never 
   "model": "gpt-5.6-sol",
   "chatend": "David\n\nNew text for this round.",
   "previous_response_id": "019f5ca7-020f-7b63-be2f-82785fb68c03",
-  "prompt_cache_key": "kennedy-conversation-prompt-v1"
+  "prompt_cache_key": "kennedy-conversation-prompt-v4"
 }
 ```
 

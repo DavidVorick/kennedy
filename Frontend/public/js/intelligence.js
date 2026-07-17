@@ -1,8 +1,9 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260717.6";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260717.7";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
 export const AGENT_LOOP_ROUND_LIMIT = 100;
+export const AGENT_LOOP_SESSION_ENDED = Symbol("agent-loop-session-ended");
 
 function throwIfCancelled(signal) {
   if (!signal?.aborted) return;
@@ -10,7 +11,7 @@ function throwIfCancelled(signal) {
 }
 
 export function createCacheKey(mode) {
-  return `kennedy-${mode}-prompt-v3`;
+  return `kennedy-${mode}-prompt-v4`;
 }
 
 export class ContinuationState {
@@ -119,10 +120,10 @@ function protocolFailureMessage(error) {
   };
 }
 
-export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {}, signal = null, operationId = null }) {
+export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {}, onResponse = async () => null, signal = null, operationId = null, requestTimeoutSeconds = null }) {
   for (let round = roundOffset; round < AGENT_LOOP_ROUND_LIMIT; round++) {
     throwIfCancelled(signal);
-    await onRoundStart(round + 1);
+    const roundDirective = await onRoundStart(round + 1);
     throwIfCancelled(signal);
     const messages = continuation.requestMessages(chatend);
     if (messages.length === 0) throw new Error("Kennedy has no new context to continue from.");
@@ -130,6 +131,7 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     let response;
     const continued = Boolean(continuation.previousResponseId);
     try {
+      const timeoutSeconds = requestTimeoutSeconds?.();
       response = await intelligence.generate(
         {
           provider,
@@ -137,9 +139,18 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
           chatend: formatChatend(messages, usage.snapshot()),
           previous_response_id: continuation.previousResponseId,
           prompt_cache_key: continuation.cacheKey,
+          ...(timeoutSeconds ? { timeout_seconds: timeoutSeconds } : {}),
         },
         { signal, operationId },
       );
+    } catch (error) {
+      if (error?.code === "stale_codex_thread" && continuation.previousResponseId) {
+        continuation.reset();
+        usage.resetThread();
+        onUpdate();
+        continue;
+      }
+      throw error;
     } finally {
       addTimingStep(timing, "llm", "LLM call", elapsedMs(llmStarted));
     }
@@ -152,6 +163,18 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     const llmTimingMessage = timingMessage("LLM call", timing.steps.at(-1).durationMs);
     chatend.append(llmTimingMessage);
     onUpdate();
+    const responseDirective = await onResponse(round + 1);
+
+    if (roundDirective?.endAfterResponse || responseDirective?.endAfterResponse) {
+      executor.sessionEndContent = content;
+      const summary = updateTimingSummary(timing);
+      chatend.append(summary);
+      onUpdate();
+      const checkpointStarted = performance.now();
+      await checkpoint();
+      addTimingStep(timing, "checkpoint", "Final free-time save", elapsedMs(checkpointStarted));
+      return AGENT_LOOP_SESSION_ENDED;
+    }
 
     let calls;
     try { calls = parseToolCalls(content); }
@@ -172,11 +195,15 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
 
     calls = calls.map((call, index) => ({ ...call, id: `text_call_${round + 1}_${index + 1}` }));
     const resetIsMixed = calls.length > 1 && calls.some(call => call.name === "ResetContext");
+    const sessionEndIsMixed = calls.length > 1 && calls.some(call => call.name === "EndFreeTimeSession");
+    let sessionEnded = false;
     for (const call of calls) {
       throwIfCancelled(signal);
       const toolStarted = performance.now();
       const execution = resetIsMixed && call.name === "ResetContext"
         ? executor.failure(call, "mixed_reset_call", "ResetContext must be requested by itself so the chatend can be rebuilt safely.")
+        : sessionEndIsMixed && call.name === "EndFreeTimeSession"
+          ? executor.failure(call, "mixed_session_end_call", "EndFreeTimeSession must be requested by itself so the session can close safely.")
         : await executor.execute(call, { signal, operationId });
       throwIfCancelled(signal);
       const durationMs = addTimingStep(
@@ -199,11 +226,13 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       } else {
         chatend.append(execution.message);
       }
+      sessionEnded ||= execution.endSession;
       onUpdate();
     }
     const checkpointStarted = performance.now();
     await checkpoint();
     addTimingStep(timing, "checkpoint", "Tool-round save", elapsedMs(checkpointStarted));
+    if (sessionEnded) return AGENT_LOOP_SESSION_ENDED;
   }
   throw new Error(`Kennedy exceeded the ${AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit.`);
 }

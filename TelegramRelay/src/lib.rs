@@ -40,11 +40,14 @@ const USERS_MIGRATION: &str = include_str!("../migrations/003_users.sql");
 const GROUP_EVENTS_MIGRATION: &str = include_str!("../migrations/003_group_events.sql");
 const GROUP_USER_SESSIONS_MIGRATION: &str =
     include_str!("../migrations/004_group_user_sessions.sql");
+const GROUP_SESSION_CONTEXT_MIGRATION: &str =
+    include_str!("../migrations/005_group_session_context.sql");
 const UNAUTHORIZED_MESSAGE: &str =
     "Sorry, this Kennedy bot is private and your Telegram handle is not whitelisted.";
 const TELEGRAM_MESSAGE_LIMIT: usize = 4_000;
 const TELEGRAM_POLL_TIMEOUT_SECONDS: u32 = 30;
 const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 40;
+const GROUP_SESSION_MESSAGE_LIMIT: i64 = 50;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -209,6 +212,24 @@ struct CompleteReset {
     message: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcknowledgeGroupContext {
+    through_message_id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveGroupMessagePreparation {
+    text: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    truncated: bool,
+}
+
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     if config.max_voice_bytes == 0 {
         anyhow::bail!("telegram max_voice_bytes must be greater than zero");
@@ -224,6 +245,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     )?;
     apply_user_migrations(&user_connection).context("applying user-directory migrations")?;
     seed_bootstrap_users(&connection, &user_connection, &config.bootstrap_usernames)?;
+    initialize_group_session_cursors(&connection, &user_connection)
+        .context("initializing Telegram group-session cursors")?;
 
     let origins = config
         .allowed_origins
@@ -308,6 +331,26 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/v1/group-ingress/{batch_id}/complete",
             post(complete_group_ingress),
         )
+        .route(
+            "/api/v1/group-sessions/updates",
+            get(list_group_session_updates),
+        )
+        .route(
+            "/api/v1/group-sessions/{conversation_id}/context-ack",
+            post(acknowledge_group_session_context),
+        )
+        .route(
+            "/api/v1/group-sessions/{conversation_id}/silent-reset-completed",
+            post(complete_silent_group_reset),
+        )
+        .route(
+            "/api/v1/group-messages/{chat_id}/{message_id}/media",
+            get(group_message_media),
+        )
+        .route(
+            "/api/v1/group-messages/{chat_id}/{message_id}/preparation",
+            post(save_group_message_preparation),
+        )
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -349,6 +392,49 @@ fn migrate_group_user_sessions(db: &Connection) -> anyhow::Result<()> {
     if !columns.iter().any(|name| name == "group_root_node_id") {
         db.execute_batch("ALTER TABLE telegram_events ADD COLUMN group_root_node_id TEXT;")?;
     }
+    let session_columns = db
+        .prepare("PRAGMA table_info(telegram_group_user_sessions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !session_columns
+        .iter()
+        .any(|name| name == "last_context_message_id")
+    {
+        db.execute_batch(
+            "ALTER TABLE telegram_group_user_sessions ADD COLUMN last_context_message_id INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !session_columns
+        .iter()
+        .any(|name| name == "last_invocation_message_id")
+    {
+        db.execute_batch(
+            "ALTER TABLE telegram_group_user_sessions ADD COLUMN last_invocation_message_id INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let message_columns = db
+        .prepare("PRAGMA table_info(telegram_group_messages)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, definition) in [
+        ("kind", "TEXT NOT NULL DEFAULT 'text'"),
+        ("media_bytes", "BLOB"),
+        ("mime_type", "TEXT"),
+        ("file_name", "TEXT"),
+        ("duration_seconds", "INTEGER"),
+        ("prepared_text", "TEXT"),
+        ("preparation_model", "TEXT"),
+        ("document_format", "TEXT"),
+        ("preparation_truncated", "INTEGER NOT NULL DEFAULT 0"),
+        ("source_conversation_id", "TEXT"),
+    ] {
+        if !message_columns.iter().any(|column| column == name) {
+            db.execute_batch(&format!(
+                "ALTER TABLE telegram_group_messages ADD COLUMN {name} {definition};"
+            ))?;
+        }
+    }
+    db.execute_batch(GROUP_SESSION_CONTEXT_MIGRATION)?;
     Ok(())
 }
 
@@ -380,6 +466,30 @@ fn apply_user_migrations(db: &Connection) -> anyhow::Result<()> {
         )?;
     }
     db.execute_batch("PRAGMA user_version=2;")?;
+    Ok(())
+}
+
+fn initialize_group_session_cursors(relay: &Connection, users: &Connection) -> anyhow::Result<()> {
+    let mappings = users
+        .prepare("SELECT chat_id,root_node_id FROM telegram_groups")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (chat_id, root) in mappings {
+        let latest = relay.query_row(
+            "SELECT COALESCE(MAX(message_id),0) FROM telegram_group_messages WHERE chat_id=?1",
+            [chat_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        relay.execute(
+            "UPDATE telegram_group_user_sessions
+             SET last_context_message_id=?1,last_invocation_message_id=?1
+             WHERE group_root_node_id=?2 AND current_conversation_id IS NOT NULL
+               AND last_context_message_id=0 AND last_invocation_message_id=0",
+            params![latest, root],
+        )?;
+    }
     Ok(())
 }
 
@@ -581,6 +691,27 @@ fn directory_group_by_id(db: &Connection, chat_id: i64) -> anyhow::Result<Option
             },
         )
         .optional()?)
+}
+
+fn directory_group_by_root(
+    db: &Connection,
+    root_node_id: &str,
+) -> anyhow::Result<Option<DirectoryGroup>> {
+    db.query_row(
+        "SELECT chat_id,title,root_node_id,root_ready,state FROM telegram_groups WHERE root_node_id=?1",
+        [root_node_id],
+        |row| {
+            Ok(DirectoryGroup {
+                chat_id: row.get(0)?,
+                title: row.get(1)?,
+                root_node_id: row.get(2)?,
+                root_ready: row.get::<_, i64>(3)? != 0,
+                state: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -910,6 +1041,307 @@ async fn complete_group_ingress(
     Ok(Json(json!({"id":batch_id,"status":"complete"})))
 }
 
+fn group_messages_for_session(
+    db: &Connection,
+    chat_id: i64,
+    after_message_id: i64,
+    through_message_id: i64,
+    conversation_id: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut statement = db.prepare(
+        "SELECT message_id,telegram_user_id,username,display_name,text,reply_to_message_id,
+                sent_by_kennedy,created_at,kind,mime_type,file_name,duration_seconds,
+                prepared_text,preparation_model,document_format,preparation_truncated,
+                media_bytes IS NOT NULL
+         FROM telegram_group_messages
+         WHERE chat_id=?1 AND message_id>?2 AND message_id<=?3
+           AND COALESCE(source_conversation_id,'')<>?4
+         ORDER BY message_id",
+    )?;
+    statement
+        .query_map(
+            params![
+                chat_id,
+                after_message_id,
+                through_message_id,
+                conversation_id
+            ],
+            |row| {
+                Ok(json!({
+                    "messageId":row.get::<_,i64>(0)?,
+                    "telegramUserId":row.get::<_,Option<i64>>(1)?,
+                    "username":row.get::<_,Option<String>>(2)?,
+                    "displayName":row.get::<_,String>(3)?,
+                    "text":row.get::<_,String>(4)?,
+                    "replyToMessageId":row.get::<_,Option<i64>>(5)?,
+                    "sentByKennedy":row.get::<_,i64>(6)? != 0,
+                    "createdAt":row.get::<_,String>(7)?,
+                    "kind":row.get::<_,String>(8)?,
+                    "mimeType":row.get::<_,Option<String>>(9)?,
+                    "fileName":row.get::<_,Option<String>>(10)?,
+                    "durationSeconds":row.get::<_,Option<i64>>(11)?,
+                    "preparedText":row.get::<_,Option<String>>(12)?,
+                    "preparationModel":row.get::<_,Option<String>>(13)?,
+                    "documentFormat":row.get::<_,Option<String>>(14)?,
+                    "preparationTruncated":row.get::<_,i64>(15)? != 0,
+                    "hasMedia":row.get::<_,i64>(16)? != 0,
+                }))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+async fn list_group_session_updates(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let descriptors = {
+        let db = state.db.lock().map_err(ApiError::internal)?;
+        let mut current_statement = db
+            .prepare(
+                "SELECT current_conversation_id,group_root_node_id,telegram_user_id,last_context_message_id,NULL
+                 FROM telegram_group_user_sessions WHERE current_conversation_id IS NOT NULL",
+            )
+            .map_err(ApiError::internal)?;
+        let mut current = current_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .map_err(ApiError::internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::internal)?;
+        let mut reset_statement = db
+            .prepare(
+                "SELECT conversation_id,group_root_node_id,telegram_user_id,last_context_message_id,through_message_id
+                 FROM telegram_group_session_resets ORDER BY datetime(created_at),conversation_id",
+            )
+            .map_err(ApiError::internal)?;
+        let resets = reset_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .map_err(ApiError::internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::internal)?;
+        current.extend(resets);
+        current
+    };
+
+    let users = state.users.lock().map_err(ApiError::internal)?;
+    let mut groups = Vec::with_capacity(descriptors.len());
+    for (conversation_id, root, user_id, last_context, reset_through) in descriptors {
+        let Some(group) = directory_group_by_root(&users, &root).map_err(ApiError::internal)?
+        else {
+            continue;
+        };
+        let participants = group_participants(&users, group.chat_id).map_err(ApiError::internal)?;
+        groups.push((
+            conversation_id,
+            root,
+            user_id,
+            last_context,
+            reset_through,
+            group,
+            participants,
+        ));
+    }
+    drop(users);
+
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let mut updates = Vec::new();
+    for (conversation_id, root, user_id, last_context, reset_through, group, participants) in groups
+    {
+        let through_message_id = match reset_through {
+            Some(value) => value,
+            None => db
+                .query_row(
+                    "SELECT COALESCE(MAX(message_id),?2) FROM telegram_group_messages WHERE chat_id=?1",
+                    params![group.chat_id, last_context],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(ApiError::internal)?,
+        };
+        if reset_through.is_none() && through_message_id <= last_context {
+            continue;
+        }
+        let messages = group_messages_for_session(
+            &db,
+            group.chat_id,
+            last_context,
+            through_message_id,
+            &conversation_id,
+        )
+        .map_err(ApiError::internal)?;
+        updates.push(json!({
+            "conversationId":conversation_id,
+            "telegramUserId":user_id,
+            "groupRootNodeId":root,
+            "throughMessageId":through_message_id,
+            "resetRequired":reset_through.is_some(),
+            "groupContext":{
+                "groupTitle":group.title,
+                "chatId":group.chat_id,
+                "invokingTelegramUserId":user_id,
+                "groupRootNodeId":group.root_node_id,
+                "groupRootReady":group.root_ready,
+                "participants":participants,
+                "messages":messages,
+            },
+        }));
+    }
+    Ok(Json(json!({"updates":updates})))
+}
+
+async fn acknowledge_group_session_context(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Json(input): Json<AcknowledgeGroupContext>,
+) -> Result<Json<Value>, ApiError> {
+    validate_conversation_id(&conversation_id)?;
+    if input.through_message_id < 0 {
+        return Err(ApiError::bad("throughMessageId must not be negative."));
+    }
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let changed = db
+        .execute(
+            "UPDATE telegram_group_user_sessions
+             SET last_context_message_id=MAX(last_context_message_id,?1),updated_at=?2
+             WHERE current_conversation_id=?3",
+            params![
+                input.through_message_id,
+                Utc::now().to_rfc3339(),
+                conversation_id
+            ],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "This Telegram group session is no longer current.",
+        ));
+    }
+    Ok(Json(json!({
+        "conversationId":conversation_id,
+        "throughMessageId":input.through_message_id,
+    })))
+}
+
+async fn complete_silent_group_reset(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    validate_conversation_id(&conversation_id)?;
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    db.execute(
+        "DELETE FROM telegram_group_session_resets WHERE conversation_id=?1",
+        [&conversation_id],
+    )
+    .map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"conversationId":conversation_id,"status":"complete"}),
+    ))
+}
+
+async fn group_message_media(
+    State(state): State<AppState>,
+    Path((chat_id, message_id)): Path<(i64, i64)>,
+) -> Result<Response, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let media = db
+        .query_row(
+            "SELECT media_bytes,mime_type,kind FROM telegram_group_messages WHERE chat_id=?1 AND message_id=?2",
+            params![chat_id, message_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    let bytes = media.0.ok_or_else(ApiError::not_found)?;
+    let mime = media.1.unwrap_or_else(|| {
+        if media.2 == "document" {
+            "application/octet-stream".into()
+        } else {
+            "audio/ogg".into()
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(bytes))
+        .map_err(ApiError::internal)
+}
+
+async fn save_group_message_preparation(
+    State(state): State<AppState>,
+    Path((chat_id, message_id)): Path<(i64, i64)>,
+    Json(input): Json<SaveGroupMessagePreparation>,
+) -> Result<Json<Value>, ApiError> {
+    let text = input.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad(
+            "Prepared group-message text must not be empty.",
+        ));
+    }
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let existing = db
+        .query_row(
+            "SELECT kind,prepared_text FROM telegram_group_messages WHERE chat_id=?1 AND message_id=?2",
+            params![chat_id, message_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    if !matches!(existing.0.as_str(), "voice" | "document") {
+        return Err(ApiError::conflict(
+            "This Telegram group message does not require media preparation.",
+        ));
+    }
+    if let Some(saved) = existing.1 {
+        if saved != text {
+            return Err(ApiError::conflict(
+                "This Telegram group message already has different prepared text.",
+            ));
+        }
+    } else {
+        db.execute(
+            "UPDATE telegram_group_messages
+             SET prepared_text=?1,preparation_model=?2,document_format=?3,preparation_truncated=?4
+             WHERE chat_id=?5 AND message_id=?6",
+            params![
+                text,
+                input.model.as_deref(),
+                input.format.as_deref(),
+                if input.truncated { 1_i64 } else { 0_i64 },
+                chat_id,
+                message_id
+            ],
+        )
+        .map_err(ApiError::internal)?;
+    }
+    Ok(Json(
+        json!({"chatId":chat_id,"messageId":message_id,"text":text}),
+    ))
+}
+
 fn row_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayEvent> {
     Ok(RelayEvent {
         id: row.get(0)?,
@@ -1087,10 +1519,43 @@ async fn bind_event(
             params![group_root_node_id, id],
         )
         .map_err(ApiError::internal)?;
+        let context_message_id = event
+            .group_context
+            .as_ref()
+            .and_then(|context| context.get("messages"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message.get("messageId").and_then(Value::as_i64))
+            .max()
+            .unwrap_or(event.message_id)
+            .max(event.message_id);
         db.execute(
-            "INSERT INTO telegram_group_user_sessions(group_root_node_id,telegram_user_id,current_conversation_id,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(group_root_node_id,telegram_user_id) DO UPDATE SET current_conversation_id=excluded.current_conversation_id,updated_at=excluded.updated_at",
-            params![group_root_node_id, event.telegram_user_id, input.conversation_id, now],
-        ).map_err(ApiError::internal)?;
+            "INSERT INTO telegram_group_user_sessions(
+                 group_root_node_id,telegram_user_id,current_conversation_id,updated_at,
+                 last_context_message_id,last_invocation_message_id
+             ) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(group_root_node_id,telegram_user_id) DO UPDATE SET
+                 current_conversation_id=excluded.current_conversation_id,
+                 updated_at=excluded.updated_at,
+                 last_context_message_id=excluded.last_context_message_id,
+                 last_invocation_message_id=excluded.last_invocation_message_id",
+            params![
+                group_root_node_id,
+                event.telegram_user_id,
+                input.conversation_id,
+                now,
+                context_message_id,
+                event.message_id
+            ],
+        )
+        .map_err(ApiError::internal)?;
+        db.execute(
+            "UPDATE telegram_group_messages SET source_conversation_id=?1
+             WHERE chat_id=?2 AND message_id=?3",
+            params![input.conversation_id, event.chat_id, event.message_id],
+        )
+        .map_err(ApiError::internal)?;
     }
     Ok(Json(fetch_event(&db, &id)?))
 }
@@ -1197,12 +1662,37 @@ async fn reply_event(
     }
     let db = state.db.lock().map_err(ApiError::internal)?;
     if event.session_kind == "group" {
+        let mut through_message_id = event.message_id;
         for message in sent {
+            through_message_id = through_message_id.max(i64::from(message.id.0));
             db.execute(
-                "INSERT INTO telegram_group_messages(chat_id,message_id,update_id,display_name,text,reply_to_message_id,sent_by_kennedy,created_at)
-                 VALUES(?1,?2,0,'Kennedy',?3,?4,1,?5) ON CONFLICT(chat_id,message_id) DO NOTHING",
-                params![event.chat_id, i64::from(message.id.0), message.text().unwrap_or(""), event.message_id, message.date.to_rfc3339()],
-            ).map_err(ApiError::internal)?;
+                "INSERT INTO telegram_group_messages(
+                     chat_id,message_id,update_id,display_name,text,reply_to_message_id,
+                     sent_by_kennedy,created_at,kind,source_conversation_id
+                 ) VALUES(?1,?2,0,'Kennedy',?3,?4,1,?5,'text',?6)
+                 ON CONFLICT(chat_id,message_id) DO NOTHING",
+                params![
+                    event.chat_id,
+                    i64::from(message.id.0),
+                    message.text().unwrap_or(""),
+                    event.message_id,
+                    message.date.to_rfc3339(),
+                    input.conversation_id
+                ],
+            )
+            .map_err(ApiError::internal)?;
+        }
+        if let Some(group_root_node_id) = event.group_root_node_id.as_deref() {
+            let reset_sessions = queue_stale_group_session_resets(
+                &db,
+                event.chat_id,
+                group_root_node_id,
+                through_message_id,
+            )
+            .map_err(ApiError::internal)?;
+            for conversation_id in reset_sessions {
+                tracing::info!(%conversation_id, chat_id=event.chat_id, "queued silent Telegram group-session reset");
+            }
         }
     }
     db.execute(
@@ -1244,11 +1734,34 @@ async fn complete_reset(
     .map_err(ApiError::internal)?;
     clear_session_binding(&db, &event, &now).map_err(ApiError::internal)?;
     if event.session_kind == "group" {
+        let mut through_message_id = event.message_id;
         for message in sent {
+            through_message_id = through_message_id.max(i64::from(message.id.0));
             db.execute(
-                "INSERT INTO telegram_group_messages(chat_id,message_id,update_id,display_name,text,reply_to_message_id,sent_by_kennedy,created_at) VALUES(?1,?2,0,'Kennedy',?3,?4,1,?5) ON CONFLICT(chat_id,message_id) DO NOTHING",
-                params![event.chat_id, i64::from(message.id.0), message.text().unwrap_or(""), event.message_id, message.date.to_rfc3339()],
-            ).map_err(ApiError::internal)?;
+                "INSERT INTO telegram_group_messages(
+                     chat_id,message_id,update_id,display_name,text,reply_to_message_id,
+                     sent_by_kennedy,created_at,kind,source_conversation_id
+                 ) VALUES(?1,?2,0,'Kennedy',?3,?4,1,?5,'text',?6)
+                 ON CONFLICT(chat_id,message_id) DO NOTHING",
+                params![
+                    event.chat_id,
+                    i64::from(message.id.0),
+                    message.text().unwrap_or(""),
+                    event.message_id,
+                    message.date.to_rfc3339(),
+                    event.conversation_id
+                ],
+            )
+            .map_err(ApiError::internal)?;
+        }
+        if let Some(group_root_node_id) = event.group_root_node_id.as_deref() {
+            queue_stale_group_session_resets(
+                &db,
+                event.chat_id,
+                group_root_node_id,
+                through_message_id,
+            )
+            .map_err(ApiError::internal)?;
         }
     }
     Ok(Json(fetch_event(&db, &id)?))
@@ -1403,14 +1916,17 @@ async fn download_message_file(
     expected_size: u32,
     maximum_bytes: usize,
     label: &str,
+    notify_errors: bool,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     if u64::from(expected_size) > maximum_bytes as u64 {
-        bot.send_message(
-            chat_id,
-            format!("That {label} is too large for Kennedy to process."),
-        )
-        .send()
-        .await?;
+        if notify_errors {
+            bot.send_message(
+                chat_id,
+                format!("That {label} is too large for Kennedy to process."),
+            )
+            .send()
+            .await?;
+        }
         return Ok(None);
     }
     let file = bot.get_file(file_id).send().await?;
@@ -1419,12 +1935,14 @@ async fn download_message_file(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if bytes.len().saturating_add(chunk.len()) > maximum_bytes {
-            bot.send_message(
-                chat_id,
-                format!("That {label} is too large for Kennedy to process."),
-            )
-            .send()
-            .await?;
+            if notify_errors {
+                bot.send_message(
+                    chat_id,
+                    format!("That {label} is too large for Kennedy to process."),
+                )
+                .send()
+                .await?;
+            }
             return Ok(None);
         }
         bytes.extend_from_slice(&chunk);
@@ -1436,6 +1954,15 @@ async fn parse_message_input(
     bot: &Bot,
     state: &AppState,
     message: &Message,
+) -> anyhow::Result<Option<MessageInput>> {
+    parse_message_input_with_feedback(bot, state, message, true).await
+}
+
+async fn parse_message_input_with_feedback(
+    bot: &Bot,
+    state: &AppState,
+    message: &Message,
+    feedback: bool,
 ) -> anyhow::Result<Option<MessageInput>> {
     if let Some(text) = message.text() {
         return Ok(Some(if reset_command(message) {
@@ -1466,6 +1993,7 @@ async fn parse_message_input(
             voice.file.size,
             state.max_voice_bytes,
             "voice note",
+            feedback,
         )
         .await?
         else {
@@ -1489,12 +2017,14 @@ async fn parse_message_input(
     if let Some(document) = message.document() {
         let mime_type = document.mime_type.as_ref().map(ToString::to_string);
         if !supported_document(document.file_name.as_deref(), mime_type.as_deref()) {
-            bot.send_message(
-                message.chat.id,
-                "Kennedy can read PDF, DOCX, spreadsheet, CSV, and text documents.",
-            )
-            .send()
-            .await?;
+            if feedback {
+                bot.send_message(
+                    message.chat.id,
+                    "Kennedy can read PDF, DOCX, spreadsheet, CSV, and text documents.",
+                )
+                .send()
+                .await?;
+            }
             return Ok(None);
         }
         let Some(bytes) = download_message_file(
@@ -1504,6 +2034,7 @@ async fn parse_message_input(
             document.file.size,
             state.max_voice_bytes,
             "document",
+            feedback,
         )
         .await?
         else {
@@ -1523,7 +2054,9 @@ async fn parse_message_input(
             duration_seconds: None,
         }));
     }
-    bot.send_message(message.chat.id, "Kennedy accepts text, voice notes, and PDF, DOCX, spreadsheet, CSV, or text documents here. Use /reset to end this Telegram session.").send().await?;
+    if feedback {
+        bot.send_message(message.chat.id, "Kennedy accepts text, voice notes, and PDF, DOCX, spreadsheet, CSV, or text documents here. Use /reset to end this Telegram session.").send().await?;
+    }
     Ok(None)
 }
 
@@ -2143,7 +2676,9 @@ fn recent_group_messages(
     limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
     let mut statement = db.prepare(
-        "SELECT message_id,telegram_user_id,username,display_name,text,reply_to_message_id,sent_by_kennedy,created_at
+        "SELECT message_id,telegram_user_id,username,display_name,text,reply_to_message_id,sent_by_kennedy,created_at,
+                kind,mime_type,file_name,duration_seconds,prepared_text,preparation_model,
+                document_format,preparation_truncated,media_bytes IS NOT NULL
          FROM telegram_group_messages WHERE chat_id=?1 AND message_id<=?2 ORDER BY message_id DESC LIMIT ?3",
     )?;
     let mut messages = statement
@@ -2153,6 +2688,11 @@ fn recent_group_messages(
                 "username":row.get::<_,Option<String>>(2)?, "displayName":row.get::<_,String>(3)?,
                 "text":row.get::<_,String>(4)?, "replyToMessageId":row.get::<_,Option<i64>>(5)?,
                 "sentByKennedy":row.get::<_,i64>(6)? != 0, "createdAt":row.get::<_,String>(7)?,
+                "kind":row.get::<_,String>(8)?, "mimeType":row.get::<_,Option<String>>(9)?,
+                "fileName":row.get::<_,Option<String>>(10)?, "durationSeconds":row.get::<_,Option<i64>>(11)?,
+                "preparedText":row.get::<_,Option<String>>(12)?, "preparationModel":row.get::<_,Option<String>>(13)?,
+                "documentFormat":row.get::<_,Option<String>>(14)?, "preparationTruncated":row.get::<_,i64>(15)? != 0,
+                "hasMedia":row.get::<_,i64>(16)? != 0,
             }))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2207,6 +2747,72 @@ fn maybe_queue_group_ingress(
     Ok(Some(last))
 }
 
+fn queue_stale_group_session_resets(
+    db: &Connection,
+    chat_id: i64,
+    group_root_node_id: &str,
+    through_message_id: i64,
+) -> anyhow::Result<Vec<String>> {
+    let sessions = db
+        .prepare(
+            "SELECT telegram_user_id,current_conversation_id,last_context_message_id,last_invocation_message_id
+             FROM telegram_group_user_sessions
+             WHERE group_root_node_id=?1 AND current_conversation_id IS NOT NULL",
+        )?
+        .query_map([group_root_node_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let transaction = db.unchecked_transaction()?;
+    let mut reset = Vec::new();
+    for (telegram_user_id, conversation_id, last_context, last_invocation) in sessions {
+        let unseen_since_invocation: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM telegram_group_messages
+             WHERE chat_id=?1 AND message_id>?2 AND message_id<=?3",
+            params![chat_id, last_invocation, through_message_id],
+            |row| row.get(0),
+        )?;
+        if unseen_since_invocation <= GROUP_SESSION_MESSAGE_LIMIT {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO telegram_group_session_resets(
+                 conversation_id,group_root_node_id,telegram_user_id,last_context_message_id,
+                 through_message_id,created_at
+             ) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(conversation_id) DO NOTHING",
+            params![
+                conversation_id,
+                group_root_node_id,
+                telegram_user_id,
+                last_context,
+                through_message_id,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE telegram_group_user_sessions
+             SET current_conversation_id=NULL,updated_at=?1
+             WHERE group_root_node_id=?2 AND telegram_user_id=?3
+               AND current_conversation_id=?4",
+            params![
+                Utc::now().to_rfc3339(),
+                group_root_node_id,
+                telegram_user_id,
+                conversation_id
+            ],
+        )?;
+        reset.push(conversation_id);
+    }
+    transaction.commit()?;
+    Ok(reset)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn insert_group_event(
     db: &Connection,
     update_id: i64,
@@ -2217,7 +2823,7 @@ fn insert_group_event(
     input: &MessageInput,
     context: &Value,
     group_root_node_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let conversation_id: Option<String> = db
         .query_row(
             "SELECT current_conversation_id FROM telegram_group_user_sessions WHERE group_root_node_id=?1 AND telegram_user_id=?2",
@@ -2231,7 +2837,27 @@ fn insert_group_event(
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending',?14,?15,'group',?16,?17) ON CONFLICT(update_id) DO NOTHING",
         params![Uuid::new_v4().to_string(), update_id, i64::from(message.id.0), telegram_user_id, message.chat.id.0, username, display_name, input.kind, input.text.as_deref(), input.media_bytes.as_deref(), input.mime_type.as_deref(), input.file_name.as_deref(), input.duration_seconds, conversation_id, message.date.to_rfc3339(), serde_json::to_string(context)?, group_root_node_id],
     )?;
-    Ok(())
+    if let Some(conversation_id) = conversation_id.as_deref() {
+        db.execute(
+            "UPDATE telegram_group_messages SET source_conversation_id=?1
+             WHERE chat_id=?2 AND message_id=?3",
+            params![conversation_id, message.chat.id.0, i64::from(message.id.0)],
+        )?;
+        db.execute(
+            "UPDATE telegram_group_user_sessions
+             SET last_invocation_message_id=?1,updated_at=?2
+             WHERE group_root_node_id=?3 AND telegram_user_id=?4
+               AND current_conversation_id=?5",
+            params![
+                i64::from(message.id.0),
+                Utc::now().to_rfc3339(),
+                group_root_node_id,
+                telegram_user_id,
+                conversation_id
+            ],
+        )?;
+    }
+    Ok(conversation_id)
 }
 
 async fn process_group_message(
@@ -2317,7 +2943,17 @@ async fn process_group_message(
     if !validate_group_membership(bot, state, chat_id).await? {
         return Ok(());
     }
-    let text = group_message_text(&message);
+    let Some(bot_user_id) = state.bot_user_id else {
+        return Ok(());
+    };
+    let invoked = !author.group_authored
+        && (reset_command(&message)
+            || group_invokes_kennedy(&message, bot_user_id, state.bot_username.as_deref()));
+    let input = parse_message_input_with_feedback(bot, state, &message, invoked).await?;
+    let text = input
+        .as_ref()
+        .and_then(|input| input.text.clone())
+        .unwrap_or_else(|| group_message_text(&message));
     let reply_to = message
         .reply_to_message()
         .map(|reply| i64::from(reply.id.0));
@@ -2327,21 +2963,34 @@ async fn process_group_message(
             .lock()
             .map_err(|_| anyhow::anyhow!("locking Telegram database"))?;
         db.execute(
-            "INSERT INTO telegram_group_messages(chat_id,message_id,update_id,telegram_user_id,username,display_name,text,reply_to_message_id,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(chat_id,message_id) DO UPDATE SET text=excluded.text,username=excluded.username,display_name=excluded.display_name,reply_to_message_id=excluded.reply_to_message_id",
-            params![chat_id, i64::from(message.id.0), update_id, author.telegram_user_id, author.username.as_deref(), &author.display_name, &text, reply_to, message.date.to_rfc3339()],
+            "INSERT INTO telegram_group_messages(
+                 chat_id,message_id,update_id,telegram_user_id,username,display_name,text,
+                 reply_to_message_id,created_at,kind,media_bytes,mime_type,file_name,duration_seconds
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(chat_id,message_id) DO UPDATE SET
+                 text=excluded.text,username=excluded.username,display_name=excluded.display_name,
+                 reply_to_message_id=excluded.reply_to_message_id",
+            params![
+                chat_id,
+                i64::from(message.id.0),
+                update_id,
+                author.telegram_user_id,
+                author.username.as_deref(),
+                &author.display_name,
+                &text,
+                reply_to,
+                message.date.to_rfc3339(),
+                input.as_ref().map(|value| value.kind).unwrap_or("text"),
+                input.as_ref().and_then(|value| value.media_bytes.as_deref()),
+                input.as_ref().and_then(|value| value.mime_type.as_deref()),
+                input.as_ref().and_then(|value| value.file_name.as_deref()),
+                input.as_ref().and_then(|value| value.duration_seconds),
+            ],
         )?;
     }
     if edited {
         return Ok(());
     }
-    let Some(bot_user_id) = state.bot_user_id else {
-        return Ok(());
-    };
-    let invoked = !author.group_authored
-        && (reset_command(&message)
-            || group_invokes_kennedy(&message, bot_user_id, state.bot_username.as_deref()));
     let users = state
         .users
         .lock()
@@ -2354,24 +3003,17 @@ async fn process_group_message(
         [chat_id], |row| row.get(0),
     )?;
     drop(users);
-    let input = if invoked {
-        let Some(input) = parse_message_input(bot, state, &message).await? else {
-            return Ok(());
-        };
-        Some(input)
-    } else {
-        None
-    };
     let db = state
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("locking Telegram database"))?;
-    if invoked {
-        let input = input.expect("an invoked group message has parsed input");
+    let mut background_cursor = None;
+    let queued_invocation = invoked && input.is_some();
+    if let Some(input) = input.as_ref().filter(|_| invoked) {
         let telegram_user_id = author
             .telegram_user_id
             .context("an invoking Telegram group message must have an identified user")?;
-        let messages = recent_group_messages(&db, chat_id, i64::from(message.id.0), 50)?;
+        let messages = recent_group_messages(&db, chat_id, i64::from(message.id.0), 51)?;
         let context = json!({
             "groupTitle":title, "chatId":chat_id, "invokingTelegramUserId":telegram_user_id,
             "groupRootNodeId":group.root_node_id, "groupRootReady":group.root_ready,
@@ -2384,11 +3026,21 @@ async fn process_group_message(
             telegram_user_id,
             author.username.as_deref(),
             &author.display_name,
-            &input,
+            input,
             &context,
             &group.root_node_id,
         )?;
-        drop(db);
+    } else {
+        background_cursor = maybe_queue_group_ingress(&db, chat_id, cursor, &participants)?;
+    }
+    let reset_sessions = queue_stale_group_session_resets(
+        &db,
+        chat_id,
+        &group.root_node_id,
+        i64::from(message.id.0),
+    )?;
+    drop(db);
+    if queued_invocation {
         let users = state
             .users
             .lock()
@@ -2397,19 +3049,18 @@ async fn process_group_message(
             "UPDATE telegram_groups SET last_invocation_message_id=?1,updated_at=?2 WHERE chat_id=?3",
             params![i64::from(message.id.0), Utc::now().to_rfc3339(), chat_id],
         )?;
-    } else {
-        let last = maybe_queue_group_ingress(&db, chat_id, cursor, &participants)?;
-        drop(db);
-        if let Some(last) = last {
-            let users = state
-                .users
-                .lock()
-                .map_err(|_| anyhow::anyhow!("locking user directory"))?;
-            users.execute(
-                "UPDATE telegram_groups SET background_cursor_message_id=?1,updated_at=?2 WHERE chat_id=?3",
-                params![last, Utc::now().to_rfc3339(), chat_id],
-            )?;
-        }
+    } else if let Some(last) = background_cursor {
+        let users = state
+            .users
+            .lock()
+            .map_err(|_| anyhow::anyhow!("locking user directory"))?;
+        users.execute(
+            "UPDATE telegram_groups SET background_cursor_message_id=?1,updated_at=?2 WHERE chat_id=?3",
+            params![last, Utc::now().to_rfc3339(), chat_id],
+        )?;
+    }
+    for conversation_id in reset_sessions {
+        tracing::info!(%conversation_id, %chat_id, "queued silent Telegram group-session reset");
     }
     Ok(())
 }
@@ -3208,5 +3859,105 @@ mod tests {
             document_event.conversation_id.as_deref(),
             Some(conversation_id)
         );
+    }
+
+    #[test]
+    fn group_session_context_includes_other_sessions_media_and_kennedy_messages() {
+        let (db, _) = databases();
+        let now = Utc::now().to_rfc3339();
+        let own_conversation = "019f5ca7-020f-7b63-be2f-82785fb68c03";
+        for (message_id, kind, source, sent_by_kennedy, bytes) in [
+            (1, "text", Some(own_conversation), 0, None),
+            (2, "voice", None, 0, Some(vec![1_u8, 2, 3])),
+            (3, "text", Some("another-conversation"), 1, None),
+        ] {
+            db.execute(
+                "INSERT INTO telegram_group_messages(
+                     chat_id,message_id,update_id,display_name,text,sent_by_kennedy,created_at,
+                     kind,media_bytes,source_conversation_id
+                 ) VALUES(-100,?1,?1,'Participant',?2,?3,?4,?5,?6,?7)",
+                params![
+                    message_id,
+                    format!("message {message_id}"),
+                    sent_by_kennedy,
+                    now,
+                    kind,
+                    bytes,
+                    source
+                ],
+            )
+            .unwrap();
+        }
+
+        let messages = group_messages_for_session(&db, -100, 0, 3, own_conversation).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["messageId"], 2);
+        assert_eq!(messages[0]["kind"], "voice");
+        assert_eq!(messages[0]["hasMedia"], true);
+        assert_eq!(messages[1]["messageId"], 3);
+        assert_eq!(messages[1]["sentByKennedy"], true);
+    }
+
+    #[test]
+    fn group_session_is_silently_reset_only_after_more_than_fifty_messages() {
+        let (db, _) = databases();
+        let group_root = "a".repeat(40);
+        let conversation_id = "019f5ca7-020f-7b63-be2f-82785fb68c03";
+        let now = Utc::now().to_rfc3339();
+        db.execute(
+            "INSERT INTO telegram_group_user_sessions(
+                 group_root_node_id,telegram_user_id,current_conversation_id,updated_at,
+                 last_context_message_id,last_invocation_message_id
+             ) VALUES(?1,42,?2,?3,0,0)",
+            params![group_root, conversation_id, now],
+        )
+        .unwrap();
+        for message_id in 1..=51 {
+            db.execute(
+                "INSERT INTO telegram_group_messages(
+                     chat_id,message_id,update_id,display_name,text,created_at,kind
+                 ) VALUES(-100,?1,?1,'Participant',?2,?3,'text')",
+                params![message_id, format!("message {message_id}"), now],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            queue_stale_group_session_resets(&db, -100, &group_root, 50)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT current_conversation_id FROM telegram_group_user_sessions WHERE group_root_node_id=?1 AND telegram_user_id=42",
+                [&group_root],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(conversation_id)
+        );
+
+        assert_eq!(
+            queue_stale_group_session_resets(&db, -100, &group_root, 51).unwrap(),
+            vec![conversation_id.to_owned()]
+        );
+        assert!(
+            db.query_row(
+                "SELECT current_conversation_id FROM telegram_group_user_sessions WHERE group_root_node_id=?1 AND telegram_user_id=42",
+                [&group_root],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let reset_through: i64 = db
+            .query_row(
+                "SELECT through_message_id FROM telegram_group_session_resets WHERE conversation_id=?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reset_through, 51);
     }
 }

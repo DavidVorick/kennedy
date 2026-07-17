@@ -32,7 +32,8 @@ Private active pointers remain in `authorized_users`. Group pointers live in
 `telegram_group_user_sessions`, keyed by stable group-root ID and Telegram user
 ID, and `telegram_events.group_root_node_id` makes that identity durable across
 chat-ID migration. A pending group event inherits its pair's current pointer;
-binding updates only that pair.
+binding updates only that pair. Each group-user pointer also records a durable
+passive-context cursor and the message ID of that user's last invocation.
 
 For groups, Kennedy requests `chat_member` updates and must be an administrator
 before processing messages. Adding and then promoting Kennedy may be two
@@ -63,6 +64,21 @@ group messages. It is
 marked `sessionKind: group`; the relay binds it to a persistent session keyed
 by `(group root, Telegram user)` and never changes the invoker's private-DM or
 other-group conversation pointer. Group `/reset` clears only that binding.
+Regardless of invocation, every accepted group message is archived once with
+its text or media metadata. The relay exposes each open session's unseen range
+through its own cursor, excluding only messages already represented by that
+session's invocation/response transcript. Kennedy replies are archived with
+their source conversation so they passively reach every other open session.
+The browser acknowledges a range only after checkpointing it into the owning
+Chatend; polling or a browser restart therefore cannot lose context. Fetch and
+preparation endpoints allow one stored voice transcription or document
+extraction to be reused by all sessions.
+
+After the 51st group message since a user's last invocation, the relay
+atomically detaches that pair's active pointer and records a silent-reset range.
+The browser appends that range, closes the Conversation History record, and
+acknowledges completion without sending anything to Telegram. A later
+invocation may start a fresh session even while the old record awaits ingress.
 More than 100 non-invocation messages after the last
 covered cursor queues the oldest 80 as one durable background-ingress batch,
 leaving 20 messages unbatched. The relay stores Kennedy's group replies in the
@@ -80,6 +96,11 @@ filename/caption, and duration metadata as private events. Reply bodies contain
 Kennedy's conversational output only, plus an
 optional separate context-window notice. Long messages are split safely below
 Telegram's message limit.
+
+A group `/reset` event carries recent group context. The browser checkpoints
+all unseen messages through the reset message before transitioning the exact
+group-user conversation into history ingress; only the normal reset
+acknowledgement is sent to the group.
 
 Directory endpoints separately expose unresolved user and group roots for
 frontend provisioning and look up a whitelisted entry by handle/numeric ID or a

@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260717.6";
+import { formatToolResult } from "./human_format.js?v=20260717.7";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
@@ -74,10 +74,10 @@ function nonemptyPreservedString(value, name, maximum) { string(value, name); if
 function choice(value, name, choices) { string(value, name); if (!choices.includes(value)) throw Object.assign(new Error(`${name} must be one of: ${choices.join(", ")}.`), { code: "invalid_arguments" }); return value; }
 
 export class ToolExecutor {
-  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {} }) {
+  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {}, endSession = null, toolGate = null, requestTimeoutSeconds = null }) {
     this.mode = mode; this.context = context; this.api = api; this.intelligence = intelligence; this.provider = provider; this.model = model; this.provenanceId = provenanceId;
     this.modelAttribution = modelAttribution; this.loadLimit = loadLimit; this.sessionType = sessionType; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
-    this.beforeMutation = beforeMutation;
+    this.beforeMutation = beforeMutation; this.endSession = endSession; this.toolGate = toolGate; this.requestTimeoutSeconds = requestTimeoutSeconds;
   }
 
   resetLoadCalls() { this.loadCalls = 0; }
@@ -128,6 +128,7 @@ export class ToolExecutor {
     const started = performance.now();
     try {
       if (signal?.aborted) throw Object.assign(new Error("Kennedy's response was stopped."), { code: "turn_stopped" });
+      if (this.toolGate) await this.toolGate(call.name);
       let outcome;
       switch (call.name) {
         case "LoadNode": outcome = await this.loadNode(call.arguments); break;
@@ -139,12 +140,13 @@ export class ToolExecutor {
         case "UpdateNode": outcome = await this.updateNode(call.arguments); break;
         case "WebSearch": outcome = await this.webSearch(call.arguments, { signal, operationId }); break;
         case "WebFetch": outcome = await this.webFetch(call.arguments, { signal, operationId }); break;
+        case "EndFreeTimeSession": outcome = await this.endFreeTimeSession(call.arguments); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
       }
       const durationMs = elapsedMs(started);
       const message = this.resultMessage(call, { ok: true, result: outcome.result }, durationMs);
       this.record({ name: call.name, arguments: call.arguments, ok: true, durationMs });
-      return { message, reset: Boolean(outcome.reset), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, previousContext: outcome.previousContext ?? null, durationMs };
+      return { message, reset: Boolean(outcome.reset), endSession: Boolean(outcome.endSession), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, previousContext: outcome.previousContext ?? null, durationMs };
     } catch (error) {
       if (signal?.aborted || error?.name === "AbortError" || ["operation_cancelled", "turn_stopped", "ingress_cancelled"].includes(error?.code)) throw error;
       const code = error.code || "tool_failed";
@@ -181,7 +183,7 @@ export class ToolExecutor {
   }
 
   async connectNodes(args) {
-    this.assertIngress(); validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers", 2);
+    this.assertWrite(); validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers", 2);
     const durable = args.identifiers.map(id => this.fullDurable(id));
     await this.beforeMutation();
     const payload = await this.api.connect(durable, this.modelAttribution);
@@ -190,7 +192,7 @@ export class ToolExecutor {
   }
 
   async consolidateFanout(args) {
-    this.assertIngress(); validateObject(args, ["parentIdentifier", "aggregatorIdentifier", "fanoutIdentifiers"]);
+    this.assertWrite(); validateObject(args, ["parentIdentifier", "aggregatorIdentifier", "fanoutIdentifiers"]);
     integer(args.parentIdentifier, "parentIdentifier"); integer(args.aggregatorIdentifier, "aggregatorIdentifier");
     integerArray(args.fanoutIdentifiers, "fanoutIdentifiers", 1);
     const parentId = this.fullDurable(args.parentIdentifier);
@@ -204,7 +206,7 @@ export class ToolExecutor {
   }
 
   async setFixedConnection(args) {
-    this.assertIngress(); validateObject(args, ["parentIdentifier", "childIdentifier", "slot"]);
+    this.assertWrite(); validateObject(args, ["parentIdentifier", "childIdentifier", "slot"]);
     integer(args.parentIdentifier, "parentIdentifier");
     if (args.childIdentifier !== "blank") integer(args.childIdentifier, "childIdentifier");
     if (![1, 2, 3].includes(args.slot)) throw Object.assign(new Error("slot must be 1, 2, or 3."), { code: "invalid_arguments" });
@@ -223,14 +225,15 @@ export class ToolExecutor {
     return { result: { node: this.context.toContextNode(payload.node), replacedFixedConnection, cleared: childId === null } };
   }
 
-  assertIngress() { if (this.mode !== "ingress" || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" }); }
-  assertWeb() { if (!["conversation", "ingress"].includes(this.mode) || !this.intelligence) throw Object.assign(new Error("This web tool is not available in this session."), { code: "tool_unavailable" }); }
+  assertWrite() { if (!["ingress", "free-time"].includes(this.mode) || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress or free time."), { code: "tool_unavailable" }); }
+  assertWeb() { if (!["conversation", "ingress", "free-time"].includes(this.mode) || !this.intelligence) throw Object.assign(new Error("This web tool is not available in this session."), { code: "tool_unavailable" }); }
 
   async webSearch(args, { signal = null, operationId = null } = {}) {
     this.assertWeb(); validateObject(args, ["question", "mode"]);
     const question = nonemptyString(args.question, "question", 4000);
     const mode = choice(args.mode, "mode", ["quality", "balanced", "fast"]);
-    return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question, mode }, { signal, operationId }) };
+    const timeoutSeconds = this.requestTimeoutSeconds?.();
+    return { result: await this.intelligence.webSearch({ provider: this.provider, model: this.model, question, mode, ...(timeoutSeconds ? { timeout_seconds: timeoutSeconds } : {}) }, { signal, operationId }) };
   }
 
   async webFetch(args, { signal = null, operationId = null } = {}) {
@@ -240,7 +243,7 @@ export class ToolExecutor {
   }
 
   async createNode(args) {
-    this.assertIngress(); validateObject(args, ["parentIdentifiers", "ownerIdentifier", "shortName", "shortDescription", "longDescription"]);
+    this.assertWrite(); validateObject(args, ["parentIdentifiers", "ownerIdentifier", "shortName", "shortDescription", "longDescription"]);
     integerArray(args.parentIdentifiers, "parentIdentifiers", 1);
     const parentIds = args.parentIdentifiers.map(id => this.fullDurable(id));
     integer(args.ownerIdentifier, "ownerIdentifier");
@@ -252,12 +255,21 @@ export class ToolExecutor {
   }
 
   async updateNode(args) {
-    this.assertIngress(); validateObject(args, ["identifier", "ownerIdentifier", "newShortName", "newShortDescription", "newLongDescription"]);
+    this.assertWrite(); validateObject(args, ["identifier", "ownerIdentifier", "newShortName", "newShortDescription", "newLongDescription"]);
     integer(args.identifier, "identifier"); const durable = this.fullDurable(args.identifier);
     integer(args.ownerIdentifier, "ownerIdentifier"); const ownerRootId = this.fullDurable(args.ownerIdentifier);
     await this.beforeMutation();
     const payload = await this.api.updateNode(durable, { provenance_id: this.provenanceId, model_attribution: this.modelAttribution, owner_root_node_id: ownerRootId, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
     this.context.refresh([payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
+  }
+
+  async endFreeTimeSession(args) {
+    validateObject(args, []);
+    if (this.mode !== "free-time" || typeof this.endSession !== "function") {
+      throw Object.assign(new Error("This tool is only available during free time."), { code: "tool_unavailable" });
+    }
+    const result = await this.endSession();
+    return { result, endSession: true };
   }
 }

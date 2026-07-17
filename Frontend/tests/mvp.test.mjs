@@ -7,13 +7,15 @@ import { MAX_RESET_SELF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from 
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, sortConversationHistory } from "../public/js/render.js";
-import { ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
+import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
 import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
 import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
+import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
+import { FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, freeTimeRequestTimeoutSeconds, freeTimeTiming, parseFreeTimeMinutes } from "../public/js/free_time.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -21,6 +23,7 @@ const node = (n, active = [], fanout = [], fixed = [], lastModifiedBy = "legacy-
 const promptManuals = (label = "Shared") => ({
   identity: `${label} identity`,
   conversationSession: `${label} conversation session`,
+  freeTimeSession: `${label} free-time session`,
   historyIngressSession: `${label} history-ingress session`,
   audioIngressSession: `${label} audio-ingress session`,
   codexHarness: `${label} Codex outer-harness note`,
@@ -486,6 +489,43 @@ test("live conversations cannot mutate the Kmap", async () => {
   }
 });
 
+test("free time authorizes Kmap writes and exposes its clean-slate end tool only there", async () => {
+  const api = new MockKweb([node(1, [2]), node(2)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  let endCalls = 0;
+  const executor = new ToolExecutor({
+    mode: "free-time", context, api, provenanceId: "free-time-provenance", loadLimit: 50,
+    endSession: async () => { endCalls += 1; return { totalTimeReduced: false, remaining: "12:00" }; },
+  });
+  const connected = await executor.execute({ id: "connect", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
+  assert.equal(connected.message.tool_result.ok, true);
+  assert.deepEqual(api.connected, [id(1), id(2)]);
+
+  const ended = await executor.execute({ id: "end", name: "EndFreeTimeSession", arguments: {} });
+  assert.equal(ended.endSession, true);
+  assert.equal(ended.message.tool_result.result.totalTimeReduced, false);
+  assert.equal(endCalls, 1);
+
+  const conversation = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
+  const unavailable = await conversation.execute({ id: "end", name: "EndFreeTimeSession", arguments: {} });
+  assert.equal(unavailable.message.tool_result.ok, false);
+  assert.match(unavailable.message.content, /only available during free time/);
+});
+
+test("free-time clocks use one absolute deadline with a three-minute warning and two-minute hard stop", () => {
+  const now = Date.parse("2026-07-17T12:00:00Z");
+  const freeTime = { deadlineAt: "2026-07-17T12:02:30Z" };
+  const timing = freeTimeTiming(freeTime, now);
+  assert.equal(timing.warningDue, true);
+  assert.equal(timing.remainingMs, 150_000);
+  assert.equal(timing.hardStopMs, Date.parse(freeTime.deadlineAt) + FREE_TIME_HARD_STOP_GRACE_MS);
+  assert.equal(freeTimeRequestTimeoutSeconds(freeTime, now), 270);
+  assert.equal(FREE_TIME_WARNING_MS, 180_000);
+  assert.equal(parseFreeTimeMinutes("0.1"), 0.1);
+  assert.equal(parseFreeTimeMinutes("480"), 480);
+  assert.throws(() => parseFreeTimeMinutes("0"), /between 0.1/);
+});
+
 test("web tools reject extra retrieval knobs and remain available during ingress", async () => {
   const searches = [];
   const intelligence = { webSearch: async body => { searches.push(body); return { answer: "Ingress evidence.", sources: [] }; } };
@@ -625,6 +665,62 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.equal(checkpoints[0].includes("Second completed."), true);
 });
 
+test("EndFreeTimeSession checkpoints its result and returns loop control without another generation", async () => {
+  const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
+  const chatend = new Chatend("free-time instructions", context, [{ role: "user", content: "Have fun." }]);
+  let requests = 0;
+  let checkpoints = 0;
+  const intelligence = {
+    generate: async () => {
+      requests += 1;
+      return {
+        status: "complete", response_id: "free-time-thread", usage: null,
+        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndFreeTimeSession","arguments":{}}]}' },
+      };
+    },
+  };
+  const executor = new ToolExecutor({
+    mode: "free-time", context, api: context.api, provenanceId: "prov", loadLimit: 50,
+    endSession: () => ({ totalTimeReduced: false }),
+  });
+  const result = await runAgentLoop({
+    intelligence, provider: "p", model: "m", chatend, executor,
+    continuation: new ContinuationState("free-time-test"), usage: new UsageTracker(),
+    checkpoint: async () => { checkpoints += 1; },
+  });
+  assert.equal(result, AGENT_LOOP_SESSION_ENDED);
+  assert.equal(requests, 1);
+  assert.equal(checkpoints, 1);
+  assert.match(chatend.messages.at(-1).content, /total time unchanged/i);
+});
+
+test("a pre-boundary Codex thread is replayed from the full visible Chatend", async () => {
+  const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
+  const chatend = new Chatend("visible instructions", context, [{ role: "user", content: "earlier" }]);
+  const continuation = new ContinuationState("kennedy-test");
+  continuation.accept("legacy-thread", chatend.messages.length);
+  chatend.append({ role: "user", content: "new question" });
+  const requests = [];
+  const intelligence = { generate: async request => {
+    requests.push(request);
+    if (requests.length === 1) {
+      throw Object.assign(new Error("stale"), { code: "stale_codex_thread" });
+    }
+    return { status: "complete", response_id: "clean-thread", message: { role: "assistant", content: "Clean answer." }, usage: null };
+  } };
+  const answer = await runAgentLoop({
+    intelligence, provider: "p", model: "m", chatend,
+    executor: { execute: async () => { throw new Error("unexpected tool"); } },
+    continuation, usage: new UsageTracker(),
+  });
+  assert.equal(answer, "Clean answer.");
+  assert.equal(requests[0].previous_response_id, "legacy-thread");
+  assert.doesNotMatch(requests[0].chatend, /visible instructions/);
+  assert.equal(requests[1].previous_response_id, null);
+  assert.match(requests[1].chatend, /visible instructions/);
+  assert.match(requests[1].chatend, /new question/);
+});
+
 test("concise context usage is model-visible and stale thread usage is cleared on reset", () => {
   const usage = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
   assert.equal(
@@ -742,6 +838,38 @@ test("conversation provenance preserves the complete structured Chatend", async 
   assert.match(archive.messages.find(message => message.display_role === "Memory tool result").content, /Loaded/);
   assert.equal(archive.messages.at(-1).content[1].image_url, "data:image/png;base64,AAAA");
   assert.equal(archive.fullHistory.segments[0].messages[0].content, "Earlier context.");
+});
+
+test("free-time sessions durably inject one warning and one deadline wrap-up notice", async () => {
+  let now = Date.parse("2026-07-17T12:27:30Z");
+  const deadlineAt = "2026-07-17T12:30:00.000Z";
+  const checkpoints = [];
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1)]), intelligence: {}, manuals: promptManuals(), rootNodeIds: [id(1)],
+    provider: "p", providerKind: "direct-api", model: "m", reasoningEffort: "high",
+    sessionType: "free-time", provenanceId: "prov", now: () => now,
+    freeTime: {
+      runId: "run-1", runStartedAt: "2026-07-17T12:00:00.000Z", deadlineAt,
+      durationMinutes: 30, sliceIndex: 1, provenanceId: "prov",
+    },
+    persist: async state => checkpoints.push(state),
+  });
+  await session.initialize();
+  session.stageFreeTimeOpening();
+  await session.prepareFreeTimeRound();
+  await session.prepareFreeTimeRound();
+  assert.equal(session.chatend.messages.filter(message => message.context_kind === "free-time-timer").length, 1);
+  assert.match(session.chatend.messages.find(message => message.context_kind === "free-time-timer").content, /final three minutes/);
+  assert.ok(checkpoints.length >= 1);
+
+  now = Date.parse(deadlineAt) + 1;
+  const directive = await session.prepareFreeTimeRound();
+  assert.deepEqual(directive, { endAfterResponse: true });
+  assert.equal(session.chatend.messages.filter(message => message.context_kind === "free-time-timer").length, 2);
+  assert.match(session.chatend.messages.at(-1).content, /final wrap-up round/);
+  const blocked = await session.executor.execute({ id: "load", name: "LoadNode", arguments: { identifier: 1 } });
+  assert.equal(blocked.message.tool_result.ok, false);
+  assert.match(blocked.message.content, /tools are no longer available/);
 });
 
 test("a structured Chatend archive retains activity while refreshing current manuals and context", async () => {
@@ -914,6 +1042,12 @@ test("conversation history titles use the first durable user message", () => {
   assert.equal(conversationTitle({ state: { transcript: [] } }), "New conversation");
 });
 
+test("free-time history titles identify clean-slate slices", () => {
+  assert.equal(conversationTitle({
+    state: { sessionType: "free-time", freeTime: { sliceIndex: 4 }, transcript: [] },
+  }), "Free time · session 4");
+});
+
 test("audio history titles use the durable original filename", () => {
   assert.equal(audioRecordingTitle({ original_filename: "2026-07-16-vnote.wav" }), "2026-07-16-vnote.wav");
   assert.equal(audioRecordingTitle({ original_filename: "x".repeat(80) }, 20), `${"x".repeat(19)}…`);
@@ -928,8 +1062,9 @@ test("conversation sidebar distinguishes continuable and closed records", async 
 });
 
 test("the selected history row exposes a guarded force-purge action", async () => {
-  const [app, render] = await Promise.all([
+  const [app, coordinator, render] = await Promise.all([
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/memory_ingress_coordinator.js", import.meta.url), "utf8"),
     readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
   ]);
   assert.match(render, /record\.id === selectedId/);
@@ -937,7 +1072,7 @@ test("the selected history row exposes a guarded force-purge action", async () =
   assert.match(app, /window\.confirm\(`Permanently purge this conversation/);
   assert.match(app, /conversationHistory\.purge\(id, \{ expected_version: latest\.version \}\)/);
   assert.match(app, /The conversation will not be sent through history ingress/);
-  assert.match(app, /beforeMutation: async \(\) =>/);
+  assert.match(coordinator, /beforeMutation: async \(\) =>/);
   const select = app.match(/async function selectConversation\(id\) \{[\s\S]*?\n\}/)?.[0];
   assert.ok(select);
   assert.ok(select.indexOf("selectedConversationId = id") < select.indexOf("await buildConversation(record)"));
@@ -1066,13 +1201,27 @@ test("history ingress activity belongs only to its selected conversation", () =>
 });
 
 test("history ingress worker records five failures before abandoning a poisoned session", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  assert.match(app, /const INGRESS_FAILURE_LIMIT = 5/);
-  assert.match(app, /conversationHistory\.ingressFailure/);
-  assert.match(app, /failedRecord\.phase === "ingress_failed"/);
-  assert.match(app, /History ingress stopped after \$\{failedRecord\.ingress_failure_count\} failed attempts/);
+  const [app, coordinator] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/memory_ingress_coordinator.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(coordinator, /const INGRESS_FAILURE_LIMIT = 5/);
+  assert.match(coordinator, /conversationHistory\.ingressFailure/);
+  assert.match(coordinator, /failedRecord\.phase === "ingress_failed"/);
+  assert.match(coordinator, /History ingress stopped after \$\{failedRecord\.ingress_failure_count\} failed attempts/);
   assert.match(app, /conversationHistory\.retryIngress\(record\.id/);
   assert.match(app, /delete fresh\.historyIngress/);
+});
+
+test("memory ingress coordinator resumes claimed work before selecting the oldest pending source", () => {
+  const conversation = { id: "conversation", phase: "ingress_pending", started_at: "2026-07-17T12:00:00Z" };
+  const audio = { id: "audio", phase: "ingress_pending", source_created_at: "2026-07-17T11:00:00Z" };
+  assert.deepEqual(selectNextMemoryIngress(conversation, audio), { kind: "audio", record: audio });
+  conversation.phase = "ingress_in_progress";
+  assert.deepEqual(selectNextMemoryIngress(conversation, audio), { kind: "conversation", record: conversation });
+  conversation.phase = "ingress_pending";
+  audio.phase = "ingress_in_progress";
+  assert.deepEqual(selectNextMemoryIngress(conversation, audio), { kind: "audio", record: audio });
 });
 
 test("failed conversation ingress exposes retry actions in the sidebar and central view", async () => {
@@ -1219,6 +1368,26 @@ test("conversation checkpoints the pending query before any model request", asyn
   assert.equal(summary.content.includes("\n"), false);
 });
 
+test("a final user message is durable without starting a Kennedy turn", async () => {
+  let generations = 0;
+  const checkpoints = [];
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1)]),
+    intelligence: { generate: async () => { generations += 1; throw new Error("must not generate"); } },
+    manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
+    persist: async (state, metadata) => checkpoints.push({ state: structuredClone(state), metadata }),
+    onUpdate: () => {},
+  });
+  await session.initialize();
+  assert.equal(await session.appendFinalUserMessage("One last thing for memory."), true);
+  assert.equal(generations, 0);
+  assert.equal(session.pendingTurn, false);
+  assert.equal(session.transcript.at(-1).content, "One last thing for memory.");
+  assert.equal(checkpoints.at(-1).state.pendingTurn, false);
+  assert.equal(checkpoints.at(-1).metadata.userActivity, true);
+  assert.equal(checkpoints.at(-1).state.archive.messages.at(-1).content, "One last thing for memory.");
+});
+
 test("an in-flight conversation can be stopped and remains explicitly retryable", async () => {
   const kweb = new MockKweb([node(1)]);
   let generateMode = "wait";
@@ -1328,13 +1497,13 @@ test("cold start leaves saved conversation retries under explicit user control",
 
 test("ending a conversation keeps its ingress record selected until New is explicit", async () => {
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  const endConversation = app.match(/async function endConversation\(\) \{[\s\S]*?\n\}\n\nasync function createTelegramConversation/)?.[0];
-  assert.ok(endConversation);
-  assert.match(endConversation, /selectedConversationId = id;/);
-  assert.match(endConversation, /selectedByView\.conversation = id;/);
-  assert.match(endConversation, /kickHistoryIngress\(\);/);
-  assert.doesNotMatch(endConversation, /historyRecords\.find\(item => item\.phase === "active"/);
-  assert.doesNotMatch(endConversation, /createNewConversation\(\)/);
+  const closeConversation = app.match(/async function closeConversation\(id, session, record\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(closeConversation);
+  assert.match(closeConversation, /selectedConversationId = id;/);
+  assert.match(closeConversation, /selectedByView\.conversation = id;/);
+  assert.match(closeConversation, /kickHistoryIngress\(\);/);
+  assert.doesNotMatch(closeConversation, /historyRecords\.find\(item => item\.phase === "active"/);
+  assert.doesNotMatch(closeConversation, /createNewConversation\(\)/);
 });
 
 test("a structured pending Chatend resumes from cold start without duplicating its user query", async () => {
@@ -1497,6 +1666,7 @@ test("system prompt composition uses readable sections rather than markup wrappe
   const manuals = {
     identity: "Identity.",
     conversationSession: "Conversation session.",
+    freeTimeSession: "Free time. Have fun and use EndFreeTimeSession for a clean slate.",
     historyIngressSession: "History session.",
     audioIngressSession: "Audio session.",
     codexHarness: "The outer harness catches Kennedy tool calls.",
@@ -1507,6 +1677,13 @@ test("system prompt composition uses readable sections rather than markup wrappe
   const prompt = composePrompt(manuals, "conversation", { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
   assert.equal(prompt, "Kennedy's identity\n\nIdentity.\n\nSession type\n\nConversation session.\n\nChannel: Kennedy's browser UI.\n\nKmap basics\n\nKmap basics.\n\nRead-only tools\n\nKmap read tools.\n\nWeb tools.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
   assert.match(composePrompt(manuals, "conversation", { sessionType: "telegram" }), /Channel: Telegram/);
+  const freeTime = composePrompt(manuals, "conversation", {
+    sessionType: "free-time",
+    sessionContext: "The shared deadline is 2026-07-17T12:30:00Z.",
+  });
+  assert.match(freeTime, /Free time\. Have fun/);
+  assert.match(freeTime, /Write tools\n\nWrite tools\./);
+  assert.match(freeTime, /Free-time schedule\n\nThe shared deadline/);
   const history = composePrompt(manuals, "ingress", { sourceSessionType: "telegram" });
   assert.match(history, /Source: an archived Telegram conversation/);
   assert.match(history, /Write tools\n\nWrite tools\./);
@@ -1525,6 +1702,7 @@ test("system prompt composition uses readable sections rather than markup wrappe
   assert.equal(prompt.includes("<kennedy_"), false);
   assert.deepEqual(requiredPromptKeys("conversation"), ["identity", "conversationSession", "kmapBasics", "readTools"]);
   assert.deepEqual(requiredPromptKeys("conversation", { providerKind: "codex" }), ["identity", "conversationSession", "kmapBasics", "readTools", "codexHarness"]);
+  assert.deepEqual(requiredPromptKeys("conversation", { sessionType: "free-time" }), ["identity", "freeTimeSession", "kmapBasics", "readTools", "writeTools"]);
   assert.deepEqual(requiredPromptKeys("ingress"), ["identity", "historyIngressSession", "kmapBasics", "readTools", "writeTools"]);
   assert.equal(promptsReady(manuals, "ingress", { sourceSessionType: "audio" }), true);
   assert.equal(promptsReady({ ...manuals, codexHarness: "" }, "conversation", { providerKind: "codex" }), false);
@@ -1559,6 +1737,7 @@ test("system prompt loader requests every composable prompt layer", async () => 
     "/base/system-prompts/AudioIngressSession.txt",
     "/base/system-prompts/CodexHarness.txt",
     "/base/system-prompts/ConversationSession.txt",
+    "/base/system-prompts/FreeTimeSession.txt",
     "/base/system-prompts/HistoryIngressSession.txt",
     "/base/system-prompts/KennedyIdentity.txt",
     "/base/system-prompts/KmapBasics.txt",
@@ -1816,11 +1995,14 @@ test("user-visible errors are logged below history instead of inside the chat pa
 });
 
 test("frontend initialization and ingress queues degrade by feature", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  const [app, coordinator] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/memory_ingress_coordinator.js", import.meta.url), "utf8"),
+  ]);
   assert.doesNotMatch(app, /Promise\.all\(\[kweb\.health\(\), kweb\.user\(\), loadPromptManuals/);
   assert.match(app, /audioIngressReady && audioPromptsReady\(\)/);
-  assert.match(app, /conversationHistory\.nextIngress\(\)\.catch/);
-  assert.match(app, /audioIngress\.nextIngress\(\)\.catch/);
+  assert.match(coordinator, /conversationHistory\.nextIngress\(\)\.catch/);
+  assert.match(coordinator, /audioIngress\.nextIngress\(\)\.catch/);
   assert.match(app, /Audio preparation and history remain available, but audio memory ingress is paused/);
   assert.match(app, /providerKind = selected\.kind/);
   assert.match(app, /promptsReady\(manuals, "conversation", \{ providerKind \}\)/);
@@ -1832,7 +2014,7 @@ test("frontend defaults to main with full and full-history inspectors and retain
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
   ]);
-  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "user-log-section", "clear-log", "tg-tab", "audio-tab", "voice-button", "stop-button"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "user-log-section", "clear-log", "tg-tab", "audio-tab", "voice-button", "stop-button", "send-end-button"]) assert.match(html, new RegExp(`id="${id}"`));
   for (const id of ["inspector-system", "inspector-tools", "inspector-memory"]) assert.doesNotMatch(html, new RegExp(`id="${id}"`));
   assert.match(app, /const INSPECTOR_MODES = \["main", "full", "history"\]/);
   assert.match(app, /let inspectorMode = "main"/);
@@ -1848,9 +2030,29 @@ test("frontend defaults to main with full and full-history inspectors and retain
   assert.match(app, /renderAudioRecording\(ui\.transcript, detail/);
   assert.match(app, /session\.stopPendingTurn\(\)/);
   assert.match(app, /stop_button\.addEventListener\("click"/);
+  assert.match(app, /send_end_button\.addEventListener\("click", \(\) => sendAndEndConversation\(\)\)/);
+  assert.match(app, /session\.appendFinalUserMessage\(text, metadata\)/);
   assert.match(html, /id="stop-button"[^>]*>Stop Kennedy<\/button>/);
+  assert.match(html, /id="send-end-button"[^>]*>Send &amp; end<\/button>/);
   assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
+});
+
+test("the browser exposes configurable durable free time with cross-tab and hard-stop orchestration", async () => {
+  const [html, app, manual] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../SystemPrompts/FreeTimeSession.txt", import.meta.url), "utf8"),
+  ]);
+  assert.match(html, /id="free-time-minutes"[^>]*min="0\.1"[^>]*max="10080"[^>]*value="30"/);
+  assert.match(html, /id="start-free-time"/);
+  assert.match(app, /navigator\.locks\.request\("kennedy-free-time"/);
+  assert.match(app, /FREE_TIME_HARD_STOP_GRACE_MS/);
+  assert.match(app, /session\.stageFreeTimeOpening\(\)/);
+  assert.match(app, /chatRuntimeReady\(\) \|\| freeTimeRuntimeReady\(\)/);
+  assert.match(manual, /Have fun/);
+  assert.match(manual, /EndFreeTimeSession/);
+  assert.match(manual, /does not surrender, shorten, reset, or otherwise reduce/);
 });
 
 test("audio recording view starts large artifacts collapsed and includes inline history ingress", async () => {
@@ -1973,6 +2175,42 @@ test("persistent Telegram group sessions append only unseen context and scope wa
   assert.equal(session.archive().channel.lastGroupContextMessageId, 12);
 });
 
+test("passive Telegram group context retains other users' media and Kennedy replies without generating", async () => {
+  let generations = 0;
+  const session = new ConversationSession({
+    kweb: new MockKweb([node(1), node(2), node(3)]),
+    intelligence: { generate: async () => { generations += 1; throw new Error("must not generate"); } },
+    manuals: promptManuals("Shared"), rootNodeIds: [id(1), id(2), id(3)],
+    provider: "p", model: "m", sessionType: "telegram-group",
+    channel: {
+      kind: "telegram-group", telegramUserId: 42, chatId: -100, lastGroupContextMessageId: 20,
+      groupContext: { groupTitle: "Trusted friends", chatId: -100, invokingTelegramUserId: 42, participants: [], messages: [] },
+    },
+    onUpdate: () => {},
+  });
+  await session.initialize();
+  session.refreshTelegramGroupContext({
+    groupTitle: "Trusted friends", chatId: -100, invokingTelegramUserId: 42, throughMessageId: 23,
+    participants: [],
+    messages: [
+      {
+        messageId: 21, telegramUserId: 77, displayName: "Friend", kind: "voice",
+        text: "[Voice note transcription]\nBring the blueprints.", sentByKennedy: false,
+        mediaRef: { kind: "voice", source: "telegram-group", chatId: -100, messageId: 21, mimeType: "audio/ogg" },
+      },
+      { messageId: 22, telegramUserId: null, displayName: "Kennedy", kind: "text", text: "I will review them.", sentByKennedy: true },
+    ],
+  });
+  assert.equal(generations, 0);
+  assert.equal(session.channel.lastGroupContextMessageId, 23);
+  assert.match(session.chatend.retained.at(-1).content, /Bring the blueprints/);
+  assert.match(session.chatend.retained.at(-1).content, /I will review them/);
+  assert.deepEqual(session.media.at(-1), {
+    id: "telegram-group:-100:21", kind: "voice", source: "telegram-group",
+    chatId: -100, messageId: 21, mimeType: "audio/ogg",
+  });
+});
+
 test("background Telegram group ingress directly loads the group and Kennedy roots", async () => {
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
   assert.match(app, /const directRoots = \[batch\.groupRootNodeId, kennedyRootNodeId\]/);
@@ -1985,7 +2223,12 @@ test("Telegram relay client exposes identity provisioning and group-ingress queu
   const requests = [];
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url, options });
-    return { ok: true, headers: { get: () => "application/json" }, json: async () => ({}) };
+    return {
+      ok: true,
+      headers: { get: name => name === "content-type" && url.endsWith("/media") ? "audio/ogg" : "application/json" },
+      json: async () => ({}),
+      blob: async () => new Blob(["media"], { type: "audio/ogg" }),
+    };
   };
   try {
     const api = TelegramRelayAPI("http://telegram");
@@ -1998,6 +2241,11 @@ test("Telegram relay client exposes identity provisioning and group-ingress queu
     await api.completeGroupRoot(-100, id(2));
     await api.groupIngress();
     await api.completeGroupIngress("batch");
+    await api.groupSessionUpdates();
+    await api.acknowledgeGroupContext("019f5ca7-020f-7b63-be2f-82785fb68c03", 51);
+    await api.completeSilentGroupReset("019f5ca7-020f-7b63-be2f-82785fb68c03");
+    await api.groupMessageMedia(-100, 50);
+    await api.saveGroupMessagePreparation(-100, 50, { text: "Prepared", model: "transcriber" });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2011,9 +2259,16 @@ test("Telegram relay client exposes identity provisioning and group-ingress queu
     "http://telegram/api/v1/groups/-100/root-ready",
     "http://telegram/api/v1/group-ingress",
     "http://telegram/api/v1/group-ingress/batch/complete",
+    "http://telegram/api/v1/group-sessions/updates",
+    "http://telegram/api/v1/group-sessions/019f5ca7-020f-7b63-be2f-82785fb68c03/context-ack",
+    "http://telegram/api/v1/group-sessions/019f5ca7-020f-7b63-be2f-82785fb68c03/silent-reset-completed",
+    "http://telegram/api/v1/group-messages/-100/50/media",
+    "http://telegram/api/v1/group-messages/-100/50/preparation",
   ]);
   assert.match(requests[2].options.body, new RegExp(id(1)));
   assert.match(requests[6].options.body, new RegExp(id(2)));
+  assert.match(requests[10].options.body, /"throughMessageId":51/);
+  assert.match(requests[13].options.body, /"text":"Prepared"/);
 });
 
 test("audio, document, durable vnote, and Telegram API clients use their queue endpoints", async () => {

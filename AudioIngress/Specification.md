@@ -56,6 +56,14 @@ resulting JSON in database order. It produces the canonical complete Markdown
 transcript, removes the known overlap, and reconciles speaker labels without
 inventing unsupported real identities.
 
+Before the worker starts, it derives and probes its own sanitized Codex model
+catalog: provider base instructions are blank, model message templates and
+agent-tool selectors are removed, model-selected skill instructions are off,
+and advertised context limits must remain unchanged. Codex developer
+runtime and developer instructions are empty. A `debug prompt-input` probe must show exactly the one
+supplied transcript-prompt item. Either failure aborts startup rather than
+silently using stock or hidden Codex instructions.
+
 The estimate is `ceil(Unicode characters / 4)`. Sol inserts
 `<!-- KENNEDY_INGRESS_BREAK -->` only at sensible boundaries when a transcript
 needs more than one piece. The service strips markers and refuses to publish

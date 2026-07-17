@@ -1,9 +1,10 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.4";
-import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.6";
-import { ConversationSession } from "./conversation.js?v=20260717.8";
-import { runHistoryIngress } from "./history_ingress.js?v=20260717.7";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260717.6";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.7";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.5";
+import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.8";
+import { ConversationSession } from "./conversation.js?v=20260717.10";
+import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260717.2";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260717.7";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, element } from "./render.js?v=20260717.8";
+import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes } from "./free_time.js?v=20260717.1";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -15,7 +16,7 @@ const CONFIG = {
 };
 
 const ui = Object.fromEntries([
-  "service-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "stop-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
+  "service-status", "free-time-minutes", "start-free-time", "free-time-status", "chat-view", "memory-view", "chat-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "send-end-button", "stop-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["main", "full", "history"];
@@ -58,11 +59,6 @@ let drafts = new Map();
 let conversationErrors = new Map();
 let endingIds = new Set();
 let creatingConversation = false;
-let ingressWorkerRunning = false;
-let activeIngressRecord = null;
-let ingressDiagnostic = null;
-let activeConversationIngressTurn = null;
-let activeAudioIngressPiece = null;
 let inspectorMode = "main";
 let recorder = null;
 let recorderChunks = [];
@@ -70,17 +66,25 @@ let recordingStream = null;
 let voiceDrafts = new Map();
 let attachmentDrafts = new Map();
 let extractingAttachments = new Set();
+let freeTimeRun = null;
+let freeTimeStarting = false;
+let freeTimeRunnerIds = new Set();
+let freeTimeContinuationRuns = new Set();
 let telegramBridgeRunning = false;
 let telegramInFlight = new Set();
+const telegramGroupPreparations = new Map();
 let kwebReady = false;
 let conversationHistoryReady = false;
 let intelligenceReady = false;
 let audioIngressReady = false;
 let telegramRelayReady = false;
-const INGRESS_FAILURE_LIMIT = 5;
 
 function conversationPromptsReady() {
   return promptsReady(manuals, "conversation", { providerKind });
+}
+
+function freeTimePromptsReady() {
+  return promptsReady(manuals, "conversation", { providerKind, sessionType: "free-time" });
 }
 
 function historyPromptsReady() {
@@ -95,11 +99,51 @@ function chatRuntimeReady() {
   return kwebReady && conversationHistoryReady && intelligenceReady && conversationPromptsReady();
 }
 
+function freeTimeRuntimeReady() {
+  return kwebReady && conversationHistoryReady && intelligenceReady && freeTimePromptsReady();
+}
+
 function memoryIngressRuntimeReady() {
   return kwebReady && intelligenceReady && (
     (conversationHistoryReady && historyPromptsReady())
     || (audioIngressReady && audioPromptsReady())
   );
+}
+
+const memoryIngress = new MemoryIngressCoordinator({
+  kweb,
+  intelligence,
+  conversationHistory,
+  audioIngress,
+  telegramRelay,
+  getRuntime: () => ({
+    manuals,
+    rootNodeIds,
+    provider,
+    providerKind,
+    model,
+    reasoningEffort,
+    contextWindowTokens,
+    maxInputTokens,
+    conversationIngressReady: conversationHistoryReady && historyPromptsReady(),
+    audioIngressReady: audioIngressReady && audioPromptsReady(),
+  }),
+  isReady: memoryIngressRuntimeReady,
+  rootsForRecord,
+  referencesForRecord,
+  groupContextOf,
+  upsertHistory,
+  refreshHistory,
+  refreshAudioHistory: () => refreshAudioHistory(activeView === "audio"),
+  onUpdate: update,
+  onError: message => showError(ui.error_banner, message),
+  onStatus: message => { ui.service_status.textContent = message; },
+  isConversationPurging: id => purgingConversationIds.has(id),
+  isConversationPurged: id => purgedConversationIds.has(id),
+});
+
+function kickHistoryIngress() {
+  memoryIngress.kick();
 }
 
 function sessionTypeOf(record) {
@@ -108,6 +152,34 @@ function sessionTypeOf(record) {
 
 function viewForSessionType(sessionType) {
   return String(sessionType).startsWith("telegram") ? "telegram" : "conversation";
+}
+
+function freeTimeOf(record) {
+  return record?.state?.freeTime || record?.state?.archive?.freeTime || null;
+}
+
+function activeFreeTimeRecord() {
+  return historyRecords.find(record => record.phase === "active" && sessionTypeOf(record) === "free-time") || null;
+}
+
+function renderFreeTimeControls() {
+  const metadata = freeTimeRun || freeTimeOf(activeFreeTimeRecord());
+  const active = Boolean(metadata);
+  ui.free_time_minutes.disabled = active || freeTimeStarting;
+  ui.start_free_time.disabled = active || freeTimeStarting || !freeTimeRuntimeReady();
+  ui.start_free_time.textContent = freeTimeStarting ? "Starting…" : active ? "Running" : "Start";
+  if (!metadata) {
+    ui.free_time_status.textContent = "";
+    return;
+  }
+  try {
+    const timing = freeTimeTiming(metadata);
+    ui.free_time_status.textContent = timing.expired
+      ? `Wrapping up · hard stop in ${formatFreeTimeRemaining(timing.hardStopMs - Date.now())}`
+      : `Session ${metadata.sliceIndex} · ${formatFreeTimeRemaining(timing.remainingMs)} left`;
+  } catch {
+    ui.free_time_status.textContent = "Schedule unavailable";
+  }
 }
 
 function recordsForView(view = activeView) {
@@ -238,7 +310,7 @@ function archivedDiagnostic(archive, mode, transcript = []) {
 function conversationDiagnostic(record, session) {
   if (session) {
     return {
-      mode: "conversation", provider, model,
+      mode: session.sessionType === "free-time" ? "free time" : "conversation", provider, model,
       chatend: session.chatend?.messages || [],
       context: session.context?.diagnostics() || {},
       loadCalls: session.executor?.loadCalls || 0,
@@ -256,17 +328,17 @@ function conversationDiagnostic(record, session) {
 }
 
 function historyIngressDiagnostic(record) {
-  if (record?.id === activeIngressRecord?.id && ingressDiagnostic) {
+  if (record?.id === memoryIngress.activeRecord?.id && memoryIngress.diagnostic) {
     return {
       mode: "history ingress", provider, model,
-      chatend: ingressDiagnostic.chatend?.messages || [],
-      context: ingressDiagnostic.context?.diagnostics?.() || {},
-      loadCalls: ingressDiagnostic.executor?.loadCalls || 0,
-      loadLimit: ingressDiagnostic.executor?.loadLimit || 50,
-      toolLog: ingressDiagnostic.executor?.toolLog || [],
-      usage: ingressDiagnostic.usage?.snapshot?.() || null,
-      memory: ingressDiagnostic.context?.snapshot?.() || EMPTY_MEMORY,
-      historySegments: ingressDiagnostic.chatend?.historySegments || [],
+      chatend: memoryIngress.diagnostic.chatend?.messages || [],
+      context: memoryIngress.diagnostic.context?.diagnostics?.() || {},
+      loadCalls: memoryIngress.diagnostic.executor?.loadCalls || 0,
+      loadLimit: memoryIngress.diagnostic.executor?.loadLimit || 50,
+      toolLog: memoryIngress.diagnostic.executor?.toolLog || [],
+      usage: memoryIngress.diagnostic.usage?.snapshot?.() || null,
+      memory: memoryIngress.diagnostic.context?.snapshot?.() || EMPTY_MEMORY,
+      historySegments: memoryIngress.diagnostic.chatend?.historySegments || [],
     };
   }
   const archive = record?.state?.historyIngress;
@@ -303,23 +375,23 @@ function diagnostic() {
     toolLog: [], usage: null, memory: EMPTY_MEMORY, historySegments: [],
   };
   const phases = [];
-  if (conversation) phases.push(historyPhase("Conversation", record?.phase === "active" ? "live" : "closed", conversation));
+  if (conversation) phases.push(historyPhase(sessionTypeOf(record) === "free-time" ? "Free time" : "Conversation", record?.phase === "active" ? "live" : "closed", conversation));
   if (status) phases.push(historyPhase("History ingress", status, ingress));
   return { ...current, ingressStatus: status, fullHistory: { phases } };
 }
 
 function audioPieceDiagnostic(piece) {
-  if (piece?.id === activeAudioIngressPiece?.id && ingressDiagnostic) {
+  if (piece?.id === memoryIngress.activeAudioPiece?.id && memoryIngress.diagnostic) {
     return {
       mode: "audio ingress", provider, model,
-      chatend: ingressDiagnostic.chatend?.messages || [],
-      context: ingressDiagnostic.context?.diagnostics?.() || {},
-      loadCalls: ingressDiagnostic.executor?.loadCalls || 0,
-      loadLimit: ingressDiagnostic.executor?.loadLimit || 50,
-      toolLog: ingressDiagnostic.executor?.toolLog || [],
-      usage: ingressDiagnostic.usage?.snapshot?.() || null,
-      memory: ingressDiagnostic.context?.snapshot?.() || EMPTY_MEMORY,
-      historySegments: ingressDiagnostic.chatend?.historySegments || [],
+      chatend: memoryIngress.diagnostic.chatend?.messages || [],
+      context: memoryIngress.diagnostic.context?.diagnostics?.() || {},
+      loadCalls: memoryIngress.diagnostic.executor?.loadCalls || 0,
+      loadLimit: memoryIngress.diagnostic.executor?.loadLimit || 50,
+      toolLog: memoryIngress.diagnostic.executor?.toolLog || [],
+      usage: memoryIngress.diagnostic.usage?.snapshot?.() || null,
+      memory: memoryIngress.diagnostic.context?.snapshot?.() || EMPTY_MEMORY,
+      historySegments: memoryIngress.diagnostic.chatend?.historySegments || [],
     };
   }
   const archive = piece?.state?.historyIngress;
@@ -329,12 +401,12 @@ function audioPieceDiagnostic(piece) {
 }
 
 function audioPieceIngressActivity(piece) {
-  const currentPiece = piece?.id === activeAudioIngressPiece?.id
-    ? activeAudioIngressPiece
+  const currentPiece = piece?.id === memoryIngress.activeAudioPiece?.id
+    ? memoryIngress.activeAudioPiece
     : piece;
   let diagnostic = null;
-  if (currentPiece?.id === activeAudioIngressPiece?.id && ingressDiagnostic) {
-    diagnostic = ingressDiagnostic;
+  if (currentPiece?.id === memoryIngress.activeAudioPiece?.id && memoryIngress.diagnostic) {
+    diagnostic = memoryIngress.diagnostic;
   } else {
     const archive = currentPiece?.state?.historyIngress;
     if (archive?.format === "kennedy-chatend") {
@@ -388,12 +460,13 @@ function audioRecordingDiagnostic() {
 function visibleIngressActivity() {
   return conversationIngressActivity({
     record: selectedRecord(),
-    liveRecordId: activeIngressRecord?.id,
-    liveDiagnostic: ingressDiagnostic,
+    liveRecordId: memoryIngress.activeRecord?.id,
+    liveDiagnostic: memoryIngress.diagnostic,
   });
 }
 
 function update() {
+  renderFreeTimeControls();
   if (activeView === "audio") {
     const detail = selectedAudioDetail();
     const audioViewKey = detail?.recording?.id
@@ -439,6 +512,7 @@ function update() {
   const session = selectedSession();
   const viewingHistory = Boolean(record && (record.phase !== "active" || !session));
   const telegramView = activeView === "telegram";
+  const freeTimeView = sessionTypeOf(record) === "free-time";
   const ingressActivity = visibleIngressActivity();
   renderTranscript(
     ui.transcript,
@@ -480,13 +554,14 @@ function update() {
     sessionBusy: Boolean(session?.busy),
     transitionBusy: creatingConversation || endingIds.has(selectedConversationId),
     pendingTurn: Boolean(session?.pendingTurn),
-    viewingHistory: viewingHistory || telegramView,
+    viewingHistory: viewingHistory || telegramView || freeTimeView,
     transcriptLength: session?.transcript.length || 0,
   });
   const extractingAttachment = extractingAttachments.has(selectedConversationId);
   ui.message_form.classList.toggle("hidden", controls.composerHidden);
   ui.message_input.disabled = controls.inputDisabled;
   ui.send_button.disabled = controls.sendDisabled || extractingAttachment;
+  ui.send_end_button.disabled = controls.sendDisabled || extractingAttachment;
   ui.end_button.disabled = controls.endDisabled;
   ui.stop_button.classList.toggle("hidden", controls.stopHidden || !session?.canStop);
   ui.stop_button.disabled = Boolean(session?.stopping);
@@ -506,11 +581,16 @@ function update() {
   ui.history_title.textContent = telegramView ? "Bot chats" : "History";
   ui.chatend_title.textContent = currentDiagnostic.mode === "history ingress"
     ? `History ingress · ${currentDiagnostic.ingressStatus || "in progress"}`
+    : freeTimeView ? "Free-time Chatend"
     : telegramView ? "Telegram Chatend" : currentDiagnostic.ingressStatus
       ? `Chatend · ingress ${currentDiagnostic.ingressStatus}`
       : "Chatend";
   ui.end_button.textContent = session?.pendingTurn ? "Retry saved query" : "End conversation";
-  ui.activity.textContent = telegramView
+  ui.activity.textContent = freeTimeView
+    ? session?.stopping ? "Free time reached its hard stop"
+      : session?.busy ? "Kennedy is enjoying free time"
+        : "This free-time session is closing"
+    : telegramView
     ? session?.busy ? "Kennedy is answering this Telegram message" : "Messages are delivered automatically"
     : viewingHistory
     ? record?.phase === "active" ? "Chat is unavailable; this saved conversation is read only" : "This conversation is closed and read only"
@@ -844,6 +924,7 @@ function purgeWarning(record) {
 }
 
 function removePurgedConversation(id) {
+  const purged = historyRecords.find(record => record.id === id);
   historyRecords = historyRecords.filter(record => record.id !== id);
   liveSessions.delete(id);
   drafts.delete(id);
@@ -853,9 +934,11 @@ function removePurgedConversation(id) {
   conversationErrors.delete(id);
   endingIds.delete(id);
   retryingConversationIds.delete(id);
-  if (activeIngressRecord?.id === id) {
-    activeIngressRecord = null;
-    ingressDiagnostic = null;
+  memoryIngress.clearConversation(id);
+  const sameActiveRunRemains = historyRecords.some(record => record.phase === "active" && freeTimeOf(record)?.runId === freeTimeOf(purged)?.runId);
+  if (sessionTypeOf(purged) === "free-time" && !sameActiveRunRemains && freeTimeRun?.runId === freeTimeOf(purged)?.runId) {
+    freeTimeRun = null;
+    freeTimeContinuationRuns.delete(freeTimeOf(purged)?.runId);
   }
   if (selectedConversationId === id) {
     const replacement = recordsForView()[0]?.id || null;
@@ -868,10 +951,7 @@ function removePurgedConversation(id) {
 async function cancelConversationWork(id) {
   const session = liveSessions.get(id);
   if (session?.canStop) await session.stopPendingTurn();
-  const ingressTurn = activeConversationIngressTurn;
-  if (ingressTurn?.recordId !== id || ingressTurn.controller.signal.aborted) return;
-  ingressTurn.controller.abort();
-  await Promise.resolve(intelligence.cancelOperation(ingressTurn.operationId)).catch(() => null);
+  await memoryIngress.cancelConversation(id);
 }
 
 async function forcePurgeConversation(record) {
@@ -948,6 +1028,8 @@ async function buildConversation(record) {
     kweb, intelligence, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
     sessionType,
     channel: record.state?.channel || record.state?.archive?.channel || null,
+    freeTime: freeTimeOf(record),
+    provenanceId: record.state?.provenanceId || record.state?.archive?.provenanceId || null,
     persist: (state, metadata) => persistSession(record.id, state, metadata),
     onUpdate: update,
   });
@@ -983,6 +1065,240 @@ async function createNewConversation() {
   } finally {
     creatingConversation = false;
     update();
+  }
+}
+
+function freeTimeTimerAt(timestamp, callback) {
+  const delay = Math.max(0, Math.min(2_147_483_647, timestamp - Date.now()));
+  return setTimeout(callback, delay);
+}
+
+async function closeFreeTimeSession(id, session) {
+  let record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
+  if (record.phase === "active") {
+    record = await conversationHistory.requestIngress(id, {
+      expected_version: record.version,
+      state: session.snapshot(),
+    });
+    upsertHistory(record);
+  }
+  liveSessions.delete(id);
+  drafts.delete(id);
+  voiceDrafts.delete(id);
+  attachmentDrafts.delete(id);
+  update();
+  kickHistoryIngress();
+  return record;
+}
+
+function nextFreeTimeSlice(freeTime) {
+  const {
+    warningNoticeAt: _warningNoticeAt,
+    expiredNoticeAt: _expiredNoticeAt,
+    sliceEndedAt: _sliceEndedAt,
+    sliceEndedReason: _sliceEndedReason,
+    ...shared
+  } = freeTime;
+  return { ...shared, sliceIndex: Number(freeTime.sliceIndex || 0) + 1 };
+}
+
+async function createFreeTimeSlice(freeTime, { select = false } = {}) {
+  const session = new ConversationSession({
+    kweb, intelligence, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort,
+    contextWindowTokens, maxInputTokens, sessionType: "free-time", freeTime,
+    provenanceId: freeTime.provenanceId, onUpdate: update,
+  });
+  await session.initialize();
+  session.stageFreeTimeOpening();
+  let record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
+  session.persist = (state, metadata) => persistSession(record.id, state, metadata);
+  liveSessions.set(record.id, session);
+  drafts.set(record.id, "");
+  upsertHistory(record);
+  await session.persistSnapshot(session.snapshot(), { userActivity: true });
+  session.pendingCheckpointed = true;
+  record = historyRecords.find(item => item.id === record.id) || record;
+  freeTimeRun = freeTime;
+  if (select) {
+    if (activeView !== "conversation") showView("conversation");
+    selectedConversationId = record.id;
+    selectedByView.conversation = record.id;
+    restoreDraft();
+  }
+  update();
+  launchFreeTimeRecord(record.id);
+  return record;
+}
+
+async function startFreeTime() {
+  if (navigator.locks?.request) {
+    return navigator.locks.request("kennedy-free-time-start", async () => {
+      await refreshHistory();
+      return startFreeTimeUnlocked();
+    });
+  }
+  await refreshHistory();
+  return startFreeTimeUnlocked();
+}
+
+async function startFreeTimeUnlocked() {
+  if (freeTimeStarting || freeTimeRun || activeFreeTimeRecord()) return;
+  if (!freeTimeRuntimeReady()) throw new Error("Free time cannot start until Kweb, conversation history, intelligence, and the free-time prompts are available.");
+  const durationMinutes = parseFreeTimeMinutes(ui.free_time_minutes.value || DEFAULT_FREE_TIME_MINUTES);
+  const runStartedAt = new Date().toISOString();
+  const runId = crypto.randomUUID();
+  const freeTime = {
+    runId,
+    runStartedAt,
+    deadlineAt: new Date(Date.now() + Math.round(durationMinutes * 60_000)).toISOString(),
+    durationMinutes,
+    sliceIndex: 1,
+  };
+  freeTimeStarting = true;
+  update();
+  try {
+    const provenance = await kweb.createProvenance({
+      data: JSON.stringify({ kind: "free-time", ...freeTime }, null, 2),
+      source: "free-time",
+      source_created_at: runStartedAt,
+      idempotency_key: `free-time:${runId}`,
+    });
+    freeTime.provenanceId = provenance.id;
+    await createFreeTimeSlice(freeTime, { select: true });
+  } finally {
+    freeTimeStarting = false;
+    update();
+  }
+}
+
+function launchFreeTimeRecord(id) {
+  if (!id || freeTimeRunnerIds.has(id)) return;
+  freeTimeRunnerIds.add(id);
+  const run = () => runFreeTimeRecord(id);
+  const work = navigator.locks?.request
+    ? navigator.locks.request("kennedy-free-time", { ifAvailable: true }, lock => {
+      if (lock) return run();
+      setTimeout(() => launchFreeTimeRecord(id), 2_000);
+      return undefined;
+    })
+    : run();
+  Promise.resolve(work).catch(error => {
+    if (!purgedConversationIds.has(id)) {
+      showError(ui.error_banner, `Free time will retry its saved session: ${error.message}`);
+      setTimeout(() => launchFreeTimeRecord(id), 2_000);
+    }
+  }).finally(() => {
+    freeTimeRunnerIds.delete(id);
+    renderFreeTimeControls();
+  });
+}
+
+function scheduleFreeTimeContinuation(freeTime, select) {
+  if (freeTimeContinuationRuns.has(freeTime.runId)) return;
+  freeTimeContinuationRuns.add(freeTime.runId);
+  freeTimeRun = freeTime;
+  const attempt = async () => {
+    if (Date.now() >= Date.parse(freeTime.deadlineAt)) {
+      freeTimeContinuationRuns.delete(freeTime.runId);
+      if (freeTimeRun?.runId === freeTime.runId) freeTimeRun = null;
+      update();
+      return;
+    }
+    try {
+      await createFreeTimeSlice(freeTime, { select });
+      freeTimeContinuationRuns.delete(freeTime.runId);
+    } catch (error) {
+      showError(ui.error_banner, `The next free-time session will retry opening: ${error.message}`);
+      setTimeout(attempt, 2_000);
+    }
+  };
+  Promise.resolve(attempt());
+}
+
+async function runFreeTimeRecord(id) {
+  let record = await conversationHistory.get(id);
+  upsertHistory(record);
+  if (record.phase !== "active" || sessionTypeOf(record) !== "free-time") {
+    await refreshHistory();
+    const current = activeFreeTimeRecord();
+    if (current) {
+      freeTimeRun = freeTimeOf(current);
+      launchFreeTimeRecord(current.id);
+    } else if (freeTimeRun && Date.now() >= Date.parse(freeTimeRun.deadlineAt)) {
+      freeTimeRun = null;
+      update();
+    } else if (freeTimeRun) {
+      // Another tab may be between closing one slice and durably creating the
+      // next. Keep following the run instead of leaving this tab's controls in
+      // a stale active state until reload.
+      setTimeout(() => launchFreeTimeRecord(id), 2_000);
+    }
+    return;
+  }
+  let session = liveSessions.get(id);
+  if (!session) session = await buildConversation(record);
+  const metadata = session.freeTime || freeTimeOf(record);
+  const timing = freeTimeTiming(metadata);
+  freeTimeRun = metadata;
+  const warningTimer = freeTimeTimerAt(timing.deadlineMs - FREE_TIME_WARNING_MS, () => {
+    renderFreeTimeControls();
+    if (!session.busy && session.pendingTurn) {
+      session.prepareFreeTimeRound().catch(error => showError(ui.error_banner, `The free-time warning could not be saved: ${error.message}`));
+    }
+  });
+  const deadlineTimer = freeTimeTimerAt(timing.deadlineMs, renderFreeTimeControls);
+  const hardStopTimer = freeTimeTimerAt(timing.hardStopMs, () => {
+    renderFreeTimeControls();
+    if (session.canStop) Promise.resolve(session.stopPendingTurn()).catch(() => {});
+  });
+  let reason = session.freeTime?.sliceEndedReason || null;
+  let lastRetryError = null;
+  try {
+    while (!reason) {
+      const currentTiming = freeTimeTiming(metadata);
+      if (currentTiming.hardExpired) {
+        if (session.canStop) await session.stopPendingTurn().catch(() => {});
+        reason = "hard-stop";
+        break;
+      }
+      if (!session.pendingTurn && !session.transcript.length) {
+        session.stageFreeTimeOpening();
+        await session.persistSnapshot(session.snapshot(), { userActivity: true });
+        session.pendingCheckpointed = true;
+      }
+      if (!session.pendingTurn) {
+        reason = session.freeTimeEndReason || (currentTiming.expired ? "deadline" : "completed");
+        break;
+      }
+      try {
+        await session.resumePendingTurn();
+        lastRetryError = null;
+      } catch (error) {
+        const stoppedAtHardLimit = error?.code === "turn_stopped" && freeTimeTiming(metadata).hardExpired;
+        if (stoppedAtHardLimit) {
+          reason = "hard-stop";
+          break;
+        }
+        if (lastRetryError !== error.message) {
+          lastRetryError = error.message;
+          showError(ui.error_banner, `Free time is retrying Kennedy's saved round: ${error.message}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 2_000));
+      }
+    }
+    await session.finalizeFreeTime(reason);
+    const selectNext = selectedConversationId === id;
+    await closeFreeTimeSession(id, session);
+    if (Date.now() < timing.deadlineMs && !purgedConversationIds.has(id)) {
+      scheduleFreeTimeContinuation(nextFreeTimeSlice(metadata), selectNext);
+    } else if (freeTimeRun?.runId === metadata.runId) {
+      freeTimeRun = null;
+      update();
+    }
+  } finally {
+    clearTimeout(warningTimer);
+    clearTimeout(deadlineTimer);
+    clearTimeout(hardStopTimer);
   }
 }
 
@@ -1072,6 +1388,25 @@ async function stopConversationTurn() {
   update();
 }
 
+async function closeConversation(id, session, record) {
+  const latest = historyRecords.find(item => item.id === id) || record;
+  const closed = await conversationHistory.requestIngress(id, {
+    expected_version: latest.version,
+    state: session.snapshot(),
+  });
+  upsertHistory(closed);
+  liveSessions.delete(id);
+  drafts.delete(id);
+  voiceDrafts.delete(id);
+  attachmentDrafts.delete(id);
+  selectedConversationId = id;
+  selectedByView.conversation = id;
+  restoreDraft();
+  update();
+  kickHistoryIngress();
+  return closed;
+}
+
 async function endConversation() {
   const id = selectedConversationId;
   const session = selectedSession();
@@ -1080,18 +1415,36 @@ async function endConversation() {
   endingIds.add(id);
   update();
   try {
-    const closed = await conversationHistory.requestIngress(id, { expected_version: record.version, state: session.snapshot() });
-    upsertHistory(closed);
-    liveSessions.delete(id);
-    drafts.delete(id);
-    attachmentDrafts.delete(id);
-    selectedConversationId = id;
-    selectedByView.conversation = id;
-    restoreDraft();
-    update();
-    kickHistoryIngress();
+    await closeConversation(id, session, record);
   } catch (error) {
     showError(ui.error_banner, error.message);
+  } finally {
+    endingIds.delete(id);
+    update();
+  }
+}
+
+async function sendAndEndConversation() {
+  const id = selectedConversationId;
+  const session = selectedSession();
+  const record = selectedRecord();
+  if (!session || !record || session.busy || session.pendingTurn || endingIds.has(id) || extractingAttachments.has(id)) return;
+  const text = ui.message_input.value;
+  const attachments = attachmentDrafts.get(id) || [];
+  if (!text.trim() && !attachments.length) return;
+  const metadata = { ...(voiceDrafts.get(id) || {}), attachments };
+  endingIds.add(id);
+  update();
+  try {
+    const appended = await session.appendFinalUserMessage(text, metadata);
+    if (!appended) return;
+    ui.message_input.value = "";
+    drafts.set(id, "");
+    voiceDrafts.delete(id);
+    attachmentDrafts.delete(id);
+    await closeConversation(id, session, record);
+  } catch (error) {
+    showError(ui.error_banner, `The final message was not fully closed into history ingress: ${error.message}`);
   } finally {
     endingIds.delete(id);
     update();
@@ -1188,6 +1541,10 @@ async function processTelegramReset(event) {
   if (!session) session = await buildConversation(record);
   if (session.busy) throw new Error("The Telegram session is still completing its previous message.");
   if (session.pendingTurn) await session.resumePendingTurn();
+  if (group && event.groupContext) {
+    session.refreshTelegramGroupContext(event.groupContext, event.messageId);
+    await session.persistSnapshot(session.snapshot());
+  }
   const latest = historyRecords.find(item => item.id === record.id) || record;
   const closed = await conversationHistory.requestIngress(record.id, { expected_version: latest.version, state: session.snapshot() });
   upsertHistory(closed);
@@ -1266,9 +1623,148 @@ async function telegramDocumentInput(event) {
   };
 }
 
+function preparedGroupMessageText(message) {
+  const base = typeof message.text === "string" ? message.text.trim() : "";
+  if (message.kind === "voice") {
+    const model = message.preparationModel ? ` · ${message.preparationModel}` : "";
+    return [`[Voice note transcription${model}]`, message.preparedText || "Voice note transcription unavailable."].join("\n");
+  }
+  if (message.kind === "document") {
+    const details = [
+      `[Document: ${message.fileName || "telegram-document"}${message.documentFormat ? ` · ${message.documentFormat}` : ""}${message.preparationTruncated ? " · truncated" : ""}]`,
+      message.preparedText || "Document text extraction unavailable.",
+    ].join("\n");
+    return [base, details].filter(Boolean).join("\n\n");
+  }
+  return base;
+}
+
+async function prepareTelegramGroupMessage(chatId, message) {
+  if (!message || message.sentByKennedy || !["voice", "document"].includes(message.kind)) {
+    return { ...message, text: preparedGroupMessageText(message || {}) };
+  }
+  const preparationKey = `${chatId}:${message.messageId}`;
+  let preparation = telegramGroupPreparations.get(preparationKey);
+  if (!preparation) {
+    preparation = (async () => {
+      const prepared = { ...message };
+      if (!prepared.preparedText && prepared.hasMedia) {
+        try {
+          const blob = await telegramRelay.groupMessageMedia(chatId, prepared.messageId);
+          if (prepared.kind === "voice") {
+            if (inputModalities.includes("audio")) throw new Error("Native Telegram group audio forwarding is not implemented for this model transport.");
+            const mimeType = blob.type || prepared.mimeType || "audio/ogg";
+            const result = await intelligence.transcribe({
+              provider, model, file: blob, fileName: prepared.fileName || `telegram-group-voice.${audioExtension(mimeType)}`,
+            });
+            prepared.preparedText = result.text;
+            prepared.preparationModel = result.transcription_model;
+          } else {
+            const result = await intelligence.extractDocument({ file: blob, fileName: prepared.fileName || "telegram-document" });
+            prepared.preparedText = result.text;
+            prepared.documentFormat = result.format;
+            prepared.preparationTruncated = Boolean(result.truncated);
+          }
+          await telegramRelay.saveGroupMessagePreparation(chatId, prepared.messageId, {
+            text: prepared.preparedText,
+            model: prepared.preparationModel || null,
+            format: prepared.documentFormat || null,
+            truncated: Boolean(prepared.preparationTruncated),
+          });
+        } catch (error) {
+          prepared.preparedText = `${prepared.kind === "voice" ? "Voice transcription" : "Document extraction"} failed: ${error.message}`;
+          prepared.preparationModel = "preparation-error";
+          await telegramRelay.saveGroupMessagePreparation(chatId, prepared.messageId, {
+            text: prepared.preparedText,
+            model: prepared.preparationModel,
+            truncated: false,
+          }).catch(() => {});
+        }
+      }
+      return prepared;
+    })();
+    telegramGroupPreparations.set(preparationKey, preparation);
+    if (telegramGroupPreparations.size > 512) {
+      telegramGroupPreparations.delete(telegramGroupPreparations.keys().next().value);
+    }
+  }
+  const prepared = { ...message, ...await preparation };
+  prepared.mediaRef = {
+    kind: prepared.kind,
+    source: "telegram-group",
+    chatId,
+    messageId: prepared.messageId,
+    fileName: prepared.fileName || null,
+    mimeType: prepared.mimeType || null,
+    durationSeconds: prepared.durationSeconds || null,
+  };
+  prepared.text = preparedGroupMessageText(prepared);
+  return prepared;
+}
+
+async function prepareTelegramGroupContext(groupContext, excludedMessageId = null) {
+  if (!groupContext || !Array.isArray(groupContext.messages)) return groupContext;
+  const messages = [];
+  for (const message of groupContext.messages) {
+    if (String(message.messageId) === String(excludedMessageId)) {
+      messages.push(message);
+    } else {
+      messages.push(await prepareTelegramGroupMessage(groupContext.chatId, message));
+    }
+  }
+  return { ...groupContext, messages };
+}
+
+async function closeTelegramGroupSessionSilently(updateRecord, session) {
+  const latest = historyRecords.find(item => item.id === updateRecord.id) || updateRecord;
+  const closed = await conversationHistory.requestIngress(latest.id, {
+    expected_version: latest.version,
+    state: session.snapshot(),
+  });
+  upsertHistory(closed);
+  liveSessions.delete(latest.id);
+  if (selectedConversationId === latest.id) update();
+  await telegramRelay.completeSilentGroupReset(latest.id);
+  kickHistoryIngress();
+}
+
+async function syncGroupSessionUpdates() {
+  if (!telegramRelayReady || !conversationHistoryReady || !chatRuntimeReady()) return;
+  const updates = (await telegramRelay.groupSessionUpdates()).updates || [];
+  for (const pending of updates) {
+    let record = historyRecords.find(item => item.id === pending.conversationId)
+      || await conversationHistory.get(pending.conversationId).catch(() => null);
+    if (!record || record.phase !== "active") {
+      if (pending.resetRequired) await telegramRelay.completeSilentGroupReset(pending.conversationId);
+      continue;
+    }
+    let session = liveSessions.get(record.id);
+    if (!session) session = await buildConversation(record);
+    if (session.busy || session.pendingTurn) continue;
+    const groupContext = await prepareTelegramGroupContext({
+      ...pending.groupContext,
+      throughMessageId: pending.throughMessageId,
+    });
+    session.refreshTelegramGroupContext(groupContext);
+    await session.persistSnapshot(session.snapshot());
+    record = historyRecords.find(item => item.id === record.id) || record;
+    if (pending.resetRequired) {
+      await closeTelegramGroupSessionSilently(record, session);
+    } else {
+      await telegramRelay.acknowledgeGroupContext(record.id, pending.throughMessageId);
+    }
+  }
+}
+
 async function processTelegramEvent(event) {
   const processingStarted = performance.now();
   await directoryUserForEvent(event);
+  if (event.sessionKind === "group" && event.groupContext) {
+    event = {
+      ...event,
+      groupContext: await prepareTelegramGroupContext(event.groupContext, event.messageId),
+    };
+  }
   if (event.kind === "reset") {
     await processTelegramReset(event);
   } else {
@@ -1412,6 +1908,7 @@ async function syncGroupIngressBatches() {
 
 async function pollTelegramEvents() {
   await provisionDirectoryRoots();
+  await syncGroupSessionUpdates();
   await syncGroupIngressBatches();
   const events = (await telegramRelay.events()).events || [];
   if (ui.service_status.textContent === "Telegram relay unavailable") ui.service_status.textContent = `Ready · ${model}`;
@@ -1456,343 +1953,6 @@ function startTelegramBridge() {
     })
     : run();
   Promise.resolve(work).catch(error => console.error("Telegram bridge stopped", error));
-}
-
-function ingressFailureMetrics(record) {
-  const live = activeIngressRecord?.id === record.id ? ingressDiagnostic : null;
-  const archived = record.state?.historyIngress;
-  const usage = live?.usage?.snapshot?.() || archived?.usage || null;
-  const roundCandidates = [live?.roundsUsed, archived?.roundsUsed].filter(Number.isInteger);
-  return {
-    rounds_used: roundCandidates.length ? Math.max(...roundCandidates) : null,
-    context_tokens: Number.isFinite(usage?.contextTokens) ? usage.contextTokens : null,
-    context_window_tokens: Number.isFinite(usage?.contextWindowTokens) ? usage.contextWindowTokens : null,
-  };
-}
-
-async function recordIngressAttemptFailure(record, error, stage) {
-  let latest;
-  try {
-    latest = await conversationHistory.get(record.id);
-  } catch (fetchError) {
-    if (fetchError.code === "not_found") return null;
-    throw fetchError;
-  }
-  if (!["ingress_pending", "ingress_in_progress"].includes(latest.phase)) return latest;
-  return conversationHistory.ingressFailure(latest.id, {
-    expected_version: latest.version,
-    stage,
-    code: typeof error?.code === "string" ? error.code : "ingress_error",
-    message: typeof error?.message === "string" ? error.message : "History ingress failed without an error message.",
-    ...ingressFailureMetrics(latest),
-  });
-}
-
-function archivedIngressMetrics(state, live = null) {
-  const archived = state?.historyIngress;
-  const usage = live?.usage?.snapshot?.() || archived?.usage || null;
-  const roundCandidates = [live?.roundsUsed, archived?.roundsUsed].filter(Number.isInteger);
-  return {
-    rounds_used: roundCandidates.length ? Math.max(...roundCandidates) : null,
-    context_tokens: Number.isFinite(usage?.contextTokens) ? usage.contextTokens : null,
-    context_window_tokens: Number.isFinite(usage?.contextWindowTokens) ? usage.contextWindowTokens : null,
-  };
-}
-
-async function nextMemoryIngress() {
-  const [conversationResult, audioResult] = await Promise.all([
-    conversationHistoryReady && historyPromptsReady()
-      ? conversationHistory.nextIngress().catch(error => {
-        showError(ui.error_banner, `Conversation memory queue is temporarily unavailable: ${error.message}`);
-        return { conversation: null };
-      })
-      : { conversation: null },
-    audioIngressReady && audioPromptsReady()
-      ? audioIngress.nextIngress().catch(error => {
-        showError(ui.error_banner, `Audio memory queue is temporarily unavailable: ${error.message}`);
-        return { piece: null };
-      })
-      : { piece: null },
-  ]);
-  const conversation = conversationResult.conversation;
-  const audio = audioResult.piece;
-  if (!conversation && !audio) return null;
-  if (conversation?.phase === "ingress_in_progress") return { kind: "conversation", record: conversation };
-  if (audio?.phase === "ingress_in_progress") return { kind: "audio", record: audio };
-  if (!conversation) return { kind: "audio", record: audio };
-  if (!audio) return { kind: "conversation", record: conversation };
-  return String(audio.source_created_at).localeCompare(String(conversation.started_at)) < 0
-    ? { kind: "audio", record: audio }
-    : { kind: "conversation", record: conversation };
-}
-
-async function processAudioIngressPiece(initialPiece) {
-  let piece = initialPiece;
-  let stage = "prepare";
-  let liveDiagnostic = null;
-  activeAudioIngressPiece = piece;
-  ingressDiagnostic = null;
-  try {
-    if (piece.phase === "ingress_pending") {
-      stage = "provenance";
-      const provenance = await kweb.createProvenance({
-        data: [
-          "Vnote final transcript piece",
-          "",
-          `Recording began: ${piece.source_created_at}`,
-          `Recording SHA-256: ${piece.sha256}`,
-          `Original filename: ${piece.original_filename}`,
-          `Transcript piece: ${piece.piece_index + 1} of ${piece.piece_count}`,
-          "",
-          piece.transcript_text,
-        ].join("\n"),
-        source: "audio-vnote",
-        source_created_at: piece.source_created_at,
-        idempotency_key: `audio:${piece.sha256}:piece:${piece.piece_index}`,
-      });
-      stage = "claim";
-      try {
-        piece = await audioIngress.ingressStarted(piece.id, { expected_version: piece.version, provenance_id: provenance.id });
-        activeAudioIngressPiece = piece;
-      } catch (error) {
-        if (error.code === "state_conflict") {
-          activeAudioIngressPiece = null;
-          return;
-        }
-        throw error;
-      }
-    }
-    if (piece.phase !== "ingress_in_progress") {
-      activeAudioIngressPiece = null;
-      return;
-    }
-    stage = "model_loop";
-    if (!piece.provenance_id) throw new Error("The queued audio transcript is missing its provenance.");
-    const persistIngress = async archive => {
-      const state = { ...piece.state, historyIngress: archive };
-      try {
-        piece = await audioIngress.ingressCheckpoint(piece.id, { expected_version: piece.version, state });
-        activeAudioIngressPiece = piece;
-      } catch (error) {
-        if (error.code !== "state_conflict") throw error;
-        const latest = await audioIngress.getPiece(piece.id);
-        if (latest.phase !== "ingress_in_progress" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
-        piece = latest;
-      }
-    };
-    await runHistoryIngress({
-      kweb, intelligence, manuals, rootNodeIds, provenanceId: piece.provenance_id,
-      provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
-      sourceSessionType: "audio",
-      restoredArchive: piece.state?.historyIngress,
-      checkpoint: persistIngress,
-      onUpdate: value => { liveDiagnostic = value; ingressDiagnostic = value; update(); },
-    });
-    ingressDiagnostic = null;
-    stage = "completion";
-    await audioIngress.ingressCompleted(piece.id, { expected_version: piece.version });
-    activeAudioIngressPiece = null;
-    await refreshAudioHistory(activeView === "audio");
-  } catch (error) {
-    const latest = await audioIngress.getPiece(piece.id);
-    if (!["ingress_pending", "ingress_in_progress"].includes(latest.phase)) {
-      activeAudioIngressPiece = null;
-      return;
-    }
-    const failed = await audioIngress.ingressFailure(latest.id, {
-      expected_version: latest.version,
-      stage,
-      code: typeof error?.code === "string" ? error.code : "ingress_error",
-      message: typeof error?.message === "string" ? error.message : "Audio ingress failed without an error message.",
-      ...archivedIngressMetrics(latest.state, liveDiagnostic),
-    });
-    console.error("Audio ingress attempt failed", {
-      recordingId: failed.recording_id, piece: failed.piece_index,
-      stage, attempt: failed.ingress_failure_count, terminal: failed.phase === "ingress_failed", error,
-    });
-    if (failed.phase === "ingress_failed") {
-      ingressDiagnostic = null;
-      activeAudioIngressPiece = null;
-      await refreshAudioHistory(activeView === "audio");
-      ui.service_status.textContent = "Audio memory ingestion failed";
-      showError(ui.error_banner, `Audio transcript ingress stopped after ${failed.ingress_failure_count} failed attempts. Recording ${failed.recording_id} remains preserved for inspection.`);
-      return;
-    }
-    ingressDiagnostic = null;
-    activeAudioIngressPiece = null;
-    await refreshAudioHistory(activeView === "audio");
-    return;
-  }
-}
-
-async function processIngressQueue() {
-  while (true) {
-    const work = await nextMemoryIngress();
-    if (!work) return;
-    if (work.kind === "audio") {
-      activeIngressRecord = null;
-      await processAudioIngressPiece(work.record);
-      continue;
-    }
-    let record = work.record;
-    let stage = "prepare";
-    activeIngressRecord = record;
-    ingressDiagnostic = null;
-    upsertHistory(record);
-    update();
-    try {
-      if (record.phase === "ingress_pending") {
-        const archive = record.state?.archive;
-        if (archive?.format !== "kennedy-chatend") throw new Error("The queued conversation is missing its durable Chatend archive.");
-        const source = archive.sessionType === "telegram-group"
-          ? "telegram-group"
-          : archive.sessionType === "telegram" ? "telegram" : "conversation";
-        stage = "provenance";
-        const provenance = await kweb.createProvenance({
-          data: JSON.stringify(archive, null, 2),
-          source,
-          source_created_at: record.started_at,
-          idempotency_key: `${source}:${record.id}`,
-        });
-        stage = "claim";
-        try {
-          record = await conversationHistory.ingressStarted(record.id, { expected_version: record.version, provenance_id: provenance.id });
-        } catch (error) {
-          if (error.code === "state_conflict") {
-            await refreshHistory();
-            continue;
-          }
-          throw error;
-        }
-        activeIngressRecord = record;
-        upsertHistory(record);
-        update();
-      }
-      if (record.phase === "ingress_in_progress") {
-        stage = "model_loop";
-        if (!record.provenance_id) throw new Error("The queued conversation is missing its history provenance.");
-        const ingressRootNodeIds = rootsForRecord(record);
-        const ingressReferenceRootNodeIds = referencesForRecord(record, ingressRootNodeIds);
-        const ingressGroupContext = groupContextOf(record);
-        const persistIngress = async archive => {
-          const state = { ...record.state, historyIngress: archive };
-          try {
-            record = await conversationHistory.ingressCheckpoint(record.id, { expected_version: record.version, state });
-          } catch (error) {
-            if (error.code !== "state_conflict") throw error;
-            const latest = await conversationHistory.get(record.id);
-            if (latest.phase !== "ingress_in_progress" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
-            record = latest;
-          }
-          activeIngressRecord = record;
-          upsertHistory(record);
-          update();
-        };
-        const ingressTurn = {
-          recordId: record.id,
-          controller: new AbortController(),
-          operationId: crypto.randomUUID(),
-        };
-        activeConversationIngressTurn = ingressTurn;
-        try {
-          await runHistoryIngress({
-            kweb, intelligence, manuals, rootNodeIds: ingressRootNodeIds,
-            referenceRootNodeIds: ingressReferenceRootNodeIds,
-            groupContext: ingressGroupContext,
-            provenanceId: record.provenance_id,
-            provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
-            sourceSessionType: record.state?.archive?.sessionType || "conversation",
-            restoredArchive: record.state?.historyIngress,
-            checkpoint: persistIngress,
-            onUpdate: value => { ingressDiagnostic = value; update(); },
-            signal: ingressTurn.controller.signal,
-            operationId: ingressTurn.operationId,
-            beforeMutation: async () => {
-              let latest;
-              try {
-                latest = await conversationHistory.get(record.id);
-              } catch (error) {
-                if (error.code !== "not_found") throw error;
-                throw Object.assign(new Error("This conversation was purged before the Kmap mutation."), { code: "ingress_cancelled" });
-              }
-              if (latest.phase !== "ingress_in_progress") {
-                throw Object.assign(new Error("This conversation is no longer approved for history ingress."), { code: "ingress_cancelled" });
-              }
-            },
-          });
-        } finally {
-          if (activeConversationIngressTurn === ingressTurn) activeConversationIngressTurn = null;
-        }
-        ingressDiagnostic = null;
-        stage = "completion";
-        record = await conversationHistory.ingressCompleted(record.id, { expected_version: record.version });
-        upsertHistory(record);
-        const groupIngressBatchId = record.state?.channel?.groupIngressBatchId
-          || record.state?.archive?.channel?.groupIngressBatchId;
-        if (groupIngressBatchId) await telegramRelay.completeGroupIngress(groupIngressBatchId);
-        activeIngressRecord = null;
-        await refreshHistory();
-      }
-    } catch (error) {
-      if (purgingConversationIds.has(record.id) || purgedConversationIds.has(record.id)) {
-        ingressDiagnostic = null;
-        activeIngressRecord = null;
-        return;
-      }
-      const failedRecord = await recordIngressAttemptFailure(record, error, stage);
-      if (!failedRecord) {
-        ingressDiagnostic = null;
-        activeIngressRecord = null;
-        await refreshHistory();
-        continue;
-      }
-      upsertHistory(failedRecord);
-      console.error("History ingress attempt failed", {
-        conversationId: record.id,
-        stage,
-        attempt: failedRecord.ingress_failure_count,
-        limit: INGRESS_FAILURE_LIMIT,
-        terminal: failedRecord.phase === "ingress_failed",
-        error,
-      });
-      if (failedRecord.phase === "ingress_failed") {
-        ingressDiagnostic = null;
-        activeIngressRecord = null;
-        ui.service_status.textContent = "Memory ingestion failed";
-        showError(ui.error_banner, `History ingress stopped after ${failedRecord.ingress_failure_count} failed attempts. Select the conversation to inspect its failure log.`);
-        await refreshHistory();
-        continue;
-      }
-      if (!["ingress_pending", "ingress_in_progress"].includes(failedRecord.phase)) {
-        activeIngressRecord = null;
-        await refreshHistory();
-        continue;
-      }
-      ingressDiagnostic = null;
-      activeIngressRecord = null;
-      await refreshHistory();
-      continue;
-    }
-  }
-}
-
-function kickHistoryIngress() {
-  if (ingressWorkerRunning || !memoryIngressRuntimeReady()) return;
-  ingressWorkerRunning = true;
-  const run = () => processIngressQueue();
-  const work = navigator.locks?.request
-    ? navigator.locks.request("kennedy-history-ingress", run)
-    : run();
-  Promise.resolve(work).catch(error => {
-    ui.service_status.textContent = "Memory ingestion needs attention";
-    showError(ui.error_banner, `History ingress will retry: ${error.message}`);
-  }).finally(() => {
-    ingressWorkerRunning = false;
-    activeIngressRecord = null;
-    activeAudioIngressPiece = null;
-    update();
-    setTimeout(kickHistoryIngress, 5000);
-  });
 }
 
 function showView(view) {
@@ -1858,10 +2018,11 @@ async function initialize() {
       kmapBasics: "Conversation and memory-ingress model sessions are unavailable",
       readTools: "Conversation and memory-ingress model sessions are unavailable",
       conversationSession: "New and restored conversations are unavailable",
+      freeTimeSession: "New and restored free-time sessions are unavailable",
       historyIngressSession: "Conversation-history memory ingress is paused",
       audioIngressSession: "Audio preparation and history remain available, but audio memory ingress is paused",
       codexHarness: "Codex-backed conversation and memory-ingress model sessions are unavailable",
-      writeTools: "Conversation-history and audio memory ingress are paused",
+      writeTools: "Conversation-history ingress, audio memory ingress, and free time are paused",
     };
     for (const [key, message] of Object.entries(loaded.errors)) {
       showError(ui.error_banner, `${promptImpact[key] || "A model mode is unavailable"}: ${message}`);
@@ -1907,16 +2068,26 @@ async function initialize() {
     showError(ui.error_banner, `Kennedy's model service is unavailable: ${error.message}`);
   }
 
-  if (chatRuntimeReady()) {
-    const activeRecords = historyRecords.filter(record => record.phase === "active");
+  const activeRecords = historyRecords.filter(record => record.phase === "active");
+  if (chatRuntimeReady() || freeTimeRuntimeReady()) {
     for (const record of activeRecords) {
       if (record.state?.channel?.backgroundIngress || record.state?.archive?.channel?.backgroundIngress) continue;
+      const freeTimeRecord = sessionTypeOf(record) === "free-time";
+      if ((freeTimeRecord && !freeTimeRuntimeReady()) || (!freeTimeRecord && !chatRuntimeReady())) continue;
       try {
         await buildConversation(record);
       } catch (error) {
         showError(ui.error_banner, `Saved ${sessionTypeOf(record)} session ${record.id} could not be restored: ${error.message}`);
       }
     }
+  }
+  if (freeTimeRuntimeReady()) {
+    for (const record of activeRecords.filter(record => sessionTypeOf(record) === "free-time" && liveSessions.has(record.id))) {
+      freeTimeRun = freeTimeOf(record);
+      launchFreeTimeRecord(record.id);
+    }
+  }
+  if (chatRuntimeReady()) {
     const activeConversations = activeRecords.filter(record =>
       sessionTypeOf(record) === "conversation" && liveSessions.has(record.id)
     );
@@ -1957,6 +2128,7 @@ async function initialize() {
 }
 
 ui.message_form.addEventListener("submit", submitMessage);
+ui.start_free_time.addEventListener("click", () => startFreeTime().catch(error => showError(ui.error_banner, error.message)));
 ui.message_input.addEventListener("input", () => {
   if (!selectedSession()) return;
   drafts.set(selectedConversationId, ui.message_input.value);
@@ -2009,7 +2181,9 @@ ui.message_resize_handle.addEventListener("keydown", event => {
 });
 const messageInputResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(syncComposerResizeValue) : null;
 messageInputResizeObserver?.observe(ui.message_input);
+setInterval(renderFreeTimeControls, 1_000);
 ui.end_button.addEventListener("click", () => selectedSession()?.pendingTurn ? resumeSavedQuery() : endConversation());
+ui.send_end_button.addEventListener("click", () => sendAndEndConversation());
 ui.stop_button.addEventListener("click", () => stopConversationTurn());
 ui.new_conversation.addEventListener("click", () => createNewConversation().catch(error => showError(ui.error_banner, error.message)));
 ui.clear_log.addEventListener("click", () => clearError(ui.error_banner));

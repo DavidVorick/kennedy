@@ -135,6 +135,13 @@ export const TelegramRelayAPI = (base) => ({
     if (!response.ok) throw new ApiError(`Telegram media fetch failed (${response.status}).`, response.status, "request_failed");
     return response.blob();
   },
+  groupMessageMedia: async (chatId, messageId) => {
+    let response;
+    try { response = await fetch(`${base}/api/v1/group-messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`, { cache: "no-store" }); }
+    catch { throw new ApiError(`Could not reach ${base}.`, 0, "network_error"); }
+    if (!response.ok) throw new ApiError(`Telegram group media fetch failed (${response.status}).`, response.status, "request_failed");
+    return response.blob();
+  },
   bind: (id, conversationId) => requestJSON(base, `/api/v1/events/${id}/bind`, { method: "POST", body: JSON.stringify({ conversationId }) }),
   saveTranscription: (id, text, transcriptionModel) => requestJSON(base, `/api/v1/events/${id}/transcription`, { method: "POST", body: JSON.stringify({ text, transcriptionModel }) }),
   reply: (id, conversationId, text, contextWarning = null) => requestJSON(base, `/api/v1/events/${id}/reply`, { method: "POST", body: JSON.stringify({ conversationId, text, contextWarning }) }),
@@ -149,4 +156,8 @@ export const TelegramRelayAPI = (base) => ({
   completeGroupRoot: (chatId, rootNodeId) => requestJSON(base, `/api/v1/groups/${encodeURIComponent(chatId)}/root-ready`, { method: "POST", body: JSON.stringify({ rootNodeId }) }),
   groupIngress: () => requestJSON(base, "/api/v1/group-ingress"),
   completeGroupIngress: (id) => requestJSON(base, `/api/v1/group-ingress/${id}/complete`, { method: "POST", body: "{}" }),
+  groupSessionUpdates: () => requestJSON(base, "/api/v1/group-sessions/updates"),
+  acknowledgeGroupContext: (conversationId, throughMessageId) => requestJSON(base, `/api/v1/group-sessions/${encodeURIComponent(conversationId)}/context-ack`, { method: "POST", body: JSON.stringify({ throughMessageId }) }),
+  completeSilentGroupReset: (conversationId) => requestJSON(base, `/api/v1/group-sessions/${encodeURIComponent(conversationId)}/silent-reset-completed`, { method: "POST", body: "{}" }),
+  saveGroupMessagePreparation: (chatId, messageId, body) => requestJSON(base, `/api/v1/group-messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/preparation`, { method: "POST", body: JSON.stringify(body) }),
 });

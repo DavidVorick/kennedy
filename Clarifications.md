@@ -128,8 +128,9 @@ canonical documents; this file is not an append-only log.
 - Run ordinary Kennedy generations through `codex-safe` and non-interactive
   `codex exec` under a bounded deadline, read-only sandbox, no approval prompts,
   and no shell/file tools. Give only the dedicated WebSearch run internet access.
-- Minimize exposed Codex scaffolding on every call: use a terse inline base
-  instruction, disable personality and project instructions, omit skill,
+- Eliminate controllable non-Chatend prompting on every call: leave developer
+  runtime and developer instructions empty, blank provider base instructions and model message
+  templates, disable personality and project instructions, omit skill,
   permission, app, collaboration, and environment instruction blocks, and
   disable optional tools, plugins, goals, browser/computer features, hooks,
   shell snapshots, and elicitation features. Ordinary generation disables web
@@ -137,17 +138,17 @@ canonical documents; this file is not an append-only log.
   capability. Do not disable bundled skills through a setting that mutates
   shared Codex state.
 - Explicitly disable Codex's experimental `request_user_input` registration.
-  After the slim catalog is applied, stock Codex still registers
-  `update_plan` and `view_image` for environment-backed turns; current Codex
-  exposes no supported setting to remove those final core schemas. They remain
-  downstream runtime scaffolding and are forbidden by Kennedy's terse base
-  instruction.
-- Derive a slim model catalog from the live `codex-safe debug models` result by
-  removing only Codex's agent-tool selectors (`tool_mode`,
-  `multi_agent_version`, and `apply_patch_tool_type`). Verify that every
-  model's advertised effective context limit is identical before using it.
-  Probe the filtered catalog through the launcher and fall back to prompt-only
-  reduction with a warning if the sandbox cannot read it.
+  Codex still registers `update_plan` and `view_image` for environment-backed
+  turns despite every exposed switch being false; current Codex exposes no
+  supported setting that removes those final forced schemas. Do not add an
+  invisible instruction to compensate for them.
+- Derive a sanitized model catalog from the live `codex-safe debug models`
+  result by blanking `base_instructions`, removing `model_messages`, disabling
+  model-selected skill instructions, and removing Codex's agent-tool selectors
+  (`tool_mode`, `multi_agent_version`, and `apply_patch_tool_type`). Verify that
+  every model's advertised effective context limit is identical before using
+  it. Probe the sanitized catalog and model-visible prompt through the launcher;
+  abort startup rather than falling back if either boundary cannot be verified.
 - The `codex-safe` container boundary must expose the host temporary directory's
   `kennedy-codex-catalogs` subdirectory at the same absolute path, read-only.
   This lets the backend pass the verified live catalog without copying mutable
@@ -537,3 +538,41 @@ canonical documents; this file is not an append-only log.
   to Kennedy; documents may invoke by bot mention in their caption or by reply.
   Queue heads are isolated per group user so one stuck session does not block
   other participants.
+
+## Passive Group Context, Session Endings, and Ingress Coordination
+
+- Supersede invocation-only group context. Archive every accepted group message
+  and durably append it, without generating a response, to every open Kennedy
+  session in that group. Include other users' voice notes and attachments and
+  Kennedy replies produced for other users; catch up before an invocation so
+  Kennedy sees the intervening discussion.
+- Before a group `/reset` closes the invoking user's session, append all unseen
+  group messages through the reset. If a user goes more than 50 group messages
+  without invoking Kennedy, silently catch up and reset that one session into
+  history ingress without sending anything to Telegram.
+- Add a browser `Send & end` action that checkpoints one final user message
+  without generating a Kennedy response, then immediately queues the complete
+  Chatend for history ingress.
+- Separate memory-ingress lifecycle orchestration from the frontend UI module.
+  A dedicated coordinator owns cross-source queue selection, claims,
+  checkpoints, retries, cancellation, and completion so future changes can be
+  made against one cohesive boundary.
+
+## Autonomous Free Time
+
+- Add a browser-triggered `free-time` session in which Kennedy is broadly told
+  to have fun and may use the complete read, web, and Kmap write tool set.
+- Default a run to 30 minutes while allowing a manually entered duration for
+  short tests and overnight use. All clean-slate sessions in one run share a
+  persisted absolute deadline; opening a new session never resets or reduces
+  the remaining time.
+- Provide `EndFreeTimeSession` only during free time. Kennedy calls it alone to
+  archive the current session and immediately open a new clean Chatend if time
+  remains. A normal final response has the same rollover behavior.
+- Inject a Chatend timer notice once a live session enters its final three
+  minutes. At the deadline block further tools and allow one wrap-up response;
+  abort any remaining intelligence operation two minutes later, with each
+  provider request capped to that same hard-stop window.
+- Persist and restore active free-time work through Conversation History,
+  serialize execution across browser tabs, give each run mutation provenance,
+  and send every completed clean-slate session through normal history ingress.

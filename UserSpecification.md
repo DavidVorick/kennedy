@@ -342,14 +342,14 @@ files in this order:
 
 1. `KennedyIdentity.txt` defines who Kennedy is.
 2. Exactly one session file describes the current work:
-   `ConversationSession.txt`, `HistoryIngressSession.txt`, or
+   `ConversationSession.txt`, `FreeTimeSession.txt`, `HistoryIngressSession.txt`, or
    `AudioIngressSession.txt`.
 3. `KmapBasics.txt` defines temporary node identifiers, always-loaded roots,
    and the exact text protocol for tool calls. It also tells Kennedy that the
    Kmap may contain additional tools and more detailed tool documentation.
 4. `ReadTools.txt` lists all shared read-only tools, including Kmap reads and
    web research.
-5. Writable ingress sessions receive `WriteTools.txt`.
+5. Writable ingress and free-time sessions receive `WriteTools.txt`.
 6. The frontend adds the current model, thinking mode, channel, or source
    details that are known only at runtime.
 
@@ -408,6 +408,7 @@ Kennedy can be called using a few different session types:
 + Conversation
 + Telegram Conversation
 + Telegram Group Invocation
++ Free Time
 + History Ingress
 + Self-Action
 
@@ -548,6 +549,30 @@ clarification notes or concrete follow-up tasks when context is materially
 missing. Preparation is server-side and restartable; Kmap mutation resumes from
 durable checkpoints whenever Kennedy's browser worker is available.
 
+### Free Time
+
+The browser's Free time control starts an autonomous run for 30 minutes by
+default. The duration field accepts fractional minutes for short tests and up
+to seven days for long or overnight runs. The run stores one absolute deadline
+in Conversation History, so reload recovery and every clean-slate rollover use
+the same remaining allowance.
+
+Kennedy is told to have fun, follow her own interests, and not wait for user
+work. Free time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
+Kmap write tools. A run-level provenance record is supplied automatically for
+memory mutations. `EndFreeTimeSession({})` is available only in this mode and
+must be called alone. It closes and archives the current session without
+reducing the shared allowance; if time remains, a fresh free-time Chatend opens
+immediately. Returning ordinary final text also rolls into a fresh session.
+
+When less than three minutes remain, the harness injects one timer notification
+into the current Chatend. At the deadline all tools except the end control are
+blocked and Kennedy receives one final wrap-up round. The active intelligence
+operation is cancelled at a hard stop two minutes later, and generation/search
+requests are server-bounded to the remaining hard-stop interval. A same-origin
+browser lock prevents two tabs from running the autonomous loop concurrently.
+Every completed clean-slate session is queued for ordinary history ingress.
+
 ### History Ingress
 
 In a history ingress session, a history provenance node is created as the first
@@ -591,12 +616,13 @@ LLM turns run through the host's `codex-safe` launcher, which keeps the Codex
 CLI and its persistent ChatGPT login inside a Podman sandbox while using the
 user's subscription limits. The configured model is `gpt-5.6-sol` with
 `xhigh` reasoning. Conversation and tool loops resume their Codex thread;
-ResetContext starts a fresh one. Kennedy supplies terse inline Codex
-instructions, disables exposed optional instruction/tool/plugin scaffolding,
-and uses a verified slim catalog derived from Codex's live model metadata when
-the sandbox can read it. The catalog reduction preserves every advertised
-effective context limit and safely falls back when the launcher boundary does
-not expose the generated file.
+ResetContext starts a fresh one. Kennedy supplies no non-Chatend developer or
+base instructions, explicitly empties runtime and developer instructions, disables exposed optional instruction/tool/plugin
+scaffolding, and requires a sanitized catalog derived from Codex's live model
+metadata. The catalog blanks provider prompt fields while preserving every
+advertised effective context limit. A model-visible prompt probe must show only
+the supplied Chatend item; catalog or prompt-boundary failure aborts startup
+rather than falling back to hidden instructions.
 
 ## UI
 

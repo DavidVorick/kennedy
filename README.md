@@ -52,8 +52,8 @@ container at the same absolute path, read-only. For example, set
 `podman run` or `podman create` arguments. If the launcher uses a persistent
 container, recreate that container with the bind mount. Kennedy creates the
 source directory before its first launcher call, probes the generated catalog
-through `codex-safe` before using it, and warns while falling back to the stock
-catalog when the mount is unavailable.
+through `codex-safe` before using it, and aborts startup rather than falling
+back to the stock instruction-bearing catalog when the mount is unavailable.
 
 The UI's Full Chatend inspector and generation path share one plaintext
 formatter: what the Full inspector shows is every application-controlled byte
@@ -64,16 +64,18 @@ only for recovery and provenance storage. History ingress parses an archive
 and sends its human-readable message text under `Archived Chatend`; it does not
 send the archive envelope, media blobs, counters, or diagnostics.
 
-The launcher must also forward `codex-safe debug models`. Kennedy discovers the
-configured model's advertised effective context window at startup and refuses
-to invent a fallback. It derives a slim catalog from that live result, removes
-only Codex's agent-tool selectors, verifies that all advertised effective
-limits are unchanged, and uses the catalog only when a launcher probe succeeds.
-Every turn also uses minimal inline Codex instructions and suppresses exposed
-optional instruction/tool/plugin scaffolding, including Codex's separately
-configured `request_user_input` tool. Stock Codex still registers its core
-`update_plan` and environment-backed `view_image` schemas; there is no supported
-0.144.1 setting to remove them, so the inline instruction forbids their use.
+The launcher must also forward `codex-safe debug models` and `codex-safe debug
+prompt-input`. Kennedy discovers the configured model's advertised effective
+context window at startup and refuses to invent a fallback. It derives a
+mandatory sanitized catalog from that live result, blanks provider base
+instructions, removes model message templates and agent-tool selectors,
+disables model-selected skill instructions, and verifies that all advertised
+effective limits are unchanged. Codex runtime and developer instructions are
+explicitly empty and all exposed optional instruction/tool/plugin scaffolding is disabled.
+The prompt-input probe requires the Chatend sentinel to be the only
+model-visible message. Codex still registers
+its forced `update_plan` and `view_image` schemas despite every exposed switch
+being false; Kennedy adds no hidden instruction to compensate for them.
 All Codex turns set the auto-compaction threshold beyond any reachable window
 so Kmap context is not silently compacted.
 Each model-facing Chatend ends with the terse line
@@ -307,16 +309,33 @@ browser must be open to run Kennedy, but Telegram messages remain durably
 queued while it is closed. `/reset` closes the current Telegram session and
 queues its full Chatend for the same history-ingress flow as an ended UI
 conversation. In a group, `/reset` closes only the invoking user's session for
-that group. Each allowed group has its own blank
+that group after checkpointing all unseen group messages. Each allowed group has its own blank
 Kmap root. Kennedy loads the invoker's root, the group root, and her own root,
 lists every other participant's root as a loadable reference, and receives the
-latest 50 messages initially and unseen messages on later invocations. Voice
+latest 50 messages initially. Afterward every group message—including other
+users' voice notes and attachments, plus Kennedy replies to other users—is
+durably appended to every open group-user Chatend without triggering a reply.
+The next invocation therefore starts from the full intervening discussion.
+Sessions silently close into history ingress after more than 50 group messages
+without an invocation. Voice
 notes sent as replies and supported documents sent by caption mention or reply
 use the same transcription/extraction paths as DMs. More than 100 uninvoked group messages queues the oldest 80
 for background ingress with the group and Kennedy roots loaded. Groups require Kennedy to be an
 administrator and are permanently blacklisted on an unknown/conflicting member
 or incomplete membership ledger. The browser composer also has a microphone button; both sources
 preserve the original audio with the paid transcription.
+
+The browser conversation composer also offers `Send & end`: it checkpoints one
+final user message without asking Kennedy to answer, then immediately closes
+the conversation into the normal history-ingress queue.
+
+The top bar also provides autonomous **Free time** with a duration in minutes
+(30 by default, fractional values allowed for tests). Kennedy receives the full
+read/web/Kmap-write tool set and can call `EndFreeTimeSession({})` to choose a
+fresh Chatend without giving up any remaining time. Free-time records survive a
+reload and roll through normal history ingress. A notice is injected for the
+last three minutes; the deadline allows one tool-free wrap-up response and a
+hard cancellation follows two minutes later.
 
 The browser composer and Telegram also accept PDF, DOCX, spreadsheet, CSV, and
 text documents up to 20 MiB. Kennedy receives locally extracted, bounded text;

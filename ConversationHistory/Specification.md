@@ -39,7 +39,8 @@ Chatend. It may include the direct root IDs, referenced group-participant root
 IDs, and dynamic channel/group context; these remain opaque to this backend.
 The backend interprets `pendingTurn` and the top-level/archive `sessionType`
 when deciding whether an idle conversation is safe to close automatically.
-All session types beginning with `telegram` are protected from idle closure.
+All session types beginning with `telegram`, plus autonomous `free-time`
+sessions, are protected from idle closure and unstarted-record cleanup.
 Private Telegram sessions and persistent `(group root, Telegram user)` sessions
 close through `/reset`; background group batches are explicitly queued by the
 frontend as soon as their independent archive is ready. For legacy safety during
@@ -62,7 +63,8 @@ active -> ingress_pending -> ingress_in_progress -> complete
   last user-message time. In the same transaction, other active conversations
   idle for more than 24 hours become `ingress_pending`, except records whose
   opaque state says Kennedy still owes a response (`pendingTurn: true`).
-  Records whose state identifies any Telegram session are also exempt.
+  Records whose state identifies any Telegram or free-time session are also
+  exempt.
 - Explicitly ending a conversation checkpoints its final state and changes
   `active` to `ingress_pending` immediately.
 - The oldest eligible queued conversation is selected by last user activity,

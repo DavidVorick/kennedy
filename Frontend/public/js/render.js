@@ -143,6 +143,10 @@ export function renderTranscript(container, transcript, ingressActivity = null, 
 
 export function conversationTitle(record, limit = 54) {
   const sessionType = record?.state?.sessionType || record?.state?.archive?.sessionType;
+  if (sessionType === "free-time") {
+    const freeTime = record?.state?.freeTime || record?.state?.archive?.freeTime || {};
+    return `Free time · session ${freeTime.sliceIndex || 1}`;
+  }
   if (sessionType === "telegram-group") {
     const channel = record?.state?.channel || record?.state?.archive?.channel || {};
     const title = channel.groupContext?.groupTitle || "Telegram group";
@@ -210,7 +214,9 @@ export function renderConversationHistory(container, records, {
       ingress_failed: "Closed · Memory failed",
       complete: "Saved · Read only",
     };
-    const phase = phases[record.phase] || record.phase.replaceAll("_", " ");
+    const basePhase = phases[record.phase] || record.phase.replaceAll("_", " ");
+    const recordSessionType = record?.state?.sessionType || record?.state?.archive?.sessionType;
+    const phase = recordSessionType === "free-time" && record.phase === "active" ? "Live · Free time" : basePhase;
     const status = element("span", `history-phase ${record.phase === "active" ? "live" : "closed"}`, phase);
     status.setAttribute("aria-label", phase);
     meta.append(status, element("time", "", historyDate(record.started_at)));

@@ -19,6 +19,7 @@ Frontend/
   SystemPrompts/
     KennedyIdentity.txt
     ConversationSession.txt
+    FreeTimeSession.txt
     HistoryIngressSession.txt
     AudioIngressSession.txt
     KmapBasics.txt
@@ -33,18 +34,22 @@ Frontend/
       app.js
       chatend.js
       conversation.js
+      free_time.js
       history_ingress.js
       intelligence.js
       kweb_context.js
+      memory_ingress_coordinator.js
       memory_explorer.js
       prompt_composer.js
       render.js
       tools.js
 ```
 
-Files under `public/js` are browser-native ES modules. Module boundaries may
-change during implementation, but UI rendering, API transport, chatend state,
-and tool execution must remain separate concerns.
+Files under `public/js` are browser-native ES modules. `app.js` wires UI and
+transport events, `conversation.js` owns a live session, and
+`memory_ingress_coordinator.js` owns the serialized conversation/audio memory
+workflow. UI rendering, API transport, Chatend state, tool execution, and
+ingress lifecycle must remain separate concerns.
 
 ## 3. Backend Addresses
 
@@ -70,6 +75,7 @@ Live application state is held in JavaScript memory:
   selectedByView: { conversation: null, telegram: null },
   historyRecords: [],
   liveSessions: new Map(), // durable ID -> independent ConversationSession
+  freeTimeRun: null,       // shared run ID, deadline, provenance, and slice
   drafts: new Map(),       // durable ID -> unsent composer text
   voiceDrafts: new Map(),  // durable ID -> original audio + transcription metadata
   telegramBridge: {
@@ -101,6 +107,8 @@ their combined model-attribution value, its own direct root IDs, and any
 unloaded group-participant root references. Root selection is durable session
 state rather than one application-global user root; group-session records
 store user, group, and Kennedy roots in that order.
+Free-time sessions additionally own persisted run/deadline metadata and a
+run-level mutation provenance ID.
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. Instead it checkpoints an opaque recovery snapshot to
@@ -164,6 +172,9 @@ Codex thread ID and submit the canonically formatted newly appended suffix;
 the preceding Chatend is already in that provider thread. System instructions
 are prose sections, Kmap context is YAML-like text, tool requests are ordinary
 assistant text, and local tool results are readable memory updates.
+If the backend rejects a continuation because its thread predates the current
+verified prompt boundary, the frontend clears that continuation and immediately
+replays the complete visible Chatend into a fresh thread.
 
 The clean transcript is maintained separately for the uncluttered conversation
 panel. Conversation provenance stores the complete versioned recovery archive
@@ -311,11 +322,11 @@ The frontend fetches composable prompt assets from
 `/system-prompts/{filename}`. It assembles every session in this order:
 
 1. `KennedyIdentity.txt`,
-2. exactly one of `ConversationSession.txt`, `HistoryIngressSession.txt`, or
-   `AudioIngressSession.txt`,
+2. exactly one of `ConversationSession.txt`, `FreeTimeSession.txt`,
+   `HistoryIngressSession.txt`, or `AudioIngressSession.txt`,
 3. `KmapBasics.txt`,
 4. `ReadTools.txt`, containing the Kmap and web read-only tools,
-5. `WriteTools.txt` only for history and audio ingress,
+5. `WriteTools.txt` only for history ingress, audio ingress, and free time,
 6. `CodexHarness.txt` only when the frontend-selected provider kind is `codex`,
 7. a dynamic runtime section with the configured model and thinking mode.
 
@@ -574,7 +585,15 @@ particular source page-by-page. Fetched content is untrusted evidence, cannot
 override system instructions, and may fail when a page is unsafe, binary,
 blocked, JavaScript-dependent, or otherwise unsupported.
 
-### 8.10 Tool Failures
+### 8.10 `EndFreeTimeSession`
+
+`EndFreeTimeSession` accepts exactly an empty object, is available only when
+the tool executor is in `free-time` mode, and must appear alone in its tool
+envelope. Its readable result confirms that total time is unchanged. The agent
+loop checkpoints that result and returns a control sentinel to the free-time
+controller instead of requesting another response in the same Chatend.
+
+### 8.11 Tool Failures
 
 Unknown tools are never executed. Invalid arguments, exhausted budgets, missing
 short IDs, unsafe URLs, and backend failures are returned to Kennedy as failed
@@ -603,7 +622,8 @@ Startup is feature-isolated rather than one all-or-nothing transaction.
    conversation that actually started.
 6. Restore every `active` record as an independently continuable session. Resume
    each saved pending query from a fresh Codex thread, including in the
-   background when another conversation is selected.
+   background when another conversation is selected. Active free-time records
+   resume autonomously under their saved absolute deadline and browser lock.
 7. Select the most recently updated active record, or create a new durable
    active record if none exists.
 8. Start the sequential history-ingress worker for the queue without blocking
@@ -611,10 +631,11 @@ Startup is feature-isolated rather than one all-or-nothing transaction.
 
 Each feature starts when only its own prompt dependencies are ready. Missing
 identity, Kmap basics, or shared read tools disables every model session. A
-missing conversation session disables live conversation and Telegram only. A
+missing conversation session disables live conversation and Telegram only; a
+missing free-time session disables only free time. A
 missing history-ingress session pauses only conversation
 memory ingress. A missing audio-ingress session pauses only audio-to-Kmap
-mutation. Missing write tools pauses both ingress modes. Read-only history,
+mutation. Missing write tools pauses both ingress modes and free time. Read-only history,
 audio preparation, and the complete audio history remain available, and a
 failure of one ingress queue's poll does not prevent the other from being
 checked.
@@ -673,6 +694,12 @@ user explicitly ends the selected conversation:
 7. only after success transition the history record to `complete`, then claim
    the next queued record.
 
+`Send & end` uses the same close path, but first appends and checkpoints one
+final user message (including prepared attachments) without setting a pending
+turn or contacting the intelligence backend. If the close transition fails,
+the final message remains durable and the live record remains recoverable; on
+success it is visible to history ingress.
+
 An ingress attempt failure is recorded through the conversation-history
 backend with its stage, normalized code/message, round count, and measured
 context occupancy. The outer worker retries the same logical session at most
@@ -680,7 +707,11 @@ four times. The fifth total failure transitions the record to
 `ingress_failed`, excludes it from queue selection, releases the serialized
 worker for the next record, and leaves its complete diagnostic log visible on
 the conversation. These failures do not disable live conversation submission.
-A same-origin browser lock and the backend's unique in-progress invariant
+A `MemoryIngressCoordinator` owns queue selection and the complete provenance,
+claim, checkpoint, failure, cancellation, and completion sagas for both
+conversation and audio sources. It resumes any already-in-progress source
+first, otherwise compares source timestamps, and runs one item at a time. A
+same-origin browser lock and each backend's unique in-progress invariant
 prevent concurrent tabs from running two ingress workers.
 
 An active conversation also moves to `ingress_pending` when it has been idle
@@ -698,6 +729,34 @@ that the record still exists in `ingress_in_progress`, which stops a worker in
 another tab from continuing after deletion. Purging an already running or
 completed ingress cannot roll back Kmap mutations that happened before purge,
 and the confirmation says so.
+
+### 9.4 Autonomous Free Time
+
+The top-bar control accepts 0.1 through 10,080 minutes and defaults to 30. It
+creates a `free-time` Conversation History record with a run UUID, run start,
+duration, absolute deadline, slice index, and an idempotent run-level Kweb
+provenance ID. The initial autonomous instruction is checkpointed as a pending
+turn before generation begins. The composer is hidden for these records, while
+their transcript, Chatend, tool traffic, countdown, and history phases remain
+inspectable.
+
+One same-origin `kennedy-free-time` Web Lock owns execution across tabs. A
+normal final response or successful `EndFreeTimeSession` finalizes the current
+record into `ingress_pending`. If wall-clock time is still before the persisted
+deadline, the controller increments the slice index and creates a new record
+with a fresh Chatend, context, continuation, counters, and the unchanged run
+deadline/provenance. Startup restores an active pending slice and reacquires the
+lock; provider or checkpoint failures retry the same durable turn.
+
+Before every model round and immediately after every model response, the
+session compares wall-clock time with the deadline. At or below three minutes
+it appends and checkpoints one retained `Free time timer` user message. At the
+deadline it appends the expiry message, rejects further ordinary tools and
+Kmap mutations, and marks the next model request as the final wrap-up round.
+Generation and quality-search requests carry a timeout no longer than the
+remaining deadline plus a two-minute grace. A browser timer also aborts and
+cancels the operation at that hard stop. Finalization clears `pendingTurn` and
+queues the complete slice archive for the normal memory-ingress coordinator.
 
 ## 10. History-Ingress Flow
 
@@ -770,7 +829,7 @@ The left panel contains only:
 
 - user and Kennedy messages,
 - multiline input,
-- Send and End Conversation controls,
+- Send, Send & end, and End Conversation controls,
 - a Stop Kennedy control while a response is in flight,
 - a Retry Saved Query state when a durable user turn needs to resume,
 - per-conversation busy status,
@@ -796,11 +855,11 @@ fully completed records last. Within each group, the most recently updated
 record appears first.
 
 The message composer is not rendered while a closed record is selected. Its
-textarea, Send control, and End Conversation control return only after the user
+textarea, Send, Send & end, and End Conversation controls return only after the user
 selects or creates a live conversation.
 
-While Kennedy is working, Stop Kennedy remains available even though Send and
-End Conversation are disabled. It aborts the active generation or web request,
+While Kennedy is working, Stop Kennedy remains available even though Send,
+Send & end, and End Conversation are disabled. It aborts the active generation or web request,
 prevents another tool-loop round from starting, restores the latest durable
 turn checkpoint, and exposes Retry Saved Query. A user-requested stop is normal
 control flow and does not add a red activity-log failure.
@@ -973,7 +1032,8 @@ discovered and provisioned by the same bridge loop before their events run.
 One browser tab holds the `kennedy-telegram-bridge` Web Lock. It polls the
 relay's durable per-private-user/per-group-user head events, binds each event to its Conversation
 History ID, runs the normal read-only conversation session, and returns only
-Kennedy's final conversational output. Event IDs are stored on user and
+Kennedy's final conversational output. It also polls durable passive group
+context ranges and checkpoints them without entering the model loop. Event IDs are stored on user and
 assistant transcript items so reload can resume generation or retry delivery
 without regenerating a completed answer. A `/reset` event closes that user's
 active record, queues its full archive for history ingress, and leaves creation
@@ -984,11 +1044,22 @@ A group event reuses the active Conversation History record keyed by the stable
 group root and invoking Telegram user. Its direct roots are that user's
 directory root, the group's reserved root, and Kennedy's root in that order.
 The frontend assigns short identifiers to every other participant root without
-loading it. The first invocation includes up to 50 recent messages; later
-invocations append only unseen group messages and omit the current invoking
-message from the contextual copy. The record remains active after delivery.
-`/reset` closes and queues only that group-user record, while group binding
-never updates a private-DM or another group-user session pointer.
+loading it. The first invocation includes up to 50 recent messages. Later,
+every accepted group message is appended to every open group-user session's
+Chatend through an independent durable cursor, without triggering Kennedy. The
+passive stream includes other users' text, voice notes, documents, and Kennedy
+replies from other sessions. Voice and document media are prepared once, their
+readable text is reused across sessions, and durable media references remain in
+each archive. A session excludes its own invocation and response from the
+passive copy because those are already in its transcript. An invocation catches
+up before generation. `/reset` catches up through the reset event, then closes
+and queues only that group-user record. Group binding never updates a private-DM
+or another group-user session pointer.
+
+If more than 50 group messages occur after a user's last invocation, the relay
+detaches that session and queues a silent reset. The bridge checkpoints the
+remaining range and transitions the old record to history ingress without any
+Telegram output. The user's next invocation starts a fresh group session.
 
 The bridge also polls durable 80-message group-ingress batches. It creates a
 recoverable `telegram-group` archive with the group root followed by Kennedy's

@@ -1,6 +1,7 @@
 export const PROMPT_FILES = {
   identity: "KennedyIdentity.txt",
   conversationSession: "ConversationSession.txt",
+  freeTimeSession: "FreeTimeSession.txt",
   historyIngressSession: "HistoryIngressSession.txt",
   audioIngressSession: "AudioIngressSession.txt",
   codexHarness: "CodexHarness.txt",
@@ -9,16 +10,16 @@ export const PROMPT_FILES = {
   writeTools: "WriteTools.txt",
 };
 
-export function requiredPromptKeys(mode, { sourceSessionType = "conversation", providerKind = null } = {}) {
+export function requiredPromptKeys(mode, { sourceSessionType = "conversation", sessionType = "conversation", providerKind = null } = {}) {
   const sessionKey = mode === "conversation"
-    ? "conversationSession"
+    ? sessionType === "free-time" ? "freeTimeSession" : "conversationSession"
     : sourceSessionType === "audio" ? "audioIngressSession" : "historyIngressSession";
   const keys = [
     "identity",
     sessionKey,
     "kmapBasics",
     "readTools",
-    ...(mode === "conversation" ? [] : ["writeTools"]),
+    ...(mode === "conversation" && sessionType !== "free-time" ? [] : ["writeTools"]),
   ];
   if (providerKind === "codex") keys.push("codexHarness");
   return keys;
@@ -54,8 +55,11 @@ export function formatModelAttribution(model, reasoningEffort) {
 
 function sessionDetail(mode, sessionType, sourceSessionType) {
   if (mode === "conversation") {
+    if (sessionType === "free-time") {
+      return "Channel: autonomous free time in Kennedy's browser harness. No user response is expected. Read, web, and Kmap write tools are all authorized for this session.";
+    }
     if (sessionType === "telegram-group") {
-      return "Channel: Telegram group. This is a persistent session scoped to one participant and one group. Only that participant's invocations accumulate in this session; other participants have separate sessions. Other participant roots are references that you may load if useful.";
+      return "Channel: Telegram group. This is a persistent session scoped to one participant and one group. Every group message accumulates as passive context, but only this participant's direct invocations trigger your response; other participants have separate sessions. Other participant roots are references that you may load if useful.";
     }
     if (sessionType === "telegram") {
       return "Channel: Telegram private message. The final conversational response is relayed to the user; the visible Chatend and tool loop still run in Kennedy's browser UI.";
@@ -65,6 +69,7 @@ function sessionDetail(mode, sessionType, sourceSessionType) {
   if (sourceSessionType === "audio") return "Source: one chronologically placed piece of a vnote transcript.";
   if (sourceSessionType === "telegram-group") return "Source: an archived Telegram group invocation or background group-chat batch.";
   if (sourceSessionType === "telegram") return "Source: an archived Telegram conversation (private message).";
+  if (sourceSessionType === "free-time") return "Source: one archived clean-slate session from an autonomous free-time run.";
   return "Source: an archived browser conversation.";
 }
 
@@ -118,11 +123,11 @@ function section(title, content) {
 
 export function composePrompt(manuals, mode, { providerKind = null, model, reasoningEffort, sessionType = "conversation", sourceSessionType = "conversation", sessionContext = "" } = {}) {
   const audioIngress = mode !== "conversation" && sourceSessionType === "audio";
-  const required = requiredPromptKeys(mode, { sourceSessionType, providerKind });
+  const required = requiredPromptKeys(mode, { sourceSessionType, sessionType, providerKind });
   const missing = required.filter(key => typeof manuals?.[key] !== "string" || !manuals[key].trim());
   if (missing.length) throw new Error(`Missing system prompt sections: ${missing.join(", ")}.`);
   const session = mode === "conversation"
-    ? manuals.conversationSession
+    ? sessionType === "free-time" ? manuals.freeTimeSession : manuals.conversationSession
     : audioIngress ? manuals.audioIngressSession : manuals.historyIngressSession;
   const currentModel = runtimeValue(model, "unknown-model");
   const currentThinkingMode = runtimeValue(reasoningEffort, "unknown-thinking");
@@ -132,9 +137,11 @@ export function composePrompt(manuals, mode, { providerKind = null, model, reaso
     section("Kmap basics", manuals.kmapBasics),
     section("Read-only tools", manuals.readTools),
   ];
-  if (mode !== "conversation") sections.push(section("Write tools", manuals.writeTools));
+  if (mode !== "conversation" || sessionType === "free-time") sections.push(section("Write tools", manuals.writeTools));
   if (providerKind === "codex") sections.push(section("Codex harness", manuals.codexHarness));
-  if (typeof sessionContext === "string" && sessionContext.trim()) sections.push(section("Telegram group context", sessionContext.trim()));
+  if (typeof sessionContext === "string" && sessionContext.trim()) {
+    sections.push(section(sessionType === "free-time" ? "Free-time schedule" : "Telegram group context", sessionContext.trim()));
+  }
   sections.push(section("Current runtime", `You are currently running on ${currentModel} with ${currentThinkingMode} thinking mode.`));
   return sections.join("\n\n");
 }

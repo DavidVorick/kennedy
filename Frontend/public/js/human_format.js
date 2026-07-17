@@ -204,6 +204,12 @@ export function formatToolResult(toolName, content) {
       return ["Memory node created.", "", formatNodes("Created node", result.node ? [result.node] : [])].join("\n");
     case "UpdateNode":
       return ["Memory node updated.", "", formatNodes("Updated node", result.node ? [result.node] : [])].join("\n");
+    case "EndFreeTimeSession":
+      return [
+        "The current free-time session is ending with the total time unchanged.",
+        `Remaining free time: ${text(result.remaining)}`,
+        text(result.next),
+      ].filter(Boolean).join("\n");
     case "WebSearch":
       return [
         "Web research completed.",

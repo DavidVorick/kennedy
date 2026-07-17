@@ -1,9 +1,10 @@
 import { Chatend } from "./chatend.js?v=20260717.5";
 import { KwebContext } from "./kweb_context.js?v=20260717.7";
-import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.6";
-import { ToolExecutor } from "./tools.js?v=20260717.6";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.5";
+import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.8";
+import { ToolExecutor } from "./tools.js?v=20260717.7";
+import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260717.7";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
+import { freeTimeExpiredMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeWarningMessage, formatFreeTimeRemaining } from "./free_time.js?v=20260717.1";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -21,18 +22,22 @@ function turnStoppedError() {
 }
 
 export class ConversationSession {
-  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, persist = async () => {}, onUpdate = () => {} }) {
+  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, freeTime = null, provenanceId = null, persist = async () => {}, onUpdate = () => {}, now = () => Date.now() }) {
     this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals;
     this.rootNodeIds = rootNodeIds || [rootNodeId]; this.rootNodeId = this.rootNodeIds[0];
     this.referenceRootNodeIds = [...new Set(referenceRootNodeIds.filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
     this.provider = provider; this.providerKind = providerKind; this.model = model; this.reasoningEffort = reasoningEffort;
     this.modelAttribution = formatModelAttribution(model, reasoningEffort);
-    if (!["conversation", "telegram", "telegram-group"].includes(sessionType)) throw new Error("Unsupported Kennedy session type.");
+    if (!["conversation", "telegram", "telegram-group", "free-time"].includes(sessionType)) throw new Error("Unsupported Kennedy session type.");
     this.sessionType = sessionType;
     this.channel = channel ? jsonCopy(channel) : null;
+    this.freeTime = freeTime ? jsonCopy(freeTime) : null;
+    this.provenanceId = provenanceId;
+    this.now = now;
+    this.freeTimeEndReason = null;
     this.persist = persist; this.onUpdate = onUpdate;
     this.transcript = []; this.media = []; this.startedAt = new Date().toISOString(); this.pendingTurn = false; this.pendingCheckpointed = false; this.pendingExternalEventId = null; this.lastContextWarningBand = 0; this.busy = false; this.stopping = false; this.activeTurn = null;
-    this.continuation = new ContinuationState(createCacheKey("conversation"));
+    this.continuation = new ContinuationState(createCacheKey(sessionType === "free-time" ? "free-time" : "conversation"));
     this.usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
   }
 
@@ -48,8 +53,10 @@ export class ConversationSession {
       this.startedAt = restored.startedAt || archive?.startedAt || this.startedAt;
       this.sessionType = restored.sessionType || archive?.sessionType || this.sessionType;
       this.channel = jsonCopy(restored.channel || archive?.channel || this.channel);
+      this.freeTime = jsonCopy(restored.freeTime || archive?.freeTime || this.freeTime);
+      this.provenanceId = restored.provenanceId || archive?.provenanceId || this.provenanceId;
       this.media = jsonCopy(restored.media || archive?.media || []);
-      this.pendingTurn = Boolean(restored.pendingTurn) || transcriptEndsWithUnansweredUser(this.transcript);
+      this.pendingTurn = Boolean(restored.pendingTurn) || (!this.freeTime?.sliceEndedAt && transcriptEndsWithUnansweredUser(this.transcript));
       this.pendingExternalEventId = restored.pendingExternalEventId || archive?.pendingExternalEventId || null;
       this.lastContextWarningBand = Number(restored.lastContextWarningBand ?? archive?.lastContextWarningBand) || 0;
       this.pendingCheckpointed = this.pendingTurn;
@@ -68,7 +75,7 @@ export class ConversationSession {
     for (const durableId of this.referenceRootNodeIds) this.context.registerReference(durableId);
     const sessionContext = this.sessionType === "telegram-group"
       ? formatTelegramGroupContext(this.channel?.groupContext, this.context)
-      : "";
+      : this.sessionType === "free-time" ? freeTimeScheduleText(this.freeTime, this.now()) : "";
     this.chatend = new Chatend(composePrompt(this.manuals, "conversation", { providerKind: this.providerKind, model: this.model, reasoningEffort: this.reasoningEffort, sessionType: this.sessionType, sessionContext }), this.context, this.retainedTranscript());
     if (Array.isArray(archive?.messages)) {
       this.chatend.restoreMessages(
@@ -77,7 +84,23 @@ export class ConversationSession {
       );
     }
     this.chatend.restoreFullHistory(archive?.fullHistory?.segments);
-    this.executor = new ToolExecutor({ mode: "conversation", context: this.context, api: this.kweb, intelligence: this.intelligence, provider: this.provider, model: this.model, modelAttribution: this.modelAttribution, loadLimit: 20, sessionType: this.sessionType, onUpdate: this.onUpdate });
+    this.executor = new ToolExecutor({
+      mode: this.sessionType === "free-time" ? "free-time" : "conversation",
+      context: this.context,
+      api: this.kweb,
+      intelligence: this.intelligence,
+      provider: this.provider,
+      model: this.model,
+      modelAttribution: this.modelAttribution,
+      provenanceId: this.provenanceId,
+      loadLimit: this.sessionType === "free-time" ? 50 : 20,
+      sessionType: this.sessionType,
+      onUpdate: this.onUpdate,
+      beforeMutation: () => this.assertFreeTimeToolAllowed("Kmap write"),
+      toolGate: name => this.assertFreeTimeToolAllowed(name),
+      endSession: () => this.requestFreeTimeSessionEnd(),
+      requestTimeoutSeconds: () => this.freeTimeRequestTimeoutSeconds(),
+    });
     if (archive?.tools) {
       this.executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
       this.executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
@@ -95,6 +118,8 @@ export class ConversationSession {
       stateVersion: 2,
       sessionType: this.sessionType,
       channel: jsonCopy(this.channel),
+      freeTime: jsonCopy(this.freeTime),
+      provenanceId: this.provenanceId,
       rootNodeIds: [...this.rootNodeIds],
       referenceRootNodeIds: [...this.referenceRootNodeIds],
       startedAt: this.startedAt,
@@ -114,6 +139,8 @@ export class ConversationSession {
       version: 2,
       sessionType: this.sessionType,
       channel: jsonCopy(this.channel),
+      freeTime: jsonCopy(this.freeTime),
+      provenanceId: this.provenanceId,
       rootNodeIds: [...this.rootNodeIds],
       referenceRootNodeIds: [...this.referenceRootNodeIds],
       startedAt: this.startedAt,
@@ -131,7 +158,7 @@ export class ConversationSession {
       },
       tools: {
         loadCalls: this.executor?.loadCalls || 0,
-        loadLimit: this.executor?.loadLimit || 20,
+        loadLimit: this.executor?.loadLimit || (this.sessionType === "free-time" ? 50 : 20),
         log: jsonCopy(this.executor?.toolLog || []),
       },
       usage: jsonCopy(this.usage?.snapshot() || null),
@@ -151,11 +178,13 @@ export class ConversationSession {
     const archive = state?.archive;
     if (!archive || !Array.isArray(archive.messages) || !archive.context?.state) return;
     this.transcript = jsonCopy(state.transcript || archive.transcript || []);
-    this.pendingTurn = Boolean(state.pendingTurn) || transcriptEndsWithUnansweredUser(this.transcript);
+    this.freeTime = jsonCopy(state.freeTime || archive.freeTime || this.freeTime);
+    this.pendingTurn = Boolean(state.pendingTurn) || (!this.freeTime?.sliceEndedAt && transcriptEndsWithUnansweredUser(this.transcript));
     this.pendingExternalEventId = state.pendingExternalEventId || archive.pendingExternalEventId || null;
     this.lastContextWarningBand = Number(state.lastContextWarningBand ?? archive.lastContextWarningBand) || 0;
     this.media = jsonCopy(state.media || archive.media || []);
     this.channel = jsonCopy(state.channel || archive.channel || this.channel);
+    this.provenanceId = state.provenanceId || archive.provenanceId || this.provenanceId;
     this.referenceRootNodeIds = [...new Set((state.referenceRootNodeIds || archive.referenceRootNodeIds || this.referenceRootNodeIds)
       .filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
     this.pendingCheckpointed = this.pendingTurn;
@@ -164,6 +193,7 @@ export class ConversationSession {
     this.context.restore(archive.context.state);
     this.executor.loadCalls = Number.isInteger(archive.tools?.loadCalls) ? archive.tools.loadCalls : 0;
     this.executor.toolLog = jsonCopy(archive.tools?.log || []);
+    this.executor.provenanceId = this.provenanceId;
     this.usage.restore(archive.usage);
   }
 
@@ -171,7 +201,10 @@ export class ConversationSession {
     if (this.sessionType !== "telegram-group" || !groupContext) return;
     const previousMessageId = Number(this.channel?.lastGroupContextMessageId) || 0;
     const messages = Array.isArray(groupContext.messages) ? groupContext.messages : [];
-    const newestMessageId = messages.reduce((latest, message) => Math.max(latest, Number(message.messageId) || 0), previousMessageId);
+    const newestMessageId = messages.reduce(
+      (latest, message) => Math.max(latest, Number(message.messageId) || 0),
+      Math.max(previousMessageId, Number(groupContext.throughMessageId) || 0),
+    );
     const unseenMessages = messages.filter(message => {
       const messageId = Number(message.messageId) || 0;
       return messageId > previousMessageId && String(message.messageId) !== String(currentMessageId);
@@ -190,6 +223,12 @@ export class ConversationSession {
       if (typeof rootNodeId !== "string" || !rootNodeId || this.rootNodeIds.includes(rootNodeId)) continue;
       if (!this.referenceRootNodeIds.includes(rootNodeId)) this.referenceRootNodeIds.push(rootNodeId);
       this.context.registerReference(rootNodeId);
+    }
+    for (const message of unseenMessages) {
+      if (!message?.mediaRef) continue;
+      const mediaId = `telegram-group:${groupContext.chatId}:${message.messageId}`;
+      if (this.media.some(item => item.id === mediaId)) continue;
+      this.media.push({ id: mediaId, ...jsonCopy(message.mediaRef) });
     }
     if (!unseenMessages.length) return;
     const update = formatTelegramGroupContext({ ...groupContext, messages: unseenMessages }, this.context);
@@ -258,10 +297,30 @@ export class ConversationSession {
         checkpoint: () => this.persistSnapshot(),
         signal: turn?.controller.signal,
         operationId: turn?.operationId,
+        onRoundStart: () => this.prepareFreeTimeRound(),
+        onResponse: () => this.prepareFreeTimeRound(),
+        requestTimeoutSeconds: () => this.freeTimeRequestTimeoutSeconds(),
       });
       if (turn?.controller.signal.aborted) throw turnStoppedError();
       turn.cancellable = false;
       this.onUpdate();
+      if (answer === AGENT_LOOP_SESSION_ENDED) {
+        if (typeof this.executor.sessionEndContent === "string" && this.executor.sessionEndContent.trim()) {
+          this.transcript.push({ role: "kennedy", content: this.executor.sessionEndContent });
+          this.chatend.retained.push({ role: "assistant", content: this.executor.sessionEndContent });
+          this.executor.sessionEndContent = null;
+        }
+        this.pendingTurn = false;
+        this.pendingExternalEventId = null;
+        this.pendingCheckpointed = false;
+        const finalSaveStarted = performance.now();
+        await this.persistSnapshot(this.snapshot());
+        addTimingStep(timing, "checkpoint", "Free-time session save", elapsedMs(finalSaveStarted));
+        updateTimingSummary(timing);
+        this.reportTurnTiming(timing, "ok");
+        this.onUpdate();
+        return answer;
+      }
       const response = { role: "kennedy", content: answer };
       if (this.pendingExternalEventId) response.externalEventId = this.pendingExternalEventId;
       const usage = this.usage.snapshot();
@@ -304,17 +363,13 @@ export class ConversationSession {
     }
   }
 
-  async send(text, metadata = {}) {
-    if (this.pendingTurn) throw new Error("Kennedy must finish the saved pending query before accepting another message.");
+  stageUserInput(text, metadata = {}) {
     const content = text.trim();
     const attachments = Array.isArray(metadata.attachments)
       ? metadata.attachments.filter(item => item?.kind === "document" && typeof item.text === "string" && item.text.trim())
       : [];
-    if (!content && !attachments.length) return;
+    if (!content && !attachments.length) return false;
     const externalEventId = typeof metadata.externalEventId === "string" ? metadata.externalEventId : null;
-    if (externalEventId && this.transcript.some(item => item.externalEventId === externalEventId)) {
-      return this.answerForExternalEvent(externalEventId)?.content || null;
-    }
     const inputKind = metadata.inputKind === "voice" ? "voice" : attachments.length ? "document" : "text";
     let chatendContent = content;
     const visibleContent = content || `Attached ${attachments.map(item => item.fileName || "document").join(", ")}.`;
@@ -359,14 +414,115 @@ export class ConversationSession {
         ...documentBlocks.flatMap((block, index) => index ? ["", block] : [block]),
       ].join("\n");
     }
-    const timing = createTurnTiming(this.sessionType);
-    const turn = this.beginTurn();
     this.transcript.push(transcriptItem);
-    this.pendingTurn = true; this.pendingCheckpointed = false;
-    this.pendingExternalEventId = externalEventId;
     this.chatend.retained.push({ role: "user", content: chatendContent });
     this.chatend.append({ role: "user", content: chatendContent });
-    this.executor.resetLoadCalls(); this.onUpdate();
+    this.executor.resetLoadCalls();
+    return true;
+  }
+
+  async appendFinalUserMessage(text, metadata = {}) {
+    if (this.busy || this.pendingTurn) throw new Error("Kennedy must finish the current turn before this conversation can end.");
+    if (!this.stageUserInput(text, metadata)) return false;
+    this.onUpdate();
+    try {
+      await this.persistSnapshot(this.snapshot(), { userActivity: true });
+      return true;
+    } catch (error) {
+      this.restoreDurableState();
+      this.onUpdate();
+      throw error;
+    }
+  }
+
+  stageFreeTimeOpening() {
+    if (this.sessionType !== "free-time" || !this.freeTime) throw new Error("This is not a free-time session.");
+    if (this.transcript.length || this.pendingTurn) return false;
+    if (!this.stageUserInput(freeTimeOpeningMessage(this.freeTime, this.now()))) return false;
+    this.pendingTurn = true;
+    this.pendingCheckpointed = false;
+    this.onUpdate();
+    return true;
+  }
+
+  freeTimeRequestTimeoutSeconds() {
+    if (this.sessionType !== "free-time") return null;
+    return freeTimeRequestTimeoutSeconds(this.freeTime, this.now());
+  }
+
+  assertFreeTimeToolAllowed(name) {
+    if (this.sessionType !== "free-time" || name === "EndFreeTimeSession") return;
+    if (freeTimeTiming(this.freeTime, this.now()).expired) {
+      throw Object.assign(new Error("The free-time deadline has passed; tools are no longer available during wrap-up."), { code: "free_time_expired" });
+    }
+  }
+
+  requestFreeTimeSessionEnd() {
+    if (this.sessionType !== "free-time") throw Object.assign(new Error("This is not a free-time session."), { code: "tool_unavailable" });
+    this.freeTimeEndReason = "tool";
+    const remaining = freeTimeTiming(this.freeTime, this.now()).remainingMs;
+    return {
+      sessionEnding: true,
+      totalTimeReduced: false,
+      remaining: formatFreeTimeRemaining(remaining),
+      next: remaining > 0 ? "A new clean-slate free-time session will open with the same deadline." : "The shared free-time deadline has arrived, so the run will end.",
+    };
+  }
+
+  appendFreeTimeTimerMessage(content) {
+    const message = { role: "user", display_role: "Free time timer", context_kind: "free-time-timer", content };
+    this.chatend.retained.push(jsonCopy(message));
+    this.chatend.append(message);
+  }
+
+  async prepareFreeTimeRound() {
+    if (this.sessionType !== "free-time") return null;
+    const timing = freeTimeTiming(this.freeTime, this.now());
+    if (timing.expired) {
+      if (!this.freeTime.expiredNoticeAt) {
+        this.freeTime.expiredNoticeAt = new Date(this.now()).toISOString();
+        this.appendFreeTimeTimerMessage(freeTimeExpiredMessage());
+        await this.persistSnapshot(this.snapshot());
+      }
+      this.freeTimeEndReason = "deadline";
+      return { endAfterResponse: true };
+    }
+    if (timing.warningDue && !this.freeTime.warningNoticeAt) {
+      this.freeTime.warningNoticeAt = new Date(this.now()).toISOString();
+      this.appendFreeTimeTimerMessage(freeTimeWarningMessage(this.freeTime, this.now()));
+      await this.persistSnapshot(this.snapshot());
+    }
+    return null;
+  }
+
+  async finalizeFreeTime(reason = this.freeTimeEndReason || "completed") {
+    if (this.sessionType !== "free-time") return;
+    if (freeTimeTiming(this.freeTime, this.now()).expired && !this.freeTime.expiredNoticeAt) {
+      this.freeTime.expiredNoticeAt = new Date(this.now()).toISOString();
+      this.appendFreeTimeTimerMessage(freeTimeExpiredMessage());
+    }
+    this.freeTimeEndReason = reason;
+    this.freeTime.sliceEndedReason = reason;
+    this.freeTime.sliceEndedAt = new Date(this.now()).toISOString();
+    this.pendingTurn = false;
+    this.pendingCheckpointed = false;
+    this.pendingExternalEventId = null;
+    await this.persistSnapshot(this.snapshot());
+    this.onUpdate();
+  }
+
+  async send(text, metadata = {}) {
+    if (this.pendingTurn) throw new Error("Kennedy must finish the saved pending query before accepting another message.");
+    const externalEventId = typeof metadata.externalEventId === "string" ? metadata.externalEventId : null;
+    if (externalEventId && this.transcript.some(item => item.externalEventId === externalEventId)) {
+      return this.answerForExternalEvent(externalEventId)?.content || null;
+    }
+    if (!this.stageUserInput(text, metadata)) return null;
+    const timing = createTurnTiming(this.sessionType);
+    const turn = this.beginTurn();
+    this.pendingTurn = true; this.pendingCheckpointed = false;
+    this.pendingExternalEventId = externalEventId;
+    this.onUpdate();
     try {
       const pendingSaveStarted = performance.now();
       await this.persistSnapshot(this.snapshot(), { userActivity: true });
