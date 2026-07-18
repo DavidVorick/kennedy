@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260717.8";
+import { formatToolResult } from "./human_format.js?v=20260718.1";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";

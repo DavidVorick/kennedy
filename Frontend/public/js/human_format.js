@@ -188,7 +188,7 @@ export function formatToolResult(toolName, content) {
         }),
       ].filter(Boolean).join("\n\n");
     case "ResetContext":
-      return ["Memory context reset completed.", "", formatKmapContext(result.context || {})].join("\n");
+      return "Memory context reset completed. The rebuilt Kmap context above contains the newly loaded nodes.";
     case "ConnectNodes":
       return ["Memory connections updated.", "", formatNodes("Affected nodes", result.nodes)].join("\n");
     case "ConsolidateFanout":

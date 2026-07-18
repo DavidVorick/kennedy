@@ -1,4 +1,4 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260717.9";
+import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260718.1";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260715.9";
 
@@ -64,7 +64,14 @@ export class UsageTracker {
     this.totalCachedTokens += normalized.cachedTokens;
     this.totalCacheWriteTokens += normalized.cacheWriteTokens;
     this.totalReasoningTokens += normalized.reasoningTokens;
-    this.last = normalized;
+    const reportedContextTokens = normalized.inputTokens + normalized.outputTokens;
+    // Codex reports cumulative usage for every internal model pass in a turn.
+    // A turn that invokes a native tool can therefore exceed the model's context
+    // window even though no individual request did. Do not present that aggregate
+    // as the size of the current context.
+    this.last = this.contextWindowTokens > 0 && reportedContextTokens > this.contextWindowTokens
+      ? null
+      : normalized;
   }
 
   resetThread() {
@@ -80,7 +87,13 @@ export class UsageTracker {
     this.totalCachedTokens = Number(snapshot.totalCachedTokens) || 0;
     this.totalCacheWriteTokens = Number(snapshot.totalCacheWriteTokens) || 0;
     this.totalReasoningTokens = Number(snapshot.totalReasoningTokens) || 0;
-    this.last = snapshot.last && typeof snapshot.last === "object" ? { ...snapshot.last } : null;
+    const restoredLast = snapshot.last && typeof snapshot.last === "object" ? { ...snapshot.last } : null;
+    const restoredContextTokens = restoredLast
+      ? (Number(restoredLast.inputTokens) || 0) + (Number(restoredLast.outputTokens) || 0)
+      : 0;
+    this.last = this.contextWindowTokens > 0 && restoredContextTokens > this.contextWindowTokens
+      ? null
+      : restoredLast;
     this.providerThreadTotals = snapshot.providerThreadTotals && typeof snapshot.providerThreadTotals === "object" ? { ...snapshot.providerThreadTotals } : null;
   }
 

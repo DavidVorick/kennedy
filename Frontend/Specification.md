@@ -208,11 +208,13 @@ by every reset; repeated node sets are collapsed into counted lines. Previous
 Kweb context and other tool activity are omitted. The clean transcript or
 provenance input and notes from prior resets remain.
 During an active tool loop, the rebuilt chatend ends with the assistant's
-visible ResetContext request and a readable result containing the newly loaded
-context. Reset abandons the old `previous_response_id` thread and submits the
-rebuilt chatend as a fresh request. Because the Full inspector is formatted
-from that same rebuilt message list, removed nodes and tool results disappear
-from both the inspector and Kennedy's next fresh-thread prompt.
+visible ResetContext request and a compact success result. The result does not
+repeat the newly loaded nodes: they already appear once in the rebuilt Kmap
+context, immediately after the optional note to self. Reset abandons the old
+`previous_response_id` thread and submits the rebuilt chatend as a fresh
+request. Because the Full inspector is formatted from that same rebuilt message
+list, removed nodes and tool results disappear from both the inspector and
+Kennedy's next fresh-thread prompt.
 
 ### 5.2 Continuation, caching, and context growth
 
@@ -230,6 +232,10 @@ capacity uses the effective context window that Codex advertises for the
 selected model. These figures are informative and never trigger compaction,
 truncation, or an automatic reset. Every Codex invocation suppresses automatic
 compaction; only an explicit ResetContext tool request rebuilds context.
+When Codex reports an aggregate covering multiple internal model passes and
+that aggregate exceeds the advertised window, the frontend retains it in the
+cumulative totals but treats current occupancy as unknown rather than showing
+an impossible context size.
 
 Every generation request ends with exactly one terse context clue:
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
@@ -441,7 +447,8 @@ Reset consumes one call from and preserves the current shared context-loading
 counter. A successful reset records the supplied nodes' names, the counter
 position, and limit. The Chatend keeps every successful entry and groups
 identical name sets irrespective of argument order. Its tool
-result contains the complete newly loaded Kweb context.
+result is only a compact acknowledgment because the rebuilt Chatend already
+contains the complete newly loaded Kweb context.
 
 ### 8.3 `ConnectNodes`
 

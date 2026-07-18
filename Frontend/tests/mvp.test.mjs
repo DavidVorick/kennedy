@@ -348,6 +348,8 @@ test("ResetContext and LoadNode share one context-loading budget", async () => {
   const reset = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [] } });
   assert.equal(reset.reset, true);
   assert.deepEqual(reset.resetHistoryEntry, { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 2 });
+  assert.match(reset.message.content, /rebuilt Kmap context above contains the newly loaded nodes/);
+  assert.doesNotMatch(reset.message.content, /Details 1/);
   const failedLoad = await executor.execute({ id: "load", name: "LoadNode", arguments: { identifier: 999 } });
   assert.match(failedLoad.message.content, /Unknown memory identifier 999/);
   const exhausted = await executor.execute({ id: "reset", name: "ResetContext", arguments: { identifiers: [] } });
@@ -897,6 +899,25 @@ test("concise context usage is model-visible and stale thread usage is cleared o
   assert.equal(usage.snapshot().totalInputTokens, 200000);
 });
 
+test("cumulative multi-pass usage is not presented as an impossible current context size", () => {
+  const usage = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
+  usage.record({
+    input_tokens: 281555, output_tokens: 238, cached_tokens: 140032,
+    cache_write_tokens: 0, reasoning_tokens: 0, cumulative: true,
+  });
+  assert.equal(usage.snapshot().contextKnown, false);
+  assert.equal(usage.snapshot().contextTokens, 0);
+  assert.equal(usage.snapshot().totalInputTokens, 281555);
+  assert.equal(formatContextWindowProgress(usage.snapshot()), "context window usage: unknown / 258,400");
+
+  const restored = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
+  restored.restore({
+    totalInputTokens: 281555,
+    last: { inputTokens: 281555, outputTokens: 238 },
+  });
+  assert.equal(restored.snapshot().contextKnown, false);
+});
+
 test("ResetContext abandons continuation and resends the rebuilt full chatend", async () => {
   const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
   const chatend = new Chatend("instructions", context, [{ role: "user", content: "reset it" }]);
@@ -924,6 +945,7 @@ test("ResetContext abandons continuation and resends the rebuilt full chatend", 
   assert.match(requests[1].chatend, /1× roots only/);
   assert.match(requests[1].chatend, /Kennedy note to self\n\ncarry this forward/);
   assert.match(requests[1].chatend, /Memory tool result\n\nMemory context reset completed\./);
+  assert.equal((requests[1].chatend.match(/Current Kmap context/g) || []).length, 1);
   assert.match(requests[1].chatend, /context window usage: unknown$/);
   assert.ok(requests[1].chatend.indexOf("1× roots only") < requests[1].chatend.indexOf("carry this forward"));
   assert.ok(requests[1].chatend.indexOf("carry this forward") < requests[1].chatend.indexOf("Kmap context"));
