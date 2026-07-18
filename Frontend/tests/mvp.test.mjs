@@ -733,7 +733,7 @@ test("history and audio ingress can invoke Rust library tools", async () => {
       generation += 1;
       return generation === 1
         ? { status: "complete", response_id: "tool", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"OpenRustLib","arguments":{"name":"example-lib"}}]}' }, usage: null }
-        : { status: "complete", response_id: "done", message: { role: "assistant", content: "Ingress complete." }, usage: null };
+        : { status: "complete", response_id: "done", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndHistoryIngress","arguments":{}}]}' }, usage: null };
     } };
     const calls = [];
     const rustLibs = { execute: async (sessionId, name, args) => {
@@ -806,6 +806,16 @@ test("self time authorizes Kmap writes and exposes its clean-slate end tool only
   const unavailable = await conversation.execute({ id: "end", name: "EndFreeTimeSession", arguments: {} });
   assert.equal(unavailable.message.tool_result.ok, false);
   assert.match(unavailable.message.content, /only available during self time/);
+
+  const ingress = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "ingress-provenance", loadLimit: 50 });
+  const ingressEnded = await ingress.execute({ id: "end-ingress", name: "EndHistoryIngress", arguments: {} });
+  assert.equal(ingressEnded.endSession, true);
+  assert.equal(ingressEnded.message.tool_result.result.ingressEnding, true);
+  assert.match(ingressEnded.message.content, /final checkpoint is being saved/);
+
+  const ingressUnavailable = await conversation.execute({ id: "end-ingress", name: "EndHistoryIngress", arguments: {} });
+  assert.equal(ingressUnavailable.message.tool_result.ok, false);
+  assert.match(ingressUnavailable.message.content, /only available during history ingress/);
 });
 
 test("self-time clocks, rollover threshold, and custom prompt preserve one durable run", () => {
@@ -1448,7 +1458,9 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   const intelligence = { generate: async request => {
     generations += 1;
     requests.push(request);
-    return { status: "complete", response_id: "ingress-response", message: { role: "assistant", content: "Memory review complete." }, usage: null };
+    return generations === 1
+      ? { status: "complete", response_id: "ingress-response", message: { role: "assistant", content: "Memory review complete." }, usage: null }
+      : { status: "complete", response_id: "ingress-ended", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndHistoryIngress","arguments":{}}]}' }, usage: null };
   }, recordTiming: timing => timings.push(timing) };
   const checkpoints = [];
   await runHistoryIngress({
@@ -1456,7 +1468,7 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
     rootNodeId: id(1), provenanceId: "provenance", provider: "p", providerKind: "codex", model: "m",
     checkpoint: async archive => checkpoints.push(structuredClone(archive)), onUpdate: () => {},
   });
-  assert.equal(generations, 1);
+  assert.equal(generations, 2);
   assert.equal(checkpoints[0].completed, false);
   assert.equal(checkpoints.at(-1).completed, true);
   assert.equal("modelAttribution" in checkpoints.at(-1), false);
@@ -1481,11 +1493,15 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   assert.equal(requests[0].chatend, inspectorText({ chatend: checkpoints[0].messages, usage: checkpoints[0].usage }));
   assert.equal("messages" in requests[0], false);
   assert.equal(checkpoints.at(-1).messages.some(message => message.content === "Memory review complete."), true);
+  assert.equal(checkpoints.at(-1).messages.some(message => message.context_kind === "history-ingress-continuation"), true);
+  assert.match(checkpoints.at(-1).messages.find(message => message.context_kind === "history-ingress-continuation").content, /You do have access to Kennedy tool calls.*EndHistoryIngress/s);
+  assert.equal(checkpoints.at(-1).tools.log.at(-1).name, "EndHistoryIngress");
   assert.equal(checkpoints.at(-1).retained[0].context_kind, "provenance");
-  assert.match(checkpoints.at(-1).messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
+  assert.match(checkpoints.at(-1).messages.at(-1).content, /final checkpoint is being saved/);
   assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
   assert.deepEqual(checkpoints.at(-1).fullHistory.segments, []);
   assert.deepEqual(timings.map(timing => [timing.action, timing.status, timing.sessionType]), [
+    ["tool", "ok", "history-ingress"],
     ["turn", "ok", "history-ingress"],
   ]);
 
@@ -1500,8 +1516,8 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   assert.equal(resumed.length, 1);
   assert.equal(resumed[0].completed, true);
   assert.equal(resumed[0].messages.some(message => message.content === "Memory review complete."), true);
-  assert.match(resumed[0].messages.at(-1).content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
-  assert.equal(resumed[0].roundsUsed, 1);
+  assert.match(resumed[0].messages.at(-1).content, /final checkpoint is being saved/);
+  assert.equal(resumed[0].roundsUsed, 2);
 
   const exhausted = structuredClone(checkpoints.at(-1));
   exhausted.completed = false;
@@ -1526,7 +1542,9 @@ test("history ingress durably checkpoints pre-reset Full History segments", asyn
     requests += 1;
     return requests === 1
       ? { status: "complete", response_id: "before-reset", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}' }, usage: null }
-      : { status: "complete", response_id: "after-reset", message: { role: "assistant", content: "Ingress complete after reset." }, usage: null };
+      : requests === 2
+        ? { status: "complete", response_id: "after-reset", message: { role: "assistant", content: "Ingress complete after reset." }, usage: null }
+        : { status: "complete", response_id: "after-reset-end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndHistoryIngress","arguments":{}}]}' }, usage: null };
   } };
   const checkpoints = [];
   await runHistoryIngress({
@@ -2867,7 +2885,9 @@ test("audio, document, durable vnote, and Telegram API clients use their queue e
     await IntelligenceAPI("http://intelligence").transcribe({ provider: "p", model: "m", file: new Blob(["audio"], { type: "audio/ogg" }), fileName: "note.ogg" });
     await IntelligenceAPI("http://intelligence").extractDocument({ file: new Blob(["report"], { type: "application/pdf" }), fileName: "report.pdf" });
     await IntelligenceAPI("http://intelligence").recordTiming({ action: "tool", name: "LoadNode", status: "ok", sessionType: "conversation", durationMs: 12 });
+    await ConversationHistoryAPI("http://history").releaseIngressRepairs();
     await AudioIngressAPI("http://audio").nextIngress();
+    await AudioIngressAPI("http://audio").releaseIngressRepairs();
     await AudioIngressAPI("http://audio").history("recording");
     await AudioIngressAPI("http://audio").ingressCheckpoint("piece", { expected_version: 2, state: { historyIngress: {} } });
     await TelegramRelayAPI("http://telegram").bind("event", "019f5ca7-020f-7b63-be2f-82785fb68c03", "029f5ca7-020f-7b63-be2f-82785fb68c03");
@@ -2882,12 +2902,16 @@ test("audio, document, durable vnote, and Telegram API clients use their queue e
   assert.equal(requests[1].options.body instanceof FormData, true);
   assert.equal(requests[2].url, "http://intelligence/api/v1/timings");
   assert.match(requests[2].options.body, /"durationMs":12/);
-  assert.equal(requests[3].url, "http://audio/api/v1/audio-ingress/ingress/next");
-  assert.equal(requests[4].url, "http://audio/api/v1/audio-ingress/recording/history");
-  assert.equal(requests[5].url, "http://audio/api/v1/audio-ingress/pieces/piece/ingress-checkpoint");
-  assert.match(requests[5].options.body, /historyIngress/);
-  assert.equal(requests[6].url, "http://telegram/api/v1/events/event/bind");
-  assert.match(requests[6].options.body, /"expectedConversationId":"029f5ca7-020f-7b63-be2f-82785fb68c03"/);
-  assert.equal(requests[7].url, "http://telegram/api/v1/events/event/abort");
-  assert.match(requests[7].options.body, /"message":"Timed out"/);
+  assert.equal(requests[3].url, "http://history/api/v1/conversations/ingress/repairs/release");
+  assert.equal(requests[3].options.method, "POST");
+  assert.equal(requests[4].url, "http://audio/api/v1/audio-ingress/ingress/next");
+  assert.equal(requests[5].url, "http://audio/api/v1/audio-ingress/ingress/repairs/release");
+  assert.equal(requests[5].options.method, "POST");
+  assert.equal(requests[6].url, "http://audio/api/v1/audio-ingress/recording/history");
+  assert.equal(requests[7].url, "http://audio/api/v1/audio-ingress/pieces/piece/ingress-checkpoint");
+  assert.match(requests[7].options.body, /historyIngress/);
+  assert.equal(requests[8].url, "http://telegram/api/v1/events/event/bind");
+  assert.match(requests[8].options.body, /"expectedConversationId":"029f5ca7-020f-7b63-be2f-82785fb68c03"/);
+  assert.equal(requests[9].url, "http://telegram/api/v1/events/event/abort");
+  assert.match(requests[9].options.body, /"message":"Timed out"/);
 });

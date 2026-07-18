@@ -52,6 +52,7 @@ const MAX_CONCURRENT_GEMINI_CHUNKS: usize = 4;
 const INGRESS_BREAK: &str = "<!-- KENNEDY_INGRESS_BREAK -->";
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
+const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-history-ingress-v1";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -222,6 +223,7 @@ fn default_list_limit() -> usize {
 struct StartIngress {
     expected_version: i64,
     provenance_id: String,
+    completion_protocol: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -333,6 +335,10 @@ pub async fn serve(config: Config, codex_catalog_cache: CatalogCache) -> anyhow:
         .route(
             "/api/v1/audio-ingress/ingress/next",
             get(next_ingress_piece),
+        )
+        .route(
+            "/api/v1/audio-ingress/ingress/repairs/release",
+            post(release_ingress_repairs),
         )
         .route(
             "/api/v1/audio-ingress/{recording_id}/history",
@@ -1848,6 +1854,52 @@ async fn next_ingress_piece(State(state): State<AppState>) -> Result<Json<Value>
     Ok(Json(json!({"piece":fetch_next_ingress_piece(&db)?})))
 }
 
+fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
+    state
+        .pointer("/historyIngress/tools/log")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("name").and_then(Value::as_str) == Some("EndHistoryIngress")
+                    && entry.get("ok").and_then(Value::as_bool) == Some(true)
+            })
+        })
+}
+
+async fn release_ingress_repairs(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let now = Utc::now().to_rfc3339();
+    let recording_ids = {
+        let mut statement = tx
+            .prepare("SELECT DISTINCT recording_id FROM audio_ingress_pieces WHERE phase='ingress_failed' AND json_extract(state_json,'$.historyIngressRepairRequired')=1 AND json_extract(state_json,'$.historyIngressRepairReleasePending')=1")
+            .map_err(ApiError::internal)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(ApiError::internal)?;
+        rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::internal)?
+    };
+    let released = tx
+        .execute(
+            "UPDATE audio_ingress_pieces SET phase='ingress_pending',state_json=json_remove(state_json,'$.historyIngress','$.historyIngressRepairReleasePending'),ingress_failure_count=0,updated_at=?1,version=version+1 WHERE phase='ingress_failed' AND json_extract(state_json,'$.historyIngressRepairRequired')=1 AND json_extract(state_json,'$.historyIngressRepairReleasePending')=1",
+            [&now],
+        )
+        .map_err(ApiError::internal)?;
+    for recording_id in recording_ids {
+        tx.execute(
+            "UPDATE audio_recordings SET status='ready_for_ingress',next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
+            params![now, recording_id],
+        )
+        .map_err(ApiError::internal)?;
+    }
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(Json(json!({"released":released})))
+}
+
 fn fetch_next_ingress_piece(db: &Connection) -> Result<Option<IngressPieceRecord>, ApiError> {
     db.query_row(
         &format!("{} WHERE p.phase IN ('ingress_in_progress','ingress_pending') AND (r.next_attempt_at IS NULL OR datetime(r.next_attempt_at)<=datetime('now')) ORDER BY CASE p.phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END,datetime(r.source_created_at),p.recording_id,p.piece_index LIMIT 1",piece_select()),
@@ -1865,6 +1917,11 @@ async fn ingress_started(
     validate_version(input.expected_version)?;
     if input.provenance_id.trim().is_empty() {
         return Err(ApiError::bad("provenance_id must not be empty."));
+    }
+    if input.completion_protocol.as_deref() != Some(HISTORY_INGRESS_COMPLETION_PROTOCOL) {
+        return Err(ApiError::conflict(
+            "This client does not support the required explicit history-ingress completion protocol.",
+        ));
     }
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let existing = fetch_piece(&db, &id)?;
@@ -1927,9 +1984,14 @@ async fn ingress_completed(
     if existing.phase == "complete" {
         return Ok(Json(existing));
     }
+    if !history_ingress_was_explicitly_ended(&existing.state) {
+        return Err(ApiError::conflict(
+            "Audio history ingress cannot complete without a successful EndHistoryIngress tool call.",
+        ));
+    }
     let tx = db.transaction().map_err(ApiError::internal)?;
     let now = Utc::now().to_rfc3339();
-    let changed=tx.execute("UPDATE audio_ingress_pieces SET phase='complete',updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3",params![now,id,input.expected_version]).map_err(ApiError::internal)?;
+    let changed=tx.execute("UPDATE audio_ingress_pieces SET phase='complete',state_json=json_remove(state_json,'$.historyIngressRepairRequired'),updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3",params![now,id,input.expected_version]).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
             "Audio transcript piece is not in the expected ingress state.",
@@ -2152,6 +2214,23 @@ mod tests {
             r#"[{{"type":"message","role":"developer","content":[{{"type":"input_text","text":"hidden"}}]}},{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{CODEX_PROMPT_BOUNDARY_SENTINEL}"}}]}}]"#
         );
         assert!(verify_codex_prompt_input(hidden.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn ingress_completion_requires_a_successful_end_tool_receipt() {
+        assert!(!history_ingress_was_explicitly_ended(&json!({})));
+        assert!(!history_ingress_was_explicitly_ended(&json!({
+            "historyIngress":{"tools":{"log":[{
+                "name":"EndHistoryIngress",
+                "ok":false
+            }]}}
+        })));
+        assert!(history_ingress_was_explicitly_ended(&json!({
+            "historyIngress":{"tools":{"log":[{
+                "name":"EndHistoryIngress",
+                "ok":true
+            }]}}
+        })));
     }
 
     #[test]

@@ -26,11 +26,13 @@ load or discovery.
 
 ## Prompt-boundary validation
 
-`codex-safe debug prompt-input` reports the exact message list that Codex would
-make model-visible after applying its configuration layers. Kennedy supplies a
-sentinel and requires the result to contain exactly that one user message. This
-detects accidental Codex base/developer instructions, project rules, skills,
-or other hidden prompt items before Kennedy creates resumable threads.
+`codex-safe debug prompt-input` reports Codex's formatted input list before the
+Responses Lite request builder adds its native-tool and base-instruction
+developer items. Kennedy supplies a sentinel and requires the reported list to
+contain exactly that one user message. This detects accidental project rules,
+skills, or other extra prompt items at that boundary. Launcher tests separately
+pin every approved instruction setting, including Intelligence's one fixed
+Kennedy tool-harness base instruction and AudioIngress's empty instructions.
 
 Intelligence and AudioIngress use different Codex configurations, so each owns
 one boundary-validation scope. A successful result is cached under the Codex

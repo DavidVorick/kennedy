@@ -78,13 +78,16 @@ version/cache miss it derives a mandatory sanitized catalog from advertised
 metadata, blanks provider base instructions, removes model message templates
 and agent-tool selectors, disables model-selected skill instructions, and
 verifies that all advertised effective limits are unchanged. Intelligence and
-AudioIngress share that work. Codex runtime and developer instructions are
-explicitly empty and all exposed optional instruction/tool/plugin scaffolding
-is disabled. The prompt-input probe requires the supplied sentinel to be the
-only model-visible message. Successful probes are cached per Codex/catalog and
-prompt configuration instead of rerunning every launch. Codex still registers
-its forced `update_plan` and `view_image` schemas despite every exposed switch
-being false; Kennedy adds no hidden instruction to compensate for them.
+AudioIngress share that work. Kennedy turns add exactly one fixed Codex base
+instruction stating that `KENNEDY_TOOL_CALLS` tools remain available even when
+absent from Codex's native list; developer instructions remain empty. Isolated
+search and AudioIngress reconciliation keep both instruction overrides empty.
+All exposed optional instruction/tool/plugin scaffolding is disabled. The
+prompt-input probe requires the supplied sentinel to be the only reported
+input message. Successful probes are cached per Codex/catalog and prompt
+configuration instead of rerunning every launch. Codex still registers its
+forced `update_plan` and `view_image` schemas despite every exposed switch
+being false.
 All Codex turns set the auto-compaction threshold beyond any reachable window
 so Kmap context is not silently compacted.
 Each model-facing Chatend ends with the terse line
@@ -365,6 +368,11 @@ preserve the original audio with the paid transcription.
 The browser conversation composer also offers `Send & end`: it checkpoints one
 final user message without asking Kennedy to answer, then immediately closes
 the conversation into the normal history-ingress queue.
+
+History and audio ingress require a successful standalone
+`EndHistoryIngress({})` tool call before their durable records can become
+complete. Ordinary final text is checkpointed and followed by a controller
+message telling Kennedy to continue Kmap work or explicitly end the ingress.
 
 The dedicated **Self Time** tab starts an autonomous run with a duration in
 minutes (30 by default, fractional values allowed for tests) and an optional

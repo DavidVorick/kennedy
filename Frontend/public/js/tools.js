@@ -1,4 +1,4 @@
-import { formatToolResult } from "./human_format.js?v=20260718.2";
+import { formatToolResult } from "./human_format.js?v=20260718.3";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 import { newIdempotencyId } from "./api.js?v=20260718.3";
 
@@ -176,6 +176,7 @@ export class ToolExecutor {
         case "PublishRustLib": outcome = await this.rustLibTool(call.name, call.arguments); break;
         case "EndSelfTimeSession":
         case "EndFreeTimeSession": outcome = await this.endSelfTimeSession(call.arguments); break;
+        case "EndHistoryIngress": outcome = await this.endHistoryIngress(call.arguments); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
       }
       const durationMs = elapsedMs(started);
@@ -382,5 +383,19 @@ export class ToolExecutor {
     }
     const result = await this.endSession(message);
     return { result, endSession: true };
+  }
+
+  async endHistoryIngress(args) {
+    validateObject(args, []);
+    if (this.mode !== "ingress") {
+      throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" });
+    }
+    return {
+      result: {
+        ingressEnding: true,
+        message: "History ingress is complete and its final checkpoint is being saved.",
+      },
+      endSession: true,
+    };
   }
 }

@@ -84,9 +84,26 @@ active -> ingress_pending -> ingress_in_progress -> complete
   falling back to its start time. An actively claimed `ingress_in_progress`
   record wins; deferred records are skipped until their next-attempt time.
 - The frontend creates or retrieves idempotent Kweb provenance, records its ID,
-  and changes the selected record to `ingress_in_progress`.
+  supplies the `end-history-ingress-v1` completion-protocol identifier, and
+  changes the selected record to `ingress_in_progress`. The backend rejects a
+  claim from an older client that does not identify that protocol.
 - Ordinary conversation records change to `complete` only after successful
-  history ingress.
+  history ingress. The completion endpoint independently requires a successful
+  `EndHistoryIngress` entry in the persisted history-ingress tool log; a normal
+  assistant answer cannot satisfy this transition even if a stale frontend
+  attempts it.
+- Self-time records normally bypass history ingress. A narrowly scoped
+  `historyIngressRepairRequired: true` marker allows a historically completed
+  self-time record whose old ingress archive proves premature termination to
+  enter the repair queue. Successful completion removes the marker.
+- `POST /api/v1/conversations/ingress/repairs/release` atomically returns only
+  terminal records carrying both the repair marker and its one-time release
+  marker to `ingress_pending`, discards their premature history-ingress
+  checkpoint, consumes the release marker, and resets their consecutive
+  attempt count. The corrected frontend calls it at startup; until then the
+  records remain quarantined from stale workers. A repair that exhausts its
+  new attempts remains terminal for later explicit retry instead of being
+  automatically released again on every frontend load.
 - The frontend records a failed ingress attempt atomically. Attempts one
   through four return the record to `ingress_pending`, release the
   single-worker claim, and defer that record for 15 seconds so other eligible
@@ -125,6 +142,7 @@ index serializes memory updates even when several conversations close together.
 - `GET /api/v1/conversations/current` (most recently updated active record,
   retained as a compatibility convenience)
 - `GET /api/v1/conversations/ingress/next`
+- `POST /api/v1/conversations/ingress/repairs/release`
 - `DELETE /api/v1/conversations/unstarted`
 - `GET /api/v1/conversations/{id}`
 - `DELETE /api/v1/conversations/{id}`
@@ -146,6 +164,8 @@ deleted ID. Unstarted cleanup is idempotent and returns the count and IDs of
 discarded records. Direct completion accepts `expected_version` and the final
 state, verifies that both stored and supplied states identify `free-time`, and
 makes the record read-only without creating a history-ingress obligation.
+Ingress start accepts `expected_version`, `provenance_id`, and the required
+`completion_protocol: "end-history-ingress-v1"` capability identifier.
 The failure endpoint accepts `expected_version`, stage, optional error code,
 message, round count, and optional context usage. It normalizes and bounds
 diagnostic text before atomically incrementing the attempt count.

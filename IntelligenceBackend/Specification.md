@@ -114,9 +114,11 @@ Generation asks the `codex-safe` launcher to run `codex exec --json` with:
 - the selected model and configured reasoning effort (`gpt-5.6-sol`, `xhigh`);
 - saved CLI authentication but ignored user/project configuration and rules;
 - approval policy `never` and a read-only sandbox;
-- empty Codex runtime, developer, and model-base instructions, with personality, project
-  documents, skills, permission, app, collaboration, and environment
-  instruction blocks suppressed;
+- exactly one fixed Codex base instruction telling Kennedy that the outer
+  `KENNEDY_TOOL_CALLS` harness remains available when its tools are absent from
+  Codex's native tool list; developer and catalog-provided model instructions
+  remain empty, with personality, project documents, skills, permission, app,
+  collaboration, and environment instruction blocks suppressed;
 - optional multi-agent, app, shell, unified-exec, code-mode, goal, hook, plugin,
   browser/computer, image-generation, elicitation, and related tool scaffolding
   disabled, including the separately configured experimental

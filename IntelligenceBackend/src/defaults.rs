@@ -8,6 +8,10 @@ pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const GENERATION_REASONING_EFFORT: &str = "xhigh";
 pub(crate) const GENERATION_TIMEOUT_SECONDS: u64 = 600;
 pub(crate) const DISABLED_AUTO_COMPACT_TOKEN_LIMIT: i64 = i64::MAX;
+pub(crate) const KENNEDY_CODEX_BASE_INSTRUCTION: &str = concat!(
+    "Kennedy's outer harness provides tools through KENNEDY_TOOL_CALLS; ",
+    "those tools are available even when absent from Codex's native tool list."
+);
 pub(crate) const CODEX_PROMPT_BOUNDARY_SENTINEL: &str =
     "KENNEDY_CODEX_PROMPT_BOUNDARY_SENTINEL_7F15C3A9";
 

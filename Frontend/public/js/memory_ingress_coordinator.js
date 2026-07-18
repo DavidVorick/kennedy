@@ -1,5 +1,5 @@
 import { newIdempotencyId } from "./api.js?v=20260718.3";
-import { runHistoryIngress } from "./history_ingress.js?v=20260718.6";
+import { runHistoryIngress } from "./history_ingress.js?v=20260718.7";
 
 const INGRESS_FAILURE_LIMIT = 5;
 
@@ -146,6 +146,7 @@ export class MemoryIngressCoordinator {
           piece = await this.audioIngress.ingressStarted(piece.id, {
             expected_version: piece.version,
             provenance_id: provenance.id,
+            completion_protocol: "end-history-ingress-v1",
           });
           this.activeAudioPiece = piece;
         } catch (error) {
@@ -287,6 +288,7 @@ export class MemoryIngressCoordinator {
           record = await this.conversationHistory.ingressStarted(record.id, {
             expected_version: record.version,
             provenance_id: provenance.id,
+            completion_protocol: "end-history-ingress-v1",
           });
         } catch (error) {
           if (error.code === "state_conflict") {

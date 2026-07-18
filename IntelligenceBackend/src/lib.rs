@@ -684,7 +684,7 @@ async fn validate_codex_prompt_boundaries(
     for (name, provider) in providers.iter() {
         for model in &provider.config.models {
             let scope = format!(
-                "kennedy-intelligence-prompt-boundary-v1:{}:{}:{}",
+                "kennedy-intelligence-prompt-boundary-v2:{}:{}:{}",
                 provider.config.executable, model, provider.config.reasoning_effort
             );
             if catalog.validation_is_cached(&scope).await? {
@@ -1057,12 +1057,22 @@ fn add_codex_config(
     reasoning_effort: &str,
     web_search_context_size: Option<&str>,
     sanitized_model_catalog: &Path,
+    kennedy_tool_harness: bool,
 ) {
+    let base_instruction = if kennedy_tool_harness {
+        KENNEDY_CODEX_BASE_INSTRUCTION
+    } else {
+        ""
+    };
     command
         .arg("-c")
         .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
         .arg("-c")
-        .arg("instructions=\"\"")
+        .arg(format!(
+            "instructions={}",
+            serde_json::to_string(base_instruction)
+                .expect("serializing the static Codex base instruction cannot fail")
+        ))
         .arg("-c")
         .arg("developer_instructions=\"\"")
         .arg("-c")
@@ -1219,6 +1229,7 @@ async fn probe_codex_prompt_boundary(
         &provider.config.reasoning_effort,
         None,
         sanitized_model_catalog,
+        true,
     );
     let output = command
         .arg(CODEX_PROMPT_BOUNDARY_SENTINEL)
@@ -1444,6 +1455,7 @@ async fn run_codex_turn(
         reasoning_effort,
         web_search_context_size,
         sanitized_model_catalog,
+        !web_search,
     );
     if let Some(thread_id) = previous_thread_id {
         command.arg(thread_id);
@@ -3008,14 +3020,17 @@ mod tests {
     fn codex_turns_minimize_codex_scaffolding_and_disable_compaction() {
         let mut command = Command::new("codex-safe");
         let catalog = Path::new("/tmp/kennedy-codex-catalogs/models.json");
-        add_codex_config(&mut command, "xhigh", None, catalog);
+        add_codex_config(&mut command, "xhigh", None, catalog, true);
         let arguments = command
             .as_std()
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         for expected in [
-            "instructions=\"\"".into(),
+            format!(
+                "instructions={}",
+                serde_json::to_string(KENNEDY_CODEX_BASE_INSTRUCTION).unwrap()
+            ),
             "developer_instructions=\"\"".into(),
             "personality=\"none\"".into(),
             "project_doc_max_bytes=0".into(),
@@ -3070,7 +3085,10 @@ mod tests {
                 .iter()
                 .filter(|argument| argument.starts_with("instructions="))
                 .collect::<Vec<_>>(),
-            vec![&"instructions=\"\"".to_owned()]
+            vec![&format!(
+                "instructions={}",
+                serde_json::to_string(KENNEDY_CODEX_BASE_INSTRUCTION).unwrap()
+            )]
         );
     }
 
@@ -3078,7 +3096,7 @@ mod tests {
     fn codex_web_search_keeps_only_the_search_capability() {
         let mut command = Command::new("codex-safe");
         let catalog = Path::new("/tmp/kennedy-codex-catalogs/models.json");
-        add_codex_config(&mut command, "low", Some("high"), catalog);
+        add_codex_config(&mut command, "low", Some("high"), catalog, false);
         let arguments = command
             .as_std()
             .get_args()

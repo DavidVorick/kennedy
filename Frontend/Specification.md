@@ -624,7 +624,27 @@ minutes remaining there is no next slice and no message is forwarded.
 `EndFreeTimeSession` remains accepted as a compatibility alias for already
 archived durable turns, but new prompts expose only the self-time name.
 
-### 8.11 Kmap-documented Rust library tools
+### 8.11 `EndHistoryIngress`
+
+`EndHistoryIngress` accepts `{}`. It is available only when the executor is in
+`ingress` mode and must appear alone in its tool envelope. A successful result
+is checkpointed before the agent loop returns its session-control sentinel.
+History and audio ingress transition to complete only after that sentinel. An
+ordinary final answer or empty provider response instead appends a durable
+history-ingress controller message reminding Kennedy that text-protocol tools
+are available and directing her to continue unfinished Kmap work or call
+`EndHistoryIngress` after successful completion.
+
+At startup, the frontend asks both durable ingress services to release records
+carrying the one-time historical repair marker. A release failure is shown as a
+repair-specific warning but does not make ordinary conversation history or
+audio browsing unavailable; the marked records remain safely quarantined until
+the corrected service is reachable.
+Every corrected conversation or audio claim also supplies
+`completion_protocol: "end-history-ingress-v1"`, allowing the backend to reject
+an older frontend before it can consume newly released repair work.
+
+### 8.12 Kmap-documented Rust library tools
 
 `CreateRustLib`, `OpenRustLib`, `WriteRustLib`, `CheckRustLib`, and
 `PublishRustLib` are always available in every Kennedy execution mode,

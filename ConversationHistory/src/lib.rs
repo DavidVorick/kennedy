@@ -33,6 +33,7 @@ const CONVERSATION_SUMMARIES_MIGRATION: &str =
     include_str!("../migrations/006_conversation_summaries.sql");
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
+const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-history-ingress-v1";
 const SUMMARY_TEXT_LIMIT: usize = 512;
 
 #[derive(Clone, Debug)]
@@ -154,6 +155,7 @@ struct RetryIngress {
 struct StartIngress {
     expected_version: i64,
     provenance_id: String,
+    completion_protocol: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +212,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route("/api/v1/conversations/current", get(current_conversation))
         .route("/api/v1/conversations/ingress/next", get(next_ingress))
+        .route(
+            "/api/v1/conversations/ingress/repairs/release",
+            post(release_ingress_repairs),
+        )
         .route(
             "/api/v1/conversations/unstarted",
             delete(discard_unstarted_conversations),
@@ -624,6 +630,25 @@ fn is_free_time_session(state: &Value) -> bool {
     free_time(state.get("sessionType")) || free_time(state.pointer("/archive/sessionType"))
 }
 
+fn requires_history_ingress_repair(state: &Value) -> bool {
+    state
+        .get("historyIngressRepairRequired")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
+    state
+        .pointer("/historyIngress/tools/log")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("name").and_then(Value::as_str) == Some("EndHistoryIngress")
+                    && entry.get("ok").and_then(Value::as_bool) == Some(true)
+            })
+        })
+}
+
 fn is_idle_protected_session(state: &Value) -> bool {
     is_telegram_session(state) || is_free_time_session(state)
 }
@@ -718,6 +743,19 @@ async fn next_ingress(State(state): State<AppState>) -> Result<Json<Value>, ApiE
     Ok(Json(json!({"conversation":fetch_next_ingress(&db)?})))
 }
 
+async fn release_ingress_repairs(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let released = db
+        .execute(
+            "UPDATE conversations SET phase='ingress_pending',state_json=json_remove(state_json,'$.historyIngress','$.historyIngressRepairReleasePending'),ingress_next_attempt_at=NULL,ingress_failure_count=0,updated_at=?1,version=version+1 WHERE phase='ingress_failed' AND json_extract(state_json,'$.historyIngressRepairRequired')=1 AND json_extract(state_json,'$.historyIngressRepairReleasePending')=1",
+            [Utc::now().to_rfc3339()],
+        )
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({"released":released})))
+}
+
 fn fetch_next_ingress(db: &Connection) -> Result<Option<ConversationRecord>, ApiError> {
     let mut statement = db
         .prepare(&format!("{} WHERE phase IN ('ingress_in_progress','ingress_pending') AND (ingress_next_attempt_at IS NULL OR datetime(ingress_next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END, datetime(COALESCE(last_user_message_at,started_at)), datetime(started_at), id", conversation_select()))
@@ -727,7 +765,7 @@ fn fetch_next_ingress(db: &Connection) -> Result<Option<ConversationRecord>, Api
         .map_err(ApiError::internal)?;
     for record in records {
         let record = record.map_err(ApiError::internal)?;
-        if !is_free_time_session(&record.state) {
+        if !is_free_time_session(&record.state) || requires_history_ingress_repair(&record.state) {
             return Ok(Some(record));
         }
     }
@@ -944,9 +982,14 @@ async fn ingress_started(
     if input.provenance_id.trim().is_empty() {
         return Err(ApiError::bad("provenance_id must not be empty."));
     }
+    if input.completion_protocol.as_deref() != Some(HISTORY_INGRESS_COMPLETION_PROTOCOL) {
+        return Err(ApiError::conflict(
+            "This client does not support the required explicit history-ingress completion protocol.",
+        ));
+    }
     let db = state.db.lock().map_err(ApiError::internal)?;
     let existing = fetch_record(&db, &id)?;
-    if is_free_time_session(&existing.state) {
+    if is_free_time_session(&existing.state) && !requires_history_ingress_repair(&existing.state) {
         return Err(ApiError::conflict(
             "Self-time records complete directly and do not undergo history ingress.",
         ));
@@ -1167,7 +1210,12 @@ async fn ingress_completed(
     if existing.phase == "complete" {
         return Ok(Json(existing));
     }
-    let changed = db.execute("UPDATE conversations SET phase='complete',ingress_next_attempt_at=NULL,updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3", params![Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
+    if !history_ingress_was_explicitly_ended(&existing.state) {
+        return Err(ApiError::conflict(
+            "History ingress cannot complete without a successful EndHistoryIngress tool call.",
+        ));
+    }
+    let changed = db.execute("UPDATE conversations SET phase='complete',state_json=json_remove(state_json,'$.historyIngressRepairRequired'),ingress_next_attempt_at=NULL,updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3", params![Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
             "Conversation is not in the expected ingress state.",
@@ -1358,6 +1406,9 @@ mod tests {
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('conversation','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
 
         assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "conversation");
+
+        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time-repair','ingress_pending','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z','{\"sessionType\":\"free-time\",\"historyIngressRepairRequired\":true}',1)", []).unwrap();
+        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "self-time-repair");
     }
 
     #[test]
@@ -1567,6 +1618,23 @@ mod tests {
             update_ingress(&db, "c", 4, &json!({})).unwrap_err().code,
             "state_conflict"
         );
+    }
+
+    #[test]
+    fn ingress_completion_requires_a_successful_end_tool_receipt() {
+        assert!(!history_ingress_was_explicitly_ended(&json!({})));
+        assert!(!history_ingress_was_explicitly_ended(&json!({
+            "historyIngress":{"tools":{"log":[{
+                "name":"EndHistoryIngress",
+                "ok":false
+            }]}}
+        })));
+        assert!(history_ingress_was_explicitly_ended(&json!({
+            "historyIngress":{"tools":{"log":[{
+                "name":"EndHistoryIngress",
+                "ok":true
+            }]}}
+        })));
     }
 
     #[test]

@@ -267,10 +267,11 @@ The intelligence backend owns:
 - validating the canonical plaintext generation request,
 - passing canonical plaintext and continuation controls into bounded,
   read-only non-interactive Codex turns,
-- enforcing an empty non-Chatend prompt boundary through empty developer
-  instructions, suppressed optional instruction/tool/plugin features, a
-  mandatory sanitized catalog with blank provider prompt fields, and a
-  model-visible prompt probe cached for each Codex/configuration identity,
+- enforcing an allowlisted non-Chatend prompt boundary through exactly one
+  fixed Kennedy tool-harness base instruction, empty developer instructions,
+  suppressed optional instruction/tool/plugin features, a mandatory sanitized
+  catalog with blank provider prompt fields, and a prompt-input probe cached
+  for each Codex/configuration identity,
 - suppressing Codex auto-compaction beyond every reachable context so Kmap
   material is never silently summarized,
 - translating Codex text, thread IDs, errors, and detailed token usage
@@ -437,6 +438,12 @@ recovery archive, persists its returned ID while transitioning exactly one recor
 to `ingress_in_progress`, and completes it before claiming the next. Live
 conversations remain usable throughout. Completed records and both archives
 remain queryable from the sidebar.
+
+The history-ingress agent loop cannot complete from ordinary assistant text.
+Such text is checkpointed, followed by a controller reminder that Kennedy's
+text-protocol Kmap tools are available, and generation continues. Only a
+successful, standalone `EndHistoryIngress({})` result returns the loop-control
+sentinel that permits the durable record to transition to `complete`.
 
 ### 5.2 Autonomous Self Time
 

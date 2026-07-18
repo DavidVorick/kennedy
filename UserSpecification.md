@@ -660,9 +660,12 @@ Kennedy's root are loaded. Kennedy can call LoadNode or ResetContext up to 50
 times in aggregate during the session.
 
 Kennedy will update as many nodes as she feels is appropriate during the
-history ingress session. Zero updates is also valid. When Kennedy feels that
-the kmap has been updated appropriately, she will end the history ingress
-session. History ingress may use WebSearch and WebFetch when external evidence
+history ingress session. Zero updates is also valid. A normal answer does not
+complete history ingress. When Kennedy has fully reviewed the source and every
+required mutation has succeeded, she must call `EndHistoryIngress({})` by
+itself. Any other final text receives a durable controller message affirming
+that the text-protocol tools are available and directing her to continue or
+call the end tool. History ingress may use WebSearch and WebFetch when external evidence
 would help. It may use ConnectNodes, ConsolidateFanout, SetFixedConnection,
 CreateNode, and UpdateNode when justified.
 The entire logical history-ingress session is limited to 100 LLM rounds. This
@@ -692,12 +695,14 @@ LLM turns run through the host's `codex-safe` launcher, which keeps the Codex
 CLI and its persistent ChatGPT login inside a Podman sandbox while using the
 user's subscription limits. The configured model is `gpt-5.6-sol` with
 `xhigh` reasoning. Conversation and tool loops resume their Codex thread;
-ResetContext starts a fresh one. Kennedy supplies no non-Chatend developer or
-base instructions, explicitly empties runtime and developer instructions, disables exposed optional instruction/tool/plugin
-scaffolding, and requires a sanitized catalog derived from Codex's live model
-metadata. The catalog blanks provider prompt fields while preserving every
-advertised effective context limit. A model-visible prompt probe must show only
-the supplied Chatend item; catalog or prompt-boundary failure aborts startup
+ResetContext starts a fresh one. Kennedy supplies exactly one non-Chatend base
+instruction: the outer `KENNEDY_TOOL_CALLS` harness remains available even when
+its tools are absent from Codex's native tool list. Developer instructions stay
+empty, exposed optional instruction/tool/plugin scaffolding is disabled, and a
+sanitized catalog is derived from Codex's live model metadata. The catalog
+blanks provider prompt fields while preserving every advertised effective
+context limit. A prompt-input probe must show only the supplied Chatend item at
+the boundary Codex exposes; catalog or prompt-boundary failure aborts startup
 rather than falling back to hidden instructions.
 
 ## UI

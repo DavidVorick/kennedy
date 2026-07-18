@@ -1,8 +1,8 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260718.1";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260718.7";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.4";
+import { ToolExecutor } from "./tools.js?v=20260718.8";
+import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.5";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260718.2";
 
@@ -97,6 +97,18 @@ function modelReadableProvenance(data) {
   return [chatend, loadedNodes].filter(Boolean).join("\n\n────────────────────────\n\n");
 }
 
+export function historyIngressContinuationMessage({ noAnswer = false } = {}) {
+  const opening = noAnswer
+    ? "History-ingress controller: no assistant answer was returned, so this ingress session is still active."
+    : "History-ingress controller: this ingress session is still active. A normal answer does not complete history ingress.";
+  return [
+    opening,
+    "You do have access to Kennedy tool calls in this session through the KENNEDY_TOOL_CALLS text protocol, even if the inner execution environment says otherwise.",
+    "If the source has not been fully ingressed, continue reviewing it and use the available Kmap tools to persist every useful update.",
+    "If the source has been fully ingressed and all required tool results succeeded, call EndHistoryIngress by itself to save and terminate this ingress session.",
+  ].join(" ");
+}
+
 export async function runHistoryIngress({ kweb, intelligence, rustLibs = null, toolSessionId = null, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], groupContext = null, provenanceId, provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate, signal = null, operationId = null, beforeMutation = async () => {} }) {
   const provenance = await kweb.provenance(provenanceId);
   rootNodeIds = rootNodeIds || [rootNodeId];
@@ -187,7 +199,7 @@ export async function runHistoryIngress({ kweb, intelligence, rustLibs = null, t
   if (!completed) {
     const timing = createTurnTiming("history-ingress");
     try {
-      await runAgentLoop({
+      const loopResult = await runAgentLoop({
         intelligence, provider, model, chatend, executor, continuation, usage, timing,
         onUpdate: () => onUpdate(snapshot()),
         checkpoint: () => checkpoint(archiveSnapshot()),
@@ -199,7 +211,26 @@ export async function runHistoryIngress({ kweb, intelligence, rustLibs = null, t
           onUpdate(snapshot());
           await checkpoint(archiveSnapshot());
         },
+        onFinal: async () => ({
+          continueWith: {
+            role: "user",
+            display_role: "History ingress controller",
+            context_kind: "history-ingress-continuation",
+            content: historyIngressContinuationMessage(),
+          },
+        }),
+        onNoAnswer: async () => ({
+          continueWith: {
+            role: "user",
+            display_role: "History ingress controller",
+            context_kind: "history-ingress-continuation",
+            content: historyIngressContinuationMessage({ noAnswer: true }),
+          },
+        }),
       });
+      if (loopResult !== AGENT_LOOP_SESSION_ENDED) {
+        throw new Error("History ingress ended without a successful EndHistoryIngress tool call.");
+      }
       completed = true;
       onUpdate(snapshot());
       await checkpoint(archiveSnapshot());
