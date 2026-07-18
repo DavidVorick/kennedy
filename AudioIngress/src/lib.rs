@@ -17,6 +17,7 @@ use axum::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{StreamExt, stream};
 use hound::{SampleFormat, WavReader, WavWriter};
+use kennedy_codex_runtime::{CatalogCache, DEFAULT_CODEX_EXECUTABLE, model_catalog_config};
 use reqwest::{Client, header};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,7 @@ const GEMINI_FILES_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 const GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
 const RECONCILIATION_MODEL: &str = "gpt-5.6-sol";
 const RECONCILIATION_REASONING: &str = "xhigh";
-const CODEX_EXECUTABLE: &str = "codex-safe";
+const CODEX_EXECUTABLE: &str = DEFAULT_CODEX_EXECUTABLE;
 const CODEX_PROMPT_BOUNDARY_SENTINEL: &str =
     "KENNEDY_AUDIO_CODEX_PROMPT_BOUNDARY_SENTINEL_4A92E1D7";
 const MAX_CHUNK_MILLISECONDS: u64 = 4 * 60 * 1_000;
@@ -256,7 +257,7 @@ struct RecordIngressFailure {
     context_window_tokens: Option<u64>,
 }
 
-pub async fn serve(config: Config) -> anyhow::Result<()> {
+pub async fn serve(config: Config, codex_catalog_cache: CatalogCache) -> anyhow::Result<()> {
     ensure!(
         MAX_CHUNK_MILLISECONDS > CHUNK_OVERLAP_MILLISECONDS,
         "audio chunk overlap must be smaller than the chunk limit"
@@ -265,8 +266,28 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         config.max_upload_bytes > 0,
         "audio upload limit must be positive"
     );
-    let codex_model_catalog = prepare_sanitized_codex_model_catalog().await?;
-    probe_codex_prompt_boundary(&codex_model_catalog).await?;
+    let codex_catalog = codex_catalog_cache.load().await?;
+    ensure!(
+        codex_catalog.executable() == CODEX_EXECUTABLE,
+        "audio reconciliation uses {CODEX_EXECUTABLE} but the shared Codex catalog belongs to {}",
+        codex_catalog.executable()
+    );
+    ensure!(
+        codex_catalog.model_limits(RECONCILIATION_MODEL).is_some(),
+        "audio reconciliation model {RECONCILIATION_MODEL} is absent from the Codex model catalog"
+    );
+    let boundary_scope = format!(
+        "kennedy-audio-prompt-boundary-v1:{CODEX_EXECUTABLE}:{RECONCILIATION_MODEL}:{RECONCILIATION_REASONING}"
+    );
+    if codex_catalog.validation_is_cached(&boundary_scope).await? {
+        tracing::info!(
+            model = RECONCILIATION_MODEL,
+            "Using cached audio Codex prompt-boundary validation"
+        );
+    } else {
+        probe_codex_prompt_boundary(codex_catalog.path()).await?;
+        codex_catalog.cache_validation(&boundary_scope).await?;
+    }
     ensure_private_directory(&config.media_directory)?;
     let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
@@ -297,7 +318,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         config: Arc::new(config),
         db: Arc::new(Mutex::new(connection)),
         client,
-        codex_model_catalog: Arc::new(codex_model_catalog),
+        codex_model_catalog: Arc::new(codex_catalog.path().to_owned()),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -1546,152 +1567,6 @@ async fn run_sol(model_catalog: &Path, prompt: &str) -> anyhow::Result<String> {
     parse_codex_answer(&stdout).context("Sol returned no final transcript")
 }
 
-fn catalog_context_limits(output: &[u8]) -> anyhow::Result<Vec<(String, u64, u64)>> {
-    let catalog: Value =
-        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
-    let models = catalog
-        .get("models")
-        .and_then(Value::as_array)
-        .context("Codex model catalog has no models array")?;
-    let mut limits = models
-        .iter()
-        .map(|model| {
-            Ok((
-                model
-                    .get("slug")
-                    .and_then(Value::as_str)
-                    .context("Codex model has no slug")?
-                    .to_owned(),
-                model
-                    .get("context_window")
-                    .and_then(Value::as_u64)
-                    .context("Codex model has no context window")?,
-                model
-                    .get("effective_context_window_percent")
-                    .and_then(Value::as_u64)
-                    .context("Codex model has no effective context percentage")?,
-            ))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    limits.sort_unstable();
-    Ok(limits)
-}
-
-fn sanitize_codex_model_catalog(output: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut catalog: Value =
-        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
-    let models = catalog
-        .get_mut("models")
-        .and_then(Value::as_array_mut)
-        .context("Codex model catalog has no models array")?;
-    for model in models {
-        let model = model
-            .as_object_mut()
-            .context("Codex model catalog contains a non-object model")?;
-        model.remove("tool_mode");
-        model.remove("multi_agent_version");
-        model.remove("apply_patch_tool_type");
-        model.remove("model_messages");
-        model.insert("base_instructions".into(), Value::String(String::new()));
-        model.insert(
-            "include_skills_usage_instructions".into(),
-            Value::Bool(false),
-        );
-    }
-    serde_json::to_vec(&catalog).context("serializing the sanitized Codex model catalog")
-}
-
-fn verify_sanitized_codex_model_catalog(output: &[u8]) -> anyhow::Result<()> {
-    let catalog: Value =
-        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
-    let models = catalog
-        .get("models")
-        .and_then(Value::as_array)
-        .context("Codex model catalog has no models array")?;
-    for model in models {
-        let model = model
-            .as_object()
-            .context("Codex model catalog contains a non-object model")?;
-        let slug = model
-            .get("slug")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown model");
-        ensure!(
-            model.get("base_instructions").and_then(Value::as_str) == Some(""),
-            "Codex retained base instructions for {slug}"
-        );
-        ensure!(
-            !model.contains_key("model_messages"),
-            "Codex retained model messages for {slug}"
-        );
-        ensure!(
-            model
-                .get("include_skills_usage_instructions")
-                .and_then(Value::as_bool)
-                == Some(false),
-            "Codex retained skill usage instructions for {slug}"
-        );
-    }
-    Ok(())
-}
-
-fn model_catalog_config(path: &Path) -> String {
-    format!(
-        "model_catalog_json={}",
-        serde_json::to_string(path.to_string_lossy().as_ref())
-            .expect("serializing a path string cannot fail")
-    )
-}
-
-async fn prepare_sanitized_codex_model_catalog() -> anyhow::Result<PathBuf> {
-    let source = Command::new(CODEX_EXECUTABLE)
-        .args(["debug", "models"])
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY")
-        .output()
-        .await
-        .context("discovering Codex models for audio reconciliation")?;
-    ensure!(
-        source.status.success(),
-        "Codex model discovery failed for audio reconciliation"
-    );
-    let catalog = sanitize_codex_model_catalog(&source.stdout)?;
-    let directory = std::env::temp_dir().join("kennedy-codex-catalogs");
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .context("creating the audio Codex model catalog directory")?;
-    let path = directory.join(format!("audio-models-{}.json", Uuid::new_v4()));
-    tokio::fs::write(&path, catalog)
-        .await
-        .context("writing the sanitized audio Codex model catalog")?;
-    let probe = Command::new(CODEX_EXECUTABLE)
-        .arg("-c")
-        .arg(model_catalog_config(&path))
-        .args(["debug", "models"])
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY")
-        .output()
-        .await
-        .context("probing the sanitized audio Codex model catalog")?;
-    let verification = (|| -> anyhow::Result<()> {
-        ensure!(
-            probe.status.success(),
-            "codex-safe cannot read the sanitized audio model catalog"
-        );
-        ensure!(
-            catalog_context_limits(&probe.stdout)? == catalog_context_limits(&source.stdout)?,
-            "sanitized audio Codex catalog changed advertised model context limits"
-        );
-        verify_sanitized_codex_model_catalog(&probe.stdout)
-    })();
-    if let Err(error) = verification {
-        let _ = tokio::fs::remove_file(&path).await;
-        return Err(error)
-            .context("refusing to start audio ingress with hidden Codex model instructions");
-    }
-    Ok(path)
-}
-
 fn add_codex_config(command: &mut Command, model_catalog: &Path) {
     command
         .arg("-c")
@@ -2245,27 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_codex_catalog_and_config_remove_hidden_prompts() {
-        let source = br#"{
-            "models":[{
-                "slug":"gpt-5.6-sol",
-                "context_window":272000,
-                "effective_context_window_percent":95,
-                "base_instructions":"provider instructions",
-                "model_messages":{"instructions_template":"more provider instructions"},
-                "include_skills_usage_instructions":true,
-                "tool_mode":"code_mode_only",
-                "multi_agent_version":"v2",
-                "apply_patch_tool_type":"freeform"
-            }]
-        }"#;
-        let sanitized = sanitize_codex_model_catalog(source).unwrap();
-        verify_sanitized_codex_model_catalog(&sanitized).unwrap();
-        assert_eq!(
-            catalog_context_limits(&sanitized).unwrap(),
-            catalog_context_limits(source).unwrap()
-        );
-
+    fn audio_codex_config_removes_hidden_prompts() {
         let mut command = Command::new("codex-safe");
         let catalog = Path::new("/tmp/kennedy-codex-catalogs/audio-models.json");
         add_codex_config(&mut command, catalog);

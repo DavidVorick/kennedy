@@ -13,6 +13,7 @@ chrono.workspace = true
 clap.workspace = true
 flate2.workspace = true
 kennedy-audio-ingress = { path = "../AudioIngress" }
+kennedy-codex-runtime = { path = "../CodexRuntime" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
 kennedy-intelligence = { path = "../IntelligenceBackend" }
 kweb = "=0.1.0"

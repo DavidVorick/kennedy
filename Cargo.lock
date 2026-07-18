@@ -1896,6 +1896,7 @@ dependencies = [
  "futures",
  "hound",
  "http",
+ "kennedy-codex-runtime",
  "reqwest 0.13.4",
  "rusqlite",
  "serde",
@@ -1905,6 +1906,18 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kennedy-codex-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1934,6 +1947,7 @@ dependencies = [
  "chrono",
  "html2text",
  "http",
+ "kennedy-codex-runtime",
  "pdf-extract",
  "quick-xml 0.41.0",
  "reqwest 0.13.4",
@@ -1959,6 +1973,7 @@ dependencies = [
  "clap",
  "flate2",
  "kennedy-audio-ingress",
+ "kennedy-codex-runtime",
  "kennedy-conversation-history",
  "kennedy-intelligence",
  "kennedy-telegram-relay",

@@ -1,5 +1,5 @@
 [workspace]
-members = ["AudioIngress", "ConversationHistory", "IntelligenceBackend", "TelegramRelay", "KennedyServer"]
+members = ["AudioIngress", "CodexRuntime", "ConversationHistory", "IntelligenceBackend", "TelegramRelay", "KennedyServer"]
 resolver = "2"
 
 [workspace.package]

@@ -248,18 +248,25 @@ transient failures from one another.
 
 ### 4.3 Intelligence Backend
 
+`kennedy-codex-runtime` owns the process-wide, Codex-versioned sanitized model
+catalog cache shared by Intelligence and AudioIngress. It has no HTTP surface.
+Kennedy launches all long-running service futures concurrently; within
+Intelligence, live login validation also runs concurrently with the shared
+catalog load. Only version-dependent discovery, sanitization, and verification
+remain ordered because each consumes the previous step's output.
+
 The intelligence backend owns:
 
 - validating ChatGPT Codex login and loading model/CLI configuration,
-- discovering each configured model's effective context window from Codex's
-  advertised catalog rather than a local constant,
+- obtaining each configured model's effective context window from the shared,
+  Codex-versioned sanitized catalog cache rather than a local constant,
 - validating the canonical plaintext generation request,
 - passing canonical plaintext and continuation controls into bounded,
   read-only non-interactive Codex turns,
 - enforcing an empty non-Chatend prompt boundary through empty developer
   instructions, suppressed optional instruction/tool/plugin features, a
-  mandatory sanitized catalog with blank provider prompt fields, and a startup
-  model-visible prompt probe,
+  mandatory sanitized catalog with blank provider prompt fields, and a
+  model-visible prompt probe cached for each Codex/configuration identity,
 - suppressing Codex auto-compaction beyond every reachable context so Kmap
   material is never silently summarized,
 - translating Codex text, thread IDs, errors, and detailed token usage
@@ -685,6 +692,8 @@ specification.
 ```text
 UserSpecification.md
 TechnicalDesign.md
+CodexRuntime/
+  Specification.md
 ConversationHistory/
   Specification.md
 TelegramRelay/

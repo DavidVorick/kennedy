@@ -10,6 +10,7 @@ axum.workspace = true
 chrono.workspace = true
 html2text.workspace = true
 http.workspace = true
+kennedy-codex-runtime = { path = "../CodexRuntime" }
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true

@@ -20,6 +20,7 @@ use axum::{
 };
 use calamine::{Reader as CalamineReader, open_workbook_auto_from_rs};
 use chrono::{DateTime, Utc};
+use kennedy_codex_runtime::{Catalog, CatalogCache, ModelLimits, model_catalog_config};
 use quick_xml::{Reader as XmlReader, events::Event as XmlEvent};
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
@@ -125,24 +126,6 @@ struct ProviderRuntime {
     config: ProviderConfig,
     model_limits: HashMap<String, ModelLimits>,
     sanitized_model_catalog: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ModelLimits {
-    context_window_tokens: u64,
-    max_input_tokens: u64,
-}
-
-#[derive(Deserialize)]
-struct CodexModelCatalog {
-    models: Vec<CodexModelMetadata>,
-}
-
-#[derive(Deserialize)]
-struct CodexModelMetadata {
-    slug: String,
-    context_window: u64,
-    effective_context_window_percent: u64,
 }
 
 #[derive(Clone)]
@@ -516,12 +499,17 @@ pub async fn serve(
     options: ServeOptions,
     transcription_api_key: Option<String>,
     gemini_api_key: Option<String>,
+    codex_catalog_cache: CatalogCache,
 ) -> anyhow::Result<()> {
     ensure_crypto_provider()?;
     let config = RuntimeDefaults::default();
     let mut providers = initialize_providers(&config)?;
-    validate_codex_logins(&providers).await?;
-    discover_codex_model_limits(&mut providers).await?;
+    let (_, catalog) = tokio::try_join!(
+        validate_codex_logins(&providers),
+        codex_catalog_cache.load()
+    )?;
+    configure_codex_catalog(&mut providers, &catalog)?;
+    validate_codex_prompt_boundaries(&providers, &catalog).await?;
     let transcription_api_key = transcription_api_key
         .filter(|value| !value.trim().is_empty())
         .map(Arc::<str>::from);
@@ -666,216 +654,55 @@ fn initialize_providers(
     Ok(runtimes)
 }
 
-fn parse_codex_model_limits(output: &[u8]) -> anyhow::Result<HashMap<String, ModelLimits>> {
-    let catalog: CodexModelCatalog =
-        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
-    let mut limits = HashMap::new();
-    for model in catalog.models {
-        if model.context_window == 0
-            || model.effective_context_window_percent == 0
-            || model.effective_context_window_percent > 100
-        {
-            anyhow::bail!(
-                "Codex advertised invalid context limits for model {}",
-                model.slug
-            );
-        }
-        let effective = model
-            .context_window
-            .checked_mul(model.effective_context_window_percent)
-            .context("Codex model context limit overflowed")?
-            / 100;
-        if effective == 0 {
-            anyhow::bail!(
-                "Codex advertised an empty effective context for model {}",
-                model.slug
-            );
-        }
-        limits.insert(
-            model.slug,
-            ModelLimits {
-                context_window_tokens: effective,
-                max_input_tokens: effective,
-            },
-        );
-    }
-    Ok(limits)
-}
-
-fn sanitize_codex_model_catalog(output: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut catalog: Value =
-        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
-    let models = catalog
-        .get_mut("models")
-        .and_then(Value::as_array_mut)
-        .context("Codex model catalog has no models array")?;
-    for model in models {
-        let model = model
-            .as_object_mut()
-            .context("Codex model catalog contains a non-object model")?;
-        model.remove("tool_mode");
-        model.remove("multi_agent_version");
-        model.remove("apply_patch_tool_type");
-        model.remove("model_messages");
-        model.insert("base_instructions".into(), Value::String(String::new()));
-        model.insert(
-            "include_skills_usage_instructions".into(),
-            Value::Bool(false),
-        );
-    }
-    serde_json::to_vec(&catalog).context("serializing the sanitized Codex model catalog")
-}
-
-fn verify_sanitized_codex_model_catalog(output: &[u8]) -> anyhow::Result<()> {
-    let catalog: Value =
-        serde_json::from_slice(output).context("Codex returned an invalid model catalog")?;
-    let models = catalog
-        .get("models")
-        .and_then(Value::as_array)
-        .context("Codex model catalog has no models array")?;
-    for model in models {
-        let model = model
-            .as_object()
-            .context("Codex model catalog contains a non-object model")?;
-        let slug = model
-            .get("slug")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown model");
-        if model.get("base_instructions").and_then(Value::as_str) != Some("") {
-            anyhow::bail!("Codex retained base instructions for {slug}");
-        }
-        if model.contains_key("model_messages") {
-            anyhow::bail!("Codex retained model messages for {slug}");
-        }
-        if model
-            .get("include_skills_usage_instructions")
-            .and_then(Value::as_bool)
-            != Some(false)
-        {
-            anyhow::bail!("Codex retained skill usage instructions for {slug}");
-        }
-    }
-    Ok(())
-}
-
-fn model_catalog_config(path: &Path) -> String {
-    format!(
-        "model_catalog_json={}",
-        serde_json::to_string(path.to_string_lossy().as_ref())
-            .expect("serializing a path string cannot fail")
-    )
-}
-
-fn sanitized_codex_catalog_directory() -> PathBuf {
-    std::env::temp_dir().join("kennedy-codex-catalogs")
-}
-
-async fn prepare_sanitized_codex_model_catalog(
-    executable: &str,
-    source: &[u8],
-) -> anyhow::Result<PathBuf> {
-    let catalog = sanitize_codex_model_catalog(source)?;
-    let directory = sanitized_codex_catalog_directory();
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .context("creating the sanitized Codex model catalog directory")?;
-    let path = directory.join(format!("models-{}.json", Uuid::new_v4()));
-    tokio::fs::write(&path, catalog)
-        .await
-        .context("writing the sanitized Codex model catalog")?;
-    let config = model_catalog_config(&path);
-    let probe = Command::new(executable)
-        .arg("-c")
-        .arg(config)
-        .args(["debug", "models"])
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY")
-        .output()
-        .await
-        .with_context(|| format!("probing slim model catalog through '{executable}'"))?;
-    let verification = (|| -> anyhow::Result<()> {
-        if !probe.status.success() {
-            anyhow::bail!(
-                "{executable} cannot read {} inside its sandbox",
-                path.display()
-            );
-        }
-        if parse_codex_model_limits(&probe.stdout)? != parse_codex_model_limits(source)? {
-            anyhow::bail!("sanitized Codex catalog changed advertised model context limits");
-        }
-        verify_sanitized_codex_model_catalog(&probe.stdout)?;
-        Ok(())
-    })();
-    if let Err(error) = verification {
-        let _ = tokio::fs::remove_file(&path).await;
-        return Err(error);
-    }
-    Ok(path)
-}
-
-async fn discover_codex_model_limits(
+fn configure_codex_catalog(
     providers: &mut HashMap<String, ProviderRuntime>,
+    catalog: &Catalog,
 ) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(sanitized_codex_catalog_directory())
-        .await
-        .context("creating the shared Codex model catalog directory")?;
-    let executables = providers
-        .values()
-        .map(|provider| provider.config.executable.clone())
-        .collect::<HashSet<_>>();
-    let mut catalogs = HashMap::new();
-    for executable in executables {
-        let output = Command::new(&executable)
-            .args(["debug", "models"])
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CODEX_API_KEY")
-            .output()
-            .await
-            .with_context(|| format!("starting Codex model discovery through '{executable}'"))?;
-        if !output.status.success() {
-            anyhow::bail!("Codex model discovery failed through {executable}");
-        }
-        let limits = parse_codex_model_limits(&output.stdout)?;
-        let sanitized_model_catalog =
-            prepare_sanitized_codex_model_catalog(&executable, &output.stdout)
-                .await
-                .with_context(|| {
-                    format!(
-                        "sanitizing the Codex model catalog through {executable}; refusing to expose hidden model instructions"
-                    )
-                })?;
-        tracing::info!(
-            executable,
-            path = %sanitized_model_catalog.display(),
-            "Codex model instructions and agent-tool selectors removed"
-        );
-        catalogs.insert(executable, (limits, sanitized_model_catalog));
-    }
     for (name, provider) in providers.iter_mut() {
-        let (catalog, sanitized_model_catalog) = catalogs
-            .get(&provider.config.executable)
-            .context("missing discovered Codex model catalog")?;
+        if provider.config.executable != catalog.executable() {
+            anyhow::bail!(
+                "provider {name} uses '{}' but the shared Codex catalog belongs to '{}'",
+                provider.config.executable,
+                catalog.executable()
+            );
+        }
         for model in &provider.config.models {
-            let limits = catalog.get(model).copied().with_context(|| {
+            let limits = catalog.model_limits(model).with_context(|| {
                 format!("provider {name} model {model} is absent from the Codex model catalog")
             })?;
             provider.model_limits.insert(model.clone(), limits);
         }
-        provider.sanitized_model_catalog = Some(sanitized_model_catalog.clone());
+        provider.sanitized_model_catalog = Some(catalog.path().to_owned());
     }
+    Ok(())
+}
+
+async fn validate_codex_prompt_boundaries(
+    providers: &HashMap<String, ProviderRuntime>,
+    catalog: &Catalog,
+) -> anyhow::Result<()> {
     for (name, provider) in providers.iter() {
-        let catalog = provider
-            .sanitized_model_catalog
-            .as_deref()
-            .context("provider is missing its sanitized Codex model catalog")?;
         for model in &provider.config.models {
-            probe_codex_prompt_boundary(provider, model, catalog)
+            let scope = format!(
+                "kennedy-intelligence-prompt-boundary-v1:{}:{}:{}",
+                provider.config.executable, model, provider.config.reasoning_effort
+            );
+            if catalog.validation_is_cached(&scope).await? {
+                tracing::info!(
+                    provider = name,
+                    model,
+                    "Using cached Codex prompt-boundary validation"
+                );
+                continue;
+            }
+            probe_codex_prompt_boundary(provider, model, catalog.path())
                 .await
                 .with_context(|| {
                     format!(
                         "provider {name} model {model} exposed model-visible content outside Kennedy's Chatend"
                     )
                 })?;
+            catalog.cache_validation(&scope).await?;
         }
     }
     Ok(())
@@ -3163,58 +2990,6 @@ mod tests {
         );
         assert_eq!(capacity.code, "provider_capacity");
         assert_eq!(capacity.status, StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[test]
-    fn advertised_codex_context_is_used_without_a_hardcoded_override() {
-        let limits = parse_codex_model_limits(
-            br#"{"models":[{"slug":"gpt-5.6-sol","context_window":272000,"effective_context_window_percent":95}]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            limits["gpt-5.6-sol"],
-            ModelLimits {
-                context_window_tokens: 258_400,
-                max_input_tokens: 258_400,
-            }
-        );
-    }
-
-    #[test]
-    fn sanitized_codex_catalog_removes_hidden_prompts_and_preserves_limits() {
-        let source = br#"{
-            "models":[{
-                "slug":"gpt-5.6-sol",
-                "context_window":272000,
-                "effective_context_window_percent":95,
-                "base_instructions":"provider instructions",
-                "model_messages":{"instructions_template":"more provider instructions"},
-                "include_skills_usage_instructions":true,
-                "tool_mode":"code_mode_only",
-                "multi_agent_version":"v2",
-                "apply_patch_tool_type":"freeform",
-                "unrelated":"preserved"
-            }]
-        }"#;
-        let sanitized = sanitize_codex_model_catalog(source).unwrap();
-        assert_eq!(
-            parse_codex_model_limits(&sanitized).unwrap(),
-            parse_codex_model_limits(source).unwrap()
-        );
-        verify_sanitized_codex_model_catalog(&sanitized).unwrap();
-        let catalog: Value = serde_json::from_slice(&sanitized).unwrap();
-        let model = catalog["models"][0].as_object().unwrap();
-        for removed in [
-            "tool_mode",
-            "multi_agent_version",
-            "apply_patch_tool_type",
-            "model_messages",
-        ] {
-            assert!(!model.contains_key(removed));
-        }
-        assert_eq!(model["base_instructions"], "");
-        assert_eq!(model["include_skills_usage_instructions"], false);
-        assert_eq!(model["unrelated"], "preserved");
     }
 
     #[test]

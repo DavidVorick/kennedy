@@ -9,6 +9,8 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   prompt manuals.
 - `kennedy-intelligence` is a local Codex bridge with thread continuation,
   token/cache telemetry, web research, and safe public page extraction.
+- `kennedy-codex-runtime` gives Intelligence and AudioIngress one process-wide,
+  versioned sanitized-model-catalog cache and compatibility-validation ledger.
 - `kennedy-conversation-history` checkpoints active conversations and durably
   stores complete conversation and history-ingress recovery archives, with
   multiple live conversations and a serialized history-ingress queue.
@@ -54,9 +56,12 @@ container at the same absolute path, read-only. For example, set
 `--mount type=bind,src="$catalog_dir",dst="$catalog_dir",ro` to the container's
 `podman run` or `podman create` arguments. If the launcher uses a persistent
 container, recreate that container with the bind mount. Kennedy creates the
-source directory before its first launcher call, probes the generated catalog
-through `codex-safe` before using it, and aborts startup rather than falling
-back to the stock instruction-bearing catalog when the mount is unavailable.
+source directory before its first launcher call. It probes a newly generated
+catalog through `codex-safe` before using it, then reuses the versioned verified
+cache on ordinary restarts. It aborts startup rather than falling back to the
+stock instruction-bearing catalog when the mount is unavailable. Set
+`CODEX_SAFE_CATALOG_DIR` for a persistent custom cache path; the launcher
+already honors the same variable.
 
 The UI's Full Chatend inspector and generation path share one plaintext
 formatter: what the Full inspector shows is every application-controlled byte
@@ -68,15 +73,16 @@ and sends its human-readable message text under `Archived Chatend`; it does not
 send the archive envelope, media blobs, counters, or diagnostics.
 
 The launcher must also forward `codex-safe debug models` and `codex-safe debug
-prompt-input`. Kennedy discovers the configured model's advertised effective
-context window at startup and refuses to invent a fallback. It derives a
-mandatory sanitized catalog from that live result, blanks provider base
-instructions, removes model message templates and agent-tool selectors,
-disables model-selected skill instructions, and verifies that all advertised
-effective limits are unchanged. Codex runtime and developer instructions are
-explicitly empty and all exposed optional instruction/tool/plugin scaffolding is disabled.
-The prompt-input probe requires the Chatend sentinel to be the only
-model-visible message. Codex still registers
+prompt-input`. Kennedy refuses to invent a fallback context window. On a Codex
+version/cache miss it derives a mandatory sanitized catalog from advertised
+metadata, blanks provider base instructions, removes model message templates
+and agent-tool selectors, disables model-selected skill instructions, and
+verifies that all advertised effective limits are unchanged. Intelligence and
+AudioIngress share that work. Codex runtime and developer instructions are
+explicitly empty and all exposed optional instruction/tool/plugin scaffolding
+is disabled. The prompt-input probe requires the supplied sentinel to be the
+only model-visible message. Successful probes are cached per Codex/catalog and
+prompt configuration instead of rerunning every launch. Codex still registers
 its forced `update_plan` and `view_image` schemas despite every exposed switch
 being false; Kennedy adds no hidden instruction to compensate for them.
 All Codex turns set the auto-compaction threshold beyond any reachable window

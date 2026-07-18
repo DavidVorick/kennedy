@@ -11,6 +11,7 @@ chrono.workspace = true
 futures.workspace = true
 hound.workspace = true
 http.workspace = true
+kennedy-codex-runtime = { path = "../CodexRuntime" }
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

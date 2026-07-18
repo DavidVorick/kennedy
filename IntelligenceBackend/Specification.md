@@ -88,18 +88,18 @@ same absolute path, read-only. A persistent container must be recreated when
 adding this mount. The backend creates the host directory before its first
 launcher call.
 
-At startup the backend runs `codex-safe debug models` and `codex-safe debug
-prompt-input`; the launcher must forward both commands. It reads each model's
-`context_window` and `effective_context_window_percent`, and exposes their
-product as the usable context and input window. The selected model must be
-present with valid advertised values or startup fails. There is no hardcoded
-fallback window. The backend also writes a sanitized catalog that blanks every
-model's `base_instructions`, removes `model_messages`, disables model-selected
-skill instructions, and removes `tool_mode`, `multi_agent_version`, and
-`apply_patch_tool_type`. It probes that catalog through `codex-safe debug
-models`, requiring the sanitized prompt fields and every advertised effective
-context limit to match expectations. Failure removes the file and aborts
-startup; Kennedy never falls back to the stock instruction-bearing catalog.
+At startup the backend and AudioIngress concurrently request one shared catalog
+from `kennedy-codex-runtime`. The runtime always checks `codex-safe --version`.
+It runs `codex-safe debug models` and sanitizes/probes the result only on a
+versioned cache miss; concurrent callers share the same initialization. It
+reads each model's `context_window` and `effective_context_window_percent`, and
+exposes their product as the usable context and input window. The selected
+model must be present with valid advertised values or startup fails. There is
+no hardcoded fallback window. The sanitized catalog blanks every model's
+`base_instructions`, removes `model_messages`, disables model-selected skill
+instructions, and removes `tool_mode`, `multi_agent_version`, and
+`apply_patch_tool_type`. Kennedy never falls back to the stock
+instruction-bearing catalog.
 
 The native-audio model list is empty for the `gpt-5.6-sol` Codex transport. A
 model belongs in that list only when its active Kennedy transport can actually
@@ -144,10 +144,12 @@ warnings are excluded from provider failure details.
 
 These settings minimize every exposed Codex layer the deployment can control.
 The canonical Chatend is the exact application-controlled plaintext sent to
-Codex. At startup, `codex-safe debug prompt-input` must report exactly one
-model-visible message containing an application sentinel; any additional or
-altered prompt item aborts startup. Codex or its upstream provider may still
-attach forced structured metadata downstream. Codex still registers its
+Codex. `codex-safe debug prompt-input` must report exactly one model-visible
+message containing an application sentinel; any additional or altered prompt
+item aborts startup. A successful result is cached for the exact Codex/catalog,
+model, reasoning, and prompt-configuration version rather than repeated on
+every launch. Codex or its upstream provider may still attach forced structured
+metadata downstream. Codex still registers its
 unconditional `update_plan` and environment-backed `view_image` schemas even
 when every exposed switch for them is false; transport testing confirms that no
 supported setting removes those final core schemas. Kennedy adds no invisible

@@ -202,6 +202,8 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     )?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?;
+    let codex_catalog_cache =
+        kennedy_codex_runtime::CatalogCache::new(kennedy_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) = kmap_http::initialize(
         &args.kweb_database,
         &args.kweb_provenance_artifacts,
@@ -242,10 +244,15 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             args.system_prompts_dir,
             kweb_listener,
         ),
-        kennedy_intelligence::serve(intelligence, transcription_api_key, gemini_api_key),
+        kennedy_intelligence::serve(
+            intelligence,
+            transcription_api_key,
+            gemini_api_key,
+            codex_catalog_cache.clone(),
+        ),
         kennedy_conversation_history::serve(history),
         kennedy_telegram_relay::serve(telegram),
-        kennedy_audio_ingress::serve(audio_ingress),
+        kennedy_audio_ingress::serve(audio_ingress, codex_catalog_cache),
     )?;
     Ok(())
 }
