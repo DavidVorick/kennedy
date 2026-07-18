@@ -1,10 +1,12 @@
 # Kennedy MVP
 
 Kennedy is a local-first personal assistant with inspectable, provenance-backed
-long-term memory. The MVP has five logically independent backend APIs and a
-browser-native frontend:
+long-term memory. The MVP has five API domains and a browser-native frontend:
 
-- `kennedy-kweb` owns SQLite, memory/history invariants, and serves the UI.
+- `kweb` is a standalone, storage-only Rust library that owns knowledge-web
+  SQLite rows, per-node history invariants, and durable mutation-idempotency
+  receipts. `kennedy-server` imports it and serves `/api/v1/kmap`, the UI, and
+  prompt manuals.
 - `kennedy-intelligence` is a local Codex bridge with thread continuation,
   token/cache telemetry, web research, and safe public page extraction.
 - `kennedy-conversation-history` checkpoints active conversations and durably
@@ -20,9 +22,10 @@ browser-native frontend:
   recovery orchestration, conversation-history browsing, and automatic
   background history ingress.
 
-All five backends are separate library crates with separate listeners, state,
-and databases. One `kennedy-server` binary hosts them without allowing the
-backends to call or access one another.
+One `kennedy-server` binary hosts the runtime. Kmap is deliberately in-process
+through its separately publishable library; the other service domains retain
+separate listeners, state, and databases. A later routing consolidation can put
+all API domains on one port without changing Kmap storage.
 
 ## First run
 
@@ -144,9 +147,10 @@ media directory to migrate the same credentials to another machine; the same
 vault passphrase unlocks them there.
 
 Open `http://127.0.0.1:4321`. The Kweb and conversation databases are created
-as `kennedy.sqlite3`, `kennedy-conversations.sqlite3`,
+as `kweb.sqlite3`, `kennedy-conversations.sqlite3`,
 `kennedy-telegram.sqlite3`, `kennedy-users.sqlite3`, and
-`kennedy-audio.sqlite3` on first run. Original
+`kennedy-audio.sqlite3` on first run. Large Kweb provenance payloads and media
+live in the sibling `kweb-provenance-artifacts/` tree. Original
 vnotes and restartable working chunks live under `kennedy-audio-ingress/`. The
 five APIs bind to loopback ports 4321 through 4325. Without a Telegram token,
 port 4324 reports the relay as disabled and the rest of Kennedy remains usable.
@@ -220,6 +224,21 @@ piece.
 
 ## Backups
 
+To split an existing pre-artifact database while Kennedy is stopped, run:
+
+```sh
+cargo run -p kennedy-server -- migrate-kweb-storage
+```
+
+The command reads `kennedy.sqlite3` without modifying it, publishes
+`kweb.sqlite3` and `kweb-provenance-artifacts/` only after verification, and
+preserves every Kweb identifier. Embedded archive media becomes an immutable
+artifact whose original basename has 12 URL-safe Base64 characters inserted
+before its extension and whose first two suffix characters select its shard
+folder. Use `--source-database`, `--kweb-database`, and
+`--kweb-provenance-artifacts` to override those paths. Existing destinations
+are never overwritten.
+
 Stop the running Kennedy server, then create an offline backup with:
 
 ```sh
@@ -235,7 +254,7 @@ instance from modifying persistent state during a backup.
 The result is a private
 `backups/kennedy-backup-YYYY-MM-DDTHH-MM-SSZ.tar.gz` archive containing
 verified standalone snapshots of all five SQLite databases, the complete
-audio-ingress media directory, the encrypted credential vault when present, a
+Kweb provenance-artifact tree, the complete audio-ingress media directory, the encrypted credential vault when present, a
 machine-readable checksum manifest, and a self-contained recovery README. The
 README begins with the creating source commit and includes the exact SQLite DDL
 and current persisted JSON/vault/audio formats. Gzip does not encrypt the
@@ -243,10 +262,17 @@ databases or recordings; move the archive to appropriately protected
 off-machine storage.
 
 Use `--backup-dir PATH` to select another destination. The existing global
-`--kweb-bind`, `--kweb-database`, `--conversation-history-database`,
+`--kweb-bind`, `--kweb-database`, `--kweb-provenance-artifacts`, `--conversation-history-database`,
 `--telegram-database`, `--user-database`, `--audio-ingress-database`,
 `--audio-ingress-media`, and `--vault-path` flags select the lock address and
 source files when their deployment values differ from the defaults.
+
+Pass `--lightweight-kweb` to the backup subcommand to intentionally omit the
+large provenance-artifact tree while retaining `kweb.sqlite3`, including its
+artifact filenames, sizes, and hashes. Node text and history remain backed up,
+but externally stored provenance cannot be fully read from that lightweight
+archive alone. A normal full backup refuses to proceed if SQLite references an
+artifact that is missing or whose copied size/hash does not match.
 
 For a quick estimate of the current Kmap's model-context footprint, run:
 
@@ -254,11 +280,11 @@ For a quick estimate of the current Kmap's model-context footprint, run:
 cargo run -p kennedy-server -- kmap-size
 ```
 
-This read-only command can run while Kennedy is serving. It reports estimated
-tokens for complete node text and for long descriptions alone, using one token
-per four Unicode characters, and also prints the underlying word and character
-counts. Node history, provenance, connections, and every non-node table are
-excluded.
+It reports estimated tokens for complete node text and for long descriptions
+alone, using one token per four Unicode characters, and also prints the
+underlying word and character counts. Opening a pre-library database may apply
+the Kmap schema migration, so perform that first run with Kennedy stopped. Node
+history, provenance, connections, and every non-node table are excluded.
 
 The compiled defaults use `gpt-5.6-sol` with `xhigh` reasoning effort and
 execute each turn through `codex-safe`, which invokes non-interactive
@@ -361,7 +387,7 @@ cargo test --workspace
 node --experimental-default-type=module --test Frontend/tests/*.test.mjs
 ```
 
-The Rust suite covers graph limits, bootstrap/history integrity, conversation
+The Rust suite covers Kmap storage/migration/history/idempotency integrity, conversation
 state transitions, Telegram authorization/queue behavior, normalized request validation, cached continuation request
 shape, and provider usage normalization. The frontend suite covers short IDs,
 resets, load limits, checkpoint-before-generation ordering, pending-query

@@ -4,12 +4,12 @@
 
 The frontend is a browser-native HTML, CSS, and JavaScript application. It has
 no Node.js dependency, package manager, bundler, TypeScript, or compile step.
-The Kweb backend serves it on localhost.
+The main Rust server serves it on localhost beside the Kmap HTTP adapter.
 
 The frontend owns Kennedy's UI and live orchestration: the clean
 transcript, the complete chatend, context glue, prompt composition, agent tool
 loops, recovery coordination, and the memory explorer. It does not own durable
-data or backend mutation rules.
+data, but it does own graph policy over the storage library's ordered ID arrays.
 
 ## 2. Source Layout
 
@@ -55,7 +55,7 @@ ingress lifecycle must remain separate concerns.
 
 The frontend defaults to:
 
-- Kweb API and static origin: `http://127.0.0.1:4321`
+- Main static origin and `/api/v1/kmap` adapter: `http://127.0.0.1:4321`
 - Intelligence API: `http://127.0.0.1:4322`
 - Conversation history API: `http://127.0.0.1:4323`
 - Telegram relay API: `http://127.0.0.1:4324`
@@ -178,7 +178,12 @@ replays the complete visible Chatend into a fresh thread.
 
 The clean transcript is maintained separately for the uncluttered conversation
 panel. Conversation provenance stores the complete versioned recovery archive
-rather than only that transcript. During history ingress the frontend parses
+rather than only that transcript. Before upload, the client copies the archive,
+moves every top-level media `dataUrl` into a multipart artifact that preserves
+its filename and content type, and replaces it with
+`provenanceArtifactIndex`. It never mutates the live recovery archive. The
+Kweb client retries one ambiguous multipart failure with the same FormData and
+`IdempotencyId`, so the server receives identical bytes. During history ingress the frontend parses
 the archive and canonically formats its `messages` array as the `Archived
 Chatend`; the archive object itself, media data URLs, counters, usage,
 diagnostics, and other recovery fields are not sent to Kennedy.
@@ -254,8 +259,10 @@ These entries are persisted in the Chatend for later model turns.
 
 ## 6. Context Glue
 
-The Kweb API returns durable IDs. The frontend converts every node exposed to
-Kennedy into an in-context node:
+The Kmap API returns complete nodes whose fixed and recent connections are
+ordered durable-ID arrays. The frontend treats the first eight recent IDs as
+active, the remainder as fanout, fetches active node bodies as needed, and
+converts every node exposed to Kennedy into an in-context node:
 
 ```json
 {
@@ -264,6 +271,7 @@ Kennedy into an in-context node:
   "shortDescription": "Short description.",
   "longDescription": "Long description.",
   "lastModifiedBy": "gpt-5.6-sol-xhigh",
+  "lastModifiedAt": "2026-07-18T00:00:00Z",
   "ownerIdentifier": 1,
   "fixedConnections": [
     {"identifier": 5, "shortName": "Pinned Memory", "slot": 1}
@@ -401,7 +409,8 @@ Execution:
    budget and reject the call if that budget is exhausted.
 2. Reject the call if ten nodes are already directly loaded.
 3. Resolve the short identifier.
-4. Call `GET /api/v1/nodes/{durable_id}/context`.
+4. Fetch `GET /api/v1/kmap/nodes/{durable_id}`, treat the first eight recent
+   IDs as active, and fetch those full node bodies.
 5. Add the requested durable ID to the directly loaded set.
 6. Mark the requested node and returned active-connection nodes as full.
 7. Assign short IDs to every newly seen node or connection summary.
@@ -467,11 +476,16 @@ LLM schema:
 Every identifier must refer to a node whose full payload is in context. This
 includes directly loaded nodes, their full active-connection expansions, and
 full nodes returned by create or update operations; it excludes summary-only
-connection references. The frontend resolves the IDs and calls
-`POST /api/v1/connections`. Returned nodes refresh matching frontend context
-records. The tool result reports the updated in-context node shapes. The
-frontend adds the current model attribution to the backend request; it is not
-part of Kennedy's arguments.
+connection references. The frontend resolves the IDs. For each node in order
+it prepends every peer to that node's recent-ID array and sends the complete
+replacement node to `PUT /api/v1/kmap/nodes/{durable_id}`. Updated nodes
+refresh matching context records. The tool result reports their in-context
+shapes. The frontend adds current model attribution to each request; it is not
+part of Kennedy's arguments. It also generates a distinct random 16-byte
+idempotency identifier for every node update and reuses the request unchanged
+for an ambiguous network retry. Individual calls are therefore idempotent;
+the multi-node sequence remains intentionally non-atomic and is not a single
+composite operation.
 
 ### 8.4 `ConsolidateFanout`
 
@@ -486,12 +500,12 @@ Available only during history ingress.
 ```
 
 The parent and aggregator must be full nodes. The moved identifiers may be
-known fanout summaries. The frontend resolves them and calls
-`POST /api/v1/connections/consolidate-fanout`; returned parent and aggregator
-nodes refresh the context.
-
-The frontend records the current model attribution for the parent, aggregator,
-and moved nodes without promoting summary-only nodes to full context.
+known fanout summaries. The frontend verifies that the aggregator and moved
+IDs are currently after the first eight parent recent IDs, removes the moved
+IDs from the parent, and appends them to the aggregator. It persists the parent
+and aggregator through two sequential complete-node updates. Final list
+position determines whether each renders as active or fanout. No Kmap
+consolidate API exists.
 
 ### 8.5 `SetFixedConnection`
 
@@ -506,13 +520,12 @@ Available only during history ingress.
 ```
 
 The parent and child must be full nodes and slot is 1, 2, or 3. The string
-`blank` in `childIdentifier` clears the selected slot. The frontend calls
-`POST /api/v1/fixed-connections`, refreshes the parent, and reports any
-displaced node. Fixed connections are arbitrary Kennedy-controlled placements
-with no priority or task meaning.
-
-The frontend attributes the parent, assigned child, and displaced child
-automatically without adding an argument to Kennedy's tool contract.
+`blank` in `childIdentifier` clears the selected position. The frontend edits
+the parent's fixed-ID array and persists that parent with
+`PUT /api/v1/kmap/nodes/{durable_id}`. Fixed connections are arbitrary
+Kennedy-controlled placements with no priority or task meaning. Because
+storage is an ID array rather than a sparse slot map, occupied positions remain
+contiguous; assigning a position beyond the next available one is rejected.
 
 ### 8.6 `CreateNode`
 
@@ -528,12 +541,14 @@ Available only during history ingress.
 }
 ```
 
-The frontend resolves the parents and root owner and calls `POST /api/v1/nodes`,
-supplying the current provenance ID. The created node is assigned a short identifier and
-marked as full before it is returned to Kennedy. Creation does not make the
-node directly loaded unless a later LoadNode call loads it.
-The frontend supplies the current model attribution automatically and refreshes
-the created node and its already-full parents from the response.
+The frontend resolves the parents and root owner and calls
+`POST /api/v1/kmap/nodes`, supplying the current provenance ID and every parent
+as the new node's recent array. It then sequentially prepends the new ID to
+every parent's recent array with ordinary node updates. The created node is
+assigned a short identifier and marked as full before it is returned to
+Kennedy. Creation does not make the node directly loaded unless a later
+LoadNode call loads it. The frontend supplies current model attribution to
+every mutation and refreshes the affected full records.
 
 ### 8.7 `UpdateNode`
 
@@ -550,9 +565,10 @@ Available only during history ingress.
 ```
 
 The frontend resolves the node and root owner and calls
-`PUT /api/v1/nodes/{durable_id}` with the current provenance ID. It refreshes the in-context representation and
-returns the updated node. The backend request also receives the frontend's
-current model attribution automatically.
+`PUT /api/v1/kmap/nodes/{durable_id}` with the current provenance ID, requested
+fields, and the node's complete existing fixed/recent arrays. It refreshes the
+in-context representation and returns the updated node. The request also
+receives the frontend's current model attribution automatically.
 
 ### 8.8 `WebSearch`
 
@@ -699,9 +715,9 @@ user explicitly ends the selected conversation:
    do not select or create a replacement conversation automatically,
 3. serialize the complete versioned recovery archive, including structured
    system, memory, tool, and media-capable message content,
-4. let the serialized ingress worker create or retrieve Kweb provenance using
-   source `conversation`, the
-   conversation start time, and idempotency key `conversation:{conversation_id}`,
+4. let the serialized ingress worker create Kweb provenance using source
+   `conversation` and the conversation start time, uploading archived
+   media through `POST /api/v1/kmap/provenance-with-artifacts`,
 5. store the returned opaque provenance ID while transitioning the history
    record to `ingress_in_progress`,
 6. run history ingress using that provenance ID in the background and
@@ -754,7 +770,7 @@ duration, and button, labels the button `Starting…`, and shares one in-page
 start promise across any repeated click handlers. It creates a `free-time`
 Conversation History record with a run UUID, run start, duration, absolute
 deadline, slice index, trimmed custom prompt, and an
-idempotent run-level Kweb provenance ID. The backend rejects creation if a
+run-level Kmap provenance ID. The backend rejects record creation if a
 free-time record is already active; the frontend then adopts that existing
 record instead of creating an overlap. The initial autonomous instruction is
 checkpointed as a pending turn before generation begins. Its first user-role
@@ -810,7 +826,7 @@ after a checkpoint conflict the latest server record is adopted before retry.
 History ingress has a new chatend and context. It does not reuse the ended
 conversation's Kweb tool history.
 
-1. Fetch `GET /api/v1/provenance/{provenance_id}` from the Kweb backend.
+1. Fetch `GET /api/v1/kmap/provenance/{provenance_id}` from the main server.
 2. Compose history-ingress instructions.
 3. parse the provenance's durable recovery archive and place the canonically
    formatted `messages` text into retained session content under `Archived
@@ -824,6 +840,11 @@ conversation's Kweb tool history.
 8. append live requests, results, and completion after the clean transcript in
    the same scroll container,
 9. mark the conversation history record complete.
+
+The provenance response contains ordered artifact metadata rather than media
+bytes. When a UI needs the original, it fetches the metadata's encoded relative
+path below `GET /api/v1/kmap/provenance-artifacts/` and receives the immutable
+file as a streamed response. Ordinary history-ingress text does not fetch media.
 
 Prompt composition and every history-ingress mutation use the selected model
 and provider-reported reasoning effort. The combined attribution format is
@@ -855,8 +876,9 @@ item from either queue completes before the next Kmap-mutating item starts. An
 in-progress item has priority; otherwise the oldest source time wins, and audio
 pieces with the same source time remain ordered by their persisted piece index.
 
-For audio, the frontend creates `audio-vnote` provenance with the recording's
-SHA-256/piece idempotency key and recording-start `source_created_at`. The
+For audio, the frontend creates `audio-vnote` provenance with the
+recording-start `source_created_at`; the recording hash and piece index remain
+inside the provenance content. The
 retained content is the Sol-produced final transcript piece, not Gemini JSON or
 audio bytes. Its heading repeats recording time, hash, filename, and piece
 position. Prompt composition selects `AudioIngressSession.txt`, then adds the
@@ -1019,12 +1041,14 @@ returns it to the durable queue.
 The explorer starts at the user root and provides persistent toolbar actions
 for jumping directly to either the user root or Kennedy root. It also supports:
 
-- viewing a full knowledge node with `GET /api/v1/nodes/{node_id}`,
+- viewing a full knowledge node with `GET /api/v1/kmap/nodes/{node_id}`,
 - following task, active, and fanout connections,
 - viewing the node's history chain with
-  `GET /api/v1/nodes/{node_id}/history`,
+  `GET /api/v1/kmap/nodes/{node_id}/history`,
 - opening a history entry's source with
-  `GET /api/v1/provenance/{provenance_id}`,
+  `GET /api/v1/kmap/provenance/{provenance_id}`,
+- retrieving an attached immutable source file from
+  `GET /api/v1/kmap/provenance-artifacts/{relative_path}` when requested,
 - browser-local back and forward navigation.
 
 The explorer does not edit durable data.
@@ -1068,11 +1092,13 @@ private Telegram, persistent per-user Telegram groups, and group-source history
 ingress. Shared prompt assets describe an arbitrary always-loaded root set;
 dynamic group context supplies the session-specific root roles and order.
 
-At startup the frontend reads the legacy user and Kennedy roots from Kweb,
+At startup the frontend reads the user and Kennedy roles from
+`GET /api/v1/kmap/roots`,
 then asks the relay for unprovisioned whitelist entries and group roots. It maps
-the configured web handle `taek42` to the legacy user root, idempotently creates
-every other reserved root with `POST /api/v1/nodes/bootstrap`, and marks each
-directory entry ready. User roots start as `User Root`; group roots start as
+the configured web handle `taek42` to the user root and creates every other
+reserved root by creating provenance and then posting the exact reserved node
+ID to `/api/v1/kmap/nodes`; it marks each directory entry ready afterward.
+User roots start as `User Root`; group roots start as
 `Group Root`. This is the only David-specific mapping; neither backend uses a
 sentinel David ID. New `/adduser` entries and newly observed groups are
 discovered and provisioned by the same bridge loop before their events run.

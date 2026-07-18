@@ -11,7 +11,7 @@ import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, runAgentLoop
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
 import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
-import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, TelegramRelayAPI } from "../public/js/api.js";
+import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, KwebAPI, TelegramRelayAPI, newIdempotencyId } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
 import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
@@ -34,10 +34,150 @@ const promptManuals = (label = "Shared") => ({
 });
 
 class MockKweb {
-  constructor(nodes) { this.nodes = new Map(nodes.map(n => [n.id, n])); this.connected = null; }
+  constructor(nodes) { this.nodes = new Map(nodes.map(n => [n.id, n])); this.updatedCalls = []; }
   async context(nodeId) { const requested = this.nodes.get(nodeId); return { requested_node: requested, active_connection_nodes: requested.active_connections.map(item => this.nodes.get(item.id)) }; }
-  async connect(nodeIds, modelAttribution) { this.connected = nodeIds; this.modelAttribution = modelAttribution; return { nodes: nodeIds.map(nodeId => ({ ...this.nodes.get(nodeId), last_modified_by: modelAttribution })) }; }
+  async updateNode(nodeId, body) {
+    this.updatedCalls.push([nodeId, body]);
+    const current = this.nodes.get(nodeId);
+    const recent = (body.recent_connections || []).map(value => ({ id: value, short_name: this.nodes.get(value)?.short_name, short_description: this.nodes.get(value)?.short_description }));
+    const updated = {
+      ...current,
+      short_name: body.short_name,
+      short_description: body.short_description,
+      long_description: body.long_description,
+      owner_node_id: body.owner_node_id,
+      owner_root_node_id: body.owner_node_id,
+      last_modified_by: body.model_attribution,
+      fixed_connections: (body.fixed_connections || []).map((value, index) => ({ id: value, slot: index + 1 })),
+      active_connections: recent.slice(0, 8),
+      fanout_connections: recent.slice(8),
+      recent_connections: body.recent_connections || [],
+    };
+    this.nodes.set(nodeId, updated);
+    return { node: updated };
+  }
 }
+
+test("Kmap client uses namespaced storage routes and derives active context", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const stored = new Map([
+    [id(1), { id: id(1), short_name: "Root Node", short_description: "", long_description: "", last_modified_by: "test", last_modified_at: "2026-07-18T00:00:00Z", owner_node_id: id(1), fixed_connections: [id(3)], recent_connections: [id(2)] }],
+    [id(2), { id: id(2), short_name: "Active Node", short_description: "", long_description: "", last_modified_by: "test", last_modified_at: "2026-07-18T00:00:00Z", owner_node_id: id(1), fixed_connections: [], recent_connections: [] }],
+  ]);
+  globalThis.fetch = async url => {
+    calls.push(String(url));
+    const nodeId = String(url).split("/").at(-1);
+    return new Response(JSON.stringify(stored.get(nodeId)), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const payload = await KwebAPI("http://local").context(id(1));
+    assert.deepEqual(calls, [
+      `http://local/api/v1/kmap/nodes/${id(1)}`,
+      `http://local/api/v1/kmap/nodes/${id(2)}`,
+    ]);
+    assert.deepEqual(payload.requested_node.fixed_connections, [{ id: id(3), slot: 1 }]);
+    assert.deepEqual(payload.requested_node.active_connections, [{ id: id(2) }]);
+    assert.equal(Object.hasOwn(payload.requested_node, "recent_connections"), false);
+    assert.equal(payload.active_connection_nodes[0].short_name, "Active Node");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Kmap mutations retain their idempotency ID across an ambiguous network retry", async () => {
+  const generated = newIdempotencyId();
+  assert.match(generated, /^[0-9a-f]{32}$/);
+
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: String(url), options });
+    if (requests.length === 1) throw new TypeError("connection lost after send");
+    return new Response(JSON.stringify({ id: id(9) }), { status: 201, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const idempotencyId = "12".repeat(16);
+    const result = await KwebAPI("http://local").createProvenance({
+      idempotency_id: idempotencyId,
+      data: "source text",
+      source: "test",
+      source_created_at: "2026-07-18T00:00:00Z",
+    });
+    assert.equal(result.id, id(9));
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].url, "http://local/api/v1/kmap/provenance");
+    assert.equal(requests[0].options.body, requests[1].options.body);
+    assert.equal(JSON.parse(requests[0].options.body).idempotency_id, idempotencyId);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Kweb archive provenance moves media into replay-stable multipart artifacts", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).startsWith("data:")) {
+      return new Response(new Blob(["voice-note"], { type: "audio/wav" }), {
+        status: 200,
+        headers: { "content-type": "audio/wav" },
+      });
+    }
+    requests.push({ url: String(url), options });
+    if (requests.length === 1) throw new TypeError("connection lost after send");
+    return new Response(JSON.stringify({ id: id(10) }), { status: 201, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const archive = {
+      messages: [],
+      media: [{
+        fileName: "telegram-vnote.wav",
+        mimeType: "audio/wav",
+        dataUrl: "data:audio/wav;base64,dm9pY2Utbm90ZQ==",
+      }],
+    };
+    const result = await KwebAPI("http://local").createProvenanceArchive({
+      idempotency_id: "34".repeat(16),
+      archive,
+      source: "conversation-history",
+      source_created_at: "2026-07-18T00:00:00Z",
+    });
+    assert.equal(result.id, id(10));
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].url, "http://local/api/v1/kmap/provenance-with-artifacts");
+    assert.equal(requests[0].options.body, requests[1].options.body);
+    const form = requests[0].options.body;
+    assert.equal(form.get("idempotency_id"), "34".repeat(16));
+    assert.equal(form.get("data_filename"), "conversation-history-archive.json");
+    const stored = JSON.parse(form.get("data"));
+    assert.equal(stored.media[0].dataUrl, undefined);
+    assert.equal(stored.media[0].provenanceArtifactIndex, 0);
+    const artifact = form.get("artifact");
+    assert.equal(artifact.name, "telegram-vnote.wav");
+    assert.equal(artifact.type, "audio/wav");
+    assert.equal(await artifact.text(), "voice-note");
+    assert.match(archive.media[0].dataUrl, /^data:/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Kweb provenance artifacts are fetched from their encoded namespaced path", async () => {
+  const originalFetch = globalThis.fetch;
+  let requested;
+  globalThis.fetch = async url => {
+    requested = String(url);
+    return new Response(new Blob(["artifact"]), { status: 200 });
+  };
+  try {
+    const blob = await KwebAPI("http://local").provenanceArtifact("a_/voice note.123.wav");
+    assert.equal(requested, "http://local/api/v1/kmap/provenance-artifacts/a_/voice%20note.123.wav");
+    assert.equal(await blob.text(), "artifact");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("short IDs are stable within a context and reset from one", async () => {
   const api = new MockKweb([node(1, [3]), node(2), node(3)]);
@@ -386,8 +526,9 @@ test("ConnectNodes translates short IDs to durable IDs", async () => {
   const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", modelAttribution: "gpt-test-xhigh", loadLimit: 20 });
   const result = await executor.execute({ id: "a", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
   assert.match(result.message.content, /Memory connections updated/);
-  assert.deepEqual(api.connected, [id(1), id(2)]);
-  assert.equal(api.modelAttribution, "gpt-test-xhigh");
+  assert.deepEqual(api.updatedCalls.map(call => call[0]), [id(1), id(2)]);
+  assert.deepEqual(api.updatedCalls.map(call => call[1].recent_connections), [[id(2)], [id(1)]]);
+  assert.ok(api.updatedCalls.every(call => call[1].model_attribution === "gpt-test-xhigh"));
   assert.match(result.message.content, /Last modified by: gpt-test-xhigh/);
 });
 
@@ -408,35 +549,27 @@ test("history ingress rechecks authorization before a Kmap mutation", async () =
     error => error.code === "ingress_cancelled",
   );
   assert.equal(checks, 1);
-  assert.equal(api.connected, null);
+  assert.equal(api.updatedCalls.length, 0);
 });
 
 test("ConsolidateFanout and SetFixedConnection translate short IDs and refresh fixed connections", async () => {
   const api = new MockKweb([node(1, [], [2, 3, 4]), node(2), node(3), node(4)]);
   const context = new KwebContext(api, id(1)); await context.initialize();
   await context.loadDurable(id(2));
-  api.consolidateFanout = async body => {
-    api.consolidated = body;
-    return { nodes: [node(1, [], [2], [], body.model_attribution), node(2, [], [3, 4], [], body.model_attribution)] };
-  };
-  api.setFixedConnection = async body => {
-    api.assigned = body;
-    return { node: body.child_node_id ? node(1, [], [3, 4], [[2, body.slot]], body.model_attribution) : node(1, [], [3, 4], [], body.model_attribution), replaced_fixed_connection: null };
-  };
   const executor = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "prov", modelAttribution: "gpt-test-xhigh", loadLimit: 20 });
   const consolidated = await executor.execute({ id: "a", name: "ConsolidateFanout", arguments: { parentIdentifier: 1, aggregatorIdentifier: 2, fanoutIdentifiers: [3, 4] } });
   assert.match(consolidated.message.content, /Fanout connections consolidated/);
-  assert.deepEqual(api.consolidated, { parent_node_id: id(1), aggregator_node_id: id(2), fanout_node_ids: [id(3), id(4)], model_attribution: "gpt-test-xhigh" });
+  assert.deepEqual(api.updatedCalls.slice(0, 2).map(call => call[0]), [id(1), id(2)]);
   assert.deepEqual(context.diagnostics().fullNodeIds.sort(), [id(1), id(2)].sort());
 
   const assigned = await executor.execute({ id: "b", name: "SetFixedConnection", arguments: { parentIdentifier: 1, childIdentifier: 2, slot: 1 } });
   assert.match(assigned.message.content, /Fixed connection assigned/);
-  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: id(2), slot: 1, model_attribution: "gpt-test-xhigh" });
+  assert.deepEqual(api.updatedCalls.at(-1)[1].fixed_connections, [id(2)]);
   assert.equal(context.snapshot().nodes.find(item => item.identifier === 1).fixedConnections[0].slot, 1);
 
   const cleared = await executor.execute({ id: "c", name: "SetFixedConnection", arguments: { parentIdentifier: 1, childIdentifier: "blank", slot: 1 } });
   assert.match(cleared.message.content, /Fixed connection slot cleared/);
-  assert.deepEqual(api.assigned, { parent_node_id: id(1), child_node_id: null, slot: 1, model_attribution: "gpt-test-xhigh" });
+  assert.deepEqual(api.updatedCalls.at(-1)[1].fixed_connections, []);
 });
 
 test("CreateNode and UpdateNode add model attribution outside Kennedy's arguments", async () => {
@@ -455,14 +588,19 @@ test("CreateNode and UpdateNode add model attribution outside Kennedy's argument
   const createArguments = { parentIdentifiers: [1], ownerIdentifier: 1, shortName: "New Memory", shortDescription: "Summary.", longDescription: "Details." };
   const created = await executor.execute({ id: "create", name: "CreateNode", arguments: createArguments });
   assert.equal(api.created.model_attribution, "gpt-5.6-sol-xhigh");
+  assert.match(api.created.idempotency_id, /^[0-9a-f]{32}$/);
   assert.equal("model_attribution" in createArguments, false);
+  assert.equal("idempotency_id" in createArguments, false);
   assert.match(created.message.content, /Last modified by: gpt-5.6-sol-xhigh/);
 
   const updateArguments = { identifier: 2, ownerIdentifier: 1, newShortName: "Updated Memory", newShortDescription: "Updated.", newLongDescription: "Updated details." };
   await executor.execute({ id: "update", name: "UpdateNode", arguments: updateArguments });
   assert.equal(api.updated[0], id(2));
   assert.equal(api.updated[1].model_attribution, "gpt-5.6-sol-xhigh");
+  assert.match(api.updated[1].idempotency_id, /^[0-9a-f]{32}$/);
+  assert.notEqual(api.updated[1].idempotency_id, api.created.idempotency_id);
   assert.equal("model_attribution" in updateArguments, false);
+  assert.equal("idempotency_id" in updateArguments, false);
 });
 
 test("WebSearch and WebFetch expose only minimal model-facing arguments", async () => {
@@ -527,7 +665,7 @@ test("self time authorizes Kmap writes and exposes its clean-slate end tool only
   });
   const connected = await executor.execute({ id: "connect", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
   assert.equal(connected.message.tool_result.ok, true);
-  assert.deepEqual(api.connected, [id(1), id(2)]);
+  assert.deepEqual(api.updatedCalls.map(call => call[0]), [id(1), id(2)]);
 
   const ended = await executor.execute({ id: "end", name: "EndSelfTimeSession", arguments: { message: "Continue with node 7." } });
   assert.equal(ended.endSession, true);

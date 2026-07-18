@@ -8,13 +8,14 @@ license.workspace = true
 anyhow.workspace = true
 age.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 flate2.workspace = true
 kennedy-audio-ingress = { path = "../AudioIngress" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
 kennedy-intelligence = { path = "../IntelligenceBackend" }
-kennedy-kweb = { path = "../BackendKweb" }
+kweb = "=0.1.0"
 kennedy-telegram-relay = { path = "../TelegramRelay" }
 rusqlite.workspace = true
 rustls.workspace = true
@@ -24,6 +25,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 tokio.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

@@ -1,6 +1,8 @@
 mod backup;
 mod credentials;
+mod kmap_http;
 mod kmap_size;
+mod kweb_migration;
 
 use std::path::{Path, PathBuf};
 
@@ -33,8 +35,10 @@ struct Args {
     audio_ingress_bind: String,
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     frontend_origin: String,
-    #[arg(long, global = true, default_value = "./kennedy.sqlite3")]
+    #[arg(long, global = true, default_value = "./kweb.sqlite3")]
     kweb_database: PathBuf,
+    #[arg(long, global = true, default_value = "./kweb-provenance-artifacts")]
+    kweb_provenance_artifacts: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-conversations.sqlite3")]
     conversation_history_database: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-telegram.sqlite3")]
@@ -49,10 +53,6 @@ struct Args {
     frontend_dir: PathBuf,
     #[arg(long, default_value = "./Frontend/SystemPrompts")]
     system_prompts_dir: PathBuf,
-    #[arg(long, default_value_t = 8)]
-    active_limit: usize,
-    #[arg(long, default_value_t = 64)]
-    fanout_limit: usize,
     #[arg(long, default_value = "@taek42")]
     telegram_bootstrap_username: String,
     #[arg(long, default_value_t = 20 * 1024 * 1024)]
@@ -73,6 +73,15 @@ enum Command {
         /// Directory in which to create the timestamped .tar.gz archive.
         #[arg(long, default_value = "./backups")]
         backup_dir: PathBuf,
+        /// Omit large Kweb provenance artifacts while retaining the Kweb database and artifact metadata.
+        #[arg(long)]
+        lightweight_kweb: bool,
+    },
+    /// Copy the legacy monolithic Kweb database into split SQLite and artifact storage.
+    MigrateKwebStorage {
+        /// Existing pre-split database. It is opened read-only and retained unchanged.
+        #[arg(long, default_value = "./kennedy.sqlite3")]
+        source_database: PathBuf,
     },
     /// Estimate the token footprint of all current Kmap node text.
     KmapSize,
@@ -95,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "kennedy_server=info,kennedy_kweb=info,kennedy_intelligence=info,kennedy_conversation_history=info,kennedy_telegram_relay=info,tower_http=info".into()
+                "kennedy_server=info,kweb=info,kennedy_intelligence=info,kennedy_conversation_history=info,kennedy_telegram_relay=info,tower_http=info".into()
             }),
         )
         .init();
@@ -116,11 +125,16 @@ async fn main() -> anyhow::Result<()> {
                 })?;
             manage_secrets(command, &vault_path)
         }
-        Some(Command::Backup { backup_dir }) => {
+        Some(Command::Backup {
+            backup_dir,
+            lightweight_kweb,
+        }) => {
             let path = backup::run(BackupOptions {
                 bind: args.kweb_bind,
                 backup_dir,
                 kmap_database: args.kweb_database,
+                kmap_artifact_directory: args.kweb_provenance_artifacts,
+                include_kmap_artifacts: !lightweight_kweb,
                 conversation_database: args.conversation_history_database,
                 telegram_database: args.telegram_database,
                 user_database: args.user_database,
@@ -130,6 +144,30 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
             println!("Created Kennedy backup {}", path.display());
+            Ok(())
+        }
+        Some(Command::MigrateKwebStorage { source_database }) => {
+            let destination_database = args.kweb_database;
+            let artifact_directory = args.kweb_provenance_artifacts;
+            let report = kweb_migration::run(kweb_migration::MigrationOptions {
+                bind: args.kweb_bind,
+                source_database: source_database.clone(),
+                destination_database: destination_database.clone(),
+                artifact_directory: artifact_directory.clone(),
+            })
+            .await?;
+            println!(
+                "Migrated {} provenance rows from {} to {} and {} ({} embedded media artifacts, {} external provenance payloads; database {} -> {} bytes, artifacts {} bytes). The source database was retained.",
+                report.provenance_rows,
+                source_database.display(),
+                destination_database.display(),
+                artifact_directory.display(),
+                report.extracted_media_artifacts,
+                report.externally_stored_provenance_rows,
+                report.source_database_bytes,
+                report.destination_database_bytes,
+                report.artifact_bytes,
+            );
             Ok(())
         }
         Some(Command::KmapSize) => {
@@ -164,14 +202,11 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     )?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?;
-    let kweb = kennedy_kweb::Config {
-        bind: args.kweb_bind,
-        database: args.kweb_database,
-        frontend_dir: args.frontend_dir,
-        system_prompts_dir: args.system_prompts_dir,
-        active_limit: args.active_limit,
-        fanout_limit: args.fanout_limit,
-    };
+    let (kmap, system_roots) = kmap_http::initialize(
+        &args.kweb_database,
+        &args.kweb_provenance_artifacts,
+        &args.user_database,
+    )?;
     let history = kennedy_conversation_history::Config {
         bind: args.conversation_history_bind,
         database: args.conversation_history_database,
@@ -200,7 +235,13 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         gemini_api_key: gemini_api_key.clone(),
     };
     tokio::try_join!(
-        kennedy_kweb::serve_with_listener(kweb, kweb_listener),
+        kmap_http::serve_with_listener(
+            kmap,
+            system_roots,
+            args.frontend_dir,
+            args.system_prompts_dir,
+            kweb_listener,
+        ),
         kennedy_intelligence::serve(intelligence, transcription_api_key, gemini_api_key),
         kennedy_conversation_history::serve(history),
         kennedy_telegram_relay::serve(telegram),
@@ -374,6 +415,7 @@ mod tests {
             audio_ingress_bind: "127.0.0.1:0".to_owned(),
             frontend_origin: "http://127.0.0.1:4321".to_owned(),
             kweb_database: kmap.clone(),
+            kweb_provenance_artifacts: directory.join("kweb-provenance-artifacts"),
             conversation_history_database: conversations.clone(),
             telegram_database: telegram.clone(),
             user_database: users.clone(),
@@ -381,8 +423,6 @@ mod tests {
             audio_ingress_media: audio_media.clone(),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
-            active_limit: 8,
-            fanout_limit: 64,
             telegram_bootstrap_username: "@test".to_owned(),
             telegram_max_voice_bytes: 1024,
             audio_ingress_max_upload_bytes: 1024,

@@ -1,5 +1,6 @@
 import { formatToolResult } from "./human_format.js?v=20260718.1";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
+import { newIdempotencyId } from "./api.js?v=20260718.3";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 export const MAX_RESET_SELF_MESSAGE_CHARACTERS = 400_000;
@@ -78,6 +79,16 @@ function string(value, name) { if (typeof value !== "string") throw Object.assig
 function nonemptyString(value, name, maximum) { string(value, name); const trimmed = value.trim(); if (!trimmed || [...trimmed].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return trimmed; }
 function nonemptyPreservedString(value, name, maximum) { string(value, name); if (!value.trim() || [...value].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return value; }
 function choice(value, name, choices) { string(value, name); if (!choices.includes(value)) throw Object.assign(new Error(`${name} must be one of: ${choices.join(", ")}.`), { code: "invalid_arguments" }); return value; }
+
+function fixedConnectionIds(node) {
+  if (Array.isArray(node?.fixed_connections) && node.fixed_connections.every(value => typeof value === "string")) return [...node.fixed_connections];
+  return (node?.fixed_connections || []).map(connection => connection.id);
+}
+
+function recentConnectionIds(node) {
+  if (Array.isArray(node?.recent_connections)) return [...node.recent_connections];
+  return [...(node?.active_connections || []), ...(node?.fanout_connections || [])].map(connection => connection.id);
+}
 
 export class ToolExecutor {
   constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {}, endSession = null, toolGate = null, requestTimeoutSeconds = null }) {
@@ -193,9 +204,16 @@ export class ToolExecutor {
     this.assertWrite(); validateObject(args, ["identifiers"]); integerArray(args.identifiers, "identifiers", 2);
     const durable = args.identifiers.map(id => this.fullDurable(id));
     await this.beforeMutation();
-    const payload = await this.api.connect(durable, this.modelAttribution);
-    this.context.refresh(payload.nodes);
-    return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
+    const nodes = [];
+    for (const sourceId of durable) {
+      const source = this.context.nodesById.get(sourceId);
+      const promoted = durable.filter(id => id !== sourceId);
+      const recent = [...promoted, ...recentConnectionIds(source).filter(id => !promoted.includes(id))];
+      const payload = await this.writeStoredNode(sourceId, source, { recent_connections: recent });
+      this.context.refresh([payload.node]);
+      nodes.push(payload.node);
+    }
+    return { result: { nodes: nodes.map(node => this.context.toContextNode(node)) } };
   }
 
   async consolidateFanout(args) {
@@ -205,11 +223,22 @@ export class ToolExecutor {
     const parentId = this.fullDurable(args.parentIdentifier);
     const aggregatorId = this.fullDurable(args.aggregatorIdentifier);
     const fanoutIds = args.fanoutIdentifiers.map(id => this.context.resolve(id));
+    if (parentId === aggregatorId || fanoutIds.includes(parentId) || fanoutIds.includes(aggregatorId)) {
+      throw Object.assign(new Error("The parent, aggregator, and moved fanout nodes must all be distinct."), { code: "invalid_arguments" });
+    }
     await this.beforeMutation();
-    const payload = await this.api.consolidateFanout({ parent_node_id: parentId, aggregator_node_id: aggregatorId, fanout_node_ids: fanoutIds, model_attribution: this.modelAttribution });
-    this.context.recordModelAttribution([parentId, aggregatorId, ...fanoutIds], this.modelAttribution);
-    this.context.refresh(payload.nodes);
-    return { result: { nodes: payload.nodes.map(node => this.context.toContextNode(node)) } };
+    const parent = this.context.nodesById.get(parentId);
+    const aggregator = this.context.nodesById.get(aggregatorId);
+    const parentRecent = recentConnectionIds(parent);
+    const parentFanout = new Set((parent.fanout_connections || []).map(connection => connection.id));
+    if (!parentFanout.has(aggregatorId)) throw Object.assign(new Error("The aggregator must currently be a fanout connection of the parent."), { code: "invalid_arguments" });
+    if (fanoutIds.some(id => !parentFanout.has(id))) throw Object.assign(new Error("Every consolidated node must currently be a fanout connection of the parent."), { code: "invalid_arguments" });
+    const parentPayload = await this.writeStoredNode(parentId, parent, { recent_connections: parentRecent.filter(id => !fanoutIds.includes(id)) });
+    const aggregatorRecent = recentConnectionIds(aggregator).filter(id => !fanoutIds.includes(id));
+    const aggregatorPayload = await this.writeStoredNode(aggregatorId, aggregator, { recent_connections: [...aggregatorRecent, ...fanoutIds] });
+    const nodes = [parentPayload.node, aggregatorPayload.node];
+    this.context.refresh(nodes);
+    return { result: { nodes: nodes.map(node => this.context.toContextNode(node)) } };
   }
 
   async setFixedConnection(args) {
@@ -219,15 +248,25 @@ export class ToolExecutor {
     if (![1, 2, 3].includes(args.slot)) throw Object.assign(new Error("slot must be 1, 2, or 3."), { code: "invalid_arguments" });
     const parentId = this.fullDurable(args.parentIdentifier);
     const childId = args.childIdentifier === "blank" ? null : this.fullDurable(args.childIdentifier);
+    if (childId === parentId) throw Object.assign(new Error("A node cannot be its own fixed connection."), { code: "invalid_arguments" });
     await this.beforeMutation();
-    const payload = await this.api.setFixedConnection({ parent_node_id: parentId, child_node_id: childId, slot: args.slot, model_attribution: this.modelAttribution });
-    const attributedIds = [parentId];
-    if (childId) attributedIds.push(childId);
-    if (payload.replaced_fixed_connection?.id) attributedIds.push(payload.replaced_fixed_connection.id);
-    this.context.recordModelAttribution(attributedIds, this.modelAttribution);
+    const parent = this.context.nodesById.get(parentId);
+    const fixed = fixedConnectionIds(parent);
+    if (childId && args.slot > fixed.length + 1) {
+      throw Object.assign(new Error("Fixed connection positions must remain contiguous."), { code: "invalid_arguments" });
+    }
+    const replacedId = fixed[args.slot - 1] || null;
+    if (childId) {
+      const withoutChild = fixed.filter(id => id !== childId);
+      withoutChild.splice(Math.min(args.slot - 1, withoutChild.length), replacedId ? 1 : 0, childId);
+      fixed.splice(0, fixed.length, ...withoutChild);
+    } else if (replacedId) {
+      fixed.splice(args.slot - 1, 1);
+    }
+    const payload = await this.writeStoredNode(parentId, parent, { fixed_connections: fixed });
     this.context.refresh([payload.node]);
-    const replacedFixedConnection = payload.replaced_fixed_connection
-      ? { ...this.context.summary(payload.replaced_fixed_connection), slot: payload.replaced_fixed_connection.slot }
+    const replacedFixedConnection = replacedId && replacedId !== childId
+      ? { ...this.context.summary({ id: replacedId }), slot: args.slot }
       : null;
     return { result: { node: this.context.toContextNode(payload.node), replacedFixedConnection, cleared: childId === null } };
   }
@@ -256,8 +295,15 @@ export class ToolExecutor {
     integer(args.ownerIdentifier, "ownerIdentifier");
     const ownerRootId = this.fullDurable(args.ownerIdentifier);
     await this.beforeMutation();
-    const payload = await this.api.createNode({ provenance_id: this.provenanceId, model_attribution: this.modelAttribution, parent_node_ids: parentIds, owner_root_node_id: ownerRootId, short_name: string(args.shortName, "shortName"), short_description: string(args.shortDescription, "shortDescription"), long_description: string(args.longDescription, "longDescription") });
-    this.context.refresh(payload.nodes || [payload.node]);
+    const payload = await this.api.createNode({ idempotency_id: newIdempotencyId(), provenance_id: this.provenanceId, model_attribution: this.modelAttribution, owner_node_id: ownerRootId, short_name: string(args.shortName, "shortName"), short_description: string(args.shortDescription, "shortDescription"), long_description: string(args.longDescription, "longDescription"), fixed_connections: [], recent_connections: parentIds });
+    const refreshed = [payload.node];
+    for (const parentId of parentIds) {
+      const parent = this.context.nodesById.get(parentId);
+      const recent = [payload.node.id, ...recentConnectionIds(parent).filter(id => id !== payload.node.id)];
+      const parentPayload = await this.writeStoredNode(parentId, parent, { recent_connections: recent });
+      refreshed.push(parentPayload.node);
+    }
+    this.context.refresh(refreshed);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
   }
 
@@ -266,9 +312,25 @@ export class ToolExecutor {
     integer(args.identifier, "identifier"); const durable = this.fullDurable(args.identifier);
     integer(args.ownerIdentifier, "ownerIdentifier"); const ownerRootId = this.fullDurable(args.ownerIdentifier);
     await this.beforeMutation();
-    const payload = await this.api.updateNode(durable, { provenance_id: this.provenanceId, model_attribution: this.modelAttribution, owner_root_node_id: ownerRootId, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
+    const current = this.context.nodesById.get(durable);
+    const payload = await this.writeStoredNode(durable, current, { owner_node_id: ownerRootId, short_name: string(args.newShortName, "newShortName"), short_description: string(args.newShortDescription, "newShortDescription"), long_description: string(args.newLongDescription, "newLongDescription") });
     this.context.refresh([payload.node]);
     return { result: { node: this.context.toContextNode(payload.node), historyNodeCreated: true } };
+  }
+
+  async writeStoredNode(id, node, overrides = {}) {
+    return this.api.updateNode(id, {
+      idempotency_id: newIdempotencyId(),
+      provenance_id: this.provenanceId,
+      model_attribution: this.modelAttribution,
+      owner_node_id: node.owner_node_id || node.owner_root_node_id || "unowned",
+      short_name: node.short_name,
+      short_description: node.short_description,
+      long_description: node.long_description,
+      fixed_connections: fixedConnectionIds(node),
+      recent_connections: recentConnectionIds(node),
+      ...overrides,
+    });
   }
 
   async endSelfTimeSession(args) {

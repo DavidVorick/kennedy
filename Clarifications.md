@@ -4,10 +4,53 @@ These user-provided decisions supplement the repository specifications and
 technical design. They may be consolidated or removed once represented by the
 canonical documents; this file is not an append-only log.
 
+## Kmap Library Split
+
+- The split-out `kweb` crate is a standalone Rust library package that owns only
+  Kmap storage. `kennedy-server` imports its published release and exposes the HTTP adapter under
+  `/api/v1/kmap`; a later consolidation may place every application API on one
+  listener.
+- The core API is limited to opening/initializing a database path, creating
+  provenance, creating/updating nodes with an existing provenance ID, reading
+  nodes/provenance/full provenance history, and returning extensible stats.
+  Stats are typed in Rust with private fields and stable getters and serialize
+  to additive JSON whose unknown fields clients must ignore.
+- Nodes store `last_modified_at`, ordered `fixed_connections` ID arrays, and
+  ordered `recent_connections` ID arrays. A legacy node receives and persists
+  the current time on its first load. The library assigns no active/fanout,
+  fixed-slot, root-role, system-prompt, user, or graph-operation meaning.
+- The frontend treats the first eight recent connections as active and the
+  remainder as fanout, maintains order itself, and implements connect,
+  consolidation, and fixed-connection workflows through sequential ordinary
+  updates. These multi-call workflows are intentionally non-atomic.
+- Root-role/user mappings live outside the Kmap database. Creation may use a
+  self-owner sentinel; ordinary create/update is the only ownership mechanism.
+  Core operations are serialized by the caller and are not concurrency-friendly.
+- Every explicit mutation requires a caller-generated random 16-byte
+  `IdempotencyId`. A successful write stores a permanent receipt atomically;
+  an exact retry no-ops and succeeds, while reuse for a different operation or
+  normalized request conflicts. Node replays return current state and
+  provenance replays return the original provenance ID. Each call in a
+  multi-call workflow uses its own stable ID, which makes individual retries
+  safe without making the workflow atomic.
+- This storage is a Kweb (knowledge web), not a Kennedy-specific database. Its
+  application filenames are `kweb.sqlite3` and the sibling
+  `kweb-provenance-artifacts/` directory.
+- Provenance media and large provenance payloads live outside SQLite. Artifact
+  filenames preserve the original safe basename with exactly 12 random
+  URL-safe Base64 characters inserted before the final extension; the first
+  two suffix characters form a shard folder. The database retains relative
+  filenames, original names, content types, sizes, hashes, roles, and order.
+- The one-time split reads the old `kennedy.sqlite3` without changing or
+  deleting it. It must preserve all identifiers, extract embedded archive
+  media, verify database counts/integrity and artifact hashes, and refuse to
+  overwrite either new destination.
+
 ## Offline Backups
 
 - `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
-  all four SQLite databases, the complete audio-ingress media tree, and the
+  all five SQLite databases, the complete Kweb provenance-artifact and
+  audio-ingress media trees, and the
   encrypted credential vault when present.
   Each archive is self-describing: its README starts with the creating commit
   hash and records the exact schemas and current data-format semantics.
@@ -19,6 +62,10 @@ canonical documents; this file is not an append-only log.
 - Backup creation verifies standalone SQLite snapshots and publishes the final
   archive atomically. The user is responsible for moving archives to durable
   off-machine storage.
+- `backup --lightweight-kweb` intentionally omits Kweb provenance artifact
+  bytes but retains the database and metadata. Full backups verify every
+  referenced copied artifact; lightweight backups cannot reconstruct
+  externally stored provenance without a separate artifact-tree backup.
 
 ## Kmap Size Estimate
 
@@ -195,12 +242,10 @@ canonical documents; this file is not an append-only log.
   or other recovery bookkeeping to Kennedy. ResetContext rebuilds this text as
   well as the Full inspector, so removed Kmap nodes and tool results disappear
   from both.
-- Kennedy has three logically separate backends: Kweb, intelligence, and
-  conversation history. They are independent services with separate APIs,
-  listeners, state, and databases and must not call or access one another. They
-  happen to be compiled into and hosted by one Rust binary for operational
-  convenience; the frontend and architecture otherwise treat them as if they
-  were unrelated processes.
+- Kennedy has logically separate API domains for Kmap, intelligence, and
+  conversation history. The Kmap domain is now an adapter in `kennedy-server`
+  over the imported storage library, rather than an independent backend
+  server; other services retain their own state and databases.
 - Show live history-ingress tool requests and results inline after the owning
   conversation so the user can follow memory updates in one continuous scroll.
 - Store the complete history-ingress Chatend on its owning conversation record.
@@ -333,7 +378,7 @@ canonical documents; this file is not an append-only log.
 - Derive and attach this metadata automatically in the frontend. It must not be
   a Kennedy-managed field or a model-visible tool argument, and the conversation
   history backend has no role in it.
-- Persist attribution in the Kweb backend, expose it with full node data, and
+- Persist attribution in Kmap storage, expose it with full node data, and
   show it in Kennedy's Kmap context and the human memory UI.
 - Add a dynamic system-prompt element telling Kennedy which model and thinking
   mode is executing the current conversation or history-ingress session.

@@ -1,8 +1,8 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI } from "./api.js?v=20260717.7";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260718.3";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
-import { ConversationSession } from "./conversation.js?v=20260718.2";
-import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260718.2";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260718.2";
+import { ConversationSession } from "./conversation.js?v=20260718.5";
+import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260718.5";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260718.3";
 import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260718.2";
 import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260717.2";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventTimeoutMs } from "./telegram_timing.js?v=20260717.1";
@@ -1191,10 +1191,10 @@ async function startFreeTimeUnlocked() {
     sliceIndex: 1,
   };
   const provenance = await kweb.createProvenance({
+    idempotency_id: newIdempotencyId(),
     data: JSON.stringify({ kind: "free-time", ...freeTime }, null, 2),
     source: "free-time",
     source_created_at: runStartedAt,
-    idempotency_key: `free-time:${runId}`,
   });
   freeTime.provenanceId = provenance.id;
   await createFreeTimeSlice(freeTime, { select: true });
@@ -2125,9 +2125,9 @@ async function initialize() {
   update();
 
   try {
-    const [health, user] = await Promise.all([kweb.health(), kweb.user()]);
-    legacyUserRootNodeId = user.user_root_node_id || user.root_node_id;
-    kennedyRootNodeId = user.kennedy_root_node_id;
+    const [health, roots] = await Promise.all([kweb.health(), kweb.roots()]);
+    legacyUserRootNodeId = roots.user_root_node_id;
+    kennedyRootNodeId = roots.kennedy_root_node_id;
     rootNodeIds = [legacyUserRootNodeId, kennedyRootNodeId];
     if (rootNodeIds.some(id => typeof id !== "string" || !id)) throw new Error("Kweb did not provide both required root nodes.");
     kwebReady = true;

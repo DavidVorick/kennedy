@@ -1,4 +1,5 @@
-import { runHistoryIngress } from "./history_ingress.js?v=20260718.2";
+import { newIdempotencyId } from "./api.js?v=20260718.3";
+import { runHistoryIngress } from "./history_ingress.js?v=20260718.5";
 
 const INGRESS_FAILURE_LIMIT = 5;
 
@@ -118,6 +119,7 @@ export class MemoryIngressCoordinator {
       if (piece.phase === "ingress_pending") {
         stage = "provenance";
         const provenance = await this.kweb.createProvenance({
+          idempotency_id: newIdempotencyId(),
           data: [
             "Vnote final transcript piece",
             "",
@@ -130,7 +132,6 @@ export class MemoryIngressCoordinator {
           ].join("\n"),
           source: "audio-vnote",
           source_created_at: piece.source_created_at,
-          idempotency_key: `audio:${piece.sha256}:piece:${piece.piece_index}`,
         });
         stage = "claim";
         try {
@@ -261,11 +262,11 @@ export class MemoryIngressCoordinator {
           : archive.sessionType === "telegram" ? "telegram"
             : archive.sessionType === "free-time" ? "free-time" : "conversation";
         stage = "provenance";
-        const provenance = await this.kweb.createProvenance({
-          data: JSON.stringify(archive, null, 2),
+        const provenance = await this.kweb.createProvenanceArchive({
+          idempotency_id: newIdempotencyId(),
+          archive,
           source,
           source_created_at: record.started_at,
-          idempotency_key: `${source}:${record.id}`,
         });
         stage = "claim";
         try {

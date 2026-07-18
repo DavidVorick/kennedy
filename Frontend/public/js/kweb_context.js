@@ -1,13 +1,29 @@
 export const MAX_DIRECTLY_LOADED_NODES = 10;
+export const ACTIVE_CONNECTION_LIMIT = 8;
 
 function normalizeNode(node) {
+  if (!node) return node;
+  if (Array.isArray(node.recent_connections)) {
+    const fixedConnections = (node.fixed_connections || []).map((connection, index) => (
+      typeof connection === "string"
+        ? { id: connection, slot: index + 1 }
+        : { ...connection, slot: connection.slot || index + 1 }
+    ));
+    const recentConnections = node.recent_connections.map(connection => (
+      typeof connection === "string" ? { id: connection } : connection
+    ));
+    return {
+      ...node,
+      owner_root_node_id: node.owner_node_id,
+      fixed_connections: fixedConnections,
+      active_connections: recentConnections.slice(0, ACTIVE_CONNECTION_LIMIT),
+      fanout_connections: recentConnections.slice(ACTIVE_CONNECTION_LIMIT),
+    };
+  }
   const legacySlots = { high: 1, medium: 2, low: 3 };
-  const fixedConnections = Array.isArray(node?.fixed_connections)
+  const fixedConnections = Array.isArray(node.fixed_connections)
     ? node.fixed_connections
-    : (node?.task_connections || []).map(connection => ({
-      ...connection,
-      slot: connection.slot || legacySlots[connection.priority] || 0,
-    }));
+    : (node.task_connections || []).map(connection => ({ ...connection, slot: connection.slot || legacySlots[connection.priority] || 0 }));
   return { ...node, fixed_connections: fixedConnections };
 }
 
@@ -157,7 +173,14 @@ export class KwebContext {
     }
   }
 
-  summary(connection) { return { identifier: this.shortId(connection.id), shortName: connection.short_name, shortDescription: connection.short_description }; }
+  summary(connection) {
+    const full = this.nodesById.get(connection.id);
+    return {
+      identifier: this.shortId(connection.id),
+      shortName: connection.short_name || full?.short_name || "Unloaded node",
+      shortDescription: connection.short_description || full?.short_description || "",
+    };
+  }
 
   toContextNode(node) {
     return {
@@ -166,6 +189,7 @@ export class KwebContext {
       shortDescription: node.short_description,
       longDescription: node.long_description,
       lastModifiedBy: node.last_modified_by || "legacy-unknown",
+      lastModifiedAt: node.last_modified_at || null,
       ownerIdentifier: node.owner_root_node_id ? this.shortId(node.owner_root_node_id) : "unowned",
       fixedConnections: (node.fixed_connections || []).map(c => ({ ...this.summary(c), slot: c.slot })),
       activeConnections: (node.active_connections || []).map(c => this.summary(c)),

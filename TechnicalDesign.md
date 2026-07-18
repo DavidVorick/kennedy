@@ -12,8 +12,10 @@ The MVP has six logical runtime components:
 1. **Frontend**: a browser-native HTML/CSS/JavaScript application. It owns the
    user interface, the live chatend, short identifiers, prompt
    composition, and agent tool orchestration.
-2. **Kweb backend**: a Rust HTTP service. It owns SQLite, durable kweb data, and
-   every graph and history invariant.
+2. **Kweb storage and HTTP adapter**: `kweb` is a standalone Rust
+   library that owns only SQLite persistence and per-node history invariants.
+   `kennedy-server` imports it and owns the versioned Kmap HTTP routes, static
+   frontend assets, root-role mappings, and transport policy.
 3. **Intelligence backend**: a Rust HTTP service. It translates a complete LLM
    request into a provider request, performs bounded web research and public
    page retrieval, and normalizes the results. It is stateless between
@@ -29,11 +31,12 @@ The MVP has six logical runtime components:
    ordered overlapping chunks with Gemini, reconciles a final transcript with
    Sol, and queues timestamped transcript pieces for Kennedy ingress.
 
-The five backends are independent library crates compiled into one
-`kennedy-server` executable. The executable starts their listeners but shares
-no router, database, application state, or service handle among them. No
-backend crate depends on another backend crate; all coordination happens in the
-frontend through their public HTTP APIs.
+The runtime services are library crates compiled into one `kennedy-server`
+executable. Kmap is the deliberate exception to the former service-isolation
+rule: its separately publishable storage crate is imported by the main binary,
+which serves its HTTP adapter. Other backend coordination still happens in the
+frontend through public HTTP APIs. A later routing consolidation may serve all
+API domains on one listener without changing the storage crate.
 
 `kennedy-server` also owns a generic named credential vault stored as the
 passphrase-encrypted `kennedy-secrets.age` file. At startup the server unlocks
@@ -59,11 +62,12 @@ The frontend appends the provider-reported current model and thinking mode.
   transports, `ConversationSession` owns one live Chatend, and
   `MemoryIngressCoordinator` owns serialized conversation/audio ingress
   selection, claims, checkpoints, retries, cancellation, and completion.
-- The Kweb backend is the single authority for durable memory.
+- The Kmap storage library is the single authority for durable memory rows;
+  the frontend owns graph policy and the main server owns HTTP and root roles.
 - The conversation history backend is the single authority for unfinished and
   completed conversation records.
-- Logical backend isolation is preserved even though all five services share
-  one deployment binary.
+- Logical service isolation is preserved except for the deliberate in-process
+  Kmap storage-library adapter in the main server.
 - The intelligence backend never needs to understand the kweb, short
   identifiers, or Kennedy's text-tool protocol.
 - The frontend owns the complete human-readable chatend. It sends the full
@@ -76,9 +80,13 @@ The frontend appends the provider-reported current model and thinking mode.
   assistant-role note to self capped at 400,000 characters, and newly loaded
   kweb nodes. Reset notes remain in retained history across later resets, while
   unloaded node content is genuinely absent afterward.
-- Short identifiers never cross the Kweb backend API boundary. The frontend
+- Short identifiers never cross the Kmap HTTP boundary. The frontend
   resolves them to durable identifiers before making backend calls.
-- All Kweb mutations that affect more than one row are SQLite transactions.
+- Each Kmap mutation has a required caller-generated 16-byte idempotency
+  identifier and commits its durable receipt in the same SQLite transaction.
+  Frontend graph workflows spanning several nodes remain sequential and
+  non-atomic; their individual requests are safely replayable under their own
+  identifiers, but the whole workflow is not one atomic/idempotent operation.
 - Behavior absent from `UserSpecification.md` is outside the MVP unless it is
   necessary to realize an explicitly specified behavior.
 
@@ -87,27 +95,29 @@ The frontend appends the provider-reported current model and thinking mode.
 ```text
 One kennedy-server process
   ├─ Encrypted credential vault -------- kennedy-secrets.age
-  ├─ Kweb API :4321 --------------------- kennedy.sqlite3
+  ├─ Main HTTP adapter :4321 ------------ kweb.sqlite3 + kweb-provenance-artifacts/ + kennedy-users.sqlite3
+  │    ├─ /api/v1/kmap/* via kweb library
   │    └─ serves frontend and manuals
   ├─ Intelligence API :4322 ------------ Podman Codex + OpenAI transcription + public web
   ├─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
   ├─ Telegram Relay API :4324 ---------- kennedy-telegram.sqlite3 + kennedy-users.sqlite3 + Telegram long polling
   └─ Audio Ingress API :4325 ----------- kennedy-audio.sqlite3 + kennedy-audio-ingress/
 
-Browser frontend calls all five APIs directly. No backend calls another.
+Browser frontend calls all API domains directly. The main adapter calls the
+Kmap library in-process; no other backend calls it.
 ```
 
 Default addresses:
 
 | Component | Address |
 | --- | --- |
-| Kweb backend | `http://127.0.0.1:4321` |
+| Main frontend/Kmap adapter | `http://127.0.0.1:4321` |
 | Intelligence backend | `http://127.0.0.1:4322` |
 | Conversation history backend | `http://127.0.0.1:4323` |
 | Telegram relay | `http://127.0.0.1:4324` |
 | Audio ingress backend | `http://127.0.0.1:4325` |
 
-The browser calls all five services directly. Cross-origin backends permit
+The browser calls all API domains directly. Cross-origin backends permit
 requests from the Kweb frontend origin. Every listener binds to loopback by
 default.
 
@@ -127,13 +137,19 @@ can mutate a backup source.
 
 While that boundary is held, the command uses SQLite's backup API to create
 standalone snapshots of the audio-ingress, Telegram transport, user directory,
-conversation-history, and Kmap databases, copies the complete audio media tree and still-encrypted
+conversation-history, and Kweb databases, copies the complete Kweb provenance-artifact and audio media trees and still-encrypted
 credential vault when present, verifies SQLite integrity and foreign keys, and
 atomically publishes a private timestamped `.tar.gz`. The archive contains a
 checksummed JSON manifest and a recovery README beginning with the creating
 commit hash. Exact snapshot DDL and semantic descriptions of every persisted
 format travel with the data so a later version can construct an explicit
 migration without trusting current source docs.
+
+The default backup is complete and validates each copied Kweb artifact against
+the byte length and SHA-256 retained in SQLite. `--lightweight-kweb`
+deliberately omits that tree while retaining its metadata and all lightweight
+node/history state; externally stored provenance is unavailable from that
+archive alone.
 
 ## 4. Ownership Boundaries
 
@@ -191,22 +207,29 @@ preserved for future media support, but the JSON archive is never used as a
 model prompt. It reconstructs the live session from that backend after a reload
 or abrupt close while refreshing the active manuals and required root context.
 
-### 4.2 Kweb Backend
+### 4.2 Kmap Storage Library and HTTP Adapter
 
-The Kweb backend owns:
+The `kweb` library owns creation/migration of the Kweb SQLite schema,
+its sibling immutable artifact store, knowledge/provenance/history rows, ordered fixed/recent ID arrays, individual
+create/update transactions, latest-model attribution, modification timestamps,
+and extensible text statistics. Its complete public contract is documented in
+the published [`kweb` 0.1.0 specification](https://docs.rs/crate/kweb/0.1.0/source/Specification.md),
+and its Rust API is available through
+[`docs.rs`](https://docs.rs/kweb/0.1.0/kweb/).
 
-- creation and migration of the SQLite schema,
-- the legacy compatibility user root, Kennedy root, and idempotent creation of
-  externally reserved blank user/group-root nodes,
-- knowledge, provenance, and history nodes,
-- connection ordering, promotion, and demotion,
-- atomic create, update, and connect operations,
-- opaque latest-model attribution for every knowledge node,
-- read APIs used by context loading and the memory explorer,
-- serving the frontend and prompt-manual files.
+The library has no HTTP server and knows nothing about root roles, Telegram
+identities, users, prompts, short identifiers, active/fanout policy, graph
+operations, LLM messages, session budgets, or provider APIs. Its caller must
+serialize access. Mutations are individually idempotent through required
+caller-generated identifiers, but there is no optimistic lost-update
+protection or transaction spanning multiple calls.
 
-It knows nothing about Telegram identities, whitelists, group membership, short
-identifiers, chatends, LLM messages, session call budgets, or provider APIs.
+`kennedy-server` wraps one library handle in a mutex, exposes it under
+`/api/v1/kmap`, serves frontend/prompt files, and stores the `user` and
+`kennedy` role mappings in the separate identity database. The frontend owns
+recent-connection ordering and implements multi-node graph operations through
+sequential complete-node updates. It interprets the first eight recent IDs as
+active expansions and the remainder as fanout summaries.
 
 The prompt route accepts safe plain `.txt` basenames from the configured prompt
 directory instead of duplicating the frontend's filename manifest in Rust.
@@ -398,8 +421,8 @@ A successful user-message checkpoint in another conversation also queues active
 records idle for more than 24 hours, except pending Kennedy turns. The frontend
 `MemoryIngressCoordinator` processes conversation and audio queues through one
 serialized worker. It resumes already-claimed work first, otherwise chooses
-the oldest source timestamp, creates idempotent data
-provenance from each complete recovery archive, transitions exactly one record
+the oldest source timestamp, creates data provenance from each complete
+recovery archive, persists its returned ID while transitioning exactly one record
 to `ingress_in_progress`, and completes it before claiming the next. Live
 conversations remain usable throughout. Completed records and both archives
 remain queryable from the sidebar.
@@ -450,12 +473,12 @@ Kennedy may navigate the kweb, connect nodes, reorganize fanout, manage fixed
 slots, create or update owned knowledge nodes, and use WebSearch or WebFetch when
 external evidence would help. The current provenance identifier is held by the
 frontend and supplied implicitly when it translates CreateNode and UpdateNode
-tool calls into Kweb API requests.
+tool calls into namespaced Kmap API requests.
 
 The frontend likewise holds the active model attribution. For every Kmap
-mutation it adds `{model}-{reasoning_effort}` to the Kweb request outside
-Kennedy's text-tool arguments. The Kweb backend atomically applies that value to
-every semantically affected node. Full node responses expose it as
+mutation it adds `{model}-{reasoning_effort}` to the Kmap request outside
+Kennedy's text-tool arguments. Each ordinary storage update atomically applies
+that value to its node. Full node responses expose it as
 `last_modified_by`; summary-only nodes remain summary-only, even when their
 durable attribution changes.
 
@@ -580,44 +603,67 @@ bottom follows appended content.
 
 SQLite stores exactly the three durable node types from the user specification:
 
-- **Knowledge node**: the current human-readable memory, nullable owner root,
-  and connection lists, with a pointer to the newest history node.
-- **Data provenance node**: immutable source material, its source, and its
-  source creation time.
+- **Knowledge node**: the current human-readable memory, nullable owner node,
+  latest attribution/time, fixed/recent ID arrays, and a pointer to the newest
+  history node.
+- **Data provenance node**: immutable source material, its source, source
+  creation time, and ordered links to immutable artifacts.
 - **Data history node**: an append-only link from one knowledge node to one
   provenance node and the previous history node.
 
-Connections are represented in a relational table as an implementation detail
-of knowledge nodes. Each directed connection has an active, fanout, or fixed
-role and a deterministic order. Fixed numbered slots use reserved negative order
-values in the existing connection schema, so legacy databases need no migration
-and nodes without assigned fixed connections expose an empty fixed list. `ConnectNodes`
-promotes every ordered pair in the supplied set. If a source exceeds the active
-limit, its least recently active connections are demoted unless that would
-exceed the fanout limit. `ConsolidateFanout` moves selected fanout references
-under an existing aggregator. `SetFixedConnection` replaces or clears one
-directional slot numbered 1, 2, or 3 without assigning priority semantics.
+The default physical store is `kweb.sqlite3` plus its sibling
+`kweb-provenance-artifacts/`. Provenance text at or below 256 KiB remains
+inline. Larger text and explicit media are written as private immutable files;
+SQLite stores relative path, preserved original basename, media type, byte
+length, SHA-256, creation time, semantic role, and order. The main provenance
+reader loads external UTF-8 data transparently, while attached media is
+returned as metadata and streamed by the HTTP adapter when requested.
 
-`knowledge_nodes.owner_root_node_id` is nullable for compatibility. Null is
-exposed as `unowned`; valid owner targets are self-owned Kennedy, user, or group
-roots. Root bootstrap establishes or repairs self-ownership, while legacy
-non-root nodes remain unowned until Kennedy updates them.
+Each stored basename inserts a retry-stable 12-character URL-safe Base64
+suffix before its final extension. The suffix derives from the mutation's
+random `IdempotencyId` and artifact position; its first two characters select
+a shard folder. Conversation archives remove top-level media `dataUrl` values
+and retain `provenanceArtifactIndex`, which addresses the returned ordered
+artifact metadata without placing the bytes back in JSON.
 
-The default limits are eight active and 64 ordinary fanout connections. A
-LoadNode context read transactionally applies the same oldest-first demotion to
-the requested node before materializing it. This lazily converts nodes at the
-former 12-active/60-fanout limits without a schema migration or database-wide
-backfill.
+Connections are normalized into ordered `fixed_connections` and
+`recent_connections` tables only to preserve ID arrays and foreign-key
+integrity. The storage layer gives those arrays no graph semantics. During
+legacy migration, former fixed slots retain slot order and former active plus
+fanout edges are merged by descending activation order. The frontend treats
+the first eight recent IDs as active and the remainder as fanout and performs
+connect/consolidate/fixed workflows using ordinary complete-state updates.
+
+`knowledge_nodes.owner_node_id` is nullable. Null is exposed as `unowned`; a
+self-owner sentinel resolves to the created/updated node ID. The library does
+not know which nodes are Kennedy, user, or group roots. System role mappings
+live in `kmap_system_roots` in the separate identity database.
+
+`last_modified_at` is generated on create/update. A migrated legacy row starts
+null and receives the current time on its first node load.
+
+Each `create_provenance`, `create_node`, and `update_node` call also supplies a
+random 16-byte `IdempotencyId`. The library hashes the normalized semantic
+request and records the operation kind, hash, result ID, and commit time in
+`idempotency_receipts` within the mutation transaction. An exact replay makes
+no write; mismatched reuse conflicts. Successful receipts are retained for the
+lifetime of the database. Failed validation or rolled-back writes create no
+receipt.
 
 ## 7. API Conventions
 
-All five backends expose versioned APIs under `/api/v1` and an
-unversioned `GET /health` endpoint.
+All API domains expose versioned APIs under `/api/v1`. Kmap health is
+`GET /api/v1/kmap/health`; the still-separate services retain unversioned
+`GET /health` endpoints.
 
-- Durable identifiers are lowercase hexadecimal encodings of 20 random bytes.
+- Durable node/provenance identifiers are lowercase hexadecimal encodings of
+  20-byte values. Library-generated values are random; when an HTTP node-create
+  omits its ID, the adapter derives a stable 20-byte value from that request's
+  idempotency identifier. Mutation idempotency identifiers encode 16 random
+  bytes as 32 lowercase hexadecimal characters.
 - Timestamps are RFC 3339 UTC strings.
-- Requests and responses use `application/json`, except multipart audio upload
-  and raw relay media retrieval.
+- Requests and responses use `application/json`, except multipart audio and
+  Kweb provenance-artifact upload and raw relay/Kweb artifact retrieval.
 - Successful deletion-style operations, where defined, may return `204`; all
   other successful operations return JSON.
 - Errors use one envelope:
@@ -639,8 +685,6 @@ specification.
 ```text
 UserSpecification.md
 TechnicalDesign.md
-BackendKweb/
-  Specification.md
 ConversationHistory/
   Specification.md
 TelegramRelay/
@@ -659,10 +703,13 @@ Frontend/
 IntelligenceBackend/
   Specification.md
 KennedyServer/
+  KmapHttp.md
   src/main.rs
 ```
 
 Implementation code belongs under its owning component directory.
+The Kweb storage implementation is the external, exact-version dependency
+[`kweb` 0.1.0](https://crates.io/crates/kweb/0.1.0), not a workspace member.
 
 ## 9. MVP Non-Goals
 

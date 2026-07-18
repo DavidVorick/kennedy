@@ -1,5 +1,5 @@
 [workspace]
-members = ["AudioIngress", "BackendKweb", "ConversationHistory", "IntelligenceBackend", "TelegramRelay", "KennedyServer"]
+members = ["AudioIngress", "ConversationHistory", "IntelligenceBackend", "TelegramRelay", "KennedyServer"]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +10,7 @@ license = "MIT"
 anyhow = "1"
 age = "0.12.1"
 axum = { version = "0.8", features = ["multipart"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"

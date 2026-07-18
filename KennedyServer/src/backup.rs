@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const BACKUP_FORMAT_VERSION: u32 = 3;
+const BACKUP_FORMAT_VERSION: u32 = 6;
 const ARCHIVE_PREFIX: &str = "kennedy-backup";
 const BACKUP_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -38,6 +38,8 @@ pub(crate) struct BackupOptions {
     pub bind: String,
     pub backup_dir: PathBuf,
     pub kmap_database: PathBuf,
+    pub kmap_artifact_directory: PathBuf,
+    pub include_kmap_artifacts: bool,
     pub conversation_database: PathBuf,
     pub telegram_database: PathBuf,
     pub user_database: PathBuf,
@@ -57,6 +59,7 @@ struct Manifest {
     snapshot_mode: &'static str,
     guard_bind: String,
     sqlite_version: String,
+    kweb_provenance_artifacts_included: bool,
     files: Vec<ManifestFile>,
 }
 
@@ -136,6 +139,14 @@ fn backup_page_router() -> Router {
 
 fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow::Result<PathBuf> {
     validate_database_source(&options.kmap_database, "Kmap")?;
+    let kweb_artifact_references = kweb_artifact_reference_count(&options.kmap_database)?;
+    if options.include_kmap_artifacts && kweb_artifact_references > 0 {
+        ensure!(
+            options.kmap_artifact_directory.is_dir(),
+            "Kweb database references {kweb_artifact_references} provenance artifacts but {} does not exist or is not a directory; refusing to create an incomplete full backup (use --lightweight-kweb to omit artifacts intentionally)",
+            options.kmap_artifact_directory.display()
+        );
+    }
     validate_database_source(&options.conversation_database, "conversation history")?;
     validate_database_source(&options.telegram_database, "Telegram relay")?;
     validate_database_source(&options.user_database, "user directory")?;
@@ -218,9 +229,9 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
             )?,
             snapshot_database(
                 &options.kmap_database,
-                &data_directory.join("kmap.sqlite3"),
-                "data/kmap.sqlite3",
-                "Kmap database",
+                &data_directory.join("kweb.sqlite3"),
+                "data/kweb.sqlite3",
+                "Kweb database",
             )?,
         ];
         copy_persistent_directory(
@@ -230,6 +241,21 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
             "durable audio-ingress media",
             &mut files,
         )?;
+        if options.include_kmap_artifacts && options.kmap_artifact_directory.exists() {
+            ensure!(
+                options.kmap_artifact_directory.is_dir(),
+                "Kweb provenance artifact path {} is not a directory",
+                options.kmap_artifact_directory.display()
+            );
+            copy_persistent_directory(
+                &options.kmap_artifact_directory,
+                &data_directory.join("kweb-provenance-artifacts"),
+                "data/kweb-provenance-artifacts",
+                "immutable Kweb provenance artifact",
+                &mut files,
+            )?;
+            verify_copied_kweb_artifacts(&data_directory.join("kweb.sqlite3"), &files)?;
+        }
 
         if options.vault.exists() {
             let destination = data_directory.join("kennedy-secrets.age");
@@ -261,6 +287,7 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
             snapshot_mode: "offline-port-guard",
             guard_bind: options.bind.clone(),
             sqlite_version: rusqlite::version().to_owned(),
+            kweb_provenance_artifacts_included: options.include_kmap_artifacts,
             files,
         };
         write_private(
@@ -318,6 +345,75 @@ fn validate_database_source(path: &Path, label: &str) -> anyhow::Result<()> {
         "{label} database {} is not a regular file",
         path.display()
     );
+    Ok(())
+}
+
+fn kweb_artifact_reference_count(path: &Path) -> anyhow::Result<u64> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='provenance_artifacts')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+    let count = connection.query_row("SELECT COUNT(*) FROM provenance_artifacts", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    u64::try_from(count).context("Kweb artifact reference count is negative")
+}
+
+fn verify_copied_kweb_artifacts(
+    kweb_snapshot: &Path,
+    files: &[ManifestFile],
+) -> anyhow::Result<()> {
+    let connection = Connection::open(kweb_snapshot)?;
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='provenance_artifacts')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    let mut statement = connection.prepare(
+        "SELECT relative_path,byte_length,lower(hex(sha256)) FROM provenance_artifacts ORDER BY relative_path",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (relative_path, byte_length, sha256) = row?;
+        let byte_length =
+            u64::try_from(byte_length).context("Kweb artifact byte length is negative")?;
+        let safe = Path::new(&relative_path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+            && Path::new(&relative_path).components().count() == 2;
+        ensure!(
+            safe,
+            "Kweb database contains unsafe artifact path {relative_path}"
+        );
+        let archive_path = format!("data/kweb-provenance-artifacts/{relative_path}");
+        let copied = files
+            .iter()
+            .find(|file| file.path == archive_path)
+            .with_context(|| {
+                format!("full backup is missing referenced Kweb artifact {relative_path}")
+            })?;
+        ensure!(
+            copied.size_bytes == byte_length && copied.sha256 == sha256,
+            "copied Kweb artifact {relative_path} does not match its database metadata"
+        );
+    }
     Ok(())
 }
 
@@ -544,6 +640,11 @@ fn render_readme(manifest: &Manifest) -> String {
         ));
     }
     readme.push_str("- `data/audio-ingress-media/` contains private original vnote audio and any durable in-progress WAV chunks. Empty directories have no checksum entry in the manifest.\n");
+    if manifest.kweb_provenance_artifacts_included {
+        readme.push_str("- `data/kweb-provenance-artifacts/` contains every immutable Kweb provenance file referenced by `data/kweb.sqlite3`; each copied size and SHA-256 was checked against SQLite. The directory may be absent when the database has no artifacts.\n");
+    } else {
+        readme.push_str("- `data/kweb-provenance-artifacts/` was intentionally omitted by lightweight-Kweb mode. Artifact filenames, sizes, and hashes remain in `data/kweb.sqlite3`, but externally stored provenance cannot be recovered from this archive alone.\n");
+    }
     if !manifest
         .files
         .iter()
@@ -555,11 +656,11 @@ fn render_readme(manifest: &Manifest) -> String {
     readme.push_str(
         r#"
 
-All files are stored beneath one top-level archive directory. The five `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
+All files are stored beneath one top-level archive directory. The five `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases, Kweb artifacts, and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
 
 ## Kmap data format
 
-`data/kmap.sqlite3` is the durable Kennedy memory graph. Twenty-byte binary identifiers are exposed by the API as 40 lowercase hexadecimal characters. `knowledge_nodes` stores current node text, its nullable owner root, and its history head. Null ownership means unowned; valid Kennedy, user, and group roots own themselves. `data_provenance_nodes` stores immutable source material and source timestamps. `data_history_nodes` is an append-only per-node linked history. `knowledge_connections` stores directed fixed, active, and fanout edges; fixed slots 1 through 3 are encoded as reserved negative activation orders. `provenance_idempotency` maps caller keys to immutable provenance. `kmap_roots` maps the `user` and `kennedy` roles to their root nodes. `knowledge_node_model_attribution` records the latest modifying model description. Foreign keys are restrictive and timestamps are textual RFC 3339 values unless the exact schema below says otherwise.
+`data/kweb.sqlite3` is the durable knowledge web owned by the storage-only `kweb` library. Twenty-byte binary identifiers are exposed by the API as 40 lowercase hexadecimal characters. `knowledge_nodes` stores current node text, nullable owner node, history head, latest modifying model description, and latest-modification time. Null ownership means unowned; the library gives owner nodes no root-role meaning. A migrated legacy row may have a null modification time until its first load writes the current time. `data_provenance_nodes` stores immutable source metadata and either inline UTF-8 data or a relative artifact path. `provenance_artifacts` stores each file's relative path, preserved original basename, media type, byte length, SHA-256, and creation time; `provenance_artifact_links` stores provenance role and order. Stored names insert 12 URL-safe Base64 characters before the final extension and use the first two as a shard directory. `data_history_nodes` is an append-only per-node linked history whose public history projection is the newest-first array of provenance IDs. `fixed_connections` and `recent_connections` preserve ordered arrays of target IDs; storage assigns no active/fanout, slot, promotion, consolidation, or root semantics. `idempotency_receipts` permanently records each successful mutation's caller-supplied 16-byte identifier, operation kind, normalized-request SHA-256, result ID, and commit time. The receipt and mutation commit atomically; an exact replay no-ops, while changed reuse conflicts. There is no root-role table in this database. Foreign keys are restrictive and timestamps are textual RFC 3339 values unless the exact schema below says otherwise. On recovery, place the artifact tree beside the live database as `kweb-provenance-artifacts/`; a lightweight backup needs that tree restored independently before external provenance reads can succeed.
 
 ## Conversation-history data format
 
@@ -573,7 +674,7 @@ All files are stored beneath one top-level archive directory. The five `.sqlite3
 
 ## User-directory data format
 
-`data/users.sqlite3` is the Telegram identity authority. `whitelist_entries` maps a normalized whitelisted handle to its reserved Kmap root and, after first observation, an immutable numeric Telegram user ID. It also records root-provisioning readiness and the administrator capability used by `/adduser`. `observed_identities` records first/last sightings. `telegram_groups` assigns each observed group a reserved Kmap root and root-readiness state alongside the complete membership ledger, cursors, and permanent blacklist decision; a blacklisted chat ID is never returned to an allowed state. `telegram_group_aliases` preserves logical group identity across Telegram chat-ID migration.
+`data/users.sqlite3` is the identity authority. `kmap_system_roots` maps the application roles `user` and `kennedy` to their Kmap node IDs outside the Kmap storage library. `whitelist_entries` maps a normalized whitelisted handle to its reserved Kmap root and, after first observation, an immutable numeric Telegram user ID. It also records root-provisioning readiness and the administrator capability used by `/adduser`. `observed_identities` records first/last sightings. `telegram_groups` assigns each observed group a reserved Kmap root and root-readiness state alongside the complete membership ledger, cursors, and permanent blacklist decision; a blacklisted chat ID is never returned to an allowed state. `telegram_group_aliases` preserves logical group identity across Telegram chat-ID migration.
 
 ## Audio-ingress data format
 
@@ -619,7 +720,7 @@ The following DDL was read from each verified snapshot's `sqlite_schema`. It is 
 3. Open each database with SQLite and run `PRAGMA integrity_check` and `PRAGMA foreign_key_check` before attempting a migration.
 4. Use the commit at the first line of this README as the primary behavioral reference. If that build was marked dirty or unavailable, use the exact schemas and JSON descriptions above to construct an explicit migration from copies of the files.
 5. Stop Kennedy. Place the five standalone databases, the complete audio-ingress media directory, and optional encrypted vault at the paths supplied to the target binary. Do not restore old `-wal` or `-shm` files.
-6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify several user and Kennedy roots, Kmap histories/connections, active and completed conversations, pending conversation/audio/group ingress, Telegram TOFU bindings/group decisions/events, audio SHA lookups, and vault unlock.
+6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify the external user/Kennedy role mappings, several Kmap histories and fixed/recent arrays, active and completed conversations, pending conversation/audio/group ingress, Telegram TOFU bindings/group decisions/events, audio SHA lookups, and vault unlock.
 
 Tracked frontend assets, system prompts, source migrations, and external Codex/ChatGPT state are not duplicated here; the source commit identifies tracked assets, and the latter is not Kennedy-owned runtime persistence.
 "#,
@@ -768,7 +869,9 @@ mod tests {
         BackupOptions {
             bind: "127.0.0.1:4321".to_owned(),
             backup_dir: directory.path().join("backups"),
-            kmap_database: directory.path().join("kmap.sqlite3"),
+            kmap_database: directory.path().join("kweb.sqlite3"),
+            kmap_artifact_directory: directory.path().join("kweb-provenance-artifacts"),
+            include_kmap_artifacts: true,
             conversation_database: directory.path().join("conversations.sqlite3"),
             telegram_database: directory.path().join("telegram.sqlite3"),
             user_database: directory.path().join("users.sqlite3"),
@@ -810,11 +913,12 @@ mod tests {
         let readme = fs::read_to_string(root.join("README.md")).unwrap();
         assert!(readme.starts_with(&format!("Kennedy commit: {}\n", env!("KENNEDY_GIT_COMMIT"))));
         assert!(readme.contains("stateVersion: 2"));
+        assert!(readme.contains("idempotency_receipts"));
         assert!(readme.contains("CREATE TABLE records"));
 
         let manifest: Value =
             serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["backup_format_version"], 3);
+        assert_eq!(manifest["backup_format_version"], 6);
         assert_eq!(manifest["snapshot_mode"], "offline-port-guard");
         assert_eq!(manifest["files"].as_array().unwrap().len(), 7);
         for file in manifest["files"].as_array().unwrap() {
@@ -824,7 +928,7 @@ mod tests {
         }
 
         for (name, expected) in [
-            ("kmap.sqlite3", "memory in wal"),
+            ("kweb.sqlite3", "memory in wal"),
             ("conversations.sqlite3", "conversation in wal"),
             ("telegram.sqlite3", "telegram in wal"),
             ("users.sqlite3", "user directory in wal"),
@@ -849,6 +953,88 @@ mod tests {
         );
 
         drop((kmap, conversations, telegram, users, audio));
+    }
+
+    #[test]
+    fn full_and_lightweight_backups_handle_kweb_artifacts_explicitly() {
+        let directory = TestDirectory::new();
+        let mut options = options(&directory);
+        let kmap = database(&options.kmap_database, "kweb");
+        let relative_path = "aa/telegram-vnote.aaaaaaaaaaaa.wav";
+        let bytes = b"private provenance voice note";
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        kmap.execute_batch(
+            "CREATE TABLE provenance_artifacts (
+                 relative_path TEXT PRIMARY KEY, byte_length INTEGER NOT NULL,
+                 sha256 BLOB NOT NULL
+             );",
+        )
+        .unwrap();
+        kmap.execute(
+            "INSERT INTO provenance_artifacts VALUES(?1,?2,?3)",
+            rusqlite::params![relative_path, bytes.len() as i64, digest.as_slice()],
+        )
+        .unwrap();
+        drop(kmap);
+        for (path, value) in [
+            (&options.conversation_database, "conversations"),
+            (&options.telegram_database, "telegram"),
+            (&options.user_database, "users"),
+            (&options.audio_database, "audio"),
+        ] {
+            drop(database(path, value));
+        }
+        let stored = options.kmap_artifact_directory.join(relative_path);
+        fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        fs::write(&stored, bytes).unwrap();
+
+        let full_time = Utc.with_ymd_and_hms(2026, 7, 16, 12, 35, 0).unwrap();
+        let full = create_archive(&options, full_time).unwrap();
+        let full_extracted = directory.path().join("full-extracted");
+        fs::create_dir(&full_extracted).unwrap();
+        tar::Archive::new(GzDecoder::new(File::open(full).unwrap()))
+            .unpack(&full_extracted)
+            .unwrap();
+        let full_root = full_extracted.join("kennedy-backup-2026-07-16T12-35-00Z");
+        assert_eq!(
+            fs::read(
+                full_root
+                    .join("data/kweb-provenance-artifacts")
+                    .join(relative_path)
+            )
+            .unwrap(),
+            bytes
+        );
+        let full_manifest: Value =
+            serde_json::from_slice(&fs::read(full_root.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(full_manifest["kweb_provenance_artifacts_included"], true);
+
+        options.include_kmap_artifacts = false;
+        let lightweight_time = Utc.with_ymd_and_hms(2026, 7, 16, 12, 35, 1).unwrap();
+        let lightweight = create_archive(&options, lightweight_time).unwrap();
+        let lightweight_extracted = directory.path().join("lightweight-extracted");
+        fs::create_dir(&lightweight_extracted).unwrap();
+        tar::Archive::new(GzDecoder::new(File::open(lightweight).unwrap()))
+            .unpack(&lightweight_extracted)
+            .unwrap();
+        let lightweight_root = lightweight_extracted.join("kennedy-backup-2026-07-16T12-35-01Z");
+        assert!(
+            !lightweight_root
+                .join("data/kweb-provenance-artifacts")
+                .exists()
+        );
+        let lightweight_manifest: Value =
+            serde_json::from_slice(&fs::read(lightweight_root.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            lightweight_manifest["kweb_provenance_artifacts_included"],
+            false
+        );
+        assert!(
+            fs::read_to_string(lightweight_root.join("README.md"))
+                .unwrap()
+                .contains("intentionally omitted")
+        );
     }
 
     #[test]

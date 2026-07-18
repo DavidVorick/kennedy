@@ -17,7 +17,7 @@ export class MemoryExplorer {
     this.content.replaceChildren(element("p", "", "Loading memory…"));
     try {
       const [node, history] = await Promise.all([this.api.node(id), this.api.history(id)]);
-      this.renderNode(node, history.history);
+      this.renderNode(node, history.provenance_ids || []);
     } catch (error) { this.content.replaceChildren(element("p", "error-banner", error.message)); }
   }
 
@@ -26,24 +26,31 @@ export class MemoryExplorer {
   updateButtons() { this.backButton.disabled = !this.back.length; this.forwardButton.disabled = !this.forward.length; }
 
   renderNode(node, history) {
+    const fixedConnections = (node.fixed_connections || []).map((id, index) => ({ id, slot: index + 1 }));
+    const recentConnections = (node.recent_connections || []).map(id => ({ id }));
     const root = document.createDocumentFragment();
     root.append(
       element("h2", "", node.short_name),
       element("p", "node-description", node.short_description || "No short description."),
       element("p", "node-attribution", `Last modified by: ${node.last_modified_by || "legacy-unknown"}`),
-      element("p", "node-attribution", `Owner root: ${node.owner_root_node_id || "unowned"}`),
+      element("p", "node-attribution", `Last modified at: ${node.last_modified_at || "unknown"}`),
+      element("p", "node-attribution", `Owner: ${node.owner_node_id || node.owner_root_node_id || "unowned"}`),
       element("div", "long-description", node.long_description || "No long description."),
     );
     const grid = element("div", "connection-grid");
-    grid.append(this.connectionList("Fixed connections", node.fixed_connections || node.task_connections || [], true), this.connectionList("Active connections", node.active_connections), this.connectionList("Fanout connections", node.fanout_connections));
+    grid.append(
+      this.connectionList("Fixed connections", fixedConnections, true),
+      this.connectionList("Active connections", recentConnections.slice(0, 8)),
+      this.connectionList("Fanout connections", recentConnections.slice(8)),
+    );
     root.append(grid);
     const historySection = element("section", "history"); historySection.append(element("h3", "", "Source history"));
     if (!history.length) historySection.append(element("p", "", "No history entries."));
-    history.forEach((entry, index) => {
+    history.forEach((provenanceId, index) => {
       const row = element("div", "history-entry");
       row.append(element("span", "", `Revision ${history.length - index}`));
       const button = element("button", "quiet", "View source"); button.type = "button";
-      button.addEventListener("click", () => this.showSource(entry.provenance_id, row)); row.append(button); historySection.append(row);
+      button.addEventListener("click", () => this.showSource(provenanceId, row)); row.append(button); historySection.append(row);
     });
     root.append(historySection); this.content.replaceChildren(root);
   }
@@ -54,7 +61,8 @@ export class MemoryExplorer {
     for (const connection of connections) {
       const button = element("button", "connection"); button.type = "button";
       const slot = connection.slot || ({ high: 1, medium: 2, low: 3 })[connection.priority] || "?";
-      button.append(element("strong", "", showPriority ? `Slot ${slot} · ${connection.short_name}` : connection.short_name), element("small", "", connection.short_description || "No description."));
+      const name = connection.short_name || "Unloaded node";
+      button.append(element("strong", "", showPriority ? `Slot ${slot} · ${name}` : name), element("small", "", connection.short_description || `ID: ${connection.id}`));
       button.addEventListener("click", () => this.open(connection.id)); section.append(button);
     }
     return section;

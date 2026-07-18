@@ -1948,37 +1948,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "kennedy-kweb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "hex",
- "rand 0.9.5",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "tower-http 0.7.0",
- "tracing",
-]
-
-[[package]]
 name = "kennedy-server"
 version = "0.1.0"
 dependencies = [
  "age",
  "anyhow",
  "axum",
+ "base64",
  "chrono",
  "clap",
  "flate2",
  "kennedy-audio-ingress",
  "kennedy-conversation-history",
  "kennedy-intelligence",
- "kennedy-kweb",
  "kennedy-telegram-relay",
+ "kweb",
  "rpassword",
  "rusqlite",
  "rustls",
@@ -1987,6 +1971,7 @@ dependencies = [
  "sha2 0.10.9",
  "tar",
  "tokio",
+ "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2012,6 +1997,21 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kweb"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "889738273f245c30bc46c65caef3f9813ce7cc2748e1b4fc29ec2cefe153678d"
+dependencies = [
+ "base64",
+ "chrono",
+ "hex",
+ "rand 0.9.5",
+ "rusqlite",
+ "serde",
+ "sha2 0.10.9",
 ]
 
 [[package]]

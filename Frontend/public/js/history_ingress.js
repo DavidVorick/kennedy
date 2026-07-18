@@ -1,8 +1,8 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
-import { KwebContext } from "./kweb_context.js?v=20260717.7";
+import { KwebContext } from "./kweb_context.js?v=20260718.1";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260718.2";
-import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.2";
+import { ToolExecutor } from "./tools.js?v=20260718.5";
+import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.4";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260718.2";
 

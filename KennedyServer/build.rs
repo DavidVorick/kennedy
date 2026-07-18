@@ -9,8 +9,6 @@ fn main() {
     for path in [
         "../Cargo.toml",
         "../Cargo.lock",
-        "../BackendKweb/src",
-        "../BackendKweb/migrations",
         "../ConversationHistory/src",
         "../ConversationHistory/migrations",
         "../IntelligenceBackend/src",

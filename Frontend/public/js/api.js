@@ -2,6 +2,12 @@ export class ApiError extends Error {
   constructor(message, status = 0, code = "network_error") { super(message); this.name = "ApiError"; this.status = status; this.code = code; }
 }
 
+export function newIdempotencyId() {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export async function requestJSON(base, path, options = {}) {
   let response;
   try {
@@ -23,6 +29,35 @@ export async function requestJSON(base, path, options = {}) {
   return payload;
 }
 
+async function requestKmapMutation(base, path, options) {
+  try {
+    return await requestJSON(base, path, options);
+  } catch (error) {
+    if (error?.code !== "network_error") throw error;
+    return requestJSON(base, path, options);
+  }
+}
+
+async function requestKmapFormMutation(base, path, form) {
+  try {
+    return await requestFormJSON(base, path, form);
+  } catch (error) {
+    if (error?.code !== "network_error") throw error;
+    return requestFormJSON(base, path, form);
+  }
+}
+
+async function dataUrlBlob(dataUrl) {
+  const response = await fetch(dataUrl);
+  if (!response.ok) throw new ApiError("An archived media data URL could not be decoded.", response.status, "invalid_media");
+  return response.blob();
+}
+
+function archiveFilename(source) {
+  const safe = String(source || "provenance").replace(/[^A-Za-z0-9_-]+/g, "-");
+  return `${safe || "provenance"}-archive.json`;
+}
+
 export async function requestFormJSON(base, path, form) {
   let response;
   try {
@@ -39,23 +74,77 @@ export async function requestFormJSON(base, path, form) {
   return payload;
 }
 
+function contextNode(node) {
+  const {
+    fixed_connections: fixedIds = [],
+    recent_connections: recentIds = [],
+    ...stored
+  } = node;
+  const recent = recentIds.map(id => ({ id }));
+  return {
+    ...stored,
+    owner_root_node_id: node.owner_node_id,
+    fixed_connections: fixedIds.map((id, index) => ({ id, slot: index + 1 })),
+    active_connections: recent.slice(0, 8),
+    fanout_connections: recent.slice(8),
+  };
+}
+
 export const KwebAPI = (base) => ({
-  health: () => requestJSON(base, "/health"),
-  user: () => requestJSON(base, "/api/v1/user"),
-  node: (id) => requestJSON(base, `/api/v1/nodes/${id}`),
-  context: (id) => requestJSON(base, `/api/v1/nodes/${id}/context`),
-  history: (id) => requestJSON(base, `/api/v1/nodes/${id}/history`),
-  provenance: (id) => requestJSON(base, `/api/v1/provenance/${id}`),
-  createProvenance: (body) => requestJSON(base, "/api/v1/provenance", { method: "POST", body: JSON.stringify(body) }),
-  createNode: (body) => requestJSON(base, "/api/v1/nodes", { method: "POST", body: JSON.stringify(body) }),
-  bootstrapNode: (nodeId, shortName = null) => requestJSON(base, "/api/v1/nodes/bootstrap", {
-    method: "POST",
-    body: JSON.stringify({ node_id: nodeId, ...(shortName ? { short_name: shortName } : {}) }),
-  }),
-  updateNode: (id, body) => requestJSON(base, `/api/v1/nodes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  connect: (nodeIds, modelAttribution) => requestJSON(base, "/api/v1/connections", { method: "POST", body: JSON.stringify({ node_ids: nodeIds, model_attribution: modelAttribution }) }),
-  consolidateFanout: (body) => requestJSON(base, "/api/v1/connections/consolidate-fanout", { method: "POST", body: JSON.stringify(body) }),
-  setFixedConnection: (body) => requestJSON(base, "/api/v1/fixed-connections", { method: "POST", body: JSON.stringify(body) }),
+  health: () => requestJSON(base, "/api/v1/kmap/health"),
+  roots: () => requestJSON(base, "/api/v1/kmap/roots"),
+  stats: () => requestJSON(base, "/api/v1/kmap/stats"),
+  node: (id) => requestJSON(base, `/api/v1/kmap/nodes/${id}`),
+  context: async (id) => {
+    const requested = await requestJSON(base, `/api/v1/kmap/nodes/${id}`);
+    const activeIds = (requested.recent_connections || []).slice(0, 8);
+    const active = await Promise.all(activeIds.map(activeId => requestJSON(base, `/api/v1/kmap/nodes/${activeId}`)));
+    return { requested_node: contextNode(requested), active_connection_nodes: active.map(contextNode) };
+  },
+  history: (id) => requestJSON(base, `/api/v1/kmap/nodes/${id}/history`),
+  provenance: (id) => requestJSON(base, `/api/v1/kmap/provenance/${id}`),
+  provenanceArtifact: (relativePath) => {
+    const encodedPath = String(relativePath).split("/").map(encodeURIComponent).join("/");
+    return fetch(`${base}/api/v1/kmap/provenance-artifacts/${encodedPath}`).then(async response => {
+      if (!response.ok) throw new Error(`Kweb artifact request failed (${response.status}).`);
+      return response.blob();
+    });
+  },
+  createProvenance: ({ idempotency_id, data, source, source_created_at }) => requestKmapMutation(base, "/api/v1/kmap/provenance", { method: "POST", body: JSON.stringify({ idempotency_id, data, source, source_created_at }) }),
+  createProvenanceArchive: async ({ idempotency_id, archive, source, source_created_at }) => {
+    const storedArchive = JSON.parse(JSON.stringify(archive));
+    const form = new FormData();
+    form.append("idempotency_id", idempotency_id);
+    form.append("source", source);
+    form.append("source_created_at", source_created_at);
+    form.append("data_filename", archiveFilename(source));
+    for (const media of storedArchive.media || []) {
+      if (typeof media?.dataUrl !== "string" || !media.dataUrl) continue;
+      const artifactIndex = form.getAll("artifact").length;
+      const blob = await dataUrlBlob(media.dataUrl);
+      const originalFilename = media.fileName || `provenance-media-${artifactIndex + 1}`;
+      delete media.dataUrl;
+      media.provenanceArtifactIndex = artifactIndex;
+      form.append("artifact", blob, originalFilename);
+    }
+    form.append("data", JSON.stringify(storedArchive, null, 2));
+    return requestKmapFormMutation(base, "/api/v1/kmap/provenance-with-artifacts", form);
+  },
+  createNode: (body) => requestKmapMutation(base, "/api/v1/kmap/nodes", { method: "POST", body: JSON.stringify(body) }),
+  bootstrapNode: async (nodeId, shortName = null) => {
+    try { return await requestJSON(base, `/api/v1/kmap/nodes/${nodeId}`); }
+    catch (error) { if (error.status !== 404) throw error; }
+    const provenance = await requestKmapMutation(base, "/api/v1/kmap/provenance", {
+      method: "POST",
+      body: JSON.stringify({ idempotency_id: newIdempotencyId(), data: "Automatically provisioned blank Kmap root node.", source: "system-bootstrap", source_created_at: new Date().toISOString() }),
+    });
+    const created = await requestKmapMutation(base, "/api/v1/kmap/nodes", {
+      method: "POST",
+      body: JSON.stringify({ idempotency_id: newIdempotencyId(), node_id: nodeId, provenance_id: provenance.id, owner_node_id: "self", model_attribution: "system-bootstrap", short_name: shortName || "User Root", short_description: "", long_description: "", fixed_connections: [], recent_connections: [] }),
+    });
+    return created.node;
+  },
+  updateNode: (id, body) => requestKmapMutation(base, `/api/v1/kmap/nodes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
 });
 
 export const IntelligenceAPI = (base) => ({
