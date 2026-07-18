@@ -500,6 +500,10 @@ struct Usage {
     cache_write_tokens: u64,
     reasoning_tokens: u64,
     cumulative: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_output_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1524,6 +1528,14 @@ fn parse_codex_turn(stdout: &str, stderr: &str, request_id: Uuid) -> Result<Code
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
                     cumulative: true,
+                    last_input_tokens: value
+                        .pointer("/last_token_usage/input_tokens")
+                        .or_else(|| value.get("last_input_tokens"))
+                        .and_then(Value::as_u64),
+                    last_output_tokens: value
+                        .pointer("/last_token_usage/output_tokens")
+                        .or_else(|| value.get("last_output_tokens"))
+                        .and_then(Value::as_u64),
                 });
             }
             _ => {}
@@ -1903,6 +1915,8 @@ fn parse_gemini_search(
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cumulative: false,
+        last_input_tokens: None,
+        last_output_tokens: None,
     });
     Ok(SearchTurn {
         answer,
@@ -3317,7 +3331,7 @@ mod tests {
             "\n",
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"Final answer"}}"#,
             "\n",
-            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":20,"reasoning_output_tokens":5}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":20,"reasoning_output_tokens":5,"last_token_usage":{"input_tokens":60,"output_tokens":8}}}"#,
             "\n",
         );
         let turn = parse_codex_turn(stdout, "", Uuid::new_v4()).unwrap();
@@ -3330,6 +3344,8 @@ mod tests {
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.reasoning_tokens, 5);
         assert!(usage.cumulative);
+        assert_eq!(usage.last_input_tokens, Some(60));
+        assert_eq!(usage.last_output_tokens, Some(8));
     }
 
     #[test]

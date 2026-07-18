@@ -1,5 +1,5 @@
-import { formatKmapContext } from "./human_format.js?v=20260717.8";
-import { formatChatend } from "./chatend_format.js?v=20260715.9";
+import { formatKmapContext } from "./human_format.js?v=20260718.1";
+import { formatChatend } from "./chatend_format.js?v=20260718.2";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
 
@@ -829,12 +829,12 @@ export function renderUsage(container, diagnostic) {
   const contextPercent = usage.contextWindowTokens ? 100 * usage.contextTokens / usage.contextWindowTokens : 0;
   const cachePercent = usage.cacheReadPercent || 0;
   const primary = usage.contextWindowTokens && usage.contextKnown === false
-    ? `Not yet measured / ${exactTokenCount(usage.contextWindowTokens)}`
+    ? `Current unknown / ${exactTokenCount(usage.contextWindowTokens)}`
     : usage.contextWindowTokens
     ? `${exactTokenCount(usage.contextTokens)} / ${exactTokenCount(usage.contextWindowTokens)}`
     : `${exactTokenCount(usage.contextTokens)} used`;
   const remaining = usage.contextKnown === false
-    ? "fresh thread"
+    ? usage.last ? "last-pass usage unavailable" : "fresh thread"
     : usage.contextRemaining === null ? "window unknown" : `${exactTokenCount(usage.contextRemaining)} remaining`;
   const text = element("div", "context-usage-text");
   text.append(
@@ -846,7 +846,9 @@ export function renderUsage(container, diagnostic) {
   fill.style.width = `${Math.max(0, Math.min(100, contextPercent))}%`;
   track.append(fill);
   container.title = [
-    `${exactTokenCount(usage.contextTokens)} tokens currently in context`,
+    usage.contextKnown === false
+      ? "Current context occupancy is not available"
+      : `${exactTokenCount(usage.contextTokens)} tokens currently in context`,
     `${remaining}`,
     `${exactTokenCount(usage.totalInputTokens)} cumulative input tokens`,
     `${exactTokenCount(usage.totalOutputTokens)} cumulative output tokens`,

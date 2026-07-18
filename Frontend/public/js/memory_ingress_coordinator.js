@@ -1,4 +1,4 @@
-import { runHistoryIngress } from "./history_ingress.js?v=20260718.1";
+import { runHistoryIngress } from "./history_ingress.js?v=20260718.2";
 
 const INGRESS_FAILURE_LIMIT = 5;
 

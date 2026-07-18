@@ -1,8 +1,8 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260717.7";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260718.1";
-import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.1";
+import { ToolExecutor } from "./tools.js?v=20260718.2";
+import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.2";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeTurnContinuationMessage, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260717.2";
 

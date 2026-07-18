@@ -4,6 +4,8 @@ A normal answer does not end a self-time session. After any answer without EndSe
 
 LoadNode and ResetContext share a budget of 50 requests per clean-slate self-time session, including failed requests.
 
+There is no history ingress following self time, if you wish for the kmap to be updated, you must do it yourself within the session, otherwise the activity will be lost.
+
 You have one tool available to you that only exists in self time sessions:
 
 EndSelfTimeSession

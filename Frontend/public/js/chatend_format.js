@@ -9,7 +9,9 @@ function exactTokens(value) {
 export function formatContextWindowProgress(usage) {
   const contextWindowTokens = Number(usage?.contextWindowTokens) || 0;
   if (contextWindowTokens <= 0) return "context window usage: unknown";
-  const contextKnown = usage?.contextKnown === true || Boolean(usage?.last);
+  const contextKnown = usage?.contextKnown === false
+    ? false
+    : usage?.contextKnown === true || Boolean(usage?.last);
   if (!contextKnown) {
     return `context window usage: unknown / ${exactTokens(contextWindowTokens)}`;
   }

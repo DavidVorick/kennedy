@@ -1,6 +1,6 @@
-import { parseToolCalls, TOOL_CALL_PREFIX } from "./tools.js?v=20260718.1";
+import { parseToolCalls, TOOL_CALL_PREFIX, truncateToolResponse } from "./tools.js?v=20260718.2";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { formatChatend } from "./chatend_format.js?v=20260715.9";
+import { formatChatend } from "./chatend_format.js?v=20260718.2";
 
 export const AGENT_LOOP_ROUND_LIMIT = 100;
 export const AGENT_LOOP_SESSION_ENDED = Symbol("agent-loop-session-ended");
@@ -41,6 +41,7 @@ export class UsageTracker {
     this.totalCacheWriteTokens = 0;
     this.totalReasoningTokens = 0;
     this.last = null;
+    this.lastContext = null;
     this.providerThreadTotals = null;
   }
 
@@ -64,18 +65,22 @@ export class UsageTracker {
     this.totalCachedTokens += normalized.cachedTokens;
     this.totalCacheWriteTokens += normalized.cacheWriteTokens;
     this.totalReasoningTokens += normalized.reasoningTokens;
-    const reportedContextTokens = normalized.inputTokens + normalized.outputTokens;
-    // Codex reports cumulative usage for every internal model pass in a turn.
-    // A turn that invokes a native tool can therefore exceed the model's context
-    // window even though no individual request did. Do not present that aggregate
-    // as the size of the current context.
-    this.last = this.contextWindowTokens > 0 && reportedContextTokens > this.contextWindowTokens
-      ? null
-      : normalized;
+    this.last = normalized;
+    const hasExplicitContext = usage.last_input_tokens !== null && usage.last_input_tokens !== undefined
+      && usage.last_output_tokens !== null && usage.last_output_tokens !== undefined
+      && Number.isFinite(Number(usage.last_input_tokens))
+      && Number.isFinite(Number(usage.last_output_tokens));
+    this.lastContext = hasExplicitContext
+      ? {
+          inputTokens: Math.max(0, Number(usage.last_input_tokens)),
+          outputTokens: Math.max(0, Number(usage.last_output_tokens)),
+        }
+      : usage.cumulative === true ? null : normalized;
   }
 
   resetThread() {
     this.last = null;
+    this.lastContext = null;
     this.providerThreadTotals = null;
   }
 
@@ -87,19 +92,14 @@ export class UsageTracker {
     this.totalCachedTokens = Number(snapshot.totalCachedTokens) || 0;
     this.totalCacheWriteTokens = Number(snapshot.totalCacheWriteTokens) || 0;
     this.totalReasoningTokens = Number(snapshot.totalReasoningTokens) || 0;
-    const restoredLast = snapshot.last && typeof snapshot.last === "object" ? { ...snapshot.last } : null;
-    const restoredContextTokens = restoredLast
-      ? (Number(restoredLast.inputTokens) || 0) + (Number(restoredLast.outputTokens) || 0)
-      : 0;
-    this.last = this.contextWindowTokens > 0 && restoredContextTokens > this.contextWindowTokens
-      ? null
-      : restoredLast;
+    this.last = snapshot.last && typeof snapshot.last === "object" ? { ...snapshot.last } : null;
+    this.lastContext = snapshot.lastContext && typeof snapshot.lastContext === "object" ? { ...snapshot.lastContext } : null;
     this.providerThreadTotals = snapshot.providerThreadTotals && typeof snapshot.providerThreadTotals === "object" ? { ...snapshot.providerThreadTotals } : null;
   }
 
   snapshot() {
-    const contextKnown = Boolean(this.last);
-    const contextTokens = contextKnown ? this.last.inputTokens + this.last.outputTokens : 0;
+    const contextKnown = Boolean(this.lastContext);
+    const contextTokens = contextKnown ? this.lastContext.inputTokens + this.lastContext.outputTokens : 0;
     const contextRemaining = contextKnown && this.contextWindowTokens ? Math.max(0, this.contextWindowTokens - contextTokens) : null;
     return {
       requests: this.requests,
@@ -115,6 +115,7 @@ export class UsageTracker {
       totalReasoningTokens: this.totalReasoningTokens,
       cacheReadPercent: this.totalInputTokens ? (100 * this.totalCachedTokens / this.totalInputTokens) : 0,
       last: this.last,
+      lastContext: this.lastContext,
       providerThreadTotals: this.providerThreadTotals,
     };
   }
@@ -186,15 +187,30 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     const content = response.message?.content;
     if (response.status !== "complete" || typeof content !== "string") throw new Error("The intelligence service returned an invalid text generation.");
     const emptyAnswer = !content.trim();
-    if (!emptyAnswer) chatend.append(response.message);
-    continuation.accept(response.response_id, chatend.messages.length);
+    let calls = null;
+    let protocolError = null;
+    if (!emptyAnswer) {
+      try { calls = parseToolCalls(content); }
+      catch (error) { protocolError = error; }
+    }
+    const acceptedContent = calls ? truncateToolResponse(content) : content;
+    const acceptedMessage = acceptedContent === content ? response.message : { ...response.message, content: acceptedContent };
+    const discardedNonWhitespace = Boolean(calls && acceptedContent !== content.trim());
+    if (!emptyAnswer) chatend.append(acceptedMessage);
+    if (!discardedNonWhitespace) continuation.accept(response.response_id, chatend.messages.length);
+    else {
+      // The provider thread still contains the untruncated assistant message.
+      // Abandon it so the next request is rebuilt from the canonical Chatend.
+      continuation.reset();
+      usage.resetThread();
+    }
     const llmTimingMessage = timingMessage("LLM call", timing.steps.at(-1).durationMs);
     chatend.append(llmTimingMessage);
     onUpdate();
     const responseDirective = await onResponse(round + 1);
 
     if (roundDirective?.endAfterResponse || responseDirective?.endAfterResponse) {
-      executor.sessionEndContent = content;
+      executor.sessionEndContent = acceptedContent;
       const summary = updateTimingSummary(timing);
       chatend.append(summary);
       onUpdate();
@@ -210,10 +226,8 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       throw new Error("The intelligence service returned no assistant answer.");
     }
 
-    let calls;
-    try { calls = parseToolCalls(content); }
-    catch (error) {
-      chatend.append(protocolFailureMessage(error));
+    if (protocolError) {
+      chatend.append(protocolFailureMessage(protocolError));
       onUpdate();
       const checkpointStarted = performance.now();
       await checkpoint();
@@ -252,7 +266,7 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
         chatend.rebuildAfterReset(
           execution.selfMessage,
           execution.resetHistoryEntry,
-          response.message,
+          acceptedMessage,
           llmTimingMessage,
           execution.message,
           { full_history_boundary: true, memory: execution.previousContext, usage: usage.snapshot() },

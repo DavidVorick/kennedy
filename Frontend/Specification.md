@@ -227,15 +227,15 @@ reads.
 The frontend aggregates provider-reported input, output, reasoning, cache-read,
 and cache-write tokens. Codex reports cumulative thread usage, so continuation
 rounds are differenced before per-call and session totals are updated. Current
-context occupancy is the latest request's input plus output tokens; remaining
-capacity uses the effective context window that Codex advertises for the
-selected model. These figures are informative and never trigger compaction,
-truncation, or an automatic reset. Every Codex invocation suppresses automatic
-compaction; only an explicit ResetContext tool request rebuilds context.
-When Codex reports an aggregate covering multiple internal model passes and
-that aggregate exceeds the advertised window, the frontend retains it in the
-cumulative totals but treats current occupancy as unknown rather than showing
-an impossible context size.
+context occupancy is the latest individual model request's input plus output
+tokens; remaining capacity uses the effective context window that Codex
+advertises for the selected model. Multi-pass or cumulative aggregates remain
+accounting telemetry and are never displayed as context occupancy, even when
+their sum happens to fit under the window. If the provider transport does not
+expose an individual-request measurement, occupancy is unknown. These figures
+are informative and never trigger compaction, truncation, or an automatic
+reset. Every Codex invocation suppresses automatic compaction; only an explicit
+ResetContext tool request rebuilds context.
 
 Every generation request ends with exactly one terse context clue:
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
@@ -373,16 +373,17 @@ KENNEDY_TOOL_CALLS
 {"calls":[{"name":"LoadNode","arguments":{"identifier":3}}]}
 ```
 
-The response must contain only the marker and an object with one non-empty
+The first envelope must contain the marker and an object with one non-empty
 `calls` array. Each call has exactly `name` and object-valued `arguments`.
-Multiple calls are allowed and execute sequentially in array order before the
-next generation request. `ResetContext` must be the only call in its response.
-The marker must be the first response text and the JSON closing brace must be
-the final non-whitespace character. Markdown fences, commentary, status
-updates, and final-answer text are forbidden before or after the envelope. The
-frontend rejects malformed envelopes and distinguishes invalid JSON, text
-before the marker, and trailing text after valid JSON in its readable protocol
-feedback so Kennedy can retry correctly.
+Multiple calls in that array are allowed and execute sequentially before the
+next generation request. `ResetContext` must be the only call in its envelope.
+The marker must be the first response text; Markdown fences, commentary, and
+status text before it remain invalid. After the first valid JSON object's
+closing brace, the frontend truncates every trailing character without reading
+or preserving it. This includes commentary, final-answer text, and later
+`KENNEDY_TOOL_CALLS` blocks, so only the first valid envelope is considered.
+Malformed first envelopes and text before the marker still produce readable
+protocol feedback so Kennedy can retry correctly.
 
 ### 8.1 `LoadNode`
 
@@ -988,7 +989,8 @@ input tokens served by prompt-cache reads. Hover details include cumulative
 input/output tokens, cache-read tokens, and cache-write tokens. Values come
 from provider usage rather than client-side token estimates; before the first
 provider response occupancy is explicitly unmeasured while the advertised
-effective limit remains visible.
+effective limit remains visible. Multi-pass aggregates are not shown in the
+context-window numerator or percentage.
 
 ### 11.3 Audio Ingress History
 

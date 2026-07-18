@@ -23,14 +23,19 @@ function splitToolEnvelope(value) {
     else if (character === "}") {
       depth -= 1;
       if (depth === 0) {
-        const trailing = value.slice(index + 1).trim();
-        if (trailing) throw Object.assign(new Error("A tool request cannot contain commentary or any other text after the JSON object's final brace."), { code: "invalid_tool_protocol" });
         return value.slice(0, index + 1);
       }
       if (depth < 0) break;
     }
   }
   return value;
+}
+
+export function truncateToolResponse(content) {
+  const trimmed = String(content || "").trim();
+  if (!trimmed.startsWith(`${TOOL_CALL_PREFIX}\n`)) return content;
+  const envelope = splitToolEnvelope(trimmed.slice(TOOL_CALL_PREFIX.length).trim());
+  return `${TOOL_CALL_PREFIX}\n${envelope}`;
 }
 
 export function parseToolCalls(content) {

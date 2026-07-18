@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
-import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls } from "../public/js/tools.js";
+import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls, truncateToolResponse } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, reconcileConversationHistory, sortConversationHistory } from "../public/js/render.js";
@@ -699,13 +699,15 @@ test("transparent tool protocol parses multiple calls from one model response", 
   assert.equal(parseToolCalls("A normal answer."), null);
 });
 
-test("tool protocol rejects narration before or after an otherwise valid envelope", () => {
+test("tool protocol truncates everything after its first valid envelope and still rejects leading narration", () => {
   const envelope = 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"WebSearch","arguments":{"question":"Compare {official} sources and escape \\\"quoted\\\" names.","mode":"quality"}}]}';
   assert.equal(parseToolCalls(`${envelope}\n  `)[0].name, "WebSearch");
-  assert.throws(
-    () => parseToolCalls(`${envelope}\nI’m looking this up now.`),
-    /cannot contain commentary or any other text after the JSON object's final brace/,
-  );
+  assert.equal(parseToolCalls(`${envelope}\nI’m looking this up now.`)[0].name, "WebSearch");
+  const second = 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":9}}]}';
+  const repeated = `${envelope}\n${second}`;
+  assert.equal(parseToolCalls(repeated).length, 1);
+  assert.equal(parseToolCalls(repeated)[0].name, "WebSearch");
+  assert.equal(truncateToolResponse(repeated), envelope);
   assert.throws(
     () => parseToolCalls(`I’m looking this up now.\n${envelope}`),
     /must be the first text in a tool-request response/,
@@ -714,6 +716,43 @@ test("tool protocol rejects narration before or after an otherwise valid envelop
     () => parseToolCalls(`\`\`\`json\n${envelope}\n\`\`\``),
     /must be the first text in a tool-request response/,
   );
+});
+
+test("a truncated tool response abandons the provider thread and replays only its first envelope", async () => {
+  const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
+  const chatend = new Chatend("instructions", context, [{ role: "user", content: "work" }]);
+  const requests = [];
+  const firstEnvelope = 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"First","arguments":{}}]}';
+  const ignoredEnvelope = 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"Ignored","arguments":{}}]}';
+  const intelligence = { generate: async request => {
+    requests.push(request);
+    if (requests.length === 1) {
+      return {
+        status: "complete", response_id: "dirty-thread",
+        message: { role: "assistant", content: `${firstEnvelope}\nTrailing commentary.\n${ignoredEnvelope}` },
+        usage: null,
+      };
+    }
+    return { status: "complete", response_id: "clean-thread", message: { role: "assistant", content: "Finished." }, usage: null };
+  } };
+  const executed = [];
+  await runAgentLoop({
+    intelligence, provider: "p", model: "m", chatend,
+    executor: {
+      execute: async call => {
+        executed.push(call.name);
+        return { reset: false, message: { role: "user", display_role: "Memory tool result", content: `${call.name} completed.` } };
+      },
+      failure: () => { throw new Error("unexpected failure"); },
+    },
+    continuation: new ContinuationState("kennedy-test"), usage: new UsageTracker(),
+  });
+  assert.deepEqual(executed, ["First"]);
+  assert.equal(requests[1].previous_response_id, null);
+  assert.match(requests[1].chatend, /Agent manuals\n\ninstructions/);
+  assert.match(requests[1].chatend, /First completed\./);
+  assert.doesNotMatch(requests[1].chatend, /Trailing commentary|Ignored/);
+  assert.equal(chatend.messages.some(message => message.content?.includes?.("Trailing commentary")), false);
 });
 
 test("agent loop executes multiple text tool calls before the next generation", async () => {
@@ -725,9 +764,9 @@ test("agent loop executes multiple text tool calls before the next generation", 
     if (requests.length === 1) return {
       status: "complete", response_id: "resp_1",
       message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"First","arguments":{}},{"name":"Second","arguments":{}}]}' },
-      usage: { input_tokens: 100, output_tokens: 10, cached_tokens: 80, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true },
+      usage: { input_tokens: 100, output_tokens: 10, cached_tokens: 80, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true, last_input_tokens: 100, last_output_tokens: 10 },
     };
-    return { status: "complete", response_id: "resp_2", message: { role: "assistant", content: "Finished." }, usage: { input_tokens: 230, output_tokens: 15, cached_tokens: 180, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true } };
+    return { status: "complete", response_id: "resp_2", message: { role: "assistant", content: "Finished." }, usage: { input_tokens: 230, output_tokens: 15, cached_tokens: 180, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true, last_input_tokens: 130, last_output_tokens: 5 } };
   } };
   const executed = [];
   const executor = {
@@ -888,6 +927,7 @@ test("concise context usage is model-visible and stale thread usage is cleared o
   usage.record({
     input_tokens: 200000, output_tokens: 1000, cached_tokens: 150000,
     cache_write_tokens: 0, reasoning_tokens: 500, cumulative: true,
+    last_input_tokens: 200000, last_output_tokens: 1000,
   });
   assert.equal(
     formatContextWindowProgress(usage.snapshot()),
@@ -899,7 +939,7 @@ test("concise context usage is model-visible and stale thread usage is cleared o
   assert.equal(usage.snapshot().totalInputTokens, 200000);
 });
 
-test("cumulative multi-pass usage is not presented as an impossible current context size", () => {
+test("cumulative multi-pass usage is never presented as current context occupancy", () => {
   const usage = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
   usage.record({
     input_tokens: 281555, output_tokens: 238, cached_tokens: 140032,
@@ -907,6 +947,7 @@ test("cumulative multi-pass usage is not presented as an impossible current cont
   });
   assert.equal(usage.snapshot().contextKnown, false);
   assert.equal(usage.snapshot().contextTokens, 0);
+  assert.equal(usage.snapshot().last.inputTokens, 281555);
   assert.equal(usage.snapshot().totalInputTokens, 281555);
   assert.equal(formatContextWindowProgress(usage.snapshot()), "context window usage: unknown / 258,400");
 
@@ -916,6 +957,16 @@ test("cumulative multi-pass usage is not presented as an impossible current cont
     last: { inputTokens: 281555, outputTokens: 238 },
   });
   assert.equal(restored.snapshot().contextKnown, false);
+
+  const exact = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
+  exact.record({
+    input_tokens: 281555, output_tokens: 238, cached_tokens: 140032,
+    cache_write_tokens: 0, reasoning_tokens: 127, cumulative: true,
+    last_input_tokens: 140857, last_output_tokens: 92,
+  });
+  assert.equal(exact.snapshot().contextKnown, true);
+  assert.equal(exact.snapshot().contextTokens, 140949);
+  assert.equal(formatContextWindowProgress(exact.snapshot()), "context window usage: 140,949 / 258,400");
 });
 
 test("ResetContext abandons continuation and resends the rebuilt full chatend", async () => {
@@ -1981,9 +2032,10 @@ test("a missing audio prompt disables only audio memory ingress", async () => {
 
 test("shared Kmap basics enforce exclusive tool-request responses", async () => {
   const basics = await readFile(new URL("../SystemPrompts/KmapBasics.txt", import.meta.url), "utf8");
-  assert.match(basics, /closing brace must be the final non-whitespace character/);
+  assert.match(basics, /harness truncates all of them without reading or executing them/);
+  assert.match(basics, /only the first object's calls are considered/);
   assert.match(basics, /Do not use a Markdown fence/);
-  assert.match(basics, /include any other text before or after the object/);
+  assert.match(basics, /put text before the marker/);
   assert.match(basics, /Additional tools and their documentation may be available in the kmap/);
 });
 

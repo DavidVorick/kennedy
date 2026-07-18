@@ -168,8 +168,11 @@ Codex JSONL may contain intermediate agent messages. Only the last completed
 `response_id`; `turn.completed.usage` supplies input, cached-input, output, and
 reasoning tokens. Codex's values are cumulative for the provider thread; the
 response marks them as cumulative so the frontend can difference continuation
-rounds. Cache-write tokens are reported as zero because Codex JSONL does not
-expose that measurement.
+rounds. When the JSON event includes an optional `last_token_usage` object or
+equivalent last-input/output fields, the bridge also exposes those individual
+model-pass counts as `last_input_tokens` and `last_output_tokens`; the frontend
+uses only those fields for context occupancy. Cache-write tokens are reported
+as zero because Codex JSONL does not expose that measurement.
 
 `quality` and `balanced` web search start a new ephemeral Codex thread with
 `--search`, retain the same read-only/no-shell restrictions, and retain the
@@ -257,7 +260,9 @@ Successful responses contain:
     "cached_tokens": 768,
     "cache_write_tokens": 0,
     "reasoning_tokens": 30,
-    "cumulative": true
+    "cumulative": true,
+    "last_input_tokens": 520,
+    "last_output_tokens": 40
   }
 }
 ```
