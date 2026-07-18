@@ -1,5 +1,5 @@
 import { newIdempotencyId } from "./api.js?v=20260718.3";
-import { runHistoryIngress } from "./history_ingress.js?v=20260718.5";
+import { runHistoryIngress } from "./history_ingress.js?v=20260718.6";
 
 const INGRESS_FAILURE_LIMIT = 5;
 
@@ -29,6 +29,7 @@ export class MemoryIngressCoordinator {
   constructor({
     kweb,
     intelligence,
+    rustLibs = null,
     conversationHistory,
     audioIngress,
     telegramRelay,
@@ -50,6 +51,7 @@ export class MemoryIngressCoordinator {
   }) {
     this.kweb = kweb;
     this.intelligence = intelligence;
+    this.rustLibs = rustLibs;
     this.conversationHistory = conversationHistory;
     this.audioIngress = audioIngress;
     this.telegramRelay = telegramRelay;
@@ -90,6 +92,11 @@ export class MemoryIngressCoordinator {
     await Promise.resolve(this.intelligence.cancelOperation(turn.operationId)).catch(() => null);
   }
 
+  async releaseRustLibs(sessionId) {
+    if (!this.rustLibs) return;
+    await this.rustLibs.release(sessionId).catch(() => {});
+  }
+
   async nextWork() {
     const runtime = this.getRuntime();
     const [conversationResult, audioResult] = await Promise.all([
@@ -111,6 +118,7 @@ export class MemoryIngressCoordinator {
 
   async processAudioPiece(initialPiece) {
     let piece = initialPiece;
+    const rustLibSessionId = `kennedy:audio-ingress:${piece.id}`;
     let stage = "prepare";
     let liveDiagnostic = null;
     this.activeAudioPiece = piece;
@@ -173,6 +181,8 @@ export class MemoryIngressCoordinator {
       await runHistoryIngress({
         kweb: this.kweb,
         intelligence: this.intelligence,
+        rustLibs: this.rustLibs,
+        toolSessionId: rustLibSessionId,
         manuals: runtime.manuals,
         rootNodeIds: runtime.rootNodeIds,
         provenanceId: piece.provenance_id,
@@ -194,11 +204,13 @@ export class MemoryIngressCoordinator {
       this.diagnostic = null;
       stage = "completion";
       await this.audioIngress.ingressCompleted(piece.id, { expected_version: piece.version });
+      await this.releaseRustLibs(rustLibSessionId);
       this.activeAudioPiece = null;
       await this.refreshAudioHistory();
     } catch (error) {
       const latest = await this.audioIngress.getPiece(piece.id);
       if (!["ingress_pending", "ingress_in_progress"].includes(latest.phase)) {
+        await this.releaseRustLibs(rustLibSessionId);
         this.activeAudioPiece = null;
         return;
       }
@@ -221,6 +233,7 @@ export class MemoryIngressCoordinator {
       this.activeAudioPiece = null;
       await this.refreshAudioHistory();
       if (failed.phase === "ingress_failed") {
+        await this.releaseRustLibs(rustLibSessionId);
         this.onStatus("Audio memory ingestion failed");
         this.onError(`Audio transcript ingress stopped after ${failed.ingress_failure_count} failed attempts. Recording ${failed.recording_id} remains preserved for inspection.`);
       }
@@ -248,6 +261,7 @@ export class MemoryIngressCoordinator {
 
   async processConversation(initialRecord) {
     let record = initialRecord;
+    const rustLibSessionId = `kennedy:history-ingress:${record.id}`;
     let stage = "prepare";
     this.activeRecord = record;
     this.diagnostic = null;
@@ -316,6 +330,8 @@ export class MemoryIngressCoordinator {
         await runHistoryIngress({
           kweb: this.kweb,
           intelligence: this.intelligence,
+          rustLibs: this.rustLibs,
+          toolSessionId: rustLibSessionId,
           manuals: runtime.manuals,
           rootNodeIds: this.rootsForRecord(record),
           referenceRootNodeIds: this.referencesForRecord(record),
@@ -357,6 +373,7 @@ export class MemoryIngressCoordinator {
       record = await this.conversationHistory.ingressCompleted(record.id, {
         expected_version: record.version,
       });
+      await this.releaseRustLibs(rustLibSessionId);
       this.upsertHistory(record);
       const groupIngressBatchId = record.state?.channel?.groupIngressBatchId
         || record.state?.archive?.channel?.groupIngressBatchId;
@@ -365,12 +382,14 @@ export class MemoryIngressCoordinator {
       await this.refreshHistory();
     } catch (error) {
       if (this.isConversationPurging(record.id) || this.isConversationPurged(record.id)) {
+        await this.releaseRustLibs(rustLibSessionId);
         this.diagnostic = null;
         this.activeRecord = null;
         return;
       }
       const failedRecord = await this.recordConversationFailure(record, error, stage);
       if (!failedRecord) {
+        await this.releaseRustLibs(rustLibSessionId);
         this.diagnostic = null;
         this.activeRecord = null;
         await this.refreshHistory();
@@ -388,6 +407,7 @@ export class MemoryIngressCoordinator {
       this.diagnostic = null;
       this.activeRecord = null;
       if (failedRecord.phase === "ingress_failed") {
+        await this.releaseRustLibs(rustLibSessionId);
         this.onStatus("Memory ingestion failed");
         this.onError(`History ingress stopped after ${failedRecord.ingress_failure_count} failed attempts. Select the conversation to inspect its failure log.`);
       }

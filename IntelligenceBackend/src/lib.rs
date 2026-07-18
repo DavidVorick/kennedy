@@ -1810,7 +1810,7 @@ async fn run_gemini_search(
                 ApiError::new(
                     StatusCode::GATEWAY_TIMEOUT,
                     "provider_timeout",
-                    "Gemini search did not finish within the 45-second fast-tier deadline.",
+                    "Gemini search did not finish within the 90-second fast-tier deadline.",
                 )
             } else {
                 ApiError::new(
@@ -3247,7 +3247,7 @@ mod tests {
         assert_eq!(balanced.model, "gpt-5.6-terra");
         assert_eq!(balanced.reasoning_effort, "low");
         assert_eq!(balanced.context_size, Some("low"));
-        assert_eq!(balanced.timeout_seconds, 90);
+        assert_eq!(balanced.timeout_seconds, 180);
 
         let fast: WebSearchRequest =
             serde_json::from_str(r#"{"question":"current fact","mode":"fast"}"#).unwrap();
@@ -3256,7 +3256,7 @@ mod tests {
         assert_eq!(fast.model, "gemini-3.1-flash-lite");
         assert_eq!(fast.reasoning_effort, "low");
         assert_eq!(fast.context_size, None);
-        assert_eq!(fast.timeout_seconds, 45);
+        assert_eq!(fast.timeout_seconds, 90);
 
         let quality: WebSearchRequest =
             serde_json::from_str(r#"{"question":"compare evidence","mode":"quality"}"#).unwrap();
@@ -3266,7 +3266,7 @@ mod tests {
         assert_eq!(quality.model, "gpt-5.6-sol");
         assert_eq!(quality.reasoning_effort, "xhigh");
         assert_eq!(quality.context_size, Some("high"));
-        assert_eq!(quality.timeout_seconds, 30 * 60);
+        assert_eq!(quality.timeout_seconds, 40 * 60);
         assert!(codex_search_prompt("topic", WebSearchMode::Balanced).contains("focused"));
         assert!(codex_search_prompt("topic", WebSearchMode::Quality).contains("thorough"));
     }

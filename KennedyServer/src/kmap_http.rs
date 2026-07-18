@@ -23,6 +23,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
+use crate::rust_lib_tools;
+
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -159,80 +161,81 @@ pub(crate) fn initialize(
     let mut kmap =
         Kmap::open_with_artifacts(kmap_database, artifact_directory).map_err(anyhow::Error::new)?;
     let mut bootstrap_provenance = None;
-    let mut ensure = |role: &str, legacy_id: Option<NodeId>| -> anyhow::Result<NodeId> {
-        let existing = identity
-            .query_row(
-                "SELECT root_node_id FROM kmap_system_roots WHERE role=?1",
-                [role],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let id = if let Some(existing) = existing {
-            NodeId::from_hex(&existing).map_err(anyhow::Error::new)?
-        } else if let Some(legacy_id) = legacy_id {
-            kmap.get_node(legacy_id).map_err(anyhow::Error::new)?;
-            identity.execute(
-                "INSERT INTO kmap_system_roots(role,root_node_id,created_at) VALUES(?1,?2,?3)",
-                params![role, legacy_id.to_string(), Utc::now().to_rfc3339()],
-            )?;
-            legacy_id
-        } else {
-            let provenance_id = match bootstrap_provenance {
-                Some(id) => id,
-                None => {
-                    let id = kmap
-                        .create_provenance(
-                            IdempotencyId::random(),
-                            NewProvenance {
-                                data: "Initial Kmap system-root bootstrap.".into(),
-                                source: "system-bootstrap".into(),
-                                source_created_at: Utc::now().to_rfc3339(),
-                            },
-                        )
-                        .map_err(anyhow::Error::new)?;
-                    bootstrap_provenance = Some(id);
-                    id
-                }
-            };
-            let id = NodeId::random();
-            let (short_name, short_description, long_description) = if role == "kennedy" {
-                (
-                    "Kennedy's Root",
-                    "The root of Kennedy's own Kmap knowledge.",
-                    "This is Kennedy's root node. It anchors Kennedy's own durable knowledge and learned lessons in the Kmap.",
+    let roots = {
+        let mut ensure = |role: &str, legacy_id: Option<NodeId>| -> anyhow::Result<NodeId> {
+            let existing = identity
+                .query_row(
+                    "SELECT root_node_id FROM kmap_system_roots WHERE role=?1",
+                    [role],
+                    |row| row.get::<_, String>(0),
                 )
+                .optional()?;
+            let id = if let Some(existing) = existing {
+                NodeId::from_hex(&existing).map_err(anyhow::Error::new)?
+            } else if let Some(legacy_id) = legacy_id {
+                kmap.get_node(legacy_id).map_err(anyhow::Error::new)?;
+                identity.execute(
+                    "INSERT INTO kmap_system_roots(role,root_node_id,created_at) VALUES(?1,?2,?3)",
+                    params![role, legacy_id.to_string(), Utc::now().to_rfc3339()],
+                )?;
+                legacy_id
             } else {
-                ("Initial User Root", "", "")
+                let provenance_id = match bootstrap_provenance {
+                    Some(id) => id,
+                    None => {
+                        let id = kmap
+                            .create_provenance(
+                                IdempotencyId::random(),
+                                NewProvenance {
+                                    data: "Initial Kmap system-root bootstrap.".into(),
+                                    source: "system-bootstrap".into(),
+                                    source_created_at: Utc::now().to_rfc3339(),
+                                },
+                            )
+                            .map_err(anyhow::Error::new)?;
+                        bootstrap_provenance = Some(id);
+                        id
+                    }
+                };
+                let id = NodeId::random();
+                let (short_name, short_description, long_description) = if role == "kennedy" {
+                    (
+                        "Kennedy's Root",
+                        "The root of Kennedy's own Kmap knowledge.",
+                        "This is Kennedy's root node. It anchors Kennedy's own durable knowledge and learned lessons in the Kmap.",
+                    )
+                } else {
+                    ("Initial User Root", "", "")
+                };
+                kmap.create_node(
+                    IdempotencyId::random(),
+                    CreateNode {
+                        id,
+                        provenance_id,
+                        owner: Owner::SelfNode,
+                        short_name: short_name.into(),
+                        short_description: short_description.into(),
+                        long_description: long_description.into(),
+                        model_attribution: "system-bootstrap".into(),
+                        fixed_connections: vec![],
+                        recent_connections: vec![],
+                    },
+                )
+                .map_err(anyhow::Error::new)?;
+                identity.execute(
+                    "INSERT INTO kmap_system_roots(role,root_node_id,created_at) VALUES(?1,?2,?3)",
+                    params![role, id.to_string(), Utc::now().to_rfc3339()],
+                )?;
+                id
             };
-            kmap.create_node(
-                IdempotencyId::random(),
-                CreateNode {
-                    id,
-                    provenance_id,
-                    owner: Owner::SelfNode,
-                    short_name: short_name.into(),
-                    short_description: short_description.into(),
-                    long_description: long_description.into(),
-                    model_attribution: "system-bootstrap".into(),
-                    fixed_connections: vec![],
-                    recent_connections: vec![],
-                },
-            )
-            .map_err(anyhow::Error::new)?;
-            identity.execute(
-                "INSERT INTO kmap_system_roots(role,root_node_id,created_at) VALUES(?1,?2,?3)",
-                params![role, id.to_string(), Utc::now().to_rfc3339()],
-            )?;
-            id
+            kmap.get_node(id).map_err(anyhow::Error::new)?;
+            Ok(id)
         };
-        kmap.get_node(id).map_err(anyhow::Error::new)?;
-        Ok(id)
+        SystemRoots {
+            user: ensure("user", legacy.user)?,
+            kennedy: ensure("kennedy", legacy.kennedy)?,
+        }
     };
-    let roots = SystemRoots {
-        user: ensure("user", legacy.user)?,
-        kennedy: ensure("kennedy", legacy.kennedy)?,
-    };
-    drop(ensure);
     let cleanup = Connection::open(kmap_database)?;
     cleanup.execute_batch(
         "PRAGMA foreign_keys=OFF; DROP TABLE IF EXISTS kmap_roots; PRAGMA foreign_keys=ON;",
@@ -283,6 +286,7 @@ pub(crate) async fn serve_with_listener(
     roots: SystemRoots,
     frontend_dir: PathBuf,
     system_prompts_dir: PathBuf,
+    rust_lib_tools: rust_lib_tools::RustLibToolService,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let artifact_directory = kmap.artifact_path().to_owned();
@@ -315,11 +319,12 @@ pub(crate) async fn serve_with_listener(
             ServeDir::new(artifact_directory),
         )
         .route("/system-prompts/{filename}", get(get_prompt))
+        .with_state(state)
+        .merge(rust_lib_tools::router(rust_lib_tools))
         .fallback_service(ServeDir::new(frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::map_response(prevent_stale_frontend_assets))
-        .with_state(state);
+        .layer(middleware::map_response(prevent_stale_frontend_assets));
     tracing::info!(address=%listener.local_addr()?, "Kennedy main HTTP server ready");
     axum::serve(listener, app).await?;
     Ok(())
@@ -713,17 +718,40 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let rust_lib_tools =
+            rust_lib_tools::RustLibToolService::new(directory.join("rust-libs")).unwrap();
         let server = tokio::spawn(serve_with_listener(
             kmap,
             roots,
             directory.join("frontend"),
             directory.join("prompts"),
+            rust_lib_tools,
             listener,
         ));
         let response = http_request(address, "GET", "/api/v1/kmap/roots", "").await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(&roots.user.to_string()));
         assert!(response.contains(&roots.kennedy.to_string()));
+
+        let rust_lib_body = json!({
+            "session_id":"conversation:http-test",
+            "name":"CreateRustLib",
+            "arguments":{"name":"http-test-lib"},
+        })
+        .to_string();
+        let rust_lib_response =
+            http_request(address, "POST", "/api/v1/rust-libs/execute", &rust_lib_body).await;
+        assert!(rust_lib_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(rust_lib_response.contains("http-test-lib"));
+        let release_response = http_request(
+            address,
+            "POST",
+            "/api/v1/rust-libs/release",
+            r#"{"session_id":"conversation:http-test"}"#,
+        )
+        .await;
+        assert!(release_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(release_response.contains(r#""released":1"#));
 
         let idempotency_id = IdempotencyId::random();
         let body = json!({

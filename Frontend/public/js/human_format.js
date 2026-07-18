@@ -165,6 +165,28 @@ function formatWebSources(sources) {
   ].join("\n");
 }
 
+function formatRustLibFiles(files) {
+  if (!files?.length) return "Files: none.";
+  return [
+    `Files (${files.length}):`,
+    ...files.flatMap(file => [
+      "",
+      `Path: ${text(file.path)}`,
+      "Complete contents as a JSON string:",
+      JSON.stringify(String(file.contents ?? "")),
+    ]),
+  ].join("\n");
+}
+
+function formatRustCheckStages(stages) {
+  if (!stages?.length) return "No validation stages ran.";
+  return stages.flatMap(stage => [
+    `${stage.success ? "Passed" : "Failed"}: ${text(stage.stage)}${stage.exit_code === null || stage.exit_code === undefined ? "" : ` (exit ${stage.exit_code})`}`,
+    `  stdout: ${JSON.stringify(String(stage.stdout ?? ""))}`,
+    `  stderr: ${JSON.stringify(String(stage.stderr ?? ""))}`,
+  ]).join("\n");
+}
+
 export function formatToolResult(toolName, content) {
   if (!content?.ok) {
     return [
@@ -206,6 +228,35 @@ export function formatToolResult(toolName, content) {
       return ["Memory node created.", "", formatNodes("Created node", result.node ? [result.node] : [])].join("\n");
     case "UpdateNode":
       return ["Memory node updated.", "", formatNodes("Updated node", result.node ? [result.node] : [])].join("\n");
+    case "CreateRustLib":
+    case "OpenRustLib":
+      return [
+        toolName === "CreateRustLib" ? "Rust library created and opened." : "Rust library opened.",
+        `Name: ${text(result.name)}`,
+        `Canonical version: ${text(result.version)}`,
+        "",
+        formatRustLibFiles(result.files),
+      ].join("\n");
+    case "WriteRustLib":
+      return [
+        "Rust library files written.",
+        `Name: ${text(result.name)}`,
+        `Canonical version: ${text(result.version)}`,
+        `Written paths: ${result.written_paths?.length ? result.written_paths.join(", ") : "none"}`,
+      ].join("\n");
+    case "CheckRustLib":
+      return [
+        result.passed ? "Rust library check passed." : "Rust library check did not pass.",
+        `Name: ${text(result.name)}`,
+        "",
+        formatRustCheckStages(result.stages),
+      ].join("\n");
+    case "PublishRustLib":
+      return [
+        "Rust library published to crates.io.",
+        `Name: ${text(result.name)}`,
+        `Published version: ${text(result.version)}`,
+      ].join("\n");
     case "EndSelfTimeSession":
     case "EndFreeTimeSession":
       return [

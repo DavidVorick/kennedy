@@ -121,6 +121,7 @@ index serializes memory updates even when several conversations close together.
 
 - `GET /health`
 - `GET|POST /api/v1/conversations`
+- `GET /api/v1/conversations/summaries`
 - `GET /api/v1/conversations/current` (most recently updated active record,
   retained as a compatibility convenience)
 - `GET /api/v1/conversations/ingress/next`
@@ -152,6 +153,16 @@ Retry accepts `expected_version` plus replacement opaque `state`.
 Purge accepts `expected_version`, deletes the complete conversation record in
 any phase, and returns its ID. A stale expected version returns
 `409 state_conflict` rather than deleting newer work.
+
+The summaries endpoint returns the same ordering and lifecycle metadata as the
+complete list, but replaces each opaque state with a bounded sidebar summary
+and marks the record with `summary: true`. The summary retains session routing,
+the first durable user message, self-time naming fields, and compact Telegram
+channel identity. It excludes Chatend archives, tool/context history, media,
+and group-message bodies. The service persists this projection beside every
+checkpoint and backfills it once for legacy rows, so listing history never
+loads every complete archive. A client fetches `GET /conversations/{id}` before
+restoring, displaying, retrying, or otherwise mutating a summarized record.
 
 ## 5. Deployment and Isolation
 

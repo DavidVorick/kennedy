@@ -19,6 +19,12 @@ assets on the same listener, and exposes:
 - `PUT /api/v1/kmap/nodes/{id}`
 - `GET /api/v1/kmap/nodes/{id}/history`
 
+The same listener carries the frontend's internal Rust-library tool bridge at
+`POST /api/v1/rust-libs/execute` and
+`POST /api/v1/rust-libs/release`. Those routes are not Kmap storage methods.
+They adapt the browser-owned text-tool loop to the in-process published
+`kcode-rust-libs` crate; Kennedy never calls the HTTP representation directly.
+
 The roots endpoint is application policy rather than a Kmap method. System
 root mappings live in `kmap_system_roots` in the separate identity database.
 On the first upgraded startup, the server copies the legacy role mappings out

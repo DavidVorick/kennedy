@@ -4,6 +4,29 @@ These user-provided decisions supplement the repository specifications and
 technical design. They may be consolidated or removed once represented by the
 canonical documents; this file is not an append-only log.
 
+## Frontend Conversation-History Recovery
+
+- Restore visible, selectable conversation history first so the user can talk
+  to Kennedy again. Keep unrelated frontend issues out of this repair.
+
+## Kmap-Documented Rust Library Tools
+
+- Give Kennedy `CreateRustLib`, `OpenRustLib`, `WriteRustLib`, `CheckRustLib`,
+  and `PublishRustLib`. Keep their complete Kennedy-facing documentation in an
+  ingressable Kmap document rather than any static prompt asset.
+- Import the already-published `kcode-rust-libs` crate. Hardcode
+  `/home/user/dev/kennedy/kcode/kcode-rust-libs` as its managed libraries root;
+  the self-hosted library is the `kcode-rust-libs` child within that root.
+- Call the crate directly inside `kennedy-server`. Because Kennedy's current
+  tool loop runs in browser JavaScript, use only one narrow same-origin RPC
+  bridge into that in-process adapter rather than an independent REST service.
+- Allow one Kennedy session to own each opened library at a time and release
+  its handles at session end. Expire idle ownership from an abandoned session
+  after 24 hours, matching the allowed lifetime of other sessions. Keep the
+  ownership/session identifier out of Kennedy-controlled arguments. The five
+  coding tools are always available in every Kennedy execution mode, including
+  conversation, Telegram, self time, history ingress, and audio ingress.
+
 ## Kmap Library Split
 
 - The split-out `kweb` crate is a standalone Rust library package that owns only
@@ -421,8 +444,9 @@ canonical documents; this file is not an append-only log.
   Chatend while retaining the original file and useful metadata. Searchable
   PDFs are required; image-only PDFs should fail clearly when OCR is needed.
 - Quality web searches can take substantially longer than ten minutes, so
-  their deadline is 30 minutes; balanced and fast search deadlines should
-  remain latency-oriented.
+  their deadline is 40 minutes. Double the prior balanced and fast deadlines
+  to 180 and 90 seconds respectively because both tiers have timed out in
+  ordinary use.
 - Make PDF upload discoverable through an explicitly labeled composer button.
 - During history ingress, show Kennedy's final review normally but start
   Kennedy tool requests, memory tool results, and protocol-error details

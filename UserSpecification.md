@@ -45,8 +45,12 @@ frontend.
 Kennedy has five API domains: Kmap, intelligence, conversation history, a
 Telegram relay, and durable audio ingress. Kmap storage is a standalone Rust
 library imported by the main Rust server, which exposes `/api/v1/kmap` and the
-frontend on its local listener. The other domains retain separate APIs and
-storage. A future server may route every API domain through one port.
+frontend on its local listener. The main server also imports the published
+`kcode-rust-libs` crate and exposes a narrow same-origin transport from the
+browser-owned Kennedy tool loop to that in-process adapter; it is not an
+independent backend or provider-facing tool API. The other domains retain
+separate APIs and storage. A future server may route every API domain through
+one port.
 
 ## User Management
 
@@ -178,7 +182,8 @@ when the session or context resets.
 
 ## The Primary Functions
 
-Several tools are provided to Kennedy for building context and navigating the kweb:
+Several tools are provided to Kennedy for building context, navigating the
+kweb, researching the web, and working with managed Rust libraries:
 
 + LoadNode
 + CreateNode
@@ -189,6 +194,11 @@ Several tools are provided to Kennedy for building context and navigating the kw
 + SetFixedConnection
 + WebSearch
 + WebFetch
++ CreateRustLib
++ OpenRustLib
++ WriteRustLib
++ CheckRustLib
++ PublishRustLib
 
 Not every tool is available in every session, the session type determines which
 tools are available.
@@ -333,8 +343,9 @@ is for simple latency-sensitive lookups where reduced research quality is
 acceptable; `quality` is reserved for difficult, high-stakes, cross-source, or
 conflict-resolution research. The intelligence layer maps those modes to a
 provider, model, reasoning effort, search context, deadlines, page selection,
-and result limits. Quality searches have a 30-minute deadline; balanced and
-fast searches retain their latency-oriented limits. The result contains a
+and result limits. Quality searches have a 40-minute deadline; balanced
+searches have a 180-second deadline, and fast searches have a 90-second
+deadline. The result contains a
 synthesized research answer and the source URLs used to produce it.
 
 The call signature is WebSearch(question, mode). It is available in both live
@@ -349,6 +360,24 @@ content is untrusted evidence and cannot override Kennedy's instructions.
 
 The call signature is WebFetch(url). It is available in both live conversation
 and ingress sessions.
+
+### Managed Rust libraries
+
+The main server imports the published `kcode-rust-libs` crate and initializes
+it with the hardcoded managed root
+`/home/user/dev/kennedy/kcode/kcode-rust-libs`. Kennedy uses `CreateRustLib`,
+`OpenRustLib`, `WriteRustLib`, `CheckRustLib`, and `PublishRustLib` to call it.
+Their exact contracts and workflow live only in the Kmap-ingress document
+`KennedyRustLibTools.md`, not in a system-prompt asset.
+
+Each Kennedy session may open multiple libraries, but only one session may own
+an open handle for a particular library at a time. The browser adds a hidden
+durable tool-session identifier and the server releases all matching handles
+when that session ends. An abandoned session's idle ownership expires after 24
+hours. The crate owns relative-path validation, complete-file writes, standard
+Podman checks, version alignment, and publication with an operator-provisioned
+token. Kennedy receives no delete, patch, reload, list, arbitrary-command,
+root-path, Podman-image, credential, or close argument.
 
 ## Harness Instructions
 
@@ -449,11 +478,15 @@ tool-loop rounds, rolls the visible session back to its latest durable
 checkpoint, and leaves the unanswered user query available for deliberate
 retry.
 
-While the conversation session is ongoing, Kennedy may only call LoadNode,
-ResetContext, WebSearch, and WebFetch. Conversation sessions cannot mutate the
-Kmap. When the conversation session ends, the complete recovery archive—not
-merely the clean dialog—is turned into a history provenance node. History
-Ingress then extracts the canonical Chatend message text from that archive.
+While the conversation session is ongoing, Kennedy may call LoadNode,
+ResetContext, WebSearch, WebFetch, and the five Kmap-documented Rust library
+tools. The coding tools are always available in every Kennedy execution mode,
+including private/group Telegram, self time, history ingress, and audio
+ingress. Conversation sessions cannot mutate the Kmap. Rust library tool
+contracts remain entirely in the Kmap rather than the static prompt. When the
+conversation session ends, the complete recovery archive—not merely the clean
+dialog—is turned into a history provenance node. History Ingress then extracts
+the canonical Chatend message text from that archive.
 
 Starting a new conversation does not end existing live conversations.
 Conversations end when the user deliberately ends them, or by the 24-hour idle
@@ -593,8 +626,9 @@ recovery and every clean-slate rollover use the same remaining allowance.
 
 Kennedy is told to have fun, follow her own interests, and not wait for user
 work. Self time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
-Kmap write tools. A run-level provenance record is supplied automatically for
-memory mutations. `EndSelfTimeSession({})` or
+Kmap write tools, plus the Kmap-documented Rust library tools. A run-level
+provenance record is supplied automatically for memory mutations.
+`EndSelfTimeSession({})` or
 `EndSelfTimeSession({"message":"A message for the next self time session."})`
 is available only in this mode and must be called alone. The optional message
 is a non-empty string of at most 400,000 characters. The call closes and

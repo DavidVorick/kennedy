@@ -147,6 +147,17 @@ export const KwebAPI = (base) => ({
   updateNode: (id, body) => requestKmapMutation(base, `/api/v1/kmap/nodes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
 });
 
+export const RustLibsAPI = (base) => ({
+  execute: (sessionId, name, args) => requestJSON(base, "/api/v1/rust-libs/execute", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId, name, arguments: args }),
+  }).then(payload => payload.result),
+  release: (sessionId) => requestJSON(base, "/api/v1/rust-libs/release", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId }),
+  }),
+});
+
 export const IntelligenceAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   providers: () => requestJSON(base, "/api/v1/providers"),
@@ -183,7 +194,7 @@ export const IntelligenceAPI = (base) => ({
 
 export const ConversationHistoryAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
-  list: () => requestJSON(base, "/api/v1/conversations"),
+  list: () => requestJSON(base, "/api/v1/conversations/summaries"),
   current: () => requestJSON(base, "/api/v1/conversations/current"),
   nextIngress: () => requestJSON(base, "/api/v1/conversations/ingress/next"),
   discardUnstarted: () => requestJSON(base, "/api/v1/conversations/unstarted", { method: "DELETE" }),

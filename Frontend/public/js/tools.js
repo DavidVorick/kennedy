@@ -1,10 +1,18 @@
-import { formatToolResult } from "./human_format.js?v=20260718.1";
+import { formatToolResult } from "./human_format.js?v=20260718.2";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 import { newIdempotencyId } from "./api.js?v=20260718.3";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 export const MAX_RESET_SELF_MESSAGE_CHARACTERS = 400_000;
 export const MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS = 400_000;
+export const RUST_LIB_TOOL_NAMES = Object.freeze([
+  "CreateRustLib",
+  "OpenRustLib",
+  "WriteRustLib",
+  "CheckRustLib",
+  "PublishRustLib",
+]);
+const RUST_LIB_TOOL_NAME_SET = new Set(RUST_LIB_TOOL_NAMES);
 
 function splitToolEnvelope(value) {
   if (!value.startsWith("{")) throw Object.assign(new Error("The tool request must contain one JSON object immediately after the marker."), { code: "invalid_tool_protocol" });
@@ -79,6 +87,7 @@ function string(value, name) { if (typeof value !== "string") throw Object.assig
 function nonemptyString(value, name, maximum) { string(value, name); const trimmed = value.trim(); if (!trimmed || [...trimmed].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return trimmed; }
 function nonemptyPreservedString(value, name, maximum) { string(value, name); if (!value.trim() || [...value].length > maximum) throw Object.assign(new Error(`${name} must contain between 1 and ${maximum} characters.`), { code: "invalid_arguments" }); return value; }
 function choice(value, name, choices) { string(value, name); if (!choices.includes(value)) throw Object.assign(new Error(`${name} must be one of: ${choices.join(", ")}.`), { code: "invalid_arguments" }); return value; }
+function rustLibName(value) { const name = nonemptyString(value, "name", 255); if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) throw Object.assign(new Error("name must begin with an ASCII letter or digit and contain only ASCII letters, digits, '-' or '_'."), { code: "invalid_arguments" }); return name; }
 
 function fixedConnectionIds(node) {
   if (Array.isArray(node?.fixed_connections) && node.fixed_connections.every(value => typeof value === "string")) return [...node.fixed_connections];
@@ -91,8 +100,9 @@ function recentConnectionIds(node) {
 }
 
 export class ToolExecutor {
-  constructor({ mode, context, api, intelligence = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {}, endSession = null, toolGate = null, requestTimeoutSeconds = null }) {
+  constructor({ mode, context, api, intelligence = null, rustLibs = null, toolSessionId = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {}, endSession = null, toolGate = null, requestTimeoutSeconds = null }) {
     this.mode = mode; this.context = context; this.api = api; this.intelligence = intelligence; this.provider = provider; this.model = model; this.provenanceId = provenanceId;
+    this.rustLibs = rustLibs; this.toolSessionId = toolSessionId;
     this.modelAttribution = modelAttribution; this.loadLimit = loadLimit; this.sessionType = sessionType; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
     this.beforeMutation = beforeMutation; this.endSession = endSession; this.toolGate = toolGate; this.requestTimeoutSeconds = requestTimeoutSeconds;
   }
@@ -111,7 +121,9 @@ export class ToolExecutor {
   }
 
   resultMessage(call, content, durationMs) {
-    const displayRole = call.name === "WebSearch" || call.name === "WebFetch" ? "Web tool result" : "Memory tool result";
+    const displayRole = call.name === "WebSearch" || call.name === "WebFetch"
+      ? "Web tool result"
+      : RUST_LIB_TOOL_NAME_SET.has(call.name) ? "Coding tool result" : "Memory tool result";
     return {
       role: "user",
       display_role: displayRole,
@@ -157,6 +169,11 @@ export class ToolExecutor {
         case "UpdateNode": outcome = await this.updateNode(call.arguments); break;
         case "WebSearch": outcome = await this.webSearch(call.arguments, { signal, operationId }); break;
         case "WebFetch": outcome = await this.webFetch(call.arguments, { signal, operationId }); break;
+        case "CreateRustLib":
+        case "OpenRustLib":
+        case "WriteRustLib":
+        case "CheckRustLib":
+        case "PublishRustLib": outcome = await this.rustLibTool(call.name, call.arguments); break;
         case "EndSelfTimeSession":
         case "EndFreeTimeSession": outcome = await this.endSelfTimeSession(call.arguments); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
@@ -273,6 +290,28 @@ export class ToolExecutor {
 
   assertWrite() { if (!["ingress", "free-time"].includes(this.mode) || !this.provenanceId) throw Object.assign(new Error("This tool is only available during history ingress or self time."), { code: "tool_unavailable" }); }
   assertWeb() { if (!["conversation", "ingress", "free-time"].includes(this.mode) || !this.intelligence) throw Object.assign(new Error("This web tool is not available in this session."), { code: "tool_unavailable" }); }
+  assertRustLib() { if (!this.rustLibs || !this.toolSessionId) throw Object.assign(new Error("Rust library tools are not configured for this Kennedy session."), { code: "tool_unavailable" }); }
+
+  async rustLibTool(name, args) {
+    this.assertRustLib();
+    if (name === "WriteRustLib") {
+      validateObject(args, ["name", "files"]);
+      const libraryName = rustLibName(args.name);
+      if (!Array.isArray(args.files) || args.files.length === 0) throw Object.assign(new Error("files must contain at least one file."), { code: "invalid_arguments" });
+      const paths = new Set();
+      const files = args.files.map((file, index) => {
+        validateObject(file, ["path", "contents"]);
+        const path = nonemptyString(file.path, `files[${index}].path`, 4096);
+        string(file.contents, `files[${index}].contents`);
+        if (paths.has(path)) throw Object.assign(new Error(`files contains duplicate path ${path}.`), { code: "invalid_arguments" });
+        paths.add(path);
+        return { path, contents: file.contents };
+      });
+      return { result: await this.rustLibs.execute(this.toolSessionId, name, { name: libraryName, files }) };
+    }
+    validateObject(args, ["name"]);
+    return { result: await this.rustLibs.execute(this.toolSessionId, name, { name: rustLibName(args.name) }) };
+  }
 
   async webSearch(args, { signal = null, operationId = null } = {}) {
     this.assertWeb(); validateObject(args, ["question", "mode"]);

@@ -1,4 +1,4 @@
-import { element } from "./render.js?v=20260718.2";
+import { element } from "./render.js?v=20260718.4";
 
 export class MemoryExplorer {
   constructor({ api, rootNodeIds, content, backButton, forwardButton }) {

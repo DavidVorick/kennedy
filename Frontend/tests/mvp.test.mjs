@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
-import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, ToolExecutor, parseToolCalls, truncateToolResponse } from "../public/js/tools.js";
+import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, RUST_LIB_TOOL_NAMES, ToolExecutor, parseToolCalls, truncateToolResponse } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, reconcileConversationHistory, sortConversationHistory } from "../public/js/render.js";
@@ -11,7 +11,7 @@ import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, runAgentLoop
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
 import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
-import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, KwebAPI, TelegramRelayAPI, newIdempotencyId } from "../public/js/api.js";
+import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, KwebAPI, RustLibsAPI, TelegramRelayAPI, newIdempotencyId } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
 import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
@@ -112,6 +112,33 @@ test("Kmap mutations retain their idempotency ID across an ambiguous network ret
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("Rust library client carries hidden session identity through the internal server bridge", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), options });
+    const result = String(url).endsWith("/execute")
+      ? { result: { name: "example", version: "0.1.0", files: [] } }
+      : { released: 1 };
+    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const api = RustLibsAPI("http://local");
+    assert.equal((await api.execute("kennedy:session", "OpenRustLib", { name: "example" })).name, "example");
+    assert.deepEqual(await api.release("kennedy:session"), { released: 1 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(requests[0].url, "http://local/api/v1/rust-libs/execute");
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    session_id: "kennedy:session",
+    name: "OpenRustLib",
+    arguments: { name: "example" },
+  });
+  assert.equal(requests[1].url, "http://local/api/v1/rust-libs/release");
+  assert.deepEqual(JSON.parse(requests[1].options.body), { session_id: "kennedy:session" });
 });
 
 test("Kweb archive provenance moves media into replay-stable multipart artifacts", async () => {
@@ -253,6 +280,25 @@ test("conversation history client permanently discards unstarted records", async
   }
   assert.equal(request.url, "http://history/api/v1/conversations/unstarted");
   assert.equal(request.options.method, "DELETE");
+});
+
+test("conversation history client lists compact summaries instead of complete archives", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ conversations: [] }),
+    };
+  };
+  try {
+    assert.deepEqual(await ConversationHistoryAPI("http://history").list(), { conversations: [] });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(requests[0].url, "http://history/api/v1/conversations/summaries");
 });
 
 test("conversation history client permanently purges one versioned record", async () => {
@@ -630,6 +676,82 @@ test("WebSearch and WebFetch expose only minimal model-facing arguments", async 
     ["tool", "WebSearch", "ok"],
     ["tool", "WebFetch", "ok"],
   ]);
+});
+
+test("Rust library tools validate complete writes and return readable coding results", async () => {
+  const calls = [];
+  const rustLibs = {
+    execute: async (sessionId, name, args) => {
+      calls.push({ sessionId, name, args });
+      if (name === "OpenRustLib") return {
+        name: args.name,
+        version: "0.1.0",
+        documentation: "Reference",
+        files: [{ path: "src/lib.rs", contents: "pub fn answer() -> u8 { 42 }\n" }],
+      };
+      if (name === "WriteRustLib") return { name: args.name, version: "0.2.0", written_paths: args.files.map(file => file.path) };
+      if (name === "CheckRustLib") return { name: args.name, passed: false, stages: [{ stage: "clippy", success: false, exit_code: 1, stdout: "", stderr: "warning\n" }] };
+      return { name: args.name, version: "0.2.0", published: true };
+    },
+  };
+  const executor = new ToolExecutor({ mode: "conversation", context: {}, api: {}, rustLibs, toolSessionId: "kennedy:tool-session", loadLimit: 20 });
+  const opened = await executor.execute({ name: "OpenRustLib", arguments: { name: "example-lib" } });
+  assert.equal(opened.message.display_role, "Coding tool result");
+  assert.match(opened.message.content, /Complete contents as a JSON string:\n"pub fn answer\(\) -> u8 \{ 42 \}\\n"/);
+
+  const written = await executor.execute({ name: "WriteRustLib", arguments: { name: "example-lib", files: [{ path: "src/lib.rs", contents: "" }] } });
+  assert.match(written.message.content, /Canonical version: 0.2.0/);
+  const checked = await executor.execute({ name: "CheckRustLib", arguments: { name: "example-lib" } });
+  assert.match(checked.message.content, /Rust library check did not pass/);
+  assert.match(checked.message.content, /Failed: clippy \(exit 1\)/);
+  const published = await executor.execute({ name: "PublishRustLib", arguments: { name: "example-lib" } });
+  assert.match(published.message.content, /Published version: 0.2.0/);
+  assert.deepEqual(calls.map(call => call.name), ["OpenRustLib", "WriteRustLib", "CheckRustLib", "PublishRustLib"]);
+  assert.ok(calls.every(call => call.sessionId === "kennedy:tool-session"));
+  assert.deepEqual(RUST_LIB_TOOL_NAMES, ["CreateRustLib", "OpenRustLib", "WriteRustLib", "CheckRustLib", "PublishRustLib"]);
+
+  const duplicate = await executor.execute({ name: "WriteRustLib", arguments: { name: "example-lib", files: [{ path: "src/lib.rs", contents: "a" }, { path: "src/lib.rs", contents: "b" }] } });
+  assert.match(duplicate.message.content, /duplicate path src\/lib.rs/);
+  assert.equal(calls.length, 4);
+
+  const ingress = new ToolExecutor({ mode: "ingress", context: {}, api: {}, rustLibs, toolSessionId: "kennedy:ingress", loadLimit: 50 });
+  const ingressOpened = await ingress.execute({ name: "OpenRustLib", arguments: { name: "example-lib" } });
+  assert.equal(ingressOpened.message.tool_result.ok, true);
+  assert.equal(calls.at(-1).sessionId, "kennedy:ingress");
+});
+
+test("history and audio ingress can invoke Rust library tools", async () => {
+  for (const sourceSessionType of ["conversation", "audio"]) {
+    const kweb = new MockKweb([node(1)]);
+    kweb.provenance = async () => ({
+      source: sourceSessionType,
+      source_created_at: "2026-07-18T00:00:00Z",
+      data: JSON.stringify({ format: "kennedy-chatend", messages: [{ role: "user", content: "Maintain the crate." }] }),
+    });
+    let generation = 0;
+    const intelligence = { generate: async () => {
+      generation += 1;
+      return generation === 1
+        ? { status: "complete", response_id: "tool", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"OpenRustLib","arguments":{"name":"example-lib"}}]}' }, usage: null }
+        : { status: "complete", response_id: "done", message: { role: "assistant", content: "Ingress complete." }, usage: null };
+    } };
+    const calls = [];
+    const rustLibs = { execute: async (sessionId, name, args) => {
+      calls.push({ sessionId, name, args });
+      return { name: args.name, version: "0.1.0", documentation: "Reference", files: [] };
+    } };
+    const checkpoints = [];
+    const toolSessionId = `kennedy:test-${sourceSessionType}`;
+    await runHistoryIngress({
+      kweb, intelligence, rustLibs, toolSessionId,
+      manuals: promptManuals("Ingress"), rootNodeId: id(1), provenanceId: "provenance",
+      provider: "p", model: "m", sourceSessionType,
+      checkpoint: async archive => checkpoints.push(structuredClone(archive)), onUpdate: () => {},
+    });
+    assert.deepEqual(calls, [{ sessionId: toolSessionId, name: "OpenRustLib", args: { name: "example-lib" } }]);
+    assert.equal(checkpoints.at(-1).rustLibSessionId, toolSessionId);
+    assert.equal(checkpoints.at(-1).completed, true);
+  }
 });
 
 test("latency formatting retains millisecond precision", () => {
@@ -1207,6 +1329,27 @@ test("conversation provenance preserves the complete structured Chatend", async 
   assert.equal(archive.fullHistory.segments[0].messages[0].content, "Earlier context.");
 });
 
+test("conversation archives retain the hidden Rust-library session and release its handles", async () => {
+  const released = [];
+  const rustLibs = { release: async sessionId => { released.push(sessionId); return { released: 2 }; } };
+  const kweb = new MockKweb([node(1)]);
+  const source = new ConversationSession({
+    kweb, rustLibs, manuals: promptManuals(), rootNodeId: id(1), provider: "primary", providerKind: "codex", model: "model", reasoningEffort: "high",
+  });
+  await source.initialize();
+  const snapshot = source.snapshot();
+  assert.match(snapshot.rustLibSessionId, /^kennedy:/);
+  assert.equal(snapshot.archive.rustLibSessionId, snapshot.rustLibSessionId);
+
+  const restored = new ConversationSession({
+    kweb, rustLibs, manuals: promptManuals(), rootNodeId: id(1), provider: "primary", providerKind: "codex", model: "model", reasoningEffort: "high",
+  });
+  await restored.initialize(snapshot);
+  assert.equal(restored.rustLibSessionId, source.rustLibSessionId);
+  assert.deepEqual(await restored.releaseRustLibs(), { released: 2 });
+  assert.deepEqual(released, [source.rustLibSessionId]);
+});
+
 test("free-time sessions durably inject one warning and one deadline wrap-up notice", async () => {
   let now = Date.parse("2026-07-17T12:27:30Z");
   const deadlineAt = "2026-07-17T12:30:00.000Z";
@@ -1490,6 +1633,10 @@ test("conversation history reconciliation never regresses a cached record versio
 
   const currentResponse = [{ id: "active", version: 5, phase: "active", updated_at: "2026-07-17T12:05:00Z" }];
   assert.equal(reconcileConversationHistory(reconciled, currentResponse)[0].version, 5);
+
+  const hydrated = [{ id: "active", version: 5, phase: "active", state: { transcript: [{ role: "user", content: "Full history" }] } }];
+  const sameVersionSummary = [{ id: "active", version: 5, phase: "active", summary: true, state: { transcript: [{ role: "user", content: "Full history" }] } }];
+  assert.equal(reconcileConversationHistory(hydrated, sameVersionSummary)[0], hydrated[0]);
 });
 
 test("composer stays editable but cannot send during a conversation transition", () => {

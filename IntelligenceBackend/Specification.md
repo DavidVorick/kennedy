@@ -58,9 +58,9 @@ The three WebSearch modes are also compiled policy:
 
 | Mode | Provider and model | Reasoning | Search context | Deadline | Source cap |
 | --- | --- | --- | --- | --- | --- |
-| `quality` | Codex `gpt-5.6-sol` | `xhigh` | `high` | 1,800 seconds | 12 |
-| `balanced` | Codex `gpt-5.6-terra` | `low` | `low` | 90 seconds | 8 |
-| `fast` | Gemini `gemini-3.1-flash-lite` | `low` | Google Search grounding | 45 seconds | 6 |
+| `quality` | Codex `gpt-5.6-sol` | `xhigh` | `high` | 2,400 seconds | 12 |
+| `balanced` | Codex `gpt-5.6-terra` | `low` | `low` | 180 seconds | 8 |
+| `fast` | Gemini `gemini-3.1-flash-lite` | `low` | Google Search grounding | 90 seconds | 6 |
 
 `balanced` is the request default and Kennedy's recommended ordinary choice.
 `quality` performs thorough research for hard questions. `fast` trades research

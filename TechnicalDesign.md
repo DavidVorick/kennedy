@@ -206,6 +206,10 @@ after complete tool rounds, and after final output. Structured content is
 preserved for future media support, but the JSON archive is never used as a
 model prompt. It reconstructs the live session from that backend after a reload
 or abrupt close while refreshing the active manuals and required root context.
+Conversation History persists a bounded summary beside each opaque archive.
+The frontend starts from those compact records so a large collection of media
+and Chatend histories cannot block the sidebar, then retrieves the complete
+state only for a conversation it opens or restores.
 
 ### 4.2 Kmap Storage Library and HTTP Adapter
 
@@ -464,8 +468,9 @@ grants one wrap-up response. Provider request timeouts remain profile-specific
 remaining two-minute shutdown grace is shorter; a browser cancellation timer
 enforces the same hard stop. Conversation History list reconciliation is
 version-monotonic, preventing a delayed response from replacing a newer local
-checkpoint version, and conflict recovery immediately adopts the latest server
-record.
+checkpoint version. At an equal version, a cached complete record also wins
+over an incoming compact summary. Conflict recovery immediately adopts the
+latest server record.
 
 ### 5.3 History Ingress
 

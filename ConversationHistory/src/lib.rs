@@ -29,8 +29,11 @@ const INGRESS_RETRY_SCHEDULE_MIGRATION: &str =
     include_str!("../migrations/004_ingress_retry_schedule.sql");
 const SELF_TIME_COMPLETION_MIGRATION: &str =
     include_str!("../migrations/005_self_time_completes_directly.sql");
+const CONVERSATION_SUMMARIES_MIGRATION: &str =
+    include_str!("../migrations/006_conversation_summaries.sql");
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
+const SUMMARY_TEXT_LIMIT: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -114,6 +117,12 @@ struct ConversationRecord {
     ingress_failure_count: i64,
     ingress_failures: Value,
     ingress_next_attempt_at: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    summary: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Deserialize)]
@@ -195,6 +204,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/v1/conversations",
             get(list_conversations).post(create_conversation),
         )
+        .route(
+            "/api/v1/conversations/summaries",
+            get(list_conversation_summaries),
+        )
         .route("/api/v1/conversations/current", get(current_conversation))
         .route("/api/v1/conversations/ingress/next", get(next_ingress))
         .route(
@@ -264,11 +277,15 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     if version < 5 {
         connection.execute_batch(SELF_TIME_COMPLETION_MIGRATION)?;
     }
+    if version < 6 {
+        connection.execute_batch(CONVERSATION_SUMMARIES_MIGRATION)?;
+    }
     // An early v2 build re-ran the v1 migration on every launch. That could recreate
     // this legacy singleton index after user_version had already advanced to 2, at
     // which point the normal v2 migration no longer ran. Repair that state
     // idempotently for every database opened by current builds.
     connection.execute_batch("DROP INDEX IF EXISTS one_unfinished_conversation;")?;
+    backfill_missing_summaries(connection)?;
     Ok(())
 }
 
@@ -321,11 +338,185 @@ fn row_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRecord> {
         ingress_failure_count: row.get(9)?,
         ingress_failures,
         ingress_next_attempt_at: row.get(11)?,
+        summary: false,
     })
+}
+
+fn row_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRecord> {
+    let mut record = row_record(row)?;
+    record.summary = true;
+    Ok(record)
+}
+
+fn bounded_summary_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) => Some(Value::String(
+            text.chars().take(SUMMARY_TEXT_LIMIT).collect(),
+        )),
+        Value::Bool(_) | Value::Number(_) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn copy_summary_fields(
+    source: Option<&Value>,
+    target: &mut serde_json::Map<String, Value>,
+    fields: &[&str],
+) {
+    let Some(source) = source.and_then(Value::as_object) else {
+        return;
+    };
+    for field in fields {
+        if let Some(value) = source.get(*field).and_then(bounded_summary_value) {
+            target.insert((*field).to_owned(), value);
+        }
+    }
+}
+
+fn first_user_message(state: &Value) -> Option<String> {
+    [
+        state.get("transcript"),
+        state.pointer("/archive/transcript"),
+        state.pointer("/archive/retained"),
+        state.pointer("/archive/messages"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_array)
+    .flat_map(|messages| messages.iter())
+    .find_map(|message| {
+        let role = message.get("role")?.as_str()?;
+        if !matches!(role, "user" | "david") {
+            return None;
+        }
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Some(content.chars().take(SUMMARY_TEXT_LIMIT).collect())
+    })
+}
+
+fn summarize_state(state: &Value) -> Value {
+    let session_type = state
+        .get("sessionType")
+        .or_else(|| state.pointer("/archive/sessionType"))
+        .and_then(Value::as_str)
+        .unwrap_or("conversation")
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let mut summary = serde_json::Map::new();
+    summary.insert("historySummary".into(), Value::Bool(true));
+    summary.insert("sessionType".into(), Value::String(session_type));
+    if let Some(pending_turn) = state
+        .get("pendingTurn")
+        .or_else(|| state.pointer("/archive/pendingTurn"))
+        .and_then(bounded_summary_value)
+    {
+        summary.insert("pendingTurn".into(), pending_turn);
+    }
+    summary.insert(
+        "transcript".into(),
+        Value::Array(
+            first_user_message(state)
+                .map(|content| vec![json!({"role":"user","content":content})])
+                .unwrap_or_default(),
+        ),
+    );
+
+    let free_time = state
+        .get("freeTime")
+        .or_else(|| state.pointer("/archive/freeTime"));
+    if free_time.is_some() {
+        let mut compact = serde_json::Map::new();
+        copy_summary_fields(
+            free_time,
+            &mut compact,
+            &["runId", "sliceIndex", "customPrompt"],
+        );
+        summary.insert("freeTime".into(), Value::Object(compact));
+    }
+
+    let channel = state
+        .get("channel")
+        .or_else(|| state.pointer("/archive/channel"));
+    if channel.is_some() {
+        let mut compact = serde_json::Map::new();
+        copy_summary_fields(
+            channel,
+            &mut compact,
+            &[
+                "kind",
+                "telegramUserId",
+                "chatId",
+                "username",
+                "displayName",
+                "groupRootNodeId",
+                "groupIngressBatchId",
+                "backgroundIngress",
+                "lastGroupContextMessageId",
+            ],
+        );
+        let group_context = channel.and_then(|value| value.get("groupContext"));
+        if group_context.is_some() {
+            let mut compact_group = serde_json::Map::new();
+            copy_summary_fields(
+                group_context,
+                &mut compact_group,
+                &["groupTitle", "groupRootNodeId", "chatId"],
+            );
+            compact.insert("groupContext".into(), Value::Object(compact_group));
+        }
+        summary.insert("channel".into(), Value::Object(compact));
+    }
+    Value::Object(summary)
+}
+
+fn serialize_state(state: &Value) -> Result<(String, String), ApiError> {
+    Ok((
+        serde_json::to_string(state).map_err(ApiError::internal)?,
+        serde_json::to_string(&summarize_state(state)).map_err(ApiError::internal)?,
+    ))
+}
+
+fn backfill_missing_summaries(db: &Connection) -> rusqlite::Result<()> {
+    let ids = {
+        let mut statement = db
+            .prepare("SELECT id FROM conversations WHERE summary_state_json IS NULL ORDER BY id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for id in ids {
+        let state_json = db.query_row(
+            "SELECT state_json FROM conversations WHERE id=?1",
+            [&id],
+            |row| row.get::<_, String>(0),
+        )?;
+        let state = serde_json::from_str::<Value>(&state_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        let summary_json = serde_json::to_string(&summarize_state(&state))
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        db.execute(
+            "UPDATE conversations SET summary_state_json=?1 WHERE id=?2 AND summary_state_json IS NULL",
+            params![summary_json, id],
+        )?;
+    }
+    Ok(())
 }
 
 fn conversation_select() -> &'static str {
     "SELECT id,phase,started_at,updated_at,state_json,provenance_id,version,last_user_message_at,ended_at,ingress_failure_count,ingress_failures_json,ingress_next_attempt_at FROM conversations"
+}
+
+fn conversation_summary_select() -> &'static str {
+    "SELECT id,phase,started_at,updated_at,summary_state_json,provenance_id,version,last_user_message_at,ended_at,ingress_failure_count,ingress_failures_json,ingress_next_attempt_at FROM conversations"
 }
 
 fn fetch_record(db: &Connection, id: &str) -> Result<ConversationRecord, ApiError> {
@@ -355,10 +546,10 @@ fn insert_conversation(
     if is_free_time_session(&input.state) && active_free_time(db)?.is_some() {
         return Err(ApiError::free_time_active());
     }
-    let state_json = serde_json::to_string(&input.state).map_err(ApiError::internal)?;
+    let (state_json, summary_state_json) = serialize_state(&input.state)?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES(?1,'active',?2,?3,?4,1)", params![id,input.started_at,now,state_json]).map_err(ApiError::internal)?;
+    db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,summary_state_json,version) VALUES(?1,'active',?2,?3,?4,?5,1)", params![id,input.started_at,now,state_json,summary_state_json]).map_err(ApiError::internal)?;
     fetch_record(db, &id)
 }
 
@@ -372,6 +563,25 @@ async fn list_conversations(State(state): State<AppState>) -> Result<Json<Value>
         .map_err(ApiError::internal)?;
     let records = statement
         .query_map([], row_record)
+        .map_err(ApiError::internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({"conversations":records})))
+}
+
+async fn list_conversation_summaries(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    backfill_missing_summaries(&db).map_err(ApiError::internal)?;
+    let mut statement = db
+        .prepare(&format!(
+            "{} ORDER BY updated_at DESC",
+            conversation_summary_select()
+        ))
+        .map_err(ApiError::internal)?;
+    let records = statement
+        .query_map([], row_summary)
         .map_err(ApiError::internal)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(ApiError::internal)?;
@@ -419,14 +629,15 @@ fn is_idle_protected_session(state: &Value) -> bool {
 }
 
 fn active_free_time(db: &Connection) -> Result<Option<ConversationRecord>, ApiError> {
+    backfill_missing_summaries(db).map_err(ApiError::internal)?;
     let mut statement = db
         .prepare(&format!(
             "{} WHERE phase='active' ORDER BY updated_at DESC",
-            conversation_select()
+            conversation_summary_select()
         ))
         .map_err(ApiError::internal)?;
     let records = statement
-        .query_map([], row_record)
+        .query_map([], row_summary)
         .map_err(ApiError::internal)?;
     for record in records {
         let record = record.map_err(ApiError::internal)?;
@@ -438,10 +649,11 @@ fn active_free_time(db: &Connection) -> Result<Option<ConversationRecord>, ApiEr
 }
 
 fn discard_unstarted(db: &mut Connection) -> Result<Vec<String>, ApiError> {
+    backfill_missing_summaries(db).map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     let mut statement = tx
         .prepare(
-            "SELECT id,state_json FROM conversations WHERE last_user_message_at IS NULL ORDER BY id",
+            "SELECT id,summary_state_json FROM conversations WHERE last_user_message_at IS NULL ORDER BY id",
         )
         .map_err(ApiError::internal)?;
     let candidates = statement
@@ -454,8 +666,9 @@ fn discard_unstarted(db: &mut Connection) -> Result<Vec<String>, ApiError> {
     drop(statement);
 
     let mut discarded = Vec::new();
-    for (id, state_json) in candidates {
-        let state = serde_json::from_str::<Value>(&state_json).map_err(ApiError::internal)?;
+    for (id, summary_state_json) in candidates {
+        let state =
+            serde_json::from_str::<Value>(&summary_state_json).map_err(ApiError::internal)?;
         if state_contains_user_message(&state) || is_idle_protected_session(&state) {
             continue;
         }
@@ -575,10 +788,10 @@ fn update_active(
     phase: &str,
 ) -> Result<ConversationRecord, ApiError> {
     validate_version(expected_version)?;
-    let state_json = serde_json::to_string(state).map_err(ApiError::internal)?;
+    let (state_json, summary_state_json) = serialize_state(state)?;
     let now = Utc::now().to_rfc3339();
     let ended_at = (phase != "active").then_some(now.as_str());
-    let changed = db.execute("UPDATE conversations SET state_json=?1,phase=?2,updated_at=?3,ended_at=COALESCE(?4,ended_at),version=version+1 WHERE id=?5 AND phase='active' AND version=?6", params![state_json,phase,now,ended_at,id,expected_version]).map_err(ApiError::internal)?;
+    let changed = db.execute("UPDATE conversations SET state_json=?1,summary_state_json=?2,phase=?3,updated_at=?4,ended_at=COALESCE(?5,ended_at),version=version+1 WHERE id=?6 AND phase='active' AND version=?7", params![state_json,summary_state_json,phase,now,ended_at,id,expected_version]).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
             "Conversation changed in another session or is no longer active.",
@@ -618,14 +831,15 @@ fn checkpoint_user_activity(
     state: &Value,
 ) -> Result<ConversationRecord, ApiError> {
     validate_version(expected_version)?;
-    let state_json = serde_json::to_string(state).map_err(ApiError::internal)?;
+    let (state_json, summary_state_json) = serialize_state(state)?;
     let now = Utc::now();
     let now_text = now.to_rfc3339();
     let cutoff = (now - ChronoDuration::hours(24)).to_rfc3339();
+    backfill_missing_summaries(db).map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     let changed = tx.execute(
-        "UPDATE conversations SET state_json=?1,updated_at=?2,last_user_message_at=?2,version=version+1 WHERE id=?3 AND phase='active' AND version=?4",
-        params![state_json,now_text,id,expected_version],
+        "UPDATE conversations SET state_json=?1,summary_state_json=?2,updated_at=?3,last_user_message_at=?3,version=version+1 WHERE id=?4 AND phase='active' AND version=?5",
+        params![state_json,summary_state_json,now_text,id,expected_version],
     ).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
@@ -634,7 +848,7 @@ fn checkpoint_user_activity(
     }
 
     let mut statement = tx.prepare(
-        "SELECT id,state_json FROM conversations WHERE phase='active' AND id<>?1 AND datetime(COALESCE(last_user_message_at,started_at))<datetime(?2)",
+        "SELECT id,summary_state_json FROM conversations WHERE phase='active' AND id<>?1 AND datetime(COALESCE(last_user_message_at,started_at))<datetime(?2)",
     ).map_err(ApiError::internal)?;
     let candidates = statement
         .query_map(params![id, cutoff], |row| {
@@ -644,8 +858,8 @@ fn checkpoint_user_activity(
         .collect::<Result<Vec<_>, _>>()
         .map_err(ApiError::internal)?;
     drop(statement);
-    for (stale_id, stale_state) in candidates {
-        let state = serde_json::from_str::<Value>(&stale_state).unwrap_or(Value::Null);
+    for (stale_id, stale_summary) in candidates {
+        let state = serde_json::from_str::<Value>(&stale_summary).unwrap_or(Value::Null);
         let pending_turn = state
             .get("pendingTurn")
             .and_then(Value::as_bool)
@@ -785,10 +999,10 @@ fn update_ingress(
     state: &Value,
 ) -> Result<ConversationRecord, ApiError> {
     validate_version(expected_version)?;
-    let state_json = serde_json::to_string(state).map_err(ApiError::internal)?;
+    let (state_json, summary_state_json) = serialize_state(state)?;
     let changed = db.execute(
-        "UPDATE conversations SET state_json=?1,updated_at=?2,version=version+1 WHERE id=?3 AND phase='ingress_in_progress' AND version=?4",
-        params![state_json,Utc::now().to_rfc3339(),id,expected_version],
+        "UPDATE conversations SET state_json=?1,summary_state_json=?2,updated_at=?3,version=version+1 WHERE id=?4 AND phase='ingress_in_progress' AND version=?5",
+        params![state_json,summary_state_json,Utc::now().to_rfc3339(),id,expected_version],
     ).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::conflict(
@@ -916,12 +1130,12 @@ fn retry_failed_ingress(
             "Conversation is not in the expected failed history-ingress state.",
         ));
     }
-    let state_json = serde_json::to_string(&input.state).map_err(ApiError::internal)?;
+    let (state_json, summary_state_json) = serialize_state(&input.state)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     let changed = tx
         .execute(
-            "UPDATE conversations SET phase='ingress_pending',state_json=?1,ingress_next_attempt_at=NULL,updated_at=?2,ingress_failure_count=0,version=version+1 WHERE id=?3 AND phase='ingress_failed' AND version=?4",
-            params![state_json, Utc::now().to_rfc3339(), id, input.expected_version],
+            "UPDATE conversations SET phase='ingress_pending',state_json=?1,summary_state_json=?2,ingress_next_attempt_at=NULL,updated_at=?3,ingress_failure_count=0,version=version+1 WHERE id=?4 AND phase='ingress_failed' AND version=?5",
+            params![state_json, summary_state_json, Utc::now().to_rfc3339(), id, input.expected_version],
         )
         .map_err(ApiError::internal)?;
     if changed == 0 {
@@ -973,6 +1187,62 @@ mod tests {
     }
 
     #[test]
+    fn conversation_summaries_exclude_large_archives_and_keep_sidebar_metadata() {
+        let db = database();
+        let large_payload = "x".repeat(1_000_000);
+        let record = insert_conversation(
+            &db,
+            CreateConversation {
+                started_at: "2026-07-18T12:00:00Z".into(),
+                state: json!({
+                    "sessionType":"telegram-group",
+                    "channel":{
+                        "kind":"telegram-group",
+                        "telegramUserId":42,
+                        "chatId":-100,
+                        "groupRootNodeId":"group-root",
+                        "groupContext":{
+                            "groupTitle":"Kennedy workshop",
+                            "messages":[{"text":large_payload.clone()}]
+                        }
+                    },
+                    "transcript":[
+                        {"role":"kennedy","content":"Welcome"},
+                        {"role":"user","content":"Plan the next workshop"}
+                    ],
+                    "archive":{
+                        "messages":[{"role":"user","content":"large archive","payload":large_payload.clone()}],
+                        "media":[{"dataUrl":format!("data:audio/ogg;base64,{large_payload}")}]
+                    }
+                }),
+            },
+        )
+        .unwrap();
+
+        let summary = db
+            .query_row(
+                &format!("{} WHERE id=?1", conversation_summary_select()),
+                [&record.id],
+                row_summary,
+            )
+            .unwrap();
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert!(summary.summary);
+        assert_eq!(summary.state["sessionType"], "telegram-group");
+        assert_eq!(
+            summary.state["transcript"][0]["content"],
+            "Plan the next workshop"
+        );
+        assert_eq!(
+            summary.state["channel"]["groupContext"]["groupTitle"],
+            "Kennedy workshop"
+        );
+        assert!(encoded.len() < 4_000);
+        assert!(!encoded.contains("data:audio"));
+        assert!(!encoded.contains(&"x".repeat(1_000)));
+    }
+
+    #[test]
     fn migration_releases_a_failed_legacy_conversation_claim() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(INITIAL_MIGRATION).unwrap();
@@ -989,7 +1259,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_in_progress','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
     }
@@ -1019,7 +1289,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -1261,7 +1531,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('new','active','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
     }

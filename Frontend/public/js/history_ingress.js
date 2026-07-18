@@ -1,7 +1,7 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260718.1";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260718.5";
+import { ToolExecutor } from "./tools.js?v=20260718.7";
 import { ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.4";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260718.2";
@@ -97,7 +97,7 @@ function modelReadableProvenance(data) {
   return [chatend, loadedNodes].filter(Boolean).join("\n\n────────────────────────\n\n");
 }
 
-export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], groupContext = null, provenanceId, provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate, signal = null, operationId = null, beforeMutation = async () => {} }) {
+export async function runHistoryIngress({ kweb, intelligence, rustLibs = null, toolSessionId = null, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], groupContext = null, provenanceId, provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sourceSessionType = "conversation", restoredArchive = null, checkpoint = async () => {}, onUpdate, signal = null, operationId = null, beforeMutation = async () => {} }) {
   const provenance = await kweb.provenance(provenanceId);
   rootNodeIds = rootNodeIds || [rootNodeId];
   const context = new KwebContext(kweb, rootNodeIds); await context.initialize();
@@ -116,6 +116,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     modelReadableProvenance(provenance.data),
   ].join("\n") }];
   const archive = restoredArchive?.format === "kennedy-chatend" && restoredArchive?.sessionType === "history-ingress" ? restoredArchive : null;
+  const rustLibSessionId = archive?.rustLibSessionId || toolSessionId || (rustLibs ? `kennedy:ingress:${crypto.randomUUID()}` : null);
   if (archive?.context?.state) {
     context.restore(archive.context.state);
     await context.ensureRootsLoaded();
@@ -145,7 +146,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
   let completed = Boolean(archive?.completed);
   let roundsUsed = Number.isInteger(archive?.roundsUsed) ? archive.roundsUsed : Number(archive?.usage?.requests) || 0;
   const snapshot = () => ({ chatend, context, executor, continuation, usage, completed, roundsUsed });
-  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, provider, model, modelAttribution, provenanceId, loadLimit: 50, sessionType: "history-ingress", onUpdate: () => onUpdate(snapshot()), beforeMutation });
+  const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, rustLibs, toolSessionId: rustLibSessionId, provider, model, modelAttribution, provenanceId, loadLimit: 50, sessionType: "history-ingress", onUpdate: () => onUpdate(snapshot()), beforeMutation });
   if (archive?.tools) {
     executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
     executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
@@ -159,6 +160,7 @@ export async function runHistoryIngress({ kweb, intelligence, manuals, rootNodeI
     referenceRootNodeIds: [...referenceRootNodeIds],
     groupContext: jsonCopy(groupContext),
     provenanceId,
+    rustLibSessionId,
     completed,
     provider,
     model,

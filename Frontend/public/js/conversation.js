@@ -1,7 +1,7 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260718.1";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260718.5";
+import { ToolExecutor } from "./tools.js?v=20260718.7";
 import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.4";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeTurnContinuationMessage, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260717.2";
@@ -22,8 +22,8 @@ function turnStoppedError() {
 }
 
 export class ConversationSession {
-  constructor({ kweb, intelligence, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, freeTime = null, provenanceId = null, persist = async () => {}, onUpdate = () => {}, now = () => Date.now() }) {
-    this.kweb = kweb; this.intelligence = intelligence; this.manuals = manuals;
+  constructor({ kweb, intelligence, rustLibs = null, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, freeTime = null, provenanceId = null, persist = async () => {}, onUpdate = () => {}, now = () => Date.now() }) {
+    this.kweb = kweb; this.intelligence = intelligence; this.rustLibs = rustLibs; this.manuals = manuals;
     this.rootNodeIds = rootNodeIds || [rootNodeId]; this.rootNodeId = this.rootNodeIds[0];
     this.referenceRootNodeIds = [...new Set(referenceRootNodeIds.filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
     this.provider = provider; this.providerKind = providerKind; this.model = model; this.reasoningEffort = reasoningEffort;
@@ -33,6 +33,7 @@ export class ConversationSession {
     this.channel = channel ? jsonCopy(channel) : null;
     this.freeTime = freeTime ? jsonCopy(freeTime) : null;
     this.provenanceId = provenanceId;
+    this.rustLibSessionId = `kennedy:${crypto.randomUUID()}`;
     this.now = now;
     this.freeTimeEndReason = null;
     this.persist = persist; this.onUpdate = onUpdate;
@@ -55,6 +56,7 @@ export class ConversationSession {
       this.channel = jsonCopy(restored.channel || archive?.channel || this.channel);
       this.freeTime = jsonCopy(restored.freeTime || archive?.freeTime || this.freeTime);
       this.provenanceId = restored.provenanceId || archive?.provenanceId || this.provenanceId;
+      this.rustLibSessionId = restored.rustLibSessionId || archive?.rustLibSessionId || this.rustLibSessionId;
       this.media = jsonCopy(restored.media || archive?.media || []);
       this.pendingTurn = Boolean(restored.pendingTurn) || (!this.freeTime?.sliceEndedAt && transcriptEndsWithUnansweredUser(this.transcript));
       this.pendingExternalEventId = restored.pendingExternalEventId || archive?.pendingExternalEventId || null;
@@ -89,6 +91,8 @@ export class ConversationSession {
       context: this.context,
       api: this.kweb,
       intelligence: this.intelligence,
+      rustLibs: this.rustLibs,
+      toolSessionId: this.rustLibSessionId,
       provider: this.provider,
       model: this.model,
       modelAttribution: this.modelAttribution,
@@ -120,6 +124,7 @@ export class ConversationSession {
       channel: jsonCopy(this.channel),
       freeTime: jsonCopy(this.freeTime),
       provenanceId: this.provenanceId,
+      rustLibSessionId: this.rustLibSessionId,
       rootNodeIds: [...this.rootNodeIds],
       referenceRootNodeIds: [...this.referenceRootNodeIds],
       startedAt: this.startedAt,
@@ -141,6 +146,7 @@ export class ConversationSession {
       channel: jsonCopy(this.channel),
       freeTime: jsonCopy(this.freeTime),
       provenanceId: this.provenanceId,
+      rustLibSessionId: this.rustLibSessionId,
       rootNodeIds: [...this.rootNodeIds],
       referenceRootNodeIds: [...this.referenceRootNodeIds],
       startedAt: this.startedAt,
@@ -173,6 +179,11 @@ export class ConversationSession {
     this.durableState = jsonCopy(state);
   }
 
+  async releaseRustLibs() {
+    if (!this.rustLibs || !this.rustLibSessionId) return { released: 0 };
+    return this.rustLibs.release(this.rustLibSessionId);
+  }
+
   restoreDurableState() {
     const state = this.durableState;
     const archive = state?.archive;
@@ -185,6 +196,7 @@ export class ConversationSession {
     this.media = jsonCopy(state.media || archive.media || []);
     this.channel = jsonCopy(state.channel || archive.channel || this.channel);
     this.provenanceId = state.provenanceId || archive.provenanceId || this.provenanceId;
+    this.rustLibSessionId = state.rustLibSessionId || archive.rustLibSessionId || this.rustLibSessionId;
     this.referenceRootNodeIds = [...new Set((state.referenceRootNodeIds || archive.referenceRootNodeIds || this.referenceRootNodeIds)
       .filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
     this.pendingCheckpointed = this.pendingTurn;
@@ -194,6 +206,7 @@ export class ConversationSession {
     this.executor.loadCalls = Number.isInteger(archive.tools?.loadCalls) ? archive.tools.loadCalls : 0;
     this.executor.toolLog = jsonCopy(archive.tools?.log || []);
     this.executor.provenanceId = this.provenanceId;
+    this.executor.toolSessionId = this.rustLibSessionId;
     this.usage.restore(archive.usage);
   }
 

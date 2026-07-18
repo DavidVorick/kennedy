@@ -1868,6 +1868,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-rust-libs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e00a4736df1f6e1fa8e59c305ed86bd1a4ecdc861b70291b555363c561e34ce"
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1972,6 +1978,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "kcode-rust-libs",
  "kennedy-audio-ingress",
  "kennedy-codex-runtime",
  "kennedy-conversation-history",

@@ -3,6 +3,7 @@ mod credentials;
 mod kmap_http;
 mod kmap_size;
 mod kweb_migration;
+mod rust_lib_tools;
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ use zeroize::Zeroize;
 const OPENAI_API_KEY_SECRET: &str = "openai-api-key";
 const GEMINI_API_KEY_SECRET: &str = "gemini-api-key";
 const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
+const RUST_LIBS_ROOT: &str = "/home/user/dev/kennedy/kcode/kcode-rust-libs";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -209,6 +211,8 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.kweb_provenance_artifacts,
         &args.user_database,
     )?;
+    let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT)
+        .with_context(|| format!("opening managed Rust libraries root {RUST_LIBS_ROOT}"))?;
     let history = kennedy_conversation_history::Config {
         bind: args.conversation_history_bind,
         database: args.conversation_history_database,
@@ -242,6 +246,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             system_roots,
             args.frontend_dir,
             args.system_prompts_dir,
+            rust_lib_tools,
             kweb_listener,
         ),
         kennedy_intelligence::serve(
@@ -381,6 +386,10 @@ mod tests {
         assert_eq!(OPENAI_API_KEY_SECRET, "openai-api-key");
         assert_eq!(GEMINI_API_KEY_SECRET, "gemini-api-key");
         assert_eq!(TELEGRAM_BOT_TOKEN_SECRET, "telegram-bot-token");
+        assert_eq!(
+            RUST_LIBS_ROOT,
+            "/home/user/dev/kennedy/kcode/kcode-rust-libs"
+        );
     }
 
     #[test]

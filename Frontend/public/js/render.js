@@ -1,4 +1,4 @@
-import { formatKmapContext } from "./human_format.js?v=20260718.1";
+import { formatKmapContext } from "./human_format.js?v=20260718.2";
 import { formatChatend } from "./chatend_format.js?v=20260718.2";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
@@ -190,7 +190,11 @@ export function reconcileConversationHistory(cachedRecords, incomingRecords) {
   const cachedById = new Map((cachedRecords || []).map(record => [record.id, record]));
   return sortConversationHistory((incomingRecords || []).map(record => {
     const cached = cachedById.get(record.id);
-    return Number(cached?.version) > Number(record?.version) ? cached : record;
+    const cachedVersion = Number(cached?.version);
+    const incomingVersion = Number(record?.version);
+    if (cachedVersion > incomingVersion) return cached;
+    if (cachedVersion === incomingVersion && !cached?.summary && record?.summary) return cached;
+    return record;
   }));
 }
 
@@ -564,6 +568,9 @@ export function ingressEntryPresentation(message) {
   if (message?.display_role === "Memory tool result") {
     return { collapsed: true, label: "Memory tool result" };
   }
+  if (message?.display_role === "Coding tool result") {
+    return { collapsed: true, label: "Coding tool result" };
+  }
   if (message?.display_role === "Tool protocol error") {
     return { collapsed: true, label: "Tool protocol error" };
   }
@@ -609,6 +616,7 @@ function parseToolRequest(content) {
 function isToolResult(message) {
   return message?.display_role === "Memory tool result" ||
     message?.display_role === "Web tool result" ||
+    message?.display_role === "Coding tool result" ||
     message?.display_role === "Tool protocol error" ||
     (typeof message?.content === "string" && message.content.startsWith("Kennedy tool result"));
 }
@@ -801,6 +809,7 @@ export function inspectorText(diagnostic, view = "full") {
       const isResult = message.role === "user" && (
         message.display_role === "Memory tool result" ||
         message.display_role === "Web tool result" ||
+        message.display_role === "Coding tool result" ||
         content.startsWith("Kennedy tool result")
       );
       return isRequest || isResult;

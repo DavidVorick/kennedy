@@ -1,4 +1,4 @@
-import { parseToolCalls, TOOL_CALL_PREFIX, truncateToolResponse } from "./tools.js?v=20260718.5";
+import { parseToolCalls, TOOL_CALL_PREFIX, truncateToolResponse } from "./tools.js?v=20260718.7";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260718.2";
 

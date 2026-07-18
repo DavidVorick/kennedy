@@ -1,9 +1,9 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260718.3";
+import { KwebAPI, RustLibsAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260718.5";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
-import { ConversationSession } from "./conversation.js?v=20260718.5";
-import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260718.5";
+import { ConversationSession } from "./conversation.js?v=20260718.6";
+import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260718.6";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260718.3";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260718.2";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260718.4";
 import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260717.2";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventTimeoutMs } from "./telegram_timing.js?v=20260717.1";
 
@@ -22,6 +22,7 @@ const ui = Object.fromEntries([
 
 const INSPECTOR_MODES = ["main", "full", "history"];
 const kweb = KwebAPI(CONFIG.kwebBase);
+const rustLibs = RustLibsAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
 const telegramRelay = TelegramRelayAPI(CONFIG.telegramRelayBase);
@@ -115,6 +116,7 @@ function memoryIngressRuntimeReady() {
 const memoryIngress = new MemoryIngressCoordinator({
   kweb,
   intelligence,
+  rustLibs,
   conversationHistory,
   audioIngress,
   telegramRelay,
@@ -618,6 +620,16 @@ function upsertHistory(record) {
   historyRecords = sortConversationHistory([record, ...historyRecords.filter(item => item.id !== record.id)]);
 }
 
+async function hydrateHistoryRecord(recordOrId) {
+  const id = typeof recordOrId === "string" ? recordOrId : recordOrId?.id;
+  if (!id) throw new Error("Conversation history record is missing an ID.");
+  const cached = historyRecords.find(item => item.id === id);
+  if (cached && !cached.summary) return cached;
+  const record = await conversationHistory.get(id);
+  upsertHistory(record);
+  return record;
+}
+
 function saveDraft() {
   if (activeView === "conversation" && selectedSession()) drafts.set(selectedConversationId, ui.message_input.value);
 }
@@ -798,17 +810,20 @@ async function toggleVoiceRecording() {
   }
 }
 
-function reconcileLiveSessions(records) {
+async function reconcileLiveSessions(records) {
   historyRecords = reconcileConversationHistory(historyRecords, records);
   const activeIds = new Set(historyRecords.filter(record => record.phase === "active").map(record => record.id));
-  for (const id of liveSessions.keys()) {
-    if (!activeIds.has(id)) liveSessions.delete(id);
+  for (const [id, session] of liveSessions.entries()) {
+    if (!activeIds.has(id)) {
+      await session.releaseRustLibs().catch(() => {});
+      liveSessions.delete(id);
+    }
   }
 }
 
 async function refreshHistory() {
   const records = (await conversationHistory.list()).conversations || [];
-  reconcileLiveSessions(records);
+  await reconcileLiveSessions(records);
   update();
 }
 
@@ -908,9 +923,10 @@ async function retryConversationIngress(record) {
   retryingConversationIds.add(record.id);
   update();
   try {
+    const latest = await hydrateHistoryRecord(record);
     const retried = await conversationHistory.retryIngress(record.id, {
-      expected_version: record.version,
-      state: freshIngressState(record.state),
+      expected_version: latest.version,
+      state: freshIngressState(latest.state),
     });
     upsertHistory(retried);
     kickHistoryIngress();
@@ -962,6 +978,7 @@ async function cancelConversationWork(id) {
   const session = liveSessions.get(id);
   if (session?.canStop) await session.stopPendingTurn();
   await memoryIngress.cancelConversation(id);
+  if (session) await session.releaseRustLibs();
 }
 
 async function forcePurgeConversation(record) {
@@ -1032,11 +1049,12 @@ async function persistSession(id, state, metadata = {}) {
 }
 
 async function buildConversation(record) {
+  record = await hydrateHistoryRecord(record);
   const sessionType = sessionTypeOf(record);
   const sessionRoots = rootsForRecord(record);
   const referenceRootNodeIds = referencesForRecord(record, sessionRoots);
   const session = new ConversationSession({
-    kweb, intelligence, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+    kweb, intelligence, rustLibs, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
     sessionType,
     channel: record.state?.channel || record.state?.archive?.channel || null,
     freeTime: freeTimeOf(record),
@@ -1057,7 +1075,7 @@ async function createNewConversation() {
   update();
   try {
     const session = new ConversationSession({
-      kweb, intelligence, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
+      kweb, intelligence, rustLibs, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
       sessionType: "conversation",
       onUpdate: update,
     });
@@ -1085,6 +1103,7 @@ function freeTimeTimerAt(timestamp, callback) {
 }
 
 async function closeFreeTimeSession(id, session) {
+  await session.releaseRustLibs();
   let record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
   if (record.phase === "active") {
     record = await conversationHistory.completeWithoutIngress(id, {
@@ -1103,7 +1122,7 @@ async function closeFreeTimeSession(id, session) {
 
 async function createFreeTimeSlice(freeTime, { select = false } = {}) {
   const session = new ConversationSession({
-    kweb, intelligence, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort,
+    kweb, intelligence, rustLibs, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort,
     contextWindowTokens, maxInputTokens, sessionType: "free-time", freeTime,
     provenanceId: freeTime.provenanceId, onUpdate: update,
   });
@@ -1341,11 +1360,13 @@ async function runFreeTimeRecord(id) {
 }
 
 async function selectConversation(id) {
-  if (id === selectedConversationId) return;
+  const cached = historyRecords.find(item => item.id === id);
+  if (id === selectedConversationId && cached && !cached.summary) return;
   saveDraft();
-  const record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
-  upsertHistory(record);
   selectedConversationId = id;
+  let record = cached;
+  update();
+  record = await hydrateHistoryRecord(record || id);
   selectedByView[viewForSessionType(sessionTypeOf(record))] = id;
   restoreDraft();
   update();
@@ -1427,6 +1448,7 @@ async function stopConversationTurn() {
 }
 
 async function closeConversation(id, session, record) {
+  await session.releaseRustLibs();
   const latest = historyRecords.find(item => item.id === id) || record;
   const closed = await conversationHistory.requestIngress(id, {
     expected_version: latest.version,
@@ -1513,7 +1535,7 @@ async function createTelegramConversation(event) {
     lastGroupContextMessageId: latestGroupMessageId,
   };
   const session = new ConversationSession({
-    kweb, intelligence, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort,
+    kweb, intelligence, rustLibs, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort,
     contextWindowTokens, maxInputTokens, sessionType, channel, onUpdate: update,
   });
   await session.initialize();
@@ -1599,6 +1621,7 @@ async function processTelegramReset(event, runtime = null) {
     await session.persistSnapshot(session.snapshot());
   }
   const latest = historyRecords.find(item => item.id === record.id) || record;
+  await session.releaseRustLibs();
   const closed = await conversationHistory.requestIngress(record.id, { expected_version: latest.version, state: session.snapshot() });
   upsertHistory(closed);
   liveSessions.delete(record.id);
@@ -1769,6 +1792,7 @@ async function prepareTelegramGroupContext(groupContext, excludedMessageId = nul
 }
 
 async function closeTelegramGroupSessionSilently(updateRecord, session) {
+  await session.releaseRustLibs();
   const latest = historyRecords.find(item => item.id === updateRecord.id) || updateRecord;
   const closed = await conversationHistory.requestIngress(latest.id, {
     expected_version: latest.version,
@@ -1950,6 +1974,7 @@ async function syncGroupIngressBatches() {
       upsertHistory(record);
     }
     if (record.phase === "active") {
+      record = await hydrateHistoryRecord(record);
       record = await conversationHistory.requestIngress(record.id, { expected_version: record.version, state: record.state });
       upsertHistory(record);
       kickHistoryIngress();
@@ -1975,6 +2000,7 @@ async function closeTimedOutTelegramConversation(runtime) {
   let latest = await conversationHistory.get(id).catch(() => null);
   if (!latest || latest.phase !== "active") return;
   if (!runtime.session?.pendingTurn && !latest.state?.pendingTurn) return;
+  await runtime.session?.releaseRustLibs().catch(() => {});
   for (let attempt = 0; attempt < 3 && latest?.phase === "active"; attempt += 1) {
     try {
       const closed = await conversationHistory.requestIngress(id, {

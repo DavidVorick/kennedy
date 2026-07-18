@@ -15,13 +15,13 @@ pub(crate) const QUALITY_SEARCH_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const QUALITY_SEARCH_REASONING_EFFORT: &str = "xhigh";
 pub(crate) const QUALITY_SEARCH_CONTEXT_SIZE: &str = "high";
 pub(crate) const QUALITY_SEARCH_MAX_SOURCES: usize = 12;
-pub(crate) const QUALITY_SEARCH_TIMEOUT_SECONDS: u64 = 30 * 60;
+pub(crate) const QUALITY_SEARCH_TIMEOUT_SECONDS: u64 = 40 * 60;
 
 pub(crate) const BALANCED_SEARCH_MODEL: &str = "gpt-5.6-terra";
 pub(crate) const BALANCED_SEARCH_REASONING_EFFORT: &str = "low";
 pub(crate) const BALANCED_SEARCH_CONTEXT_SIZE: &str = "low";
 pub(crate) const BALANCED_SEARCH_MAX_SOURCES: usize = 8;
-pub(crate) const BALANCED_SEARCH_TIMEOUT_SECONDS: u64 = 90;
+pub(crate) const BALANCED_SEARCH_TIMEOUT_SECONDS: u64 = 180;
 
 pub(crate) const GEMINI_SEARCH_API_BASE: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
@@ -31,7 +31,7 @@ pub(crate) const FAST_SEARCH_THINKING_LEVEL: &str = "low";
 pub(crate) const FAST_SEARCH_SERVICE_TIER: &str = "priority";
 pub(crate) const FAST_SEARCH_MAX_SOURCES: usize = 6;
 pub(crate) const FAST_SEARCH_MAX_OUTPUT_TOKENS: u64 = 2_048;
-pub(crate) const FAST_SEARCH_TIMEOUT_SECONDS: u64 = 45;
+pub(crate) const FAST_SEARCH_TIMEOUT_SECONDS: u64 = 90;
 
 pub(crate) const FETCH_TIMEOUT_SECONDS: u64 = 30;
 pub(crate) const MAX_FETCH_BYTES: usize = 2_000_000;
