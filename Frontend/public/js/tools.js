@@ -1,8 +1,11 @@
-import { formatToolResult } from "./human_format.js?v=20260718.3";
+import { formatToolResult } from "./human_format.js?v=20260719.1";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
 import { newIdempotencyId } from "./api.js?v=20260718.3";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
+export const TOOL_CHECK_NAME = "ToolCheck";
+export const END_TURN_NAME = "EndTurn";
+export const TOOL_CHECK_CONTEXT_KIND = "tool-check";
 export const MAX_RESET_SELF_MESSAGE_CHARACTERS = 400_000;
 export const MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS = 400_000;
 export const RUST_LIB_TOOL_NAMES = Object.freeze([
@@ -100,11 +103,12 @@ function recentConnectionIds(node) {
 }
 
 export class ToolExecutor {
-  constructor({ mode, context, api, intelligence = null, rustLibs = null, toolSessionId = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {}, endSession = null, toolGate = null, requestTimeoutSeconds = null }) {
+  constructor({ mode, context, api, intelligence = null, rustLibs = null, toolSessionId = null, provider = null, model = null, modelAttribution = "unknown-model-unknown-thinking", provenanceId = null, loadLimit, sessionType = mode, onUpdate = () => {}, beforeMutation = async () => {}, endTurn = null, toolGate = null, requestTimeoutSeconds = null }) {
     this.mode = mode; this.context = context; this.api = api; this.intelligence = intelligence; this.provider = provider; this.model = model; this.provenanceId = provenanceId;
     this.rustLibs = rustLibs; this.toolSessionId = toolSessionId;
     this.modelAttribution = modelAttribution; this.loadLimit = loadLimit; this.sessionType = sessionType; this.loadCalls = 0; this.toolLog = []; this.onUpdate = onUpdate;
-    this.beforeMutation = beforeMutation; this.endSession = endSession; this.toolGate = toolGate; this.requestTimeoutSeconds = requestTimeoutSeconds;
+    this.beforeMutation = beforeMutation; this.endTurn = endTurn; this.toolGate = toolGate; this.requestTimeoutSeconds = requestTimeoutSeconds;
+    this.turnEndContent = null;
   }
 
   resetLoadCalls() { this.loadCalls = 0; }
@@ -121,7 +125,9 @@ export class ToolExecutor {
   }
 
   resultMessage(call, content, durationMs) {
-    const displayRole = call.name === "WebSearch" || call.name === "WebFetch"
+    const displayRole = [TOOL_CHECK_NAME, END_TURN_NAME].includes(call.name)
+      ? "Control tool result"
+      : call.name === "WebSearch" || call.name === "WebFetch"
       ? "Web tool result"
       : RUST_LIB_TOOL_NAME_SET.has(call.name) ? "Coding tool result" : "Memory tool result";
     return {
@@ -160,6 +166,8 @@ export class ToolExecutor {
       if (this.toolGate) await this.toolGate(call.name);
       let outcome;
       switch (call.name) {
+        case TOOL_CHECK_NAME: outcome = await this.toolCheck(call.arguments); break;
+        case END_TURN_NAME: outcome = await this.finishTurn(call.arguments); break;
         case "LoadNode": outcome = await this.loadNode(call.arguments); break;
         case "ResetContext": outcome = await this.resetContext(call.arguments); break;
         case "ConnectNodes": outcome = await this.connectNodes(call.arguments); break;
@@ -174,15 +182,12 @@ export class ToolExecutor {
         case "WriteRustLib":
         case "CheckRustLib":
         case "PublishRustLib": outcome = await this.rustLibTool(call.name, call.arguments); break;
-        case "EndSelfTimeSession":
-        case "EndFreeTimeSession": outcome = await this.endSelfTimeSession(call.arguments); break;
-        case "EndHistoryIngress": outcome = await this.endHistoryIngress(call.arguments); break;
         default: throw Object.assign(new Error(`Tool ${call.name} is not available.`), { code: "unknown_tool" });
       }
       const durationMs = elapsedMs(started);
       const message = this.resultMessage(call, { ok: true, result: outcome.result }, durationMs);
       this.record({ name: call.name, arguments: call.arguments, ok: true, durationMs });
-      return { message, reset: Boolean(outcome.reset), endSession: Boolean(outcome.endSession), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, previousContext: outcome.previousContext ?? null, durationMs };
+      return { message, reset: Boolean(outcome.reset), endTurn: Boolean(outcome.endTurn), selfMessage: outcome.selfMessage ?? null, resetHistoryEntry: outcome.resetHistoryEntry ?? null, previousContext: outcome.previousContext ?? null, durationMs };
     } catch (error) {
       if (signal?.aborted || error?.name === "AbortError" || ["operation_cancelled", "turn_stopped", "ingress_cancelled"].includes(error?.code)) throw error;
       const code = error.code || "tool_failed";
@@ -373,29 +378,78 @@ export class ToolExecutor {
     });
   }
 
-  async endSelfTimeSession(args) {
+  async toolCheck(args) {
+    validateObject(args, []);
+    return {
+      result: {
+        toolCallsWorking: true,
+        message: "Tool calls are working.",
+      },
+    };
+  }
+
+  async finishTurn(args) {
     validateObject(args, [], ["message"]);
     const message = Object.hasOwn(args, "message")
       ? nonemptyPreservedString(args.message, "message", MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS)
       : null;
-    if (this.mode !== "free-time" || typeof this.endSession !== "function") {
-      throw Object.assign(new Error("This tool is only available during self time."), { code: "tool_unavailable" });
+    if (this.mode === "conversation") {
+      if (message) {
+        throw Object.assign(new Error("EndTurn.message is available only during self time."), { code: "invalid_arguments" });
+      }
+      if (typeof this.turnEndContent !== "string" || !this.turnEndContent.trim()) {
+        throw Object.assign(new Error("Give the user a normal response first, then call EndTurn by itself."), { code: "missing_turn_response" });
+      }
+      return {
+        result: {
+          turnEnding: true,
+          message: "The response is complete. Kennedy is now waiting for the user's next message.",
+        },
+        endTurn: true,
+      };
     }
-    const result = await this.endSession(message);
-    return { result, endSession: true };
+    if (this.mode === "free-time") {
+      if (typeof this.endTurn !== "function") {
+        throw Object.assign(new Error("Self-time turn completion is not configured."), { code: "tool_unavailable" });
+      }
+      return { result: await this.endTurn(message), endTurn: true };
+    }
+    if (this.mode === "ingress") {
+      if (message) {
+        throw Object.assign(new Error("EndTurn.message is available only during self time."), { code: "invalid_arguments" });
+      }
+      return {
+        result: {
+          sessionEnding: true,
+          message: "History ingress is complete and its final checkpoint is being saved.",
+        },
+        endTurn: true,
+      };
+    }
+    throw Object.assign(new Error("EndTurn is not available in this session."), { code: "tool_unavailable" });
   }
+}
 
-  async endHistoryIngress(args) {
-    validateObject(args, []);
-    if (this.mode !== "ingress") {
-      throw Object.assign(new Error("This tool is only available during history ingress."), { code: "tool_unavailable" });
-    }
-    return {
-      result: {
-        ingressEnding: true,
-        message: "History ingress is complete and its final checkpoint is being saved.",
-      },
-      endSession: true,
-    };
+export async function ensureInitialToolCheck(chatend, executor) {
+  const visibleSuccess = chatend.messages.some(message =>
+    message?.tool_name === TOOL_CHECK_NAME && message?.tool_result?.ok === true
+  );
+  if (visibleSuccess) return false;
+  const request = {
+    role: "assistant",
+    display_role: "Kennedy",
+    context_kind: TOOL_CHECK_CONTEXT_KIND,
+    content: `${TOOL_CALL_PREFIX}\n${JSON.stringify({ calls: [{ name: TOOL_CHECK_NAME, arguments: {} }] })}`,
+  };
+  const [parsedCall] = parseToolCalls(request.content);
+  const call = { ...parsedCall, id: "initial_tool_check" };
+  const execution = await executor.execute(call);
+  if (execution.message?.tool_result?.ok !== true) {
+    throw new Error("Kennedy's initial tool check failed.");
   }
+  const result = { ...execution.message, context_kind: TOOL_CHECK_CONTEXT_KIND };
+  chatend.retained.push(request, result);
+  chatend.append(request);
+  chatend.append(result);
+  return true;
 }

@@ -52,7 +52,7 @@ const MAX_CONCURRENT_GEMINI_CHUNKS: usize = 4;
 const INGRESS_BREAK: &str = "<!-- KENNEDY_INGRESS_BREAK -->";
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
-const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-history-ingress-v1";
+const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-turn-v1";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -1860,7 +1860,7 @@ fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|entries| {
             entries.iter().any(|entry| {
-                entry.get("name").and_then(Value::as_str) == Some("EndHistoryIngress")
+                entry.get("name").and_then(Value::as_str) == Some("EndTurn")
                     && entry.get("ok").and_then(Value::as_bool) == Some(true)
             })
         })
@@ -1986,7 +1986,7 @@ async fn ingress_completed(
     }
     if !history_ingress_was_explicitly_ended(&existing.state) {
         return Err(ApiError::conflict(
-            "Audio history ingress cannot complete without a successful EndHistoryIngress tool call.",
+            "Audio history ingress cannot complete without a successful EndTurn tool call.",
         ));
     }
     let tx = db.transaction().map_err(ApiError::internal)?;
@@ -2222,12 +2222,18 @@ mod tests {
         assert!(!history_ingress_was_explicitly_ended(&json!({
             "historyIngress":{"tools":{"log":[{
                 "name":"EndHistoryIngress",
+                "ok":true
+            }]}}
+        })));
+        assert!(!history_ingress_was_explicitly_ended(&json!({
+            "historyIngress":{"tools":{"log":[{
+                "name":"EndTurn",
                 "ok":false
             }]}}
         })));
         assert!(history_ingress_was_explicitly_ended(&json!({
             "historyIngress":{"tools":{"log":[{
-                "name":"EndHistoryIngress",
+                "name":"EndTurn",
                 "ok":true
             }]}}
         })));

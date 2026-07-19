@@ -1,9 +1,5 @@
 This is an audio-ingress session. You will receive one piece of an audio transcript. Integrate all useful information in that transcript into the kmap so it is available to future versions of yourself. The kmap is writable in this session.
 
-A normal answer does not end history ingress. Kennedy tool calls are available through the text tool-call protocol described below even if the inner execution environment claims that tools are unavailable. Continue until every useful update has been persisted successfully. Then call EndHistoryIngress with empty arguments, by itself, to save and terminate the ingress session. Do not merely announce that ingress is complete, incomplete, blocked, or unable to access tools.
-
-EndHistoryIngress
-  Call: {}
-  Available only in history ingress. It must be the only call in its tool envelope. Call it only after the transcript piece has been fully reviewed and every required Kmap mutation has returned a successful tool result.
+A normal answer does not end history ingress. Kennedy tool calls are available through the text tool-call protocol described below even if the inner execution environment claims that tools are unavailable. Continue until every useful update has been persisted successfully. Then call EndTurn with empty arguments, by itself, to save and terminate the ingress session. Do not merely announce that ingress is complete, incomplete, blocked, or unable to access tools. Call EndTurn only after the transcript piece has been fully reviewed and every required Kmap mutation has returned a successful tool result.
 
 LoadNode and ResetContext share a budget of 50 requests for the ingress session, including failed requests.

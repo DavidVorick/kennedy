@@ -1,9 +1,9 @@
-import { parseToolCalls, TOOL_CALL_PREFIX, truncateToolResponse } from "./tools.js?v=20260718.8";
+import { END_TURN_NAME, TOOL_CHECK_NAME, parseToolCalls, TOOL_CALL_PREFIX, truncateToolResponse } from "./tools.js?v=20260719.1";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260718.2";
 
 export const AGENT_LOOP_ROUND_LIMIT = 100;
-export const AGENT_LOOP_SESSION_ENDED = Symbol("agent-loop-session-ended");
+export const AGENT_LOOP_TURN_ENDED = Symbol("agent-loop-turn-ended");
 
 function throwIfCancelled(signal) {
   if (!signal?.aborted) return;
@@ -11,7 +11,7 @@ function throwIfCancelled(signal) {
 }
 
 export function createCacheKey(mode) {
-  return `kennedy-${mode}-prompt-v4`;
+  return `kennedy-${mode}-prompt-v5`;
 }
 
 export class ContinuationState {
@@ -129,7 +129,7 @@ function protocolFailureMessage(error) {
       "Kennedy tool protocol error",
       "",
       error.message,
-      `Return either a normal final answer with no ${TOOL_CALL_PREFIX} marker, or a tool request containing only ${TOOL_CALL_PREFIX}, one newline, and one valid JSON envelope whose closing brace is the final non-whitespace character.`,
+      `Return either normal prose with no ${TOOL_CALL_PREFIX} marker, or a tool request containing only ${TOOL_CALL_PREFIX}, one newline, and one valid JSON envelope whose closing brace is the final non-whitespace character. Normal prose does not end the turn; EndTurn must eventually be called by itself.`,
     ].join("\n"),
   };
 }
@@ -140,8 +140,18 @@ async function checkpointContinuation(chatend, directive, timing, onUpdate, chec
   onUpdate();
   const checkpointStarted = performance.now();
   await checkpoint();
-  addTimingStep(timing, "checkpoint", "Self-time continuation save", elapsedMs(checkpointStarted));
+  addTimingStep(timing, "checkpoint", "Agent-loop continuation save", elapsedMs(checkpointStarted));
   return true;
+}
+
+export function turnContinuationMessage({ noAnswer = false } = {}) {
+  return [
+    noAnswer
+      ? "Kennedy turn controller: no assistant answer was returned, so this turn is still active."
+      : "Kennedy turn controller: the response above did not end this turn.",
+    "Kennedy tool calls are available through KENNEDY_TOOL_CALLS; the successful ToolCheck at the beginning of this session is direct evidence that the harness is working.",
+    "If more tool work is needed, continue with it. If the response is complete, call EndTurn with empty arguments by itself.",
+  ].join(" ");
 }
 
 export async function runAgentLoop({ intelligence, provider, model, chatend, executor, continuation, usage, timing = createTurnTiming(), onUpdate = () => {}, checkpoint = async () => {}, roundOffset = 0, onRoundStart = async () => {}, onResponse = async () => null, onFinal = async () => null, onNoAnswer = async () => null, signal = null, operationId = null, requestTimeoutSeconds = null }) {
@@ -169,7 +179,9 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       );
     } catch (error) {
       if (error?.code === "empty_assistant_message") {
-        const directive = await onNoAnswer(round + 1);
+        const directive = await onNoAnswer(round + 1) || {
+          continueWith: { role: "user", display_role: "Turn controller", context_kind: "turn-continuation", content: turnContinuationMessage({ noAnswer: true }) },
+        };
         if (await checkpointContinuation(chatend, directive, timing, onUpdate, checkpoint)) continue;
       }
       if (error?.code === "stale_codex_thread" && continuation.previousResponseId) {
@@ -210,20 +222,22 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
     const responseDirective = await onResponse(round + 1);
 
     if (roundDirective?.endAfterResponse || responseDirective?.endAfterResponse) {
-      executor.sessionEndContent = acceptedContent;
+      executor.turnEndContent = acceptedContent;
       const summary = updateTimingSummary(timing);
       chatend.append(summary);
       onUpdate();
       const checkpointStarted = performance.now();
       await checkpoint();
       addTimingStep(timing, "checkpoint", "Final self-time save", elapsedMs(checkpointStarted));
-      return AGENT_LOOP_SESSION_ENDED;
+      return AGENT_LOOP_TURN_ENDED;
     }
 
     if (emptyAnswer) {
-      const directive = await onNoAnswer(round + 1);
+      const directive = await onNoAnswer(round + 1) || {
+        continueWith: { role: "user", display_role: "Turn controller", context_kind: "turn-continuation", content: turnContinuationMessage({ noAnswer: true }) },
+      };
       if (await checkpointContinuation(chatend, directive, timing, onUpdate, checkpoint)) continue;
-      throw new Error("The intelligence service returned no assistant answer.");
+      continue;
     }
 
     if (protocolError) {
@@ -235,26 +249,26 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       continue;
     }
     if (!calls) {
-      const directive = await onFinal(content, round + 1);
+      executor.turnEndContent = content;
+      const directive = await onFinal(content, round + 1) || {
+        continueWith: { role: "user", display_role: "Turn controller", context_kind: "turn-continuation", content: turnContinuationMessage() },
+      };
       if (await checkpointContinuation(chatend, directive, timing, onUpdate, checkpoint)) continue;
-      const summary = updateTimingSummary(timing);
-      chatend.append(summary);
-      onUpdate();
-      return content;
+      continue;
     }
 
     calls = calls.map((call, index) => ({ ...call, id: `text_call_${round + 1}_${index + 1}` }));
     const resetIsMixed = calls.length > 1 && calls.some(call => call.name === "ResetContext");
-    const sessionEndTools = ["EndSelfTimeSession", "EndFreeTimeSession", "EndHistoryIngress"];
-    const sessionEndIsMixed = calls.length > 1 && calls.some(call => sessionEndTools.includes(call.name));
-    let sessionEnded = false;
+    const endTurnIsMixed = calls.length > 1 && calls.some(call => call.name === END_TURN_NAME);
+    let turnEnded = false;
     for (const call of calls) {
       throwIfCancelled(signal);
+      if (![END_TURN_NAME, TOOL_CHECK_NAME].includes(call.name)) executor.turnEndContent = null;
       const toolStarted = performance.now();
       const execution = resetIsMixed && call.name === "ResetContext"
         ? executor.failure(call, "mixed_reset_call", "ResetContext must be requested by itself so the chatend can be rebuilt safely.")
-        : sessionEndIsMixed && sessionEndTools.includes(call.name)
-          ? executor.failure(call, "mixed_session_end_call", `${call.name} must be requested by itself so the session can close safely.`)
+        : endTurnIsMixed && call.name === END_TURN_NAME
+          ? executor.failure(call, "mixed_end_turn_call", "EndTurn must be requested by itself so the turn can close safely.")
         : await executor.execute(call, { signal, operationId });
       throwIfCancelled(signal);
       const durationMs = addTimingStep(
@@ -277,13 +291,17 @@ export async function runAgentLoop({ intelligence, provider, model, chatend, exe
       } else {
         chatend.append(execution.message);
       }
-      sessionEnded ||= execution.endSession;
+      turnEnded ||= execution.endTurn;
       onUpdate();
     }
     const checkpointStarted = performance.now();
     await checkpoint();
     addTimingStep(timing, "checkpoint", "Tool-round save", elapsedMs(checkpointStarted));
-    if (sessionEnded) return AGENT_LOOP_SESSION_ENDED;
+    if (turnEnded) {
+      chatend.append(updateTimingSummary(timing));
+      onUpdate();
+      return AGENT_LOOP_TURN_ENDED;
+    }
   }
   throw new Error(`Kennedy exceeded the ${AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit.`);
 }

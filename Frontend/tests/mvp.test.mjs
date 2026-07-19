@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { KwebContext } from "../public/js/kweb_context.js";
 import { Chatend } from "../public/js/chatend.js";
-import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, RUST_LIB_TOOL_NAMES, ToolExecutor, parseToolCalls, truncateToolResponse } from "../public/js/tools.js";
+import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, RUST_LIB_TOOL_NAMES, ToolExecutor, ensureInitialToolCheck, parseToolCalls, truncateToolResponse } from "../public/js/tools.js";
 import { ConversationSession } from "../public/js/conversation.js";
 import { runHistoryIngress } from "../public/js/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, reconcileConversationHistory, sortConversationHistory } from "../public/js/render.js";
-import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
+import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
 import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
@@ -32,6 +32,26 @@ const promptManuals = (label = "Shared") => ({
   readTools: `${label} read and web tools`,
   writeTools: `${label} write tools`,
 });
+
+function endTurnGenerator(answer, { usage = null, onRequest = () => {} } = {}) {
+  let responseReady = false;
+  let generation = 0;
+  return async request => {
+    generation += 1;
+    onRequest(request, generation);
+    if (!responseReady) {
+      responseReady = true;
+      return { status: "complete", response_id: `response_${generation}`, message: { role: "assistant", content: answer }, usage };
+    }
+    responseReady = false;
+    return {
+      status: "complete",
+      response_id: `response_${generation}`,
+      message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' },
+      usage: null,
+    };
+  };
+}
 
 class MockKweb {
   constructor(nodes) { this.nodes = new Map(nodes.map(n => [n.id, n])); this.updatedCalls = []; }
@@ -733,7 +753,7 @@ test("history and audio ingress can invoke Rust library tools", async () => {
       generation += 1;
       return generation === 1
         ? { status: "complete", response_id: "tool", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"OpenRustLib","arguments":{"name":"example-lib"}}]}' }, usage: null }
-        : { status: "complete", response_id: "done", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndHistoryIngress","arguments":{}}]}' }, usage: null };
+        : { status: "complete", response_id: "done", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
     } };
     const calls = [];
     const rustLibs = { execute: async (sessionId, name, args) => {
@@ -776,46 +796,75 @@ test("live conversations cannot mutate the Kmap", async () => {
   }
 });
 
-test("self time authorizes Kmap writes and exposes its clean-slate end tool only there", async () => {
+test("ToolCheck is repeatable and EndTurn applies each session's completion semantics", async () => {
   const api = new MockKweb([node(1, [2]), node(2)]);
   const context = new KwebContext(api, id(1)); await context.initialize();
   let endCalls = 0;
   let forwardedMessage = null;
   const executor = new ToolExecutor({
     mode: "free-time", context, api, provenanceId: "free-time-provenance", loadLimit: 50,
-    endSession: async message => { endCalls += 1; forwardedMessage = message; return { totalTimeReduced: false, remaining: "12:00", messageForwarded: Boolean(message) }; },
+    endTurn: async message => { endCalls += 1; forwardedMessage = message; return { totalTimeReduced: false, remaining: "12:00", messageForwarded: Boolean(message) }; },
   });
   const connected = await executor.execute({ id: "connect", name: "ConnectNodes", arguments: { identifiers: [1, 2] } });
   assert.equal(connected.message.tool_result.ok, true);
   assert.deepEqual(api.updatedCalls.map(call => call[0]), [id(1), id(2)]);
 
-  const ended = await executor.execute({ id: "end", name: "EndSelfTimeSession", arguments: { message: "Continue with node 7." } });
-  assert.equal(ended.endSession, true);
+  const checked = await executor.execute({ id: "check", name: "ToolCheck", arguments: {} });
+  assert.equal(checked.message.tool_result.ok, true);
+  assert.equal(checked.message.tool_result.result.toolCallsWorking, true);
+  assert.match(checked.message.content, /Tool calls are working/);
+
+  const ended = await executor.execute({ id: "end", name: "EndTurn", arguments: { message: "Continue with node 7." } });
+  assert.equal(ended.endTurn, true);
   assert.equal(ended.message.tool_result.result.totalTimeReduced, false);
   assert.equal(ended.message.tool_result.result.messageForwarded, true);
   assert.equal(forwardedMessage, "Continue with node 7.");
   assert.equal(endCalls, 1);
 
-  const invalidMessage = await executor.execute({ id: "invalid-end", name: "EndSelfTimeSession", arguments: { message: "" } });
+  const invalidMessage = await executor.execute({ id: "invalid-end", name: "EndTurn", arguments: { message: "" } });
   assert.equal(invalidMessage.message.tool_result.ok, false);
   assert.match(invalidMessage.message.content, /message must contain between 1 and 400000 characters/);
   assert.equal(endCalls, 1);
   assert.equal(MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, 400_000);
 
   const conversation = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
-  const unavailable = await conversation.execute({ id: "end", name: "EndFreeTimeSession", arguments: {} });
-  assert.equal(unavailable.message.tool_result.ok, false);
-  assert.match(unavailable.message.content, /only available during self time/);
+  const missingResponse = await conversation.execute({ id: "end", name: "EndTurn", arguments: {} });
+  assert.equal(missingResponse.message.tool_result.ok, false);
+  assert.match(missingResponse.message.content, /normal response first/);
+  conversation.turnEndContent = "A complete response.";
+  const conversationEnded = await conversation.execute({ id: "end", name: "EndTurn", arguments: {} });
+  assert.equal(conversationEnded.endTurn, true);
+  assert.match(conversationEnded.message.content, /waiting for the user's next message/);
 
   const ingress = new ToolExecutor({ mode: "ingress", context, api, provenanceId: "ingress-provenance", loadLimit: 50 });
-  const ingressEnded = await ingress.execute({ id: "end-ingress", name: "EndHistoryIngress", arguments: {} });
-  assert.equal(ingressEnded.endSession, true);
-  assert.equal(ingressEnded.message.tool_result.result.ingressEnding, true);
+  const ingressEnded = await ingress.execute({ id: "end-ingress", name: "EndTurn", arguments: {} });
+  assert.equal(ingressEnded.endTurn, true);
+  assert.equal(ingressEnded.message.tool_result.result.sessionEnding, true);
   assert.match(ingressEnded.message.content, /final checkpoint is being saved/);
 
-  const ingressUnavailable = await conversation.execute({ id: "end-ingress", name: "EndHistoryIngress", arguments: {} });
-  assert.equal(ingressUnavailable.message.tool_result.ok, false);
-  assert.match(ingressUnavailable.message.content, /only available during history ingress/);
+  const messageUnavailable = await conversation.execute({ id: "end-message", name: "EndTurn", arguments: { message: "not self time" } });
+  assert.equal(messageUnavailable.message.tool_result.ok, false);
+  assert.match(messageUnavailable.message.content, /available only during self time/);
+  for (const legacyName of ["EndSelfTimeSession", "EndFreeTimeSession", "EndHistoryIngress"]) {
+    const legacy = await executor.execute({ id: legacyName, name: legacyName, arguments: {} });
+    assert.equal(legacy.message.tool_result.ok, false);
+    assert.match(legacy.message.content, /is not available/);
+  }
+});
+
+test("every session can retain one genuinely executed initial ToolCheck exchange", async () => {
+  const api = new MockKweb([node(1)]);
+  const context = new KwebContext(api, id(1)); await context.initialize();
+  const chatend = new Chatend("instructions", context);
+  const executor = new ToolExecutor({ mode: "conversation", context, api, loadLimit: 20 });
+  assert.equal(await ensureInitialToolCheck(chatend, executor), true);
+  assert.equal(executor.toolLog.filter(entry => entry.name === "ToolCheck" && entry.ok).length, 1);
+  assert.match(chatend.messages.at(-2).content, /"ToolCheck"/);
+  assert.match(chatend.messages.at(-1).content, /Tool calls are working/);
+  assert.equal(chatend.messages.at(-1).tool_result.result.toolCallsWorking, true);
+  assert.equal(await ensureInitialToolCheck(chatend, executor), false);
+  chatend.rebuild();
+  assert.match(chatend.messages.find(message => message.tool_name === "ToolCheck").content, /Tool calls are working/);
 });
 
 test("self-time clocks, rollover threshold, and custom prompt preserve one durable run", () => {
@@ -846,11 +895,11 @@ test("self-time clocks, rollover threshold, and custom prompt preserve one durab
   assert.equal(opening, "Self time session 2 is open, you have 5:00 remaining in the shared sessions run.");
   assert.match(
     freeTimeTurnContinuationMessage({ deadlineAt: new Date(now + 300_000).toISOString() }, now),
-    /still active, with 5:00 remaining.*normal answer does not end self time.*EndSelfTimeSession/s,
+    /still active, with 5:00 remaining.*normal answer does not end self time.*EndTurn/s,
   );
   assert.match(
     freeTimeNoAnswerContinuationMessage({ deadlineAt: new Date(now + 300_000).toISOString() }, now),
-    /no assistant answer.*5:00 remaining.*concrete answer or Kennedy tool call/s,
+    /no assistant answer.*5:00 remaining.*EndTurn/s,
   );
   const next = nextFreeTimeSlice({
     runId: "self-time-run", sliceIndex: 2, deadlineAt: new Date(now + 600_000).toISOString(),
@@ -883,13 +932,13 @@ test("self-time opening keeps the automatic, launch, and handoff messages distin
     "Message passed from the previous self time session:\n\nContinue from node 7.\nKeep the uncertainty.",
   ]);
 
-  const ended = await session.executor.execute({ id: "end", name: "EndSelfTimeSession", arguments: { message: "Inspect node 11 next." } });
+  const ended = await session.executor.execute({ id: "end", name: "EndTurn", arguments: { message: "Inspect node 11 next." } });
   assert.equal(ended.message.tool_result.result.messageForwarded, true);
   assert.equal(session.freeTime.nextSessionMessage, "Inspect node 11 next.");
   assert.equal(session.snapshot().archive.freeTime.nextSessionMessage, "Inspect node 11 next.");
 
   now += 360_001;
-  const noNext = await session.executor.execute({ id: "end-late", name: "EndSelfTimeSession", arguments: { message: "This cannot be forwarded." } });
+  const noNext = await session.executor.execute({ id: "end-late", name: "EndTurn", arguments: { message: "This cannot be forwarded." } });
   assert.equal(noNext.message.tool_result.result.messageForwarded, false);
   assert.equal("nextSessionMessage" in session.freeTime, false);
 });
@@ -1003,21 +1052,23 @@ test("a truncated tool response abandons the provider thread and replays only it
         usage: null,
       };
     }
-    return { status: "complete", response_id: "clean-thread", message: { role: "assistant", content: "Finished." }, usage: null };
+    if (requests.length === 2) return { status: "complete", response_id: "clean-thread", message: { role: "assistant", content: "Finished." }, usage: null };
+    return { status: "complete", response_id: "ended-thread", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
   } };
   const executed = [];
   await runAgentLoop({
     intelligence, provider: "p", model: "m", chatend,
     executor: {
+      turnEndContent: null,
       execute: async call => {
         executed.push(call.name);
-        return { reset: false, message: { role: "user", display_role: "Memory tool result", content: `${call.name} completed.` } };
+        return { reset: false, endTurn: call.name === "EndTurn", message: { role: "user", display_role: "Control tool result", content: `${call.name} completed.` } };
       },
       failure: () => { throw new Error("unexpected failure"); },
     },
     continuation: new ContinuationState("kennedy-test"), usage: new UsageTracker(),
   });
-  assert.deepEqual(executed, ["First"]);
+  assert.deepEqual(executed, ["First", "EndTurn"]);
   assert.equal(requests[1].previous_response_id, null);
   assert.match(requests[1].chatend, /Agent manuals\n\ninstructions/);
   assert.match(requests[1].chatend, /First completed\./);
@@ -1036,11 +1087,13 @@ test("agent loop executes multiple text tool calls before the next generation", 
       message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"First","arguments":{}},{"name":"Second","arguments":{}}]}' },
       usage: { input_tokens: 100, output_tokens: 10, cached_tokens: 80, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true, last_input_tokens: 100, last_output_tokens: 10 },
     };
-    return { status: "complete", response_id: "resp_2", message: { role: "assistant", content: "Finished." }, usage: { input_tokens: 230, output_tokens: 15, cached_tokens: 180, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true, last_input_tokens: 130, last_output_tokens: 5 } };
+    if (requests.length === 2) return { status: "complete", response_id: "resp_2", message: { role: "assistant", content: "Finished." }, usage: { input_tokens: 230, output_tokens: 15, cached_tokens: 180, cache_write_tokens: 20, reasoning_tokens: 4, cumulative: true, last_input_tokens: 130, last_output_tokens: 5 } };
+    return { status: "complete", response_id: "resp_3", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
   } };
   const executed = [];
   const executor = {
-    execute: async call => { executed.push(call.name); return { reset: false, message: { role: "user", display_role: "Memory tool result", content: `${call.name} completed.` } }; },
+    turnEndContent: null,
+    execute: async call => { executed.push(call.name); return { reset: false, endTurn: call.name === "EndTurn", message: { role: "user", display_role: "Memory tool result", content: `${call.name} completed.` } }; },
     failure: () => { throw new Error("unexpected failure"); },
   };
   const continuation = new ContinuationState("kennedy-test");
@@ -1052,9 +1105,10 @@ test("agent loop executes multiple text tool calls before the next generation", 
     intelligence, provider: "p", model: "m", chatend, executor, continuation, usage,
     checkpoint: async () => checkpoints.push(chatend.messages.map(message => message.content)),
   });
-  assert.equal(answer, "Finished.");
-  assert.deepEqual(executed, ["First", "Second"]);
-  assert.equal(requests.length, 2);
+  assert.equal(answer, AGENT_LOOP_TURN_ENDED);
+  assert.equal(executor.turnEndContent, "Finished.");
+  assert.deepEqual(executed, ["First", "Second", "EndTurn"]);
+  assert.equal(requests.length, 3);
   assert.equal(requests[1].previous_response_id, "resp_1");
   assert.match(requests[1].chatend, /^Latency\n\nLatency: LLM call \d+ ms/);
   assert.match(requests[1].chatend, /Memory tool result\n\nFirst completed\./);
@@ -1067,12 +1121,12 @@ test("agent loop executes multiple text tool calls before the next generation", 
   assert.equal(usage.snapshot().contextTokens, 135);
   assert.equal(usage.snapshot().contextRemaining, 865);
   assert.equal(usage.snapshot().cacheReadPercent, (100 * 180) / 230);
-  assert.equal(checkpoints.length, 1);
+  assert.equal(checkpoints.length, 3);
   assert.equal(checkpoints[0].includes("First completed."), true);
   assert.equal(checkpoints[0].includes("Second completed."), true);
 });
 
-test("EndSelfTimeSession checkpoints its result and returns loop control without another generation", async () => {
+test("EndTurn checkpoints its result and returns loop control without another generation", async () => {
   const context = new KwebContext(new MockKweb([node(1)]), id(1)); await context.initialize();
   const chatend = new Chatend("free-time instructions", context, [{ role: "user", content: "Have fun." }]);
   let requests = 0;
@@ -1082,26 +1136,26 @@ test("EndSelfTimeSession checkpoints its result and returns loop control without
       requests += 1;
       return {
         status: "complete", response_id: "free-time-thread", usage: null,
-        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndSelfTimeSession","arguments":{}}]}' },
+        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' },
       };
     },
   };
   const executor = new ToolExecutor({
     mode: "free-time", context, api: context.api, provenanceId: "prov", loadLimit: 50,
-    endSession: () => ({ totalTimeReduced: false }),
+    endTurn: () => ({ totalTimeReduced: false, remaining: "12:00", messageForwarded: false, next: "The run will end." }),
   });
   const result = await runAgentLoop({
     intelligence, provider: "p", model: "m", chatend, executor,
     continuation: new ContinuationState("free-time-test"), usage: new UsageTracker(),
     checkpoint: async () => { checkpoints += 1; },
   });
-  assert.equal(result, AGENT_LOOP_SESSION_ENDED);
+  assert.equal(result, AGENT_LOOP_TURN_ENDED);
   assert.equal(requests, 1);
   assert.equal(checkpoints, 1);
-  assert.match(chatend.messages.at(-1).content, /total time unchanged/i);
+  assert.match(chatend.messages.find(message => message.tool_name === "EndTurn").content, /total time unchanged/i);
 });
 
-test("self time continues after empty and ordinary answers until EndSelfTimeSession", async () => {
+test("self time continues after empty and ordinary answers until EndTurn", async () => {
   const now = Date.parse("2026-07-17T12:00:00Z");
   const requests = [];
   let generations = 0;
@@ -1122,7 +1176,7 @@ test("self time continues after empty and ordinary answers until EndSelfTimeSess
       }
       return {
         status: "complete", response_id: "end-session-thread", usage: null,
-        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndSelfTimeSession","arguments":{}}]}' },
+        message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' },
       };
     },
   };
@@ -1140,12 +1194,12 @@ test("self time continues after empty and ordinary answers until EndSelfTimeSess
   session.stageFreeTimeOpening();
   await assert.rejects(
     () => session.finalizeFreeTime(),
-    /only after EndSelfTimeSession or the shared deadline/,
+    /only after EndTurn or the shared deadline/,
   );
 
   const result = await session.resumePendingTurn();
 
-  assert.equal(result.description, AGENT_LOOP_SESSION_ENDED.description);
+  assert.equal(result.description, AGENT_LOOP_TURN_ENDED.description);
   assert.equal(generations, 3);
   assert.equal(session.freeTimeEndReason, "tool");
   assert.equal(session.pendingTurn, false);
@@ -1173,14 +1227,20 @@ test("a pre-boundary Codex thread is replayed from the full visible Chatend", as
     if (requests.length === 1) {
       throw Object.assign(new Error("stale"), { code: "stale_codex_thread" });
     }
-    return { status: "complete", response_id: "clean-thread", message: { role: "assistant", content: "Clean answer." }, usage: null };
+    if (requests.length === 2) return { status: "complete", response_id: "clean-thread", message: { role: "assistant", content: "Clean answer." }, usage: null };
+    return { status: "complete", response_id: "ended-thread", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
   } };
+  const executor = {
+    turnEndContent: null,
+    execute: async call => ({ endTurn: call.name === "EndTurn", message: { role: "user", content: "Turn ended." } }),
+  };
   const answer = await runAgentLoop({
     intelligence, provider: "p", model: "m", chatend,
-    executor: { execute: async () => { throw new Error("unexpected tool"); } },
+    executor,
     continuation, usage: new UsageTracker(),
   });
-  assert.equal(answer, "Clean answer.");
+  assert.equal(answer, AGENT_LOOP_TURN_ENDED);
+  assert.equal(executor.turnEndContent, "Clean answer.");
   assert.equal(requests[0].previous_response_id, "legacy-thread");
   assert.doesNotMatch(requests[0].chatend, /visible instructions/);
   assert.equal(requests[1].previous_response_id, null);
@@ -1247,16 +1307,21 @@ test("ResetContext abandons continuation and resends the rebuilt full chatend", 
   const intelligence = { generate: async request => {
     requests.push(request);
     if (requests.length === 1) return { status: "complete", response_id: "resp_old", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[],"selfMessage":"carry this forward"}}]}' }, usage: null };
-    return { status: "complete", response_id: "resp_new", message: { role: "assistant", content: "Fresh context." }, usage: null };
+    if (requests.length === 2) return { status: "complete", response_id: "resp_new", message: { role: "assistant", content: "Fresh context." }, usage: null };
+    return { status: "complete", response_id: "resp_end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
   } };
   const executor = {
-    execute: async () => ({
-      reset: true,
-      selfMessage: "carry this forward",
-      resetHistoryEntry: { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 20 },
-      previousContext: context.snapshot(),
-      message: { role: "user", display_role: "Memory tool result", content: "Memory context reset completed." },
-    }),
+    turnEndContent: null,
+    execute: async call => call.name === "EndTurn" ? {
+      endTurn: true,
+      message: { role: "user", display_role: "Control tool result", content: "Turn ended." },
+    } : ({
+        reset: true,
+        selfMessage: "carry this forward",
+        resetHistoryEntry: { retainedNodeNames: [], budgetUsed: 1, budgetLimit: 20 },
+        previousContext: context.snapshot(),
+        message: { role: "user", display_role: "Memory tool result", content: "Memory context reset completed." },
+      }),
     failure: () => { throw new Error("unexpected failure"); },
   };
   await runAgentLoop({ intelligence, provider: "p", model: "m", chatend, executor, continuation: new ContinuationState("kennedy-test"), usage: new UsageTracker() });
@@ -1292,7 +1357,7 @@ test("a repeated ResetContext loop cannot successfully reset more than the share
         role: "assistant",
         content: requests <= 22
           ? 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}'
-          : "Stopped resetting.",
+          : requests === 23 ? "Stopped resetting." : 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}',
       },
       usage: null,
     };
@@ -1302,7 +1367,8 @@ test("a repeated ResetContext loop cannot successfully reset more than the share
     intelligence, provider: "p", model: "m", chatend, executor,
     continuation: new ContinuationState("kennedy-test"), usage: new UsageTracker(),
   });
-  assert.equal(answer, "Stopped resetting.");
+  assert.equal(answer, AGENT_LOOP_TURN_ENDED);
+  assert.equal(executor.turnEndContent, "Stopped resetting.");
   assert.equal(executor.loadCalls, 22);
   assert.equal(executor.toolLog.filter(entry => entry.name === "ResetContext" && entry.ok).length, 20);
   assert.equal(executor.toolLog.filter(entry => entry.name === "ResetContext" && !entry.ok && entry.code === "load_budget_exhausted").length, 2);
@@ -1333,7 +1399,7 @@ test("conversation provenance preserves the complete structured Chatend", async 
   assert.match(archive.systemPrompt, /Shared/);
   assert.match(archive.systemPrompt, /Codex harness\n\nShared Codex outer-harness note/);
   assert.equal(archive.context.snapshot.nodes[0].longDescription, "Details 1");
-  assert.match(archive.messages.find(message => typeof message.content === "string" && message.content.includes("KENNEDY_TOOL_CALLS")).content, /LoadNode/);
+  assert.match(archive.messages.find(message => typeof message.content === "string" && message.content.includes('"LoadNode"')).content, /LoadNode/);
   assert.match(archive.messages.find(message => message.display_role === "Memory tool result").content, /Loaded/);
   assert.equal(archive.messages.at(-1).content[1].image_url, "data:image/png;base64,AAAA");
   assert.equal(archive.fullHistory.segments[0].messages[0].content, "Earlier context.");
@@ -1418,7 +1484,10 @@ test("a structured Chatend archive retains activity while refreshing current man
   assert.deepEqual(restored.context.loadedNodeIds, [id(1), id(2), id(3)]);
   assert.match(restored.chatend.messages.find(message => message.context_kind === "memory").content, /Always-loaded root identifiers: 1, 3/);
   assert.equal(restored.executor.loadCalls, 3);
-  assert.deepEqual(restored.executor.toolLog, [{ name: "LoadNode", ok: true }]);
+  assert.deepEqual(restored.executor.toolLog.map(entry => ({ name: entry.name, ok: entry.ok })), [
+    { name: "ToolCheck", ok: true },
+    { name: "LoadNode", ok: true },
+  ]);
   assert.equal(restored.usage.snapshot().totalInputTokens, 12);
   assert.deepEqual(restored.chatend.historySegments, source.chatend.historySegments);
 });
@@ -1460,7 +1529,7 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
     requests.push(request);
     return generations === 1
       ? { status: "complete", response_id: "ingress-response", message: { role: "assistant", content: "Memory review complete." }, usage: null }
-      : { status: "complete", response_id: "ingress-ended", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndHistoryIngress","arguments":{}}]}' }, usage: null };
+      : { status: "complete", response_id: "ingress-ended", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
   }, recordTiming: timing => timings.push(timing) };
   const checkpoints = [];
   await runHistoryIngress({
@@ -1494,13 +1563,14 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   assert.equal("messages" in requests[0], false);
   assert.equal(checkpoints.at(-1).messages.some(message => message.content === "Memory review complete."), true);
   assert.equal(checkpoints.at(-1).messages.some(message => message.context_kind === "history-ingress-continuation"), true);
-  assert.match(checkpoints.at(-1).messages.find(message => message.context_kind === "history-ingress-continuation").content, /You do have access to Kennedy tool calls.*EndHistoryIngress/s);
-  assert.equal(checkpoints.at(-1).tools.log.at(-1).name, "EndHistoryIngress");
+  assert.match(checkpoints.at(-1).messages.find(message => message.context_kind === "history-ingress-continuation").content, /You do have access to Kennedy tool calls.*EndTurn/s);
+  assert.equal(checkpoints.at(-1).tools.log.at(-1).name, "EndTurn");
   assert.equal(checkpoints.at(-1).retained[0].context_kind, "provenance");
-  assert.match(checkpoints.at(-1).messages.at(-1).content, /final checkpoint is being saved/);
+  assert.match(checkpoints.at(-1).messages.find(message => message.tool_name === "EndTurn").content, /final checkpoint is being saved/);
   assert.equal(checkpoints.at(-1).context.snapshot.nodes[0].longDescription, "Details 1");
   assert.deepEqual(checkpoints.at(-1).fullHistory.segments, []);
   assert.deepEqual(timings.map(timing => [timing.action, timing.status, timing.sessionType]), [
+    ["tool", "ok", "history-ingress"],
     ["tool", "ok", "history-ingress"],
     ["turn", "ok", "history-ingress"],
   ]);
@@ -1516,8 +1586,32 @@ test("history ingress compacts archived Kmap nodes to titles and short descripti
   assert.equal(resumed.length, 1);
   assert.equal(resumed[0].completed, true);
   assert.equal(resumed[0].messages.some(message => message.content === "Memory review complete."), true);
-  assert.match(resumed[0].messages.at(-1).content, /final checkpoint is being saved/);
+  assert.match(resumed[0].messages.find(message => message.tool_name === "EndTurn").content, /final checkpoint is being saved/);
   assert.equal(resumed[0].roundsUsed, 2);
+
+  const legacyCompleted = structuredClone(checkpoints.at(-1));
+  legacyCompleted.completed = true;
+  legacyCompleted.roundsUsed = 100;
+  legacyCompleted.tools.log = legacyCompleted.tools.log.map(entry =>
+    entry.name === "EndTurn" ? { ...entry, name: "EndHistoryIngress" } : entry
+  );
+  let legacyGenerations = 0;
+  const migrated = [];
+  await runHistoryIngress({
+    kweb,
+    intelligence: { generate: async () => {
+      legacyGenerations += 1;
+      return { status: "complete", response_id: "migrated-end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
+    } },
+    manuals: promptManuals("Changed"), rootNodeId: id(1),
+    provenanceId: "provenance", provider: "p", model: "m",
+    restoredArchive: legacyCompleted, checkpoint: async archive => migrated.push(structuredClone(archive)), onUpdate: () => {},
+  });
+  assert.equal(legacyGenerations, 1);
+  assert.equal(migrated[0].completed, false);
+  assert.equal(migrated[0].roundsUsed, 0);
+  assert.equal(migrated.at(-1).completed, true);
+  assert.equal(migrated.at(-1).tools.log.at(-1).name, "EndTurn");
 
   const exhausted = structuredClone(checkpoints.at(-1));
   exhausted.completed = false;
@@ -1544,7 +1638,7 @@ test("history ingress durably checkpoints pre-reset Full History segments", asyn
       ? { status: "complete", response_id: "before-reset", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"ResetContext","arguments":{"identifiers":[]}}]}' }, usage: null }
       : requests === 2
         ? { status: "complete", response_id: "after-reset", message: { role: "assistant", content: "Ingress complete after reset." }, usage: null }
-        : { status: "complete", response_id: "after-reset-end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndHistoryIngress","arguments":{}}]}' }, usage: null };
+        : { status: "complete", response_id: "after-reset-end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
   } };
   const checkpoints = [];
   await runHistoryIngress({
@@ -1899,10 +1993,7 @@ test("conversation checkpoints the pending query before any model request", asyn
   const timings = [];
   const kweb = new MockKweb([node(1)]);
   const intelligence = {
-    generate: async () => {
-      events.push("generate");
-      return { status: "complete", response_id: "response", message: { role: "assistant", content: "Saved answer." }, usage: null };
-    },
+    generate: endTurnGenerator("Saved answer.", { onRequest: () => events.push("generate") }),
     recordTiming: timing => timings.push(timing),
   };
   const session = new ConversationSession({
@@ -1911,14 +2002,18 @@ test("conversation checkpoints the pending query before any model request", asyn
   });
   await session.initialize();
   await session.send("Saved question");
-  assert.deepEqual(events, ["checkpoint-pending", "generate", "checkpoint-complete"]);
-  assert.deepEqual(metadata, [{ userActivity: true }, {}]);
+  assert.equal(events[0], "checkpoint-pending");
+  assert.equal(events[1], "generate");
+  assert.equal(events.at(-1), "checkpoint-complete");
+  assert.equal(events.filter(event => event === "generate").length, 2);
+  assert.deepEqual(metadata[0], { userActivity: true });
+  assert.ok(metadata.slice(1).every(item => Object.keys(item).length === 0));
   assert.deepEqual(session.transcript.map(item => item.content), ["Saved question", "Saved answer."]);
   const turn = timings.find(timing => timing.action === "turn");
   assert.equal(turn.status, "ok");
   assert.equal(turn.sessionType, "conversation");
   assert.equal(Number.isInteger(turn.durationMs), true);
-  assert.equal(turn.stepCount, 3);
+  assert.ok(turn.stepCount >= 5);
   const summary = session.chatend.messages.find(message => message.display_role === "Latency summary");
   assert.match(summary.content, /^Turn latency: \d+ ms total · \d+ ms in LLM\/tools$/);
   assert.equal(summary.content.includes("\n"), false);
@@ -1949,6 +2044,7 @@ test("an in-flight conversation can be stopped and remains explicitly retryable"
   let generateMode = "wait";
   let generateStarted;
   let releaseGenerateStarted;
+  let responseReady = false;
   let seenOptions = null;
   let cancelledOperationId = null;
   generateStarted = new Promise(resolve => { releaseGenerateStarted = resolve; });
@@ -1956,7 +2052,11 @@ test("an in-flight conversation can be stopped and remains explicitly retryable"
     generate: async (_request, options) => {
       seenOptions = options;
       if (generateMode === "answer") {
-        return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered." }, usage: null };
+        if (!responseReady) {
+          responseReady = true;
+          return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered." }, usage: null };
+        }
+        return { status: "complete", response_id: "end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
       }
       releaseGenerateStarted();
       return new Promise((_resolve, reject) => {
@@ -1990,10 +2090,7 @@ test("an in-flight conversation can be stopped and remains explicitly retryable"
 
 test("document attachments become model-readable text without duplicating extraction in media", async () => {
   const kweb = new MockKweb([node(1)]);
-  const intelligence = { generate: async () => ({
-    status: "complete", response_id: "document-response",
-    message: { role: "assistant", content: "I read the report." }, usage: null,
-  }) };
+  const intelligence = { generate: endTurnGenerator("I read the report.") };
   const session = new ConversationSession({
     kweb, intelligence, manuals: promptManuals("Shared"),
     rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
@@ -2022,15 +2119,44 @@ test("restored pending conversation resumes from durable transcript and context"
   let generated = 0;
   const session = new ConversationSession({
     kweb,
-    intelligence: { generate: async () => { generated += 1; return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered answer." }, usage: null }; } },
+    intelligence: { generate: endTurnGenerator("Recovered answer.", { onRequest: () => { generated += 1; } }) },
     manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m", persist: async () => {}, onUpdate: () => {},
   });
   await session.initialize({ startedAt: "2026-07-12T00:00:00Z", transcript: [{ role: "user", content: "Interrupted query" }], loadedNodeIds: [id(1), id(2)], pendingTurn: true });
   assert.deepEqual(session.context.loadedNodeIds, [id(1), id(2)]);
   await session.resumePendingTurn();
-  assert.equal(generated, 1);
+  assert.equal(generated, 2);
   assert.equal(session.pendingTurn, false);
   assert.equal(session.transcript.at(-1).content, "Recovered answer.");
+});
+
+test("a response awaiting EndTurn survives reload without being generated again", async () => {
+  const kweb = new MockKweb([node(1)]);
+  const source = new ConversationSession({
+    kweb, intelligence: {}, manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
+  });
+  await source.initialize();
+  source.stageUserInput("Question");
+  source.pendingTurn = true;
+  source.executor.turnEndContent = "Prepared answer.";
+  source.chatend.append({ role: "assistant", content: "Prepared answer." });
+  source.chatend.append({ role: "user", context_kind: "turn-continuation", content: "Call EndTurn." });
+  const saved = source.snapshot();
+
+  let generations = 0;
+  const restored = new ConversationSession({
+    kweb,
+    intelligence: { generate: async () => {
+      generations += 1;
+      return { status: "complete", response_id: "end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
+    } },
+    manuals: promptManuals("Changed"), rootNodeId: id(1), provider: "p", model: "m", persist: async () => {},
+  });
+  await restored.initialize(saved);
+  assert.equal(restored.executor.turnEndContent, "Prepared answer.");
+  await restored.resumePendingTurn();
+  assert.equal(generations, 1);
+  assert.deepEqual(restored.transcript.map(item => item.content), ["Question", "Prepared answer."]);
 });
 
 test("a restored user tail is retryable even when an older checkpoint omitted pendingTurn", async () => {
@@ -2087,16 +2213,13 @@ test("a structured pending Chatend resumes from cold start without duplicating i
   const requests = [];
   const restored = new ConversationSession({
     kweb,
-    intelligence: { generate: async request => {
-      requests.push(request);
-      return { status: "complete", response_id: "response", message: { role: "assistant", content: "Recovered once." }, usage: null };
-    } },
+    intelligence: { generate: endTurnGenerator("Recovered once.", { onRequest: request => requests.push(request) }) },
     manuals: promptManuals("Changed"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async () => {}, onUpdate: () => {},
   });
   await restored.initialize(saved);
   await restored.resumePendingTurn();
-  assert.equal(requests.length, 1);
+  assert.equal(requests.length, 2);
   assert.equal(requests[0].previous_response_id, null);
   assert.equal(requests[0].chatend.match(/Cold-start query/g)?.length, 1);
   assert.deepEqual(restored.transcript.map(item => item.content), ["Cold-start query", "Recovered once."]);
@@ -2114,7 +2237,8 @@ test("a failed mid-loop checkpoint rolls back transient tool state before retry"
         status: "complete", response_id: "tool-response",
         message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' }, usage: { input_tokens: 10, output_tokens: 2 },
       };
-      return { status: "complete", response_id: "retry-response", message: { role: "assistant", content: "Recovered cleanly." }, usage: null };
+      if (generations === 2) return { status: "complete", response_id: "retry-response", message: { role: "assistant", content: "Recovered cleanly." }, usage: null };
+      return { status: "complete", response_id: "retry-end", message: { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"EndTurn","arguments":{}}]}' }, usage: null };
     } },
     manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async () => { checkpoints += 1; if (checkpoints === 2) throw new Error("checkpoint interrupted"); }, onUpdate: () => {},
@@ -2122,13 +2246,13 @@ test("a failed mid-loop checkpoint rolls back transient tool state before retry"
   await session.initialize();
   await assert.rejects(() => session.send("Load more context"), /checkpoint interrupted/);
   assert.deepEqual(session.context.loadedNodeIds, [id(1)]);
-  assert.deepEqual(session.executor.toolLog, []);
+  assert.deepEqual(session.executor.toolLog.map(entry => entry.name), ["ToolCheck"]);
   assert.equal(session.usage.snapshot().requests, 0);
   assert.equal(session.chatend.messages.some(message => message.content?.includes?.("LoadNode")), false);
   assert.equal(session.continuation.previousResponseId, null);
 
   await session.resumePendingTurn();
-  assert.equal(generations, 2);
+  assert.equal(generations, 3);
   assert.equal(session.pendingTurn, false);
   assert.equal(session.transcript.at(-1).content, "Recovered cleanly.");
 });
@@ -2155,7 +2279,7 @@ test("retry persists an initially failed pending checkpoint before generation", 
   let fail = true;
   const session = new ConversationSession({
     kweb,
-    intelligence: { generate: async () => { events.push("generate"); return { status: "complete", response_id: "response", message: { role: "assistant", content: "Answer." }, usage: null }; } },
+    intelligence: { generate: endTurnGenerator("Answer.", { onRequest: () => events.push("generate") }) },
     manuals: promptManuals("Shared"), rootNodeId: id(1), provider: "p", model: "m",
     persist: async state => { events.push(state.pendingTurn ? "persist-pending" : "persist-complete"); if (fail) { fail = false; throw new Error("history unavailable"); } }, onUpdate: () => {},
   });
@@ -2163,7 +2287,10 @@ test("retry persists an initially failed pending checkpoint before generation", 
   await assert.rejects(() => session.send("Question"), /history unavailable/);
   assert.deepEqual(events, ["persist-pending"]);
   await session.resumePendingTurn();
-  assert.deepEqual(events, ["persist-pending", "persist-pending", "generate", "persist-complete"]);
+  assert.equal(events[0], "persist-pending");
+  assert.equal(events[1], "persist-pending");
+  assert.equal(events.filter(event => event === "generate").length, 2);
+  assert.equal(events.at(-1), "persist-complete");
 });
 
 test("Kmap context uses compact role-based node and fanout representations", () => {
@@ -2230,7 +2357,7 @@ test("system prompt composition uses readable sections rather than markup wrappe
   const manuals = {
     identity: "Identity.",
     conversationSession: "Conversation session.",
-    freeTimeSession: "Self time. Have fun and use EndSelfTimeSession for a clean slate.",
+    freeTimeSession: "Self time. Have fun and use EndTurn for a clean slate.",
     historyIngressSession: "History session.",
     audioIngressSession: "Audio session.",
     codexHarness: "The outer harness catches Kennedy tool calls.",
@@ -2340,6 +2467,11 @@ test("shared Kmap basics enforce exclusive tool-request responses", async () => 
   assert.match(basics, /Do not use a Markdown fence/);
   assert.match(basics, /put text before the marker/);
   assert.match(basics, /Additional tools and their documentation may be available in the kmap/);
+  assert.match(basics, /Every Kennedy session begins with a real successful ToolCheck call/);
+  assert.match(basics, /Returns "Tool calls are working\."/);
+  assert.match(basics, /Every normally completed turn must finish with a successful standalone EndTurn tool call/);
+  assert.match(basics, /browser and Telegram conversations.*wait for the user's next message/s);
+  assert.match(basics, /history ingress, audio ingress, and self time, EndTurn ends the entire one-turn session/);
 });
 
 test("layered prompt assets separate session, shared read, web, and write contracts", async () => {
@@ -2627,8 +2759,8 @@ test("the browser exposes self time in a dedicated tab with a durable custom pro
   assert.match(app, /session\.stageFreeTimeOpening\(\)/);
   assert.match(app, /chatRuntimeReady\(\) \|\| freeTimeRuntimeReady\(\)/);
   assert.match(manual, /free to do whatever you want/i);
-  assert.match(manual, /EndSelfTimeSession/);
-  assert.match(manual, /\{\} or \{"message":"A message for the next self time session\."\}/);
+  assert.match(manual, /EndTurn/);
+  assert.match(manual, /optional message/);
   assert.match(manual, /allocating all remaining time/);
 });
 
@@ -2672,9 +2804,7 @@ test("telegram voice sessions archive media, correlate delivery, and emit contex
   const checkpoints = [];
   const session = new ConversationSession({
     kweb: new MockKweb([node(1)]),
-    intelligence: { generate: async () => ({
-      status: "complete", response_id: "telegram-response",
-      message: { role: "assistant", content: "I heard you." },
+    intelligence: { generate: endTurnGenerator("I heard you.", {
       usage: { input_tokens: 100001, output_tokens: 20, cached_tokens: 90000, cache_write_tokens: 0, reasoning_tokens: 0 },
     }) },
     manuals: promptManuals("Shared"), rootNodeId: id(1),
@@ -2740,9 +2870,7 @@ test("persistent Telegram group sessions append only unseen context and scope wa
   };
   const session = new ConversationSession({
     kweb: new MockKweb([node(1), node(2), node(3), node(4)]),
-    intelligence: { generate: async () => ({
-      status: "complete", response_id: "group-response",
-      message: { role: "assistant", content: "Group answer." },
+    intelligence: { generate: endTurnGenerator("Group answer.", {
       usage: { input_tokens: 100001, output_tokens: 20, cached_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0 },
     }) },
     manuals: promptManuals("Shared"), rootNodeIds: [id(1), id(2), id(3)],

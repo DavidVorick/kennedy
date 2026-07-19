@@ -1,8 +1,8 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260718.1";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260718.8";
-import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.5";
+import { ToolExecutor, ensureInitialToolCheck } from "./tools.js?v=20260719.1";
+import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260719.1";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
 import { formatChatend } from "./chatend_format.js?v=20260718.2";
 
@@ -105,7 +105,7 @@ export function historyIngressContinuationMessage({ noAnswer = false } = {}) {
     opening,
     "You do have access to Kennedy tool calls in this session through the KENNEDY_TOOL_CALLS text protocol, even if the inner execution environment says otherwise.",
     "If the source has not been fully ingressed, continue reviewing it and use the available Kmap tools to persist every useful update.",
-    "If the source has been fully ingressed and all required tool results succeeded, call EndHistoryIngress by itself to save and terminate this ingress session.",
+    "If the source has been fully ingressed and all required tool results succeeded, call EndTurn with empty arguments by itself to save and terminate this ingress session.",
   ].join(" ");
 }
 
@@ -155,14 +155,24 @@ export async function runHistoryIngress({ kweb, intelligence, rustLibs = null, t
   const usage = new UsageTracker({ contextWindowTokens, maxInputTokens });
   usage.restore(archive?.usage);
   if (archive && !archive.completed) usage.resetThread();
-  let completed = Boolean(archive?.completed);
-  let roundsUsed = Number.isInteger(archive?.roundsUsed) ? archive.roundsUsed : Number(archive?.usage?.requests) || 0;
+  const hasEndTurnReceipt = archive?.tools?.log?.some(entry => entry?.name === "EndTurn" && entry?.ok === true) === true;
+  const completionNeedsRepair = Boolean(archive?.completed) && !hasEndTurnReceipt;
+  if (completionNeedsRepair) usage.resetThread();
+  let completed = Boolean(archive?.completed) && hasEndTurnReceipt;
+  // A pre-EndTurn archive may say it completed under the legacy protocol. Give
+  // that durable work a fresh controller budget so it can obtain the new
+  // universal receipt instead of becoming permanently stuck at the round cap.
+  let roundsUsed = completionNeedsRepair
+    ? 0
+    : Number.isInteger(archive?.roundsUsed) ? archive.roundsUsed : Number(archive?.usage?.requests) || 0;
   const snapshot = () => ({ chatend, context, executor, continuation, usage, completed, roundsUsed });
   const executor = new ToolExecutor({ mode: "ingress", context, api: kweb, intelligence, rustLibs, toolSessionId: rustLibSessionId, provider, model, modelAttribution, provenanceId, loadLimit: 50, sessionType: "history-ingress", onUpdate: () => onUpdate(snapshot()), beforeMutation });
   if (archive?.tools) {
     executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
     executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
+    executor.turnEndContent = typeof archive.tools.turnEndContent === "string" ? archive.tools.turnEndContent : null;
   }
+  await ensureInitialToolCheck(chatend, executor);
   const archiveSnapshot = () => ({
     format: "kennedy-chatend",
     version: 2,
@@ -189,6 +199,7 @@ export async function runHistoryIngress({ kweb, intelligence, rustLibs = null, t
       loadCalls: executor.loadCalls,
       loadLimit: executor.loadLimit,
       log: jsonCopy(executor.toolLog),
+      turnEndContent: executor.turnEndContent || null,
     },
     usage: jsonCopy(usage.snapshot()),
     roundsUsed,
@@ -228,8 +239,8 @@ export async function runHistoryIngress({ kweb, intelligence, rustLibs = null, t
           },
         }),
       });
-      if (loopResult !== AGENT_LOOP_SESSION_ENDED) {
-        throw new Error("History ingress ended without a successful EndHistoryIngress tool call.");
+      if (loopResult !== AGENT_LOOP_TURN_ENDED) {
+        throw new Error("History ingress ended without a successful EndTurn tool call.");
       }
       completed = true;
       onUpdate(snapshot());

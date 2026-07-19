@@ -407,6 +407,16 @@ Kennedy—automatically records that combined identity on every affected node as
 its latest modifier. Node context and the memory explorer display this metadata;
 it is not part of any Kennedy tool signature.
 
+Every newly created or restored Kennedy session begins with a real
+`ToolCheck({})` request executed through the same text-tool dispatcher Kennedy
+uses later. Its retained result says `Tool calls are working.`, survives context
+resets, and the call remains repeatable. Ordinary prose never completes a
+normal Kennedy turn. Kennedy must finish every model-controlled turn with the
+universal standalone `EndTurn` tool. In browser and Telegram conversations it
+releases the preceding prose response and waits for the user; in self time and
+history/audio ingress it ends the entire one-turn session. Shared deadline and
+hard-stop enforcement may still terminate self time externally.
+
 ## Conversation Persistence
 
 The conversation history backend durably stores active and completed
@@ -627,19 +637,20 @@ recovery and every clean-slate rollover use the same remaining allowance.
 Kennedy is told to have fun, follow her own interests, and not wait for user
 work. Self time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
 Kmap write tools, plus the Kmap-documented Rust library tools. A run-level
-provenance record is supplied automatically for memory mutations.
-`EndSelfTimeSession({})` or
-`EndSelfTimeSession({"message":"A message for the next self time session."})`
-is available only in this mode and must be called alone. The optional message
-is a non-empty string of at most 400,000 characters. The call closes and
+provenance record is supplied automatically for memory mutations. The universal
+`EndTurn({})` call, or
+`EndTurn({"message":"A message for the next self-time session."})`, must be
+called alone. The optional self-time-only message is a non-empty string of at
+most 400,000 characters. The call closes and
 archives the current session without reducing the shared allowance; if at least
 five minutes remain, a fresh self-time Chatend opens immediately and receives
 the message. With less than five minutes left, the run ends and the message is
-not forwarded. Returning ordinary final text uses the same rollover threshold.
+not forwarded. Ordinary final text does not close or roll over the session.
 
 When less than three minutes remain, the harness injects one timer notification
-into the current Chatend. At the deadline all tools except the end control are
-blocked and Kennedy receives one final wrap-up round. The active intelligence
+into the current Chatend. At the deadline substantive tools are blocked while
+`ToolCheck` and `EndTurn` remain available, and Kennedy receives one final
+wrap-up round. The active intelligence
 operation is cancelled at a hard stop two minutes later. Generation and search
 requests retain the intelligence provider's profile-specific allowance, so a
 quality search can run longer than 90 seconds, while the remaining hard-stop
@@ -662,7 +673,7 @@ times in aggregate during the session.
 Kennedy will update as many nodes as she feels is appropriate during the
 history ingress session. Zero updates is also valid. A normal answer does not
 complete history ingress. When Kennedy has fully reviewed the source and every
-required mutation has succeeded, she must call `EndHistoryIngress({})` by
+required mutation has succeeded, she must call `EndTurn({})` by
 itself. Any other final text receives a durable controller message affirming
 that the text-protocol tools are available and directing her to continue or
 call the end tool. History ingress may use WebSearch and WebFetch when external evidence

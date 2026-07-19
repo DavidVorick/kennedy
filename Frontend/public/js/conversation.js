@@ -1,10 +1,10 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260718.1";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
-import { ToolExecutor } from "./tools.js?v=20260718.8";
-import { AGENT_LOOP_SESSION_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260718.5";
+import { END_TURN_NAME, TOOL_CHECK_NAME, ToolExecutor, ensureInitialToolCheck } from "./tools.js?v=20260719.1";
+import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260719.1";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeTurnContinuationMessage, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260717.2";
+import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeTurnContinuationMessage, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260719.1";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -102,13 +102,15 @@ export class ConversationSession {
       onUpdate: this.onUpdate,
       beforeMutation: () => this.assertFreeTimeToolAllowed("Kmap write"),
       toolGate: name => this.assertFreeTimeToolAllowed(name),
-      endSession: message => this.requestFreeTimeSessionEnd(message),
+      endTurn: message => this.requestFreeTimeSessionEnd(message),
       requestTimeoutSeconds: () => this.freeTimeRequestTimeoutSeconds(),
     });
     if (archive?.tools) {
       this.executor.loadCalls = Number.isInteger(archive.tools.loadCalls) ? archive.tools.loadCalls : 0;
       this.executor.toolLog = Array.isArray(archive.tools.log) ? jsonCopy(archive.tools.log) : [];
+      this.executor.turnEndContent = typeof archive.tools.turnEndContent === "string" ? archive.tools.turnEndContent : null;
     }
+    await ensureInitialToolCheck(this.chatend, this.executor);
     this.usage.restore(archive?.usage);
     if (archive) this.usage.resetThread();
     this.durableState = this.snapshot();
@@ -166,6 +168,7 @@ export class ConversationSession {
         loadCalls: this.executor?.loadCalls || 0,
         loadLimit: this.executor?.loadLimit || (this.sessionType === "free-time" ? 50 : 20),
         log: jsonCopy(this.executor?.toolLog || []),
+        turnEndContent: this.executor?.turnEndContent || null,
       },
       usage: jsonCopy(this.usage?.snapshot() || null),
       pendingExternalEventId: this.pendingExternalEventId,
@@ -205,6 +208,7 @@ export class ConversationSession {
     this.context.restore(archive.context.state);
     this.executor.loadCalls = Number.isInteger(archive.tools?.loadCalls) ? archive.tools.loadCalls : 0;
     this.executor.toolLog = jsonCopy(archive.tools?.log || []);
+    this.executor.turnEndContent = typeof archive.tools?.turnEndContent === "string" ? archive.tools.turnEndContent : null;
     this.executor.provenanceId = this.provenanceId;
     this.executor.toolSessionId = this.rustLibSessionId;
     this.usage.restore(archive.usage);
@@ -303,7 +307,7 @@ export class ConversationSession {
   async runPendingTurn(timing = createTurnTiming(this.sessionType), turn = this.activeTurn) {
     if (!this.pendingTurn) return null;
     try {
-      const answer = await runAgentLoop({
+      let answer = await runAgentLoop({
         intelligence: this.intelligence, provider: this.provider, model: this.model,
         chatend: this.chatend, executor: this.executor, continuation: this.continuation,
         usage: this.usage, timing, onUpdate: this.onUpdate,
@@ -319,11 +323,18 @@ export class ConversationSession {
       if (turn?.controller.signal.aborted) throw turnStoppedError();
       turn.cancellable = false;
       this.onUpdate();
-      if (answer === AGENT_LOOP_SESSION_ENDED) {
-        if (typeof this.executor.sessionEndContent === "string" && this.executor.sessionEndContent.trim()) {
-          this.transcript.push({ role: "kennedy", content: this.executor.sessionEndContent });
-          this.chatend.retained.push({ role: "assistant", content: this.executor.sessionEndContent });
-          this.executor.sessionEndContent = null;
+      if (answer === AGENT_LOOP_TURN_ENDED && this.sessionType !== "free-time") {
+        answer = this.executor.turnEndContent;
+        this.executor.turnEndContent = null;
+        if (typeof answer !== "string" || !answer.trim()) {
+          throw new Error("Kennedy ended the turn without first providing a response for the user.");
+        }
+      }
+      if (answer === AGENT_LOOP_TURN_ENDED) {
+        if (typeof this.executor.turnEndContent === "string" && this.executor.turnEndContent.trim()) {
+          this.transcript.push({ role: "kennedy", content: this.executor.turnEndContent });
+          this.chatend.retained.push({ role: "assistant", content: this.executor.turnEndContent });
+          this.executor.turnEndContent = null;
         }
         this.pendingTurn = false;
         this.pendingExternalEventId = null;
@@ -384,6 +395,7 @@ export class ConversationSession {
       ? metadata.attachments.filter(item => item?.kind === "document" && typeof item.text === "string" && item.text.trim())
       : [];
     if (!content && !attachments.length) return false;
+    if (this.executor) this.executor.turnEndContent = null;
     const externalEventId = typeof metadata.externalEventId === "string" ? metadata.externalEventId : null;
     const inputKind = metadata.inputKind === "voice" ? "voice" : attachments.length ? "document" : "text";
     let chatendContent = content;
@@ -472,7 +484,7 @@ export class ConversationSession {
   }
 
   assertFreeTimeToolAllowed(name) {
-    if (this.sessionType !== "free-time" || ["EndSelfTimeSession", "EndFreeTimeSession"].includes(name)) return;
+    if (this.sessionType !== "free-time" || [END_TURN_NAME, TOOL_CHECK_NAME].includes(name)) return;
     if (freeTimeTiming(this.freeTime, this.now()).expired) {
       throw Object.assign(new Error("The self-time deadline has passed; tools are no longer available during wrap-up."), { code: "free_time_expired" });
     }
@@ -559,7 +571,7 @@ export class ConversationSession {
     const explicitToolEnd = reason === "tool" && this.freeTimeEndReason === "tool";
     const timerEnd = ["deadline", "hard-stop"].includes(reason) && timing.expired;
     if (!explicitToolEnd && !timerEnd) {
-      throw new Error("Self time can finalize only after EndSelfTimeSession or the shared deadline.");
+      throw new Error("Self time can finalize only after EndTurn or the shared deadline.");
     }
     if (timing.expired && !this.freeTime.expiredNoticeAt) {
       this.freeTime.expiredNoticeAt = new Date(this.now()).toISOString();

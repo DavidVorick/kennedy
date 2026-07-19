@@ -33,7 +33,7 @@ const CONVERSATION_SUMMARIES_MIGRATION: &str =
     include_str!("../migrations/006_conversation_summaries.sql");
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
-const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-history-ingress-v1";
+const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-turn-v1";
 const SUMMARY_TEXT_LIMIT: usize = 512;
 
 #[derive(Clone, Debug)]
@@ -637,16 +637,20 @@ fn requires_history_ingress_repair(state: &Value) -> bool {
         == Some(true)
 }
 
-fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
+fn tool_log_has_success(state: &Value, pointer: &str, name: &str) -> bool {
     state
-        .pointer("/historyIngress/tools/log")
+        .pointer(pointer)
         .and_then(Value::as_array)
         .is_some_and(|entries| {
             entries.iter().any(|entry| {
-                entry.get("name").and_then(Value::as_str) == Some("EndHistoryIngress")
+                entry.get("name").and_then(Value::as_str) == Some(name)
                     && entry.get("ok").and_then(Value::as_bool) == Some(true)
             })
         })
+}
+
+fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
+    tool_log_has_success(state, "/historyIngress/tools/log", "EndTurn")
 }
 
 fn is_idle_protected_session(state: &Value) -> bool {
@@ -953,7 +957,14 @@ fn complete_self_time(
         .and_then(Value::as_str);
     if !matches!(ended_reason, Some("tool" | "deadline" | "hard-stop")) {
         return Err(ApiError::bad(
-            "Self time can complete only after EndSelfTimeSession or the shared deadline.",
+            "Self time can complete only after EndTurn or the shared deadline.",
+        ));
+    }
+    if ended_reason == Some("tool")
+        && !tool_log_has_success(state, "/archive/tools/log", "EndTurn")
+    {
+        return Err(ApiError::bad(
+            "Self time cannot complete from a tool ending without a successful EndTurn receipt.",
         ));
     }
     update_active(db, id, expected_version, state, "complete")
@@ -1212,7 +1223,7 @@ async fn ingress_completed(
     }
     if !history_ingress_was_explicitly_ended(&existing.state) {
         return Err(ApiError::conflict(
-            "History ingress cannot complete without a successful EndHistoryIngress tool call.",
+            "History ingress cannot complete without a successful EndTurn tool call.",
         ));
     }
     let changed = db.execute("UPDATE conversations SET phase='complete',state_json=json_remove(state_json,'$.historyIngressRepairRequired'),ingress_next_attempt_at=NULL,updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3", params![Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
@@ -1374,13 +1385,13 @@ mod tests {
 
         let unfinished = complete_self_time(&db, "self-time", 1, &active_state).unwrap_err();
         assert_eq!(unfinished.code, "invalid_request");
-        assert!(unfinished.message.contains("EndSelfTimeSession"));
+        assert!(unfinished.message.contains("EndTurn"));
         assert_eq!(fetch_record(&db, "self-time").unwrap().phase, "active");
 
         let state = json!({
             "sessionType":"free-time",
             "freeTime":{"sliceEndedReason":"tool"},
-            "archive":{"format":"kennedy-chatend","sessionType":"free-time"}
+            "archive":{"format":"kennedy-chatend","sessionType":"free-time","tools":{"log":[{"name":"EndTurn","ok":true}]}}
         });
         let completed = complete_self_time(&db, "self-time", 1, &state).unwrap();
         assert_eq!(completed.phase, "complete");
@@ -1626,12 +1637,18 @@ mod tests {
         assert!(!history_ingress_was_explicitly_ended(&json!({
             "historyIngress":{"tools":{"log":[{
                 "name":"EndHistoryIngress",
+                "ok":true
+            }]}}
+        })));
+        assert!(!history_ingress_was_explicitly_ended(&json!({
+            "historyIngress":{"tools":{"log":[{
+                "name":"EndTurn",
                 "ok":false
             }]}}
         })));
         assert!(history_ingress_was_explicitly_ended(&json!({
             "historyIngress":{"tools":{"log":[{
-                "name":"EndHistoryIngress",
+                "name":"EndTurn",
                 "ok":true
             }]}}
         })));

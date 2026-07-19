@@ -91,14 +91,14 @@ instead of repeating the same oversized request five times.
 
 The frontend creates provenance with source `audio-vnote`, the piece-specific
 idempotency key `audio:{sha256}:piece:{index}`, and `source_created_at` equal to
-recording start. It supplies the `end-history-ingress-v1` completion-protocol
+recording start. It supplies the `end-turn-v1` completion-protocol
 identifier when claiming work, and the backend rejects claims from older
 clients. It runs the normal mutation tool loop with the additional
 audio-ingress prompt policy. The frontend uses one Web Lock for conversation
 and audio ingress, providing global browser-side Kmap mutation serialization.
 Completing the final piece atomically marks the recording complete.
 The completion endpoint independently requires a successful
-`EndHistoryIngress` entry in the persisted history-ingress tool log. Historical
+`EndTurn` entry in the persisted history-ingress tool log. Historical
 pieces identified as prematurely completed remain terminal with
 `historyIngressRepairRequired: true` until the corrected frontend calls the
 repair-release endpoint; release removes the old ingress checkpoint, resets the

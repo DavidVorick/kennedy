@@ -257,16 +257,15 @@ export function formatToolResult(toolName, content) {
         `Name: ${text(result.name)}`,
         `Published version: ${text(result.version)}`,
       ].join("\n");
-    case "EndSelfTimeSession":
-    case "EndFreeTimeSession":
-      return [
+    case "ToolCheck":
+      return text(result.message || "Tool calls are working.");
+    case "EndTurn":
+      return result.remaining ? [
         "The current self-time session is ending with the total time unchanged.",
         `Remaining self time: ${text(result.remaining)}`,
         result.messageForwarded ? "The message was saved for the next self-time session." : null,
         text(result.next),
-      ].filter(Boolean).join("\n");
-    case "EndHistoryIngress":
-      return text(result.message || "History ingress is complete and its final checkpoint is being saved.");
+      ].filter(Boolean).join("\n") : text(result.message || "The turn is ending.");
     case "WebSearch":
       return [
         "Web research completed.",

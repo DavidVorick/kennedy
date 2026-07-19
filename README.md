@@ -369,22 +369,26 @@ The browser conversation composer also offers `Send & end`: it checkpoints one
 final user message without asking Kennedy to answer, then immediately closes
 the conversation into the normal history-ingress queue.
 
-History and audio ingress require a successful standalone
-`EndHistoryIngress({})` tool call before their durable records can become
-complete. Ordinary final text is checkpointed and followed by a controller
-message telling Kennedy to continue Kmap work or explicitly end the ingress.
+Every Kennedy session begins with a genuine retained `ToolCheck({})` exchange
+whose result says `Tool calls are working.` Kennedy can repeat it at any time.
+Ordinary prose never completes a turn: all normal paths require a successful
+standalone `EndTurn` call. In browser and Telegram conversations that releases
+the preceding prose response and waits for the next user message; in history
+or audio ingress it ends the one-turn session and is required before the
+durable record can become complete.
 
 The dedicated **Self Time** tab starts an autonomous run with a duration in
 minutes (30 by default, fractional values allowed for tests) and an optional
 user prompt that carries into every clean-slate slice. Kennedy receives the
-full read/web/Kmap-write tool set and can call `EndSelfTimeSession({})`, or pass
+full read/web/Kmap-write tool set and can call `EndTurn({})`, or pass
 the next session a note with
-`EndSelfTimeSession({"message":"Continue this investigation."})`, to choose a
+`EndTurn({"message":"Continue this investigation."})`, to choose a
 fresh Chatend without giving up any remaining time. Self-time records survive
 a reload and become read-only history directly; they bypass normal history
 ingress because the live run already performs Kmap memory work. A notice is
-injected for the last three minutes; the deadline allows one tool-free wrap-up
-response and a hard cancellation follows two minutes later. Start feedback is
+injected for the last three minutes; at the deadline substantive tools are
+blocked but `ToolCheck` and `EndTurn` remain available for one wrap-up round,
+and a hard cancellation follows two minutes later. Start feedback is
 immediate and both the browser and history service prevent overlapping runs. Model and search
 requests retain their provider/profile timeout, including long quality
 searches, but can never run past the self-time hard stop.

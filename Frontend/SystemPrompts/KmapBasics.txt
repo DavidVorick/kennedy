@@ -11,4 +11,16 @@ Tool requests use this exact exclusive text protocol:
 KENNEDY_TOOL_CALLS
 {"calls":[{"name":"LoadNode","arguments":{"identifier":3}}]}
 
-KENNEDY_TOOL_CALLS must be the first characters of the response, followed by exactly one newline and one valid JSON object containing only a non-empty calls array. Each call contains exactly name and arguments. Do not use a Markdown fence or put text before the marker. End the response after the object's closing brace. If you emit any characters, commentary, messages, or additional tool-call blocks after the first valid object, the harness truncates all of them without reading or executing them; only the first object's calls are considered. Calls inside that first object execute sequentially in array order. ResetContext must be the only call in its first object. Tool results arrive as user-role messages headed "Kennedy tool result." A failed result means the operation did not succeed. A normal response without the marker ends the tool loop.
+KENNEDY_TOOL_CALLS must be the first characters of the response, followed by exactly one newline and one valid JSON object containing only a non-empty calls array. Each call contains exactly name and arguments. Do not use a Markdown fence or put text before the marker. End the response after the object's closing brace. If you emit any characters, commentary, messages, or additional tool-call blocks after the first valid object, the harness truncates all of them without reading or executing them; only the first object's calls are considered. Calls inside that first object execute sequentially in array order. ResetContext and EndTurn must each be the only call in their tool envelope. Tool results arrive as user-role messages headed "Kennedy tool result." A failed result means the operation did not succeed.
+
+Every Kennedy session begins with a real successful ToolCheck call and its real tool result in the Chatend. This is direct evidence that the outer tool harness is available. ToolCheck remains available throughout the session and may be repeated whenever useful.
+
+ToolCheck
+  Call: {}
+  Returns "Tool calls are working." without changing session state.
+
+A normal prose response does not end a turn. After prose, the controller will ask you either to continue tool work or to call EndTurn. Every normally completed turn must finish with a successful standalone EndTurn tool call.
+
+EndTurn
+  Call: {} or, during self time only, {"message":"A message for the next self-time session."}
+  In browser and Telegram conversations, first provide the complete normal response for the user; then call EndTurn by itself to finish delivery and wait for the user's next message. In history ingress, audio ingress, and self time, EndTurn ends the entire one-turn session. The optional message exists only for self time and is forwarded to the next clean-slate self-time session when enough scheduled time remains.

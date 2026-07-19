@@ -439,10 +439,18 @@ to `ingress_in_progress`, and completes it before claiming the next. Live
 conversations remain usable throughout. Completed records and both archives
 remain queryable from the sidebar.
 
+Session construction executes `ToolCheck({})` through the real browser tool
+dispatcher and retains both its assistant envelope and successful result. This
+gives every later model round—including rounds after `ResetContext`—visible
+evidence that the outer text-tool path works. The shared agent loop treats prose
+as candidate turn content, checkpoints it, and continues until standalone
+`EndTurn({})` succeeds. Conversation and Telegram controllers then publish that
+candidate response; one-turn autonomous and ingress controllers terminate.
+
 The history-ingress agent loop cannot complete from ordinary assistant text.
 Such text is checkpointed, followed by a controller reminder that Kennedy's
 text-protocol Kmap tools are available, and generation continues. Only a
-successful, standalone `EndHistoryIngress({})` result returns the loop-control
+successful, standalone `EndTurn({})` result returns the loop-control
 sentinel that permits the durable record to transition to `complete`.
 
 ### 5.2 Autonomous Self Time
@@ -455,7 +463,7 @@ a run-level Kweb provenance and a backward-compatible `free-time` Conversation
 History record containing an absolute deadline and clean-slate slice number.
 Kennedy's prompt tells her to have fun and includes the shared read/web manuals
 plus the Kmap write manual. The self-time executor therefore permits every
-baseline Kennedy tool and adds `EndSelfTimeSession`, whose loop-control result
+baseline Kennedy tool; the universal `EndTurn` result
 closes the current record and opens a fresh slice without changing the run
 deadline only when at least five minutes remain. Its optional, bounded message
 is checkpointed on the ending record, promoted into that next slice as a

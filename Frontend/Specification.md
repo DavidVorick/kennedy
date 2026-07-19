@@ -384,7 +384,8 @@ KENNEDY_TOOL_CALLS
 The first envelope must contain the marker and an object with one non-empty
 `calls` array. Each call has exactly `name` and object-valued `arguments`.
 Multiple calls in that array are allowed and execute sequentially before the
-next generation request. `ResetContext` must be the only call in its envelope.
+next generation request. `ResetContext` and `EndTurn` must each be the only
+call in their envelope.
 The marker must be the first response text; Markdown fences, commentary, and
 status text before it remain invalid. After the first valid JSON object's
 closing brace, the frontend truncates every trailing character without reading
@@ -609,31 +610,34 @@ particular source page-by-page. Fetched content is untrusted evidence, cannot
 override system instructions, and may fail when a page is unsafe, binary,
 blocked, JavaScript-dependent, or otherwise unsupported.
 
-### 8.10 `EndSelfTimeSession`
+### 8.10 `ToolCheck`
 
-`EndSelfTimeSession` accepts `{}` or `{"message":"A message for the next self
-time session."}`. The optional `message` must be a non-empty string of at most
-400,000 characters. The tool is available only when the executor is in
-`free-time` mode and must appear alone in its tool envelope. Its readable
-result confirms that total time is unchanged and, when another session can
-open, that the message was saved. The agent loop checkpoints the result and
-the pending handoff before returning a control sentinel to the self-time
-controller instead of requesting another response in the same Chatend. The
-rollover promotes the handoff into the next slice only; with less than five
-minutes remaining there is no next slice and no message is forwarded.
-`EndFreeTimeSession` remains accepted as a compatibility alias for already
-archived durable turns, but new prompts expose only the self-time name.
+`ToolCheck` accepts `{}` in every Kennedy execution mode and returns the exact
+readable confirmation `Tool calls are working.` without changing session
+state. Each newly created or restored session that lacks visible evidence runs
+this tool through the real executor, then retains its assistant request and
+successful result in the active Chatend. The exchange therefore survives
+`ResetContext`. Kennedy may repeat the same real call at any time.
 
-### 8.11 `EndHistoryIngress`
+### 8.11 `EndTurn`
 
-`EndHistoryIngress` accepts `{}`. It is available only when the executor is in
-`ingress` mode and must appear alone in its tool envelope. A successful result
-is checkpointed before the agent loop returns its session-control sentinel.
-History and audio ingress transition to complete only after that sentinel. An
-ordinary final answer or empty provider response instead appends a durable
-history-ingress controller message reminding Kennedy that text-protocol tools
-are available and directing her to continue unfinished Kmap work or call
-`EndHistoryIngress` after successful completion.
+`EndTurn` is the only normal model-controlled way to complete a turn and must
+appear alone in its tool envelope. Ordinary prose and empty provider responses
+remain inside the active loop and receive a durable controller message. In a
+browser, private Telegram, or Telegram-group conversation, Kennedy must first
+provide the complete normal user response; `EndTurn({})` then releases that
+response for durable completion and waits for the next user message. Calling it
+before prose fails with `missing_turn_response`. The candidate prose is stored
+with the pending Chatend, so a reload between prose and `EndTurn` resumes with
+the same response instead of asking Kennedy to regenerate it.
+
+In history and audio ingress, `EndTurn({})` ends the one-turn session and is
+checkpointed before the loop returns its control sentinel. In self time it
+accepts `{}` or `{"message":"A message for the next self-time session."}`; the
+optional non-empty message is limited to 400,000 characters and is forwarded
+only if another clean-slate slice can open. With less than five minutes left,
+the self-time run ends and no message is forwarded. The old session-specific
+end-tool names are not exposed or accepted.
 
 At startup, the frontend asks both durable ingress services to release records
 carrying the one-time historical repair marker. A release failure is shown as a
@@ -641,7 +645,7 @@ repair-specific warning but does not make ordinary conversation history or
 audio browsing unavailable; the marked records remain safely quarantined until
 the corrected service is reachable.
 Every corrected conversation or audio claim also supplies
-`completion_protocol: "end-history-ingress-v1"`, allowing the backend to reject
+`completion_protocol: "end-turn-v1"`, allowing the backend to reject
 an older frontend before it can consume newly released repair work.
 
 ### 8.12 Kmap-documented Rust library tools
@@ -841,7 +845,7 @@ launch prompt plus the session number, falling back to `Self time · session N`
 when no prompt was supplied.
 
 One same-origin `kennedy-free-time` Web Lock owns execution across tabs. Only a
-successful `EndSelfTimeSession`, the shared deadline, or its hard-stop grace
+successful `EndTurn`, the shared deadline, or its hard-stop grace
 finalizes the current record directly into read-only `complete` history without
 submitting its Chatend to history ingress: the live self-time session already
 performs Kmap memory work with its run-level provenance. An ordinary final

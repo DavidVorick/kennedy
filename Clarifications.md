@@ -640,14 +640,15 @@ canonical documents; this file is not an append-only log.
   short tests and overnight use. All clean-slate sessions in one run share a
   persisted absolute deadline; opening a new session never resets or reduces
   the remaining time.
-- Provide `EndSelfTimeSession` only during self time. Kennedy calls it alone to
-  archive the current session and immediately open a new clean Chatend if time
-  remains. It may include an optional non-empty `message` of at most 400,000
-  characters; checkpoint and deliver that message to the next session only. A
-  normal final response has the same rollover behavior.
+- Use the universal standalone `EndTurn` tool to archive the current self-time
+  session and immediately open a new clean Chatend if time remains. In self
+  time it may include an optional non-empty `message` of at most 400,000
+  characters; checkpoint and deliver that message to the next session only.
+  Ordinary prose does not end or roll over the session.
 - Inject a Chatend timer notice once a live session enters its final three
-  minutes. At the deadline block further tools and allow one wrap-up response;
-  abort any remaining intelligence operation two minutes later, with each
+  minutes. At the deadline block substantive tools, retain `ToolCheck` and
+  `EndTurn`, and allow one wrap-up response; abort any remaining intelligence
+  operation two minutes later, with each
   provider request capped to that same hard-stop window.
 - Persist and restore active self-time work through Conversation History,
   serialize execution across browser tabs, and give each run mutation

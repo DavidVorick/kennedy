@@ -72,12 +72,12 @@ export function freeTimeOpeningMessage(freeTime, now = Date.now()) {
 
 export function freeTimeTurnContinuationMessage(freeTime, now = Date.now()) {
   const remaining = formatFreeTimeRemaining(freeTimeTiming(freeTime, now).remainingMs);
-  return `Self-time controller: this session is still active, with ${remaining} remaining. A normal answer does not end self time. Continue working and provide another concrete answer or Kennedy tool call, or call EndSelfTimeSession explicitly if you intend to close this clean-slate session.`;
+  return `Self-time controller: this session is still active, with ${remaining} remaining. A normal answer does not end self time. Continue with any needed tool work, or call EndTurn by itself if you intend to close this clean-slate session.`;
 }
 
 export function freeTimeNoAnswerContinuationMessage(freeTime, now = Date.now()) {
   const remaining = formatFreeTimeRemaining(freeTimeTiming(freeTime, now).remainingMs);
-  return `Self-time controller: Codex returned no assistant answer, so this session is continuing with ${remaining} remaining. Respond with a concrete answer or Kennedy tool call. Call EndSelfTimeSession only if you intend to close this clean-slate session.`;
+  return `Self-time controller: Codex returned no assistant answer, so this session is continuing with ${remaining} remaining. Continue with a Kennedy tool call, or call EndTurn by itself if you intend to close this clean-slate session.`;
 }
 
 export function nextFreeTimeSlice(freeTime) {
