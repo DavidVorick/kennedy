@@ -27,9 +27,9 @@ canonical documents; this file is not an append-only log.
   coding tools are always available in every Kennedy execution mode, including
   conversation, Telegram, self time, history ingress, and audio ingress.
 
-## Kmap Library Split
+## Kmap DB Core
 
-- The split-out `kweb` crate is a standalone Rust library package that owns only
+- The `kweb-db-core` crate is a standalone Rust library package that owns only
   Kmap storage. `kennedy-server` imports its published release and exposes the HTTP adapter under
   `/api/v1/kmap`; a later consolidation may place every application API on one
   listener.
@@ -38,9 +38,8 @@ canonical documents; this file is not an append-only log.
   nodes/provenance/full provenance history, and returning extensible stats.
   Stats are typed in Rust with private fields and stable getters and serialize
   to additive JSON whose unknown fields clients must ignore.
-- Nodes store `last_modified_at`, ordered `fixed_connections` ID arrays, and
-  ordered `recent_connections` ID arrays. A legacy node receives and persists
-  the current time on its first load. The library assigns no active/fanout,
+- Nodes store a required `last_modified_at`, ordered `fixed_connections` ID arrays,
+  and ordered `recent_connections` ID arrays. The library assigns no active/fanout,
   fixed-slot, root-role, system-prompt, user, or graph-operation meaning.
 - The frontend treats the first eight recent connections as active and the
   remainder as fanout, maintains order itself, and implements connect,
@@ -56,18 +55,14 @@ canonical documents; this file is not an append-only log.
   provenance replays return the original provenance ID. Each call in a
   multi-call workflow uses its own stable ID, which makes individual retries
   safe without making the workflow atomic.
-- This storage is a Kweb (knowledge web), not a Kennedy-specific database. Its
-  application filenames are `kweb.sqlite3` and the sibling
-  `kweb-provenance-artifacts/` directory.
+- This storage is a Kweb (knowledge web), not a Kennedy-specific database. The
+  database path is caller-supplied; Kennedy defaults it to `kweb-db-core.sqlite3` and
+  supplies the sibling `kweb-provenance-artifacts/` directory.
 - Provenance media and large provenance payloads live outside SQLite. Artifact
   filenames preserve the original safe basename with exactly 12 random
   URL-safe Base64 characters inserted before the final extension; the first
   two suffix characters form a shard folder. The database retains relative
   filenames, original names, content types, sizes, hashes, roles, and order.
-- The one-time split reads the old `kennedy.sqlite3` without changing or
-  deleting it. It must preserve all identifiers, extract embedded archive
-  media, verify database counts/integrity and artifact hashes, and refuse to
-  overwrite either new destination.
 
 ## Offline Backups
 

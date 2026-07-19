@@ -1869,9 +1869,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-libs"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e00a4736df1f6e1fa8e59c305ed86bd1a4ecdc861b70291b555363c561e34ce"
+checksum = "7d14c0b6f7b9ac16bc8a9977cfcdfc733ed8454bfd943e5e1a188b365f60356a"
 
 [[package]]
 name = "keccak"
@@ -1984,7 +1984,7 @@ dependencies = [
  "kennedy-conversation-history",
  "kennedy-intelligence",
  "kennedy-telegram-relay",
- "kweb",
+ "kweb-db-core",
  "rpassword",
  "rusqlite",
  "rustls",
@@ -2022,10 +2022,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "kweb"
-version = "0.1.0"
+name = "kweb-db-core"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "889738273f245c30bc46c65caef3f9813ce7cc2748e1b4fc29ec2cefe153678d"
+checksum = "335bb52f5401dbe11bcb5ba149392e3e26197703dccdd649bb2e73597d846029"
 dependencies = [
  "base64",
  "chrono",

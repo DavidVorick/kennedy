@@ -286,7 +286,7 @@ node exposed to Kennedy into an in-context node:
 ```
 
 `ownerIdentifier` is a root-node short identifier, or the literal `unowned`
-when a legacy database row has no owner.
+when a database row deliberately has no owner.
 
 Short identifiers are positive integers allocated in first-seen order. A
 durable node receives one short identifier per session, even if it appears in

@@ -3,7 +3,7 @@
 Kennedy is a local-first personal assistant with inspectable, provenance-backed
 long-term memory. The MVP has five API domains and a browser-native frontend:
 
-- `kweb` is a standalone, storage-only Rust library that owns knowledge-web
+- `kweb-db-core` is a standalone, storage-only Rust library that owns knowledge-web
   SQLite rows, per-node history invariants, and durable mutation-idempotency
   receipts. `kennedy-server` imports it and serves `/api/v1/kmap`, the UI, and
   prompt manuals.
@@ -156,7 +156,7 @@ media directory to migrate the same credentials to another machine; the same
 vault passphrase unlocks them there.
 
 Open `http://127.0.0.1:4321`. The Kweb and conversation databases are created
-as `kweb.sqlite3`, `kennedy-conversations.sqlite3`,
+as `kweb-db-core.sqlite3`, `kennedy-conversations.sqlite3`,
 `kennedy-telegram.sqlite3`, `kennedy-users.sqlite3`, and
 `kennedy-audio.sqlite3` on first run. Large Kweb provenance payloads and media
 live in the sibling `kweb-provenance-artifacts/` tree. Original
@@ -233,21 +233,6 @@ piece.
 
 ## Backups
 
-To split an existing pre-artifact database while Kennedy is stopped, run:
-
-```sh
-cargo run -p kennedy-server -- migrate-kweb-storage
-```
-
-The command reads `kennedy.sqlite3` without modifying it, publishes
-`kweb.sqlite3` and `kweb-provenance-artifacts/` only after verification, and
-preserves every Kweb identifier. Embedded archive media becomes an immutable
-artifact whose original basename has 12 URL-safe Base64 characters inserted
-before its extension and whose first two suffix characters select its shard
-folder. Use `--source-database`, `--kweb-database`, and
-`--kweb-provenance-artifacts` to override those paths. Existing destinations
-are never overwritten.
-
 Stop the running Kennedy server, then create an offline backup with:
 
 ```sh
@@ -277,7 +262,7 @@ Use `--backup-dir PATH` to select another destination. The existing global
 source files when their deployment values differ from the defaults.
 
 Pass `--lightweight-kweb` to the backup subcommand to intentionally omit the
-large provenance-artifact tree while retaining `kweb.sqlite3`, including its
+large provenance-artifact tree while retaining `kweb-db-core.sqlite3`, including its
 artifact filenames, sizes, and hashes. Node text and history remain backed up,
 but externally stored provenance cannot be fully read from that lightweight
 archive alone. A normal full backup refuses to proceed if SQLite references an
@@ -291,8 +276,8 @@ cargo run -p kennedy-server -- kmap-size
 
 It reports estimated tokens for complete node text and for long descriptions
 alone, using one token per four Unicode characters, and also prints the
-underlying word and character counts. Opening a pre-library database may apply
-the Kmap schema migration, so perform that first run with Kennedy stopped. Node
+underlying word and character counts. The database must already satisfy the
+current strict Kweb DB Core schema; opening it never performs a migration. Node
 history, provenance, connections, and every non-node table are excluded.
 
 The compiled defaults use `gpt-5.6-sol` with `xhigh` reasoning effort and

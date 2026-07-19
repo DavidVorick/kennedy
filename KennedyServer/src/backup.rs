@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const BACKUP_FORMAT_VERSION: u32 = 6;
+const BACKUP_FORMAT_VERSION: u32 = 7;
 const ARCHIVE_PREFIX: &str = "kennedy-backup";
 const BACKUP_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -229,8 +229,8 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
             )?,
             snapshot_database(
                 &options.kmap_database,
-                &data_directory.join("kweb.sqlite3"),
-                "data/kweb.sqlite3",
+                &data_directory.join("kweb-db-core.sqlite3"),
+                "data/kweb-db-core.sqlite3",
                 "Kweb database",
             )?,
         ];
@@ -254,7 +254,7 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
                 "immutable Kweb provenance artifact",
                 &mut files,
             )?;
-            verify_copied_kweb_artifacts(&data_directory.join("kweb.sqlite3"), &files)?;
+            verify_copied_kweb_artifacts(&data_directory.join("kweb-db-core.sqlite3"), &files)?;
         }
 
         if options.vault.exists() {
@@ -641,9 +641,9 @@ fn render_readme(manifest: &Manifest) -> String {
     }
     readme.push_str("- `data/audio-ingress-media/` contains private original vnote audio and any durable in-progress WAV chunks. Empty directories have no checksum entry in the manifest.\n");
     if manifest.kweb_provenance_artifacts_included {
-        readme.push_str("- `data/kweb-provenance-artifacts/` contains every immutable Kweb provenance file referenced by `data/kweb.sqlite3`; each copied size and SHA-256 was checked against SQLite. The directory may be absent when the database has no artifacts.\n");
+        readme.push_str("- `data/kweb-provenance-artifacts/` contains every immutable Kweb provenance file referenced by `data/kweb-db-core.sqlite3`; each copied size and SHA-256 was checked against SQLite. The directory may be absent when the database has no artifacts.\n");
     } else {
-        readme.push_str("- `data/kweb-provenance-artifacts/` was intentionally omitted by lightweight-Kweb mode. Artifact filenames, sizes, and hashes remain in `data/kweb.sqlite3`, but externally stored provenance cannot be recovered from this archive alone.\n");
+        readme.push_str("- `data/kweb-provenance-artifacts/` was intentionally omitted by lightweight-Kweb mode. Artifact filenames, sizes, and hashes remain in `data/kweb-db-core.sqlite3`, but externally stored provenance cannot be recovered from this archive alone.\n");
     }
     if !manifest
         .files
@@ -660,7 +660,7 @@ All files are stored beneath one top-level archive directory. The five `.sqlite3
 
 ## Kmap data format
 
-`data/kweb.sqlite3` is the durable knowledge web owned by the storage-only `kweb` library. Twenty-byte binary identifiers are exposed by the API as 40 lowercase hexadecimal characters. `knowledge_nodes` stores current node text, nullable owner node, history head, latest modifying model description, and latest-modification time. Null ownership means unowned; the library gives owner nodes no root-role meaning. A migrated legacy row may have a null modification time until its first load writes the current time. `data_provenance_nodes` stores immutable source metadata and either inline UTF-8 data or a relative artifact path. `provenance_artifacts` stores each file's relative path, preserved original basename, media type, byte length, SHA-256, and creation time; `provenance_artifact_links` stores provenance role and order. Stored names insert 12 URL-safe Base64 characters before the final extension and use the first two as a shard directory. `data_history_nodes` is an append-only per-node linked history whose public history projection is the newest-first array of provenance IDs. `fixed_connections` and `recent_connections` preserve ordered arrays of target IDs; storage assigns no active/fanout, slot, promotion, consolidation, or root semantics. `idempotency_receipts` permanently records each successful mutation's caller-supplied 16-byte identifier, operation kind, normalized-request SHA-256, result ID, and commit time. The receipt and mutation commit atomically; an exact replay no-ops, while changed reuse conflicts. There is no root-role table in this database. Foreign keys are restrictive and timestamps are textual RFC 3339 values unless the exact schema below says otherwise. On recovery, place the artifact tree beside the live database as `kweb-provenance-artifacts/`; a lightweight backup needs that tree restored independently before external provenance reads can succeed.
+`data/kweb-db-core.sqlite3` is the durable knowledge web owned by the storage-only `kweb-db-core` library. Twenty-byte binary identifiers are exposed by the API as 40 lowercase hexadecimal characters. `knowledge_nodes` stores current node text, nullable owner node, history head, latest modifying model description, and required latest-modification time. Null ownership means unowned; the library gives owner nodes no root-role meaning. `data_provenance_nodes` stores immutable source metadata and either inline UTF-8 data or a relative artifact path. `provenance_artifacts` stores each file's relative path, preserved original basename, media type, byte length, SHA-256, and creation time; `provenance_artifact_links` stores provenance role and order. Stored names insert 12 URL-safe Base64 characters before the final extension and use the first two as a shard directory. `data_history_nodes` is an append-only per-node linked history whose public history projection is the newest-first array of provenance IDs. `fixed_connections` and `recent_connections` preserve ordered arrays of target IDs; storage assigns no active/fanout, slot, promotion, consolidation, or root semantics. `idempotency_receipts` permanently records each successful mutation's caller-supplied 16-byte identifier, operation kind, normalized-request SHA-256, result ID, and commit time. The receipt and mutation commit atomically; an exact replay no-ops, while changed reuse conflicts. There is no root-role table in this database. Foreign keys are restrictive and timestamps are textual RFC 3339 values unless the exact schema below says otherwise. The core performs no migration when opening an existing database. On recovery, place the artifact tree beside the live database as `kweb-provenance-artifacts/`; a lightweight backup needs that tree restored independently before external provenance reads can succeed.
 
 ## Conversation-history data format
 
@@ -869,7 +869,7 @@ mod tests {
         BackupOptions {
             bind: "127.0.0.1:4321".to_owned(),
             backup_dir: directory.path().join("backups"),
-            kmap_database: directory.path().join("kweb.sqlite3"),
+            kmap_database: directory.path().join("kweb-db-core.sqlite3"),
             kmap_artifact_directory: directory.path().join("kweb-provenance-artifacts"),
             include_kmap_artifacts: true,
             conversation_database: directory.path().join("conversations.sqlite3"),
@@ -918,7 +918,7 @@ mod tests {
 
         let manifest: Value =
             serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["backup_format_version"], 6);
+        assert_eq!(manifest["backup_format_version"], 7);
         assert_eq!(manifest["snapshot_mode"], "offline-port-guard");
         assert_eq!(manifest["files"].as_array().unwrap().len(), 7);
         for file in manifest["files"].as_array().unwrap() {
@@ -928,7 +928,7 @@ mod tests {
         }
 
         for (name, expected) in [
-            ("kweb.sqlite3", "memory in wal"),
+            ("kweb-db-core.sqlite3", "memory in wal"),
             ("conversations.sqlite3", "conversation in wal"),
             ("telegram.sqlite3", "telegram in wal"),
             ("users.sqlite3", "user directory in wal"),

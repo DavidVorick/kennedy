@@ -13,8 +13,8 @@ pub(crate) struct KmapSize {
     pub long_description_tokens: u64,
 }
 
-pub(crate) fn measure(path: &Path) -> anyhow::Result<KmapSize> {
-    let kmap = kweb::Kmap::open(path)
+pub(crate) fn measure(path: &Path, artifact_directory: &Path) -> anyhow::Result<KmapSize> {
+    let kmap = kweb_db_core::Kmap::open_with_artifacts(path, artifact_directory)
         .map_err(anyhow::Error::new)
         .with_context(|| format!("opening Kmap database {}", path.display()))?;
     let stats = kmap.stats().map_err(anyhow::Error::new)?;

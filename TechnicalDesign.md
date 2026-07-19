@@ -12,7 +12,7 @@ The MVP has six logical runtime components:
 1. **Frontend**: a browser-native HTML/CSS/JavaScript application. It owns the
    user interface, the live chatend, short identifiers, prompt
    composition, and agent tool orchestration.
-2. **Kweb storage and HTTP adapter**: `kweb` is a standalone Rust
+2. **Kweb storage and HTTP adapter**: `kweb-db-core` is a standalone Rust
    library that owns only SQLite persistence and per-node history invariants.
    `kennedy-server` imports it and owns the versioned Kmap HTTP routes, static
    frontend assets, root-role mappings, and transport policy.
@@ -95,8 +95,8 @@ The frontend appends the provider-reported current model and thinking mode.
 ```text
 One kennedy-server process
   ├─ Encrypted credential vault -------- kennedy-secrets.age
-  ├─ Main HTTP adapter :4321 ------------ kweb.sqlite3 + kweb-provenance-artifacts/ + kennedy-users.sqlite3
-  │    ├─ /api/v1/kmap/* via kweb library
+  ├─ Main HTTP adapter :4321 ------------ kweb-db-core.sqlite3 + kweb-provenance-artifacts/ + kennedy-users.sqlite3
+  │    ├─ /api/v1/kmap/* via kweb-db-core
   │    └─ serves frontend and manuals
   ├─ Intelligence API :4322 ------------ Podman Codex + OpenAI transcription + public web
   ├─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
@@ -215,13 +215,14 @@ state only for a conversation it opens or restores.
 
 ### 4.2 Kmap Storage Library and HTTP Adapter
 
-The `kweb` library owns creation/migration of the Kweb SQLite schema,
+The `kweb-db-core` library owns the strict current Kweb SQLite schema,
 its sibling immutable artifact store, knowledge/provenance/history rows, ordered fixed/recent ID arrays, individual
 create/update transactions, latest-model attribution, modification timestamps,
-and extensible text statistics. Its complete public contract is documented in
-the published [`kweb` 0.1.0 specification](https://docs.rs/crate/kweb/0.1.0/source/Specification.md),
-and its Rust API is available through
-[`docs.rs`](https://docs.rs/kweb/0.1.0/kweb/).
+and extensible text statistics. It initializes new databases but deliberately
+contains no compatibility or migration behavior; existing files must already
+satisfy its schema before they are opened. Its complete public contract and
+Rust API are published on
+[`docs.rs`](https://docs.rs/crate/kweb-db-core/0.2.2).
 
 The library has no HTTP server and knows nothing about root roles, Telegram
 identities, users, prompts, short identifiers, active/fanout policy, graph
@@ -646,7 +647,7 @@ SQLite stores exactly the three durable node types from the user specification:
 - **Data history node**: an append-only link from one knowledge node to one
   provenance node and the previous history node.
 
-The default physical store is `kweb.sqlite3` plus its sibling
+The default physical store is `kweb-db-core.sqlite3` plus its sibling
 `kweb-provenance-artifacts/`. Provenance text at or below 256 KiB remains
 inline. Larger text and explicit media are written as private immutable files;
 SQLite stores relative path, preserved original basename, media type, byte
@@ -663,9 +664,7 @@ artifact metadata without placing the bytes back in JSON.
 
 Connections are normalized into ordered `fixed_connections` and
 `recent_connections` tables only to preserve ID arrays and foreign-key
-integrity. The storage layer gives those arrays no graph semantics. During
-legacy migration, former fixed slots retain slot order and former active plus
-fanout edges are merged by descending activation order. The frontend treats
+integrity. The storage layer gives those arrays no graph semantics. The frontend treats
 the first eight recent IDs as active and the remainder as fanout and performs
 connect/consolidate/fixed workflows using ordinary complete-state updates.
 
@@ -674,8 +673,8 @@ self-owner sentinel resolves to the created/updated node ID. The library does
 not know which nodes are Kennedy, user, or group roots. System role mappings
 live in `kmap_system_roots` in the separate identity database.
 
-`last_modified_at` is generated on create/update. A migrated legacy row starts
-null and receives the current time on its first node load.
+`last_modified_at` is required and generated on every create/update. Reads do
+not repair or otherwise mutate stored nodes.
 
 Each `create_provenance`, `create_node`, and `update_node` call also supplies a
 random 16-byte `IdempotencyId`. The library hashes the normalized semantic
@@ -746,7 +745,7 @@ KennedyServer/
 
 Implementation code belongs under its owning component directory.
 The Kweb storage implementation is the external, exact-version dependency
-[`kweb` 0.1.0](https://crates.io/crates/kweb/0.1.0), not a workspace member.
+[`kweb-db-core`](https://crates.io/crates/kweb-db-core), not a workspace member.
 
 ## 9. MVP Non-Goals
 

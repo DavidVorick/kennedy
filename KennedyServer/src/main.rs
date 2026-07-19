@@ -2,7 +2,6 @@ mod backup;
 mod credentials;
 mod kmap_http;
 mod kmap_size;
-mod kweb_migration;
 mod rust_lib_tools;
 
 use std::path::{Path, PathBuf};
@@ -37,7 +36,7 @@ struct Args {
     audio_ingress_bind: String,
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     frontend_origin: String,
-    #[arg(long, global = true, default_value = "./kweb.sqlite3")]
+    #[arg(long, global = true, default_value = "./kweb-db-core.sqlite3")]
     kweb_database: PathBuf,
     #[arg(long, global = true, default_value = "./kweb-provenance-artifacts")]
     kweb_provenance_artifacts: PathBuf,
@@ -79,12 +78,6 @@ enum Command {
         #[arg(long)]
         lightweight_kweb: bool,
     },
-    /// Copy the legacy monolithic Kweb database into split SQLite and artifact storage.
-    MigrateKwebStorage {
-        /// Existing pre-split database. It is opened read-only and retained unchanged.
-        #[arg(long, default_value = "./kennedy.sqlite3")]
-        source_database: PathBuf,
-    },
     /// Estimate the token footprint of all current Kmap node text.
     KmapSize,
 }
@@ -106,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "kennedy_server=info,kweb=info,kennedy_intelligence=info,kennedy_conversation_history=info,kennedy_telegram_relay=info,tower_http=info".into()
+                "kennedy_server=info,kweb_db_core=info,kennedy_intelligence=info,kennedy_conversation_history=info,kennedy_telegram_relay=info,tower_http=info".into()
             }),
         )
         .init();
@@ -148,32 +141,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Created Kennedy backup {}", path.display());
             Ok(())
         }
-        Some(Command::MigrateKwebStorage { source_database }) => {
-            let destination_database = args.kweb_database;
-            let artifact_directory = args.kweb_provenance_artifacts;
-            let report = kweb_migration::run(kweb_migration::MigrationOptions {
-                bind: args.kweb_bind,
-                source_database: source_database.clone(),
-                destination_database: destination_database.clone(),
-                artifact_directory: artifact_directory.clone(),
-            })
-            .await?;
-            println!(
-                "Migrated {} provenance rows from {} to {} and {} ({} embedded media artifacts, {} external provenance payloads; database {} -> {} bytes, artifacts {} bytes). The source database was retained.",
-                report.provenance_rows,
-                source_database.display(),
-                destination_database.display(),
-                artifact_directory.display(),
-                report.extracted_media_artifacts,
-                report.externally_stored_provenance_rows,
-                report.source_database_bytes,
-                report.destination_database_bytes,
-                report.artifact_bytes,
-            );
-            Ok(())
-        }
         Some(Command::KmapSize) => {
-            let size = kmap_size::measure(&args.kweb_database)?;
+            let size = kmap_size::measure(&args.kweb_database, &args.kweb_provenance_artifacts)?;
             println!("{}", kmap_size::render(&size));
             Ok(())
         }

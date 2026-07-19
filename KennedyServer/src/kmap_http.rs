@@ -14,11 +14,11 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use kweb::{
+use kweb_db_core::{
     CreateNode, Error as KmapError, IdempotencyId, Kmap, NewProvenance, NewProvenanceArtifact,
     NodeId, Owner, ProvenanceStorage, UpdateNode,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -144,7 +144,6 @@ pub(crate) fn initialize(
     artifact_directory: &FilePath,
     identity_database: &FilePath,
 ) -> anyhow::Result<(Kmap, SystemRoots)> {
-    let legacy = read_legacy_roots(kmap_database)?;
     let identity = Connection::open(identity_database).with_context(|| {
         format!(
             "opening identity database {} for system roots",
@@ -163,7 +162,7 @@ pub(crate) fn initialize(
         Kmap::open_with_artifacts(kmap_database, artifact_directory).map_err(anyhow::Error::new)?;
     let mut bootstrap_provenance = None;
     let roots = {
-        let mut ensure = |role: &str, legacy_id: Option<NodeId>| -> anyhow::Result<NodeId> {
+        let mut ensure = |role: &str| -> anyhow::Result<NodeId> {
             let existing = identity
                 .query_row(
                     "SELECT root_node_id FROM kmap_system_roots WHERE role=?1",
@@ -173,13 +172,6 @@ pub(crate) fn initialize(
                 .optional()?;
             let id = if let Some(existing) = existing {
                 NodeId::from_hex(&existing).map_err(anyhow::Error::new)?
-            } else if let Some(legacy_id) = legacy_id {
-                kmap.get_node(legacy_id).map_err(anyhow::Error::new)?;
-                identity.execute(
-                    "INSERT INTO kmap_system_roots(role,root_node_id,created_at) VALUES(?1,?2,?3)",
-                    params![role, legacy_id.to_string(), Utc::now().to_rfc3339()],
-                )?;
-                legacy_id
             } else {
                 let provenance_id = match bootstrap_provenance {
                     Some(id) => id,
@@ -233,53 +225,11 @@ pub(crate) fn initialize(
             Ok(id)
         };
         SystemRoots {
-            user: ensure("user", legacy.user)?,
-            kennedy: ensure("kennedy", legacy.kennedy)?,
+            user: ensure("user")?,
+            kennedy: ensure("kennedy")?,
         }
     };
-    let cleanup = Connection::open(kmap_database)?;
-    cleanup.execute_batch(
-        "PRAGMA foreign_keys=OFF; DROP TABLE IF EXISTS kmap_roots; PRAGMA foreign_keys=ON;",
-    )?;
     Ok((kmap, roots))
-}
-
-#[derive(Default)]
-struct LegacyRoots {
-    user: Option<NodeId>,
-    kennedy: Option<NodeId>,
-}
-
-fn read_legacy_roots(path: &FilePath) -> anyhow::Result<LegacyRoots> {
-    if !path.exists() {
-        return Ok(LegacyRoots::default());
-    }
-    let db = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kmap_roots')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        return Ok(LegacyRoots::default());
-    }
-    let read = |role: &str| -> anyhow::Result<Option<NodeId>> {
-        db.query_row(
-            "SELECT hex(knowledge_node_id) FROM kmap_roots WHERE role=?1",
-            [role],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .map(|value| NodeId::from_hex(&value.to_ascii_lowercase()).map_err(anyhow::Error::new))
-        .transpose()
-    };
-    Ok(LegacyRoots {
-        user: read("user")?,
-        kennedy: read("kennedy")?,
-    })
 }
 
 pub(crate) async fn serve_with_listener(
@@ -356,7 +306,7 @@ async fn get_roots(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn get_stats(State(state): State<AppState>) -> Result<Json<kweb::Stats>, ApiError> {
+async fn get_stats(State(state): State<AppState>) -> Result<Json<kweb_db_core::Stats>, ApiError> {
     let stats = state
         .kmap
         .lock()
@@ -513,7 +463,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<(), ApiErro
 async fn get_provenance(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<kweb::Provenance>, ApiError> {
+) -> Result<Json<kweb_db_core::Provenance>, ApiError> {
     let id = NodeId::from_hex(&id).map_err(ApiError::from)?;
     let provenance = state
         .kmap
@@ -566,7 +516,7 @@ fn generated_node_id(idempotency_id: IdempotencyId) -> NodeId {
     NodeId::from_hex(&encoded).expect("SHA-256 prefix is a valid Kmap node identifier")
 }
 
-fn node_response(kmap: &mut Kmap, node: &kweb::Node) -> Result<Value, ApiError> {
+fn node_response(kmap: &mut Kmap, node: &kweb_db_core::Node) -> Result<Value, ApiError> {
     let mut seen = HashSet::new();
     let mut connection_summaries = Vec::new();
     for connection_id in node
@@ -932,74 +882,6 @@ mod tests {
 
         server.abort();
         let _ = server.await;
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn moves_legacy_system_roles_out_of_kmap_storage() {
-        let directory = std::env::temp_dir().join(format!(
-            "kennedy-kmap-root-migration-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let kmap_path = directory.join("kmap.sqlite3");
-        let identity_path = directory.join("users.sqlite3");
-        let mut kmap = Kmap::open(&kmap_path).unwrap();
-        let provenance_id = kmap
-            .create_provenance(
-                IdempotencyId::random(),
-                NewProvenance {
-                    data: "legacy roots".into(),
-                    source: "test".into(),
-                    source_created_at: "2026-07-18T00:00:00Z".into(),
-                },
-            )
-            .unwrap();
-        let user = NodeId::random();
-        let kennedy = NodeId::random();
-        for (id, name) in [(user, "User Root"), (kennedy, "Kennedy Root")] {
-            kmap.create_node(
-                IdempotencyId::random(),
-                CreateNode {
-                    id,
-                    provenance_id,
-                    owner: Owner::SelfNode,
-                    short_name: name.into(),
-                    short_description: String::new(),
-                    long_description: String::new(),
-                    model_attribution: "test".into(),
-                    fixed_connections: vec![],
-                    recent_connections: vec![],
-                },
-            )
-            .unwrap();
-        }
-        drop(kmap);
-        let legacy = Connection::open(&kmap_path).unwrap();
-        legacy
-            .execute_batch(&format!(
-                "CREATE TABLE kmap_roots(role TEXT PRIMARY KEY,knowledge_node_id BLOB NOT NULL UNIQUE);
-                 INSERT INTO kmap_roots VALUES('user',X'{user}');
-                 INSERT INTO kmap_roots VALUES('kennedy',X'{kennedy}');"
-            ))
-            .unwrap();
-        drop(legacy);
-
-        let (kmap, roots) =
-            initialize(&kmap_path, &directory.join("artifacts"), &identity_path).unwrap();
-        assert_eq!(roots.user, user);
-        assert_eq!(roots.kennedy, kennedy);
-        drop(kmap);
-        let kmap_db = Connection::open(&kmap_path).unwrap();
-        let retained: bool = kmap_db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kmap_roots')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!retained);
-        drop(kmap_db);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

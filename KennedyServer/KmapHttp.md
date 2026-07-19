@@ -1,7 +1,7 @@
 # Kmap HTTP Adapter
 
 `kennedy-server` owns the HTTP representation of the storage-only
-`kweb` library. The library itself contains no Axum or filesystem asset
+`kweb-db-core` library. The library itself contains no Axum or filesystem asset
 serving code.
 
 The adapter serializes access to one `Kmap`, serves the frontend and prompt
@@ -27,8 +27,8 @@ They adapt the browser-owned text-tool loop to the in-process published
 
 The roots endpoint is application policy rather than a Kmap method. System
 root mappings live in `kmap_system_roots` in the separate identity database.
-On the first upgraded startup, the server copies the legacy role mappings out
-of the Kmap database and removes that obsolete table.
+The Kmap database must already satisfy the strict core schema; neither the core
+nor the adapter performs compatibility migration during startup.
 
 An HTTP create may omit `node_id`, in which case the adapter deterministically
 derives one from the request's random idempotency identifier so an exact replay

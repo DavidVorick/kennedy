@@ -2,7 +2,7 @@ Kmap nodes have positive integer identifiers. An identifier is valid only in the
 
 The session's root nodes are always loaded automatically in the order declared by the current Kmap context. ResetContext preserves every root even when it is not listed in the call.
 
-Every full Kmap node declares its Kennedy, user, or group root owner. A legacy node with no stored owner is shown as unowned; when updating such a node, assign the appropriate root owner. Fixed connections are three arbitrary numbered slots controlled by Kennedy and do not imply priority, tasks, or completion state.
+Every full Kmap node declares its Kennedy, user, or group root owner. A node with no stored owner is shown as unowned; when updating such a node, assign the appropriate root owner. Fixed connections are three arbitrary numbered slots controlled by Kennedy and do not imply priority, tasks, or completion state.
 
 The tools documented below are the baseline tools for this session. Additional tools and their documentation may be available in the kmap; use the kmap to learn about those capabilities rather than expecting every instruction to be repeated in the system prompt.
 

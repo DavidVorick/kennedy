@@ -16,8 +16,8 @@ kennedy-audio-ingress = { path = "../AudioIngress" }
 kennedy-codex-runtime = { path = "../CodexRuntime" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
 kennedy-intelligence = { path = "../IntelligenceBackend" }
-kcode-rust-libs = "=0.1.0"
-kweb = "=0.1.0"
+kcode-rust-libs = "=0.1.2"
+kweb-db-core = "=0.2.2"
 kennedy-telegram-relay = { path = "../TelegramRelay" }
 rusqlite.workspace = true
 rustls.workspace = true
