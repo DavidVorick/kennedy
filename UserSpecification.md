@@ -557,12 +557,14 @@ supported; scanned/image-only PDFs report that OCR is required.
 ### Telegram Group Invocation
 
 Kennedy participates only in groups where she is an administrator, her member
-ledger is complete, and every member is a TOFU-valid whitelisted identity. Any
-unknown member, pinned-handle conflict, incomplete member ledger, or later loss
-of administrator monitoring permanently blacklists that chat ID. Whitelisting
-the person later does not revive the group; users must create a new one.
+ledger is complete, and every current or departed historical member is a
+TOFU-valid whitelisted identity. An unknown member, incomplete ledger, or loss
+of administrator monitoring quarantines the group and causes Kennedy to discard
+message content without reading, downloading, or archiving it. The quarantine
+is fail-closed but reversible: once the complete historical ledger is
+whitelisted, Kennedy may participate again.
 Each observed group receives its own initially blank Kmap root. That assignment
-survives permanent blacklisting and Telegram chat-ID migration.
+survives quarantine and Telegram chat-ID migration.
 
 Kennedy is invoked only by a direct bot-handle mention or a reply to one of her
 messages; a scoped group `/reset` also invokes her. A voice note invokes by

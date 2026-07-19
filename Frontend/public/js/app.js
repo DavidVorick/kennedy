@@ -1,4 +1,4 @@
-import { KwebAPI, RustLibsAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260719.3";
+import { KwebAPI, RustLibsAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, TelegramDirectoryAPI, newIdempotencyId } from "./api.js?v=20260719.4";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
 import { ConversationSession } from "./conversation.js?v=20260719.3";
 import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260719.3";
@@ -26,6 +26,7 @@ const rustLibs = RustLibsAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
 const telegramRelay = TelegramRelayAPI(CONFIG.telegramRelayBase);
+const telegramDirectory = TelegramDirectoryAPI(CONFIG.kwebBase);
 const audioIngress = AudioIngressAPI(CONFIG.audioIngressBase);
 
 let manuals = {};
@@ -210,10 +211,10 @@ function groupSessionMatches(record, event) {
   if (sessionTypeOf(record) !== "telegram-group") return false;
   const channel = channelOf(record);
   const sameUser = String(channel?.telegramUserId) === String(event.telegramUserId);
-  const eventGroupRoot = event.groupRootNodeId || event.groupContext?.groupRootNodeId;
-  const channelGroupRoot = channel?.groupRootNodeId || channel?.groupContext?.groupRootNodeId;
-  const sameGroup = eventGroupRoot && channelGroupRoot
-    ? eventGroupRoot === channelGroupRoot
+  const eventGroupId = event.groupId || event.groupContext?.groupId;
+  const channelGroupId = channel?.groupId || channel?.groupContext?.groupId;
+  const sameGroup = eventGroupId && channelGroupId
+    ? eventGroupId === channelGroupId
     : String(channel?.chatId) === String(event.chatId);
   return sameUser && sameGroup;
 }
@@ -240,45 +241,62 @@ function referencesForRecord(record, directRoots = rootsForRecord(record)) {
 async function provisionDirectoryRoots() {
   if (!kwebReady || !telegramRelayReady) return;
   const [pendingUsers, pendingGroups] = await Promise.all([
-    telegramRelay.provisioningUsers(),
-    telegramRelay.provisioningGroups(),
+    telegramDirectory.provisioningUsers(),
+    telegramDirectory.provisioningGroups(),
   ]);
   for (const entry of pendingUsers.users || []) {
     const isWebUser = String(entry.handle).toLowerCase() === CONFIG.webUserHandle.toLowerCase();
     const targetRoot = isWebUser ? legacyUserRootNodeId : entry.rootNodeId;
     if (!isWebUser) await kweb.bootstrapNode(targetRoot);
-    await telegramRelay.completeHandleRoot(entry.handle, targetRoot);
+    await telegramDirectory.completeHandleRoot(entry.handle, targetRoot);
   }
   for (const group of pendingGroups.groups || []) {
     await kweb.bootstrapNode(group.rootNodeId, "Group Root");
-    await telegramRelay.completeGroupRoot(group.chatId, group.rootNodeId);
+    await telegramDirectory.completeGroupRoot(group.groupId, group.rootNodeId);
   }
-  webDirectoryUser = await telegramRelay.userByHandle(CONFIG.webUserHandle);
+  webDirectoryUser = await telegramDirectory.userByHandle(CONFIG.webUserHandle);
   rootNodeIds = [webDirectoryUser.rootNodeId, kennedyRootNodeId];
 }
 
 async function directoryUserForEvent(event) {
   await provisionDirectoryRoots();
-  const user = await telegramRelay.userById(event.telegramUserId);
+  const user = await telegramDirectory.userById(event.telegramUserId);
   if (!user.rootReady) {
     await kweb.bootstrapNode(user.rootNodeId);
-    return telegramRelay.completeUserRoot(user.telegramUserId, user.rootNodeId);
+    return telegramDirectory.completeUserRoot(user.telegramUserId, user.rootNodeId);
   }
   return user;
 }
 
-async function provisionGroupRoot(chatId) {
+async function provisionGroupRoot(groupId) {
   await provisionDirectoryRoots();
-  let group = await telegramRelay.groupById(chatId);
+  if (typeof groupId !== "string" || !groupId) throw new Error("Telegram group identity is missing.");
+  let group = await telegramDirectory.groupById(groupId);
   if (!group.rootReady) {
     await kweb.bootstrapNode(group.rootNodeId, "Group Root");
-    group = await telegramRelay.completeGroupRoot(group.chatId, group.rootNodeId);
+    group = await telegramDirectory.completeGroupRoot(group.groupId, group.rootNodeId);
   }
   return group;
 }
 
 async function directoryGroupForEvent(event) {
-  return event.sessionKind === "group" ? provisionGroupRoot(event.chatId) : null;
+  return event.sessionKind === "group" ? provisionGroupRoot(event.groupId) : null;
+}
+
+async function decorateGroupContextWithDirectory(groupContext, groupId, directoryGroup = null) {
+  if (!groupContext) return groupContext;
+  const group = directoryGroup || await provisionGroupRoot(groupId);
+  const participants = await Promise.all((groupContext.participants || []).map(async participant => {
+    const user = await directoryUserForEvent(participant);
+    return { ...participant, rootNodeId: user.rootNodeId, rootReady: user.rootReady };
+  }));
+  return {
+    ...groupContext,
+    groupId,
+    groupRootNodeId: group.rootNodeId,
+    groupRootReady: group.rootReady,
+    participants,
+  };
 }
 
 function selectedRecord() {
@@ -1518,19 +1536,23 @@ async function createTelegramConversation(event) {
   const sessionRoots = directoryGroup
     ? [directoryUser.rootNodeId, directoryGroup.rootNodeId, kennedyRootNodeId]
     : [directoryUser.rootNodeId, kennedyRootNodeId];
-  const latestGroupMessageId = (event.groupContext?.messages || [])
+  const directoryGroupContext = sessionType === "telegram-group" && event.groupContext
+    ? await decorateGroupContextWithDirectory(event.groupContext, event.groupId, directoryGroup)
+    : null;
+  const latestGroupMessageId = (directoryGroupContext?.messages || [])
     .reduce((latest, message) => Math.max(latest, Number(message.messageId) || 0), 0);
-  const groupContext = sessionType === "telegram-group" && event.groupContext
-    ? { ...event.groupContext, messages: (event.groupContext.messages || []).filter(message => String(message.messageId) !== String(event.messageId)) }
+  const groupContext = directoryGroupContext
+    ? { ...directoryGroupContext, messages: directoryGroupContext.messages.filter(message => String(message.messageId) !== String(event.messageId)) }
     : null;
   const referenceRootNodeIds = referencesForGroup(groupContext, sessionRoots);
   const channel = {
     kind: sessionType,
     telegramUserId: event.telegramUserId,
     chatId: event.chatId,
+    groupId: event.groupId || null,
     username: event.username || null,
     displayName: event.displayName,
-    groupRootNodeId: directoryGroup?.rootNodeId || event.groupRootNodeId || null,
+    groupRootNodeId: directoryGroup?.rootNodeId || null,
     groupContext,
     lastGroupContextMessageId: latestGroupMessageId,
   };
@@ -1576,13 +1598,18 @@ async function telegramConversationFor(event, runtime = null) {
   }
   if (runtime) runtime.conversationId = record.id;
   if (group && !created) {
+    const groupContext = await decorateGroupContextWithDirectory(
+      event.groupContext,
+      event.groupId,
+    );
     session.channel = {
       ...(session.channel || {}),
       username: event.username || null,
       displayName: event.displayName,
-      groupRootNodeId: event.groupRootNodeId || event.groupContext?.groupRootNodeId || session.channel?.groupRootNodeId || null,
+      groupId: event.groupId,
+      groupRootNodeId: groupContext?.groupRootNodeId || session.channel?.groupRootNodeId || null,
     };
-    session.refreshTelegramGroupContext(event.groupContext, event.messageId);
+    session.refreshTelegramGroupContext(groupContext, event.messageId);
     await session.persistSnapshot(session.snapshot());
   }
   return { record, session };
@@ -1778,7 +1805,7 @@ async function prepareTelegramGroupMessage(chatId, message) {
   return prepared;
 }
 
-async function prepareTelegramGroupContext(groupContext, excludedMessageId = null) {
+async function prepareTelegramGroupContext(groupContext, excludedMessageId = null, groupId = null) {
   if (!groupContext || !Array.isArray(groupContext.messages)) return groupContext;
   const messages = [];
   for (const message of groupContext.messages) {
@@ -1788,7 +1815,10 @@ async function prepareTelegramGroupContext(groupContext, excludedMessageId = nul
       messages.push(await prepareTelegramGroupMessage(groupContext.chatId, message));
     }
   }
-  return { ...groupContext, messages };
+  return decorateGroupContextWithDirectory(
+    { ...groupContext, messages },
+    groupId || groupContext.groupId,
+  );
 }
 
 async function closeTelegramGroupSessionSilently(updateRecord, session) {
@@ -1821,7 +1851,7 @@ async function syncGroupSessionUpdates() {
     const groupContext = await prepareTelegramGroupContext({
       ...pending.groupContext,
       throughMessageId: pending.throughMessageId,
-    });
+    }, null, pending.groupId);
     session.refreshTelegramGroupContext(groupContext);
     await session.persistSnapshot(session.snapshot());
     record = historyRecords.find(item => item.id === record.id) || record;
@@ -1839,7 +1869,7 @@ async function processTelegramEvent(event, runtime = null) {
   if (event.sessionKind === "group" && event.groupContext) {
     event = {
       ...event,
-      groupContext: await prepareTelegramGroupContext(event.groupContext, event.messageId),
+      groupContext: await prepareTelegramGroupContext(event.groupContext, event.messageId, event.groupId),
     };
   }
   if (event.kind === "reset") {
@@ -1895,6 +1925,7 @@ function groupIngressState(batch) {
   const groupContext = {
     groupTitle: batch.groupTitle || "Telegram group",
     chatId: batch.chatId,
+    groupId: batch.groupId,
     invokingTelegramUserId: null,
     groupRootNodeId: batch.groupRootNodeId,
     groupRootReady: batch.groupRootReady,
@@ -1917,6 +1948,8 @@ function groupIngressState(batch) {
   const channel = {
     kind: "telegram-group",
     chatId: batch.chatId,
+    groupId: batch.groupId,
+    groupRootNodeId: batch.groupRootNodeId,
     groupIngressBatchId: batch.id,
     backgroundIngress: true,
     groupContext,
@@ -1958,12 +1991,15 @@ async function syncGroupIngressBatches() {
   await provisionDirectoryRoots();
   const batches = (await telegramRelay.groupIngress()).batches || [];
   for (const batch of batches) {
-    if (!batch.groupRootReady) {
-      const group = await provisionGroupRoot(batch.chatId);
-      batch.groupTitle = group.title;
-      batch.groupRootNodeId = group.rootNodeId;
-      batch.groupRootReady = group.rootReady;
-    }
+    const group = await provisionGroupRoot(batch.groupId);
+    const groupContext = await decorateGroupContextWithDirectory(
+      { participants: batch.participants || [], messages: batch.messages || [] },
+      batch.groupId,
+      group,
+    );
+    batch.groupRootNodeId = group.rootNodeId;
+    batch.groupRootReady = group.rootReady;
+    batch.participants = groupContext.participants;
     let record = historyRecords.find(item =>
       item.state?.channel?.groupIngressBatchId === batch.id
       || item.state?.archive?.channel?.groupIngressBatchId === batch.id

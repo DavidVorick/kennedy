@@ -238,6 +238,7 @@ pub(crate) async fn serve_with_listener(
     frontend_dir: PathBuf,
     system_prompts_dir: PathBuf,
     rust_lib_tools: rust_lib_tools::RustLibToolService,
+    telegram_directory: Router,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let artifact_directory = kmap.artifact_path().to_owned();
@@ -272,6 +273,7 @@ pub(crate) async fn serve_with_listener(
         .route("/system-prompts/{filename}", get(get_prompt))
         .with_state(state)
         .merge(rust_lib_tools::router(rust_lib_tools))
+        .merge(telegram_directory)
         .fallback_service(ServeDir::new(frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -701,6 +703,7 @@ mod tests {
             directory.join("frontend"),
             directory.join("prompts"),
             rust_lib_tools,
+            Router::new(),
             listener,
         ));
         let response = http_request(address, "GET", "/api/v1/kmap/roots", "").await;

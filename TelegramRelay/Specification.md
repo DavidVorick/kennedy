@@ -1,132 +1,76 @@
 # Telegram Relay Specification
 
-The Telegram relay is a Rust service in the Kennedy server binary. It
-long-polls Telegram with `teloxide`, accepts private and strictly validated
-group messages from whitelisted users, stores transport work durably, and
-exposes a loopback HTTP API to the browser frontend. It does not construct
-prompts, run Kennedy, access the Kmap, or inspect the Chatend.
+## Library boundary
 
-Identity state is isolated in `kennedy-users.sqlite3`, separate from the relay
-queue and Kweb databases. `@taek42` is the only initial whitelist entry and has
-the generic `can_add_users` capability. Its first observed matching Telegram
-account pins the stable numeric ID under trust on first use (TOFU), exactly like
-any subsequently whitelisted handle. Once pinned, numeric ID is authoritative
-even if the username changes. A different ID presenting a pinned handle is a
-conflict. The backend contains no David-specific numeric ID or sentinel path.
+The Telegram relay is a Rust library invoked by the Kennedy server binary. It long-polls Telegram with `teloxide`, persists transport work, enforces group transport security, and exposes a loopback HTTP queue for the browser frontend. It does not unlock Kennedy's credential vault, own or open Kennedy's user database, assign Kmap roots, construct prompts, invoke a model, inspect Chatend state, or grant application capabilities.
 
-The privileged pinned identity may send `/adduser @handle` in a private chat.
-This immediately reserves a random Kmap root ID and an unresolved whitelist
-entry. No registration or onboarding event exists. The frontend idempotently
-materializes the reserved structurally blank root through Kweb and marks it
-ready. Unauthorized private message content is not stored.
+The host passes an optional `BotToken` directly in `Config`. With no token, the HTTP API remains available and reports Telegram disabled. A configured token is validated with `getMe` during startup, is never serialized or exposed by an API, has a redacted `Debug` representation, and is zeroized on drop.
 
-Text, voice-note, supported document, and `/reset` updates are processed in
-per-user order. Documents include PDF, DOCX, spreadsheet, CSV, and text files
-up to 20 MiB. An update remains pending or processing until the browser supplies
-the reply and Telegram accepts it. Original voice-note and document bytes remain
-in the relay archive. `/reset` is an event: the browser closes the corresponding
-Telegram conversation, requests history ingress, and acknowledges the reset only
-after that transition is durable.
+The host supplies an `IdentitySink` implementation. The relay reports an `IdentityObservation` containing a numeric Telegram ID, current handle when known, and display name. It requests point-in-time `WhitelistSnapshot` values containing authorized numeric IDs. The private `/adduser` command is transported by the relay, but authorization, handle normalization/pinning, mutation, and application capability checks occur through the host's `request_add_user` implementation. Stable opaque group IDs are reported through `observe_group` so the host may attach application-owned state independently.
 
-Binding an event records `processing_started_at`, which is the durable origin
-of its 30-minute response deadline. If a processing event names a Conversation
-History record that no longer exists, the browser may replace that binding only
-with an `expectedConversationId` matching the event's current value. This
-compare-and-swap recovery starts a fresh deadline and retains the event's media
-and saved transcription. An ordinary processing event cannot otherwise be
-rebound.
+The relay package has standalone Cargo metadata and dependencies. Copying the `TelegramRelay` directory to another repository is sufficient to build the library; the consumer supplies its own `IdentitySink` and startup configuration.
 
-Private active pointers remain in `authorized_users`. Group pointers live in
-`telegram_group_user_sessions`, keyed by stable group-root ID and Telegram user
-ID, and `telegram_events.group_root_node_id` makes that identity durable across
-chat-ID migration. A pending group event inherits its pair's current pointer;
-binding updates only that pair. Each group-user pointer also records a durable
-passive-context cursor and the message ID of that user's last invocation.
+## Identity and private messages
 
-For groups, Kennedy requests `chat_member` updates and must be an administrator
-before processing messages. Adding and then promoting Kennedy may be two
-actions; the group remains inert in `validating` between them. The relay keeps
-a member ledger, resolves previously unpinned whitelisted handles through TOFU,
-and compares the observed active ledger plus Kennedy with Telegram's member
-count. Any unknown identity, TOFU conflict, incomplete ledger, or loss of
-administrator monitoring after activation permanently blacklists that chat ID.
-Later `/adduser` calls or member departures cannot reverse the decision.
-Every group is also assigned a stable reserved Kmap root when first observed.
-Blacklisting retains that assignment. A Telegram basic-group-to-supergroup
-migration maps the new chat ID to the same root and carries forward membership,
-cursor, readiness, and permanent-blacklist state.
+Kennedy owns the whitelist, observed-identity directory, TOFU handle pinning, `/adduser` authority, and Kmap root assignments in `kennedy-users.sqlite3`. The relay database contains none of those tables.
 
-Telegram's Bot API does not enumerate every ordinary member of an existing
-group. Consequently the reliable strict flow is to create a new group with
-Kennedy, promote her to administrator, and then add the whitelisted members so
-each join is observed. Dropping Kennedy into a pre-existing group whose full
-membership was not observed produces a count mismatch and permanent blacklist,
-which is the fail-closed behavior required by this policy.
+For each private message, the relay reports the sender's numeric ID, handle, and display name before requesting a whitelist snapshot. Unauthorized content is not archived. Authorized text, voice note, supported document, and `/reset` updates are processed in per-user order. Supported documents include PDF, DOCX, spreadsheet, CSV, and text formats within the configured byte limit. Original voice-note and document bytes remain in the transport archive.
 
-An allowed group message queues Kennedy when it mentions her bot handle,
-replies to one of her messages, or is a scoped `/reset`. Voice notes therefore
-invoke by reply; supported documents may invoke by caption mention or reply.
-The event carries the group root, the complete
-current member ledger with reserved user-root IDs, and the latest 50 archived
-group messages. It is
-marked `sessionKind: group`; the relay binds it to a persistent session keyed
-by `(group root, Telegram user)` and never changes the invoker's private-DM or
-other-group conversation pointer. Group `/reset` clears only that binding.
-Regardless of invocation, every accepted group message is archived once with
-its text or media metadata. The relay exposes each open session's unseen range
-through its own cursor, excluding only messages already represented by that
-session's invocation/response transcript. Kennedy replies are archived with
-their source conversation so they passively reach every other open session.
-The browser acknowledges a range only after checkpointing it into the owning
-Chatend; polling or a browser restart therefore cannot lose context. Fetch and
-preparation endpoints allow one stored voice transcription or document
-extraction to be reused by all sessions.
+The private `/adduser @handle` UX calls the host. A forbidden outcome produces an administrator-only response; a successful outcome reports whether a numeric ID is already known. The relay itself never inserts, updates, or queries a user-management table.
 
-After the 51st group message since a user's last invocation, the relay
-atomically detaches that pair's active pointer and records a silent-reset range.
-The browser appends that range, closes the Conversation History record, and
-acknowledges completion without sending anything to Telegram. A later
-invocation may start a fresh session even while the old record awaits ingress.
-More than 100 non-invocation messages after the last
-covered cursor queues the oldest 80 as one durable background-ingress batch,
-leaving 20 messages unbatched. The relay stores Kennedy's group replies in the
-same message archive.
+Private active conversation pointers are keyed by numeric Telegram user ID. Binding an event records `processing_started_at`, the durable origin of its 30-minute response deadline. Compare-and-swap rebinding is allowed only when the caller supplies the event's exact current conversation ID. Replies, resets, timeouts, and media behavior remain durable and idempotent.
 
-The browser may fetch one head-of-line event per private user or group-user
-pair, bind it to a Conversation
-History ID, store a voice note's paid transcription, fetch original media bytes,
-locally extract bounded document text through the intelligence backend, and
-submit a final reply. A document that is corrupt, image-only, or otherwise not
-readable, or whose extraction otherwise fails, receives a clear Telegram error
-and is completed instead of retrying forever and blocking that user's later
-events. Group voice and document events retain the same bytes, MIME type,
-filename/caption, and duration metadata as private events. Reply bodies contain
-Kennedy's conversational output only, plus an
-optional separate context-window notice. Long messages are split safely below
-Telegram's message limit.
+## Stable group identity and historical membership
 
-The browser runs fetched stream heads independently and enforces each event's
-durable 30-minute deadline. At expiry it cancels the locally active model/tool
-turn and calls the relay's abort transition. That transition atomically marks
-the exact event complete with `completion_reason: timeout` and clears only a
-private or group-user pointer that still matches the event's binding, allowing
-the next head in that stream to appear immediately. The relay then attempts a
-timeout notice; Telegram delivery failure is logged but cannot put the event
-back in the queue. Repeating the abort is idempotent.
+Every observed Telegram group receives a random stable opaque `group_id`. Current and former Telegram chat IDs map to it through an alias table, so a basic-group-to-supergroup migration retains the member ledger, security state, cursors, messages, and group-user session pointers. No application root ID is stored in the relay.
 
-A group `/reset` event carries recent group context. The browser checkpoints
-all unseen messages through the reset message before transitioning the exact
-group-user conversation into history ingress; only the normal reset
-acknowledgement is sent to the group.
+The bot must be a group administrator. Polling explicitly requests `message`, `edited_message`, `my_chat_member`, and `chat_member` updates. Administrator loss immediately fails closed.
 
-Directory endpoints separately expose unresolved user and group roots for
-frontend provisioning and look up a whitelisted entry by handle/numeric ID or a
-group by chat ID. Group-ingress endpoints expose pending 80-message batches
-decorated with their group root and idempotently mark them complete after the
-normal Conversation History/Kmap ingress pipeline finishes.
+For each group, the relay maintains a permanent human membership ledger. It updates the ledger from Telegram's administrator list, membership updates, join/leave service metadata, and sender envelopes. A member who leaves or is kicked remains in the ledger with that terminal membership status. The bot itself and Telegram's anonymous group identity are never inserted as human users. Every real human observation is sent to the host even when the person has departed.
 
-If the configured bot-token name is absent from Kennedy's unlocked encrypted
-credential vault, the relay HTTP service remains available and reports itself
-disabled. `kennedy-server` passes the resolved value directly into the relay at
-startup; the token is never exposed by the API, frontend, configuration file,
-or a vault reveal command.
+Before reading group message content, the relay performs this eligibility test:
+
+1. Telegram confirms that the bot is currently an owner or administrator.
+2. Telegram's current member count exactly equals the number of ledger entries currently marked member/administrator/creator plus the bot.
+3. Every numeric human ID ever recorded in that group's ledger appears in the host's latest whitelist snapshot, including left and kicked members.
+
+Passing all checks sets the group to `allowed`. Any failed check sets it to `quarantined` with roster-completeness metadata and a reason. Quarantine is reversible: eligibility is recomputed on later updates/messages, and a group becomes allowed once the roster is complete and the host has whitelisted every historical identity. Rediscovering or renaming a chat alone does not bypass quarantine.
+
+Telegram has no bot method that enumerates all ordinary members in an existing group. Its available membership methods provide administrator lists, a count, and lookup of an already known user. Therefore the reliable strict onboarding sequence is to create a new group with the bot, promote it to administrator, and then add members so each join is observed. A pre-existing group remains quarantined until every current human has at least been observed and the count reconciles. Membership that predates the bot and departed before it joined cannot be reconstructed.
+
+## Quarantined message handling
+
+Telegram necessarily delivers and deserializes an update envelope before application code can identify its chat and sender. Within the relay, a quarantined group message is handled only far enough to record sender/membership/service metadata and recompute eligibility. If the group is still ineligible, the function returns before:
+
+- testing mentions, commands, replies, or reset instructions;
+- reading or deriving message/caption text;
+- downloading voice notes or documents;
+- producing validation feedback;
+- storing message content, media, events, or background-ingress rows;
+- exposing content to Kennedy's browser/model pipeline.
+
+This is the strongest content-isolation boundary available to a Bot API client and prevents unauthorized group text from entering any application prompt or durable content archive.
+
+## Allowed group transport
+
+An allowed group message invokes Kennedy when it mentions the bot handle, replies to a bot message, or is a scoped `/reset`. Voice notes invoke by reply; documents may invoke by caption mention or reply. Each event carries relay identity fields, its stable `groupId`, and recent transport context. The relay never decorates an event with user or group root IDs. Kennedy's frontend obtains those separately from Kennedy's directory API and joins them by numeric user ID and stable group ID.
+
+Group conversation pointers are keyed by `(group_id, telegram_user_id)` and never alter a private-DM or other-group pointer. Each pointer tracks passive-context and invocation cursors. Every allowed message is archived once; bot replies are archived with their source conversation. Media fetch/preparation endpoints allow a stored voice transcription or document extraction to be reused across sessions.
+
+After the 51st group message since a user's last invocation, the relay atomically detaches that pair's active pointer and records a silent-reset range. More than 100 non-invocation messages beyond the covered cursor queues the oldest 80 as a durable background-ingress batch, leaving 20 unbatched. Queue payloads carry transport fields, `groupId`, participants' Telegram IDs/handles/display names, and group title; they contain no Kmap roots.
+
+## Storage and host API
+
+The relay SQLite database owns:
+
+- private transport sessions;
+- Telegram events and original event media;
+- stable opaque groups and Telegram chat-ID aliases;
+- the permanent historical group-member ledger;
+- group-user sessions and reset ranges;
+- allowed group message/media archives;
+- background-ingress batches and transport cursors.
+
+It does not own whitelist entries, observed-identity directory records, `can_add_users` or any other application capability, user roots, group roots, system roots, API keys, or bot tokens.
+
+`migrate_storage(path)` applies transport migrations idempotently. A legacy permanent-blacklist schema is converted to fail-closed `quarantined` rows with `roster_complete = false`; existing IDs, aliases, members, messages, sessions, resets, cursors, and events are preserved. The loopback API exposes only transport health, event/media/binding/reply/reset/abort transitions, group ingress, and group-session context operations.

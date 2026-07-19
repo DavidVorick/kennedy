@@ -22,10 +22,13 @@ The MVP has six logical runtime components:
    requests.
 4. **Conversation history backend**: a Rust HTTP service. It durably checkpoints
    active browser conversations and owns the sequential history-ingress queue.
-5. **Telegram relay**: a Rust service built on `teloxide`. It long-polls
-   Telegram, owns a separate identity/group-policy database, durably queues
-   private and group work, and ferries conversational output between Telegram
-   and the browser without constructing prompts or running Kennedy.
+5. **Telegram relay**: a transplantable Rust library built on `teloxide`. It long-polls
+   Telegram, owns Telegram transport, stable opaque group identity, membership,
+   and group-security state, durably queues private and group work, and ferries
+   conversational output between Telegram and the browser without constructing
+   prompts or running Kennedy. Kennedy passes the bot token and an identity
+   callback into the library; Kennedy's user directory separately owns
+   whitelist/TOFU identity, `/adduser` capability, and Kmap-root assignments.
 6. **Audio ingress backend**: a Rust HTTP service. It durably accepts vnote WAV
    files, owns content-hash idempotency and restartable preparation, transcribes
    ordered overlapping chunks with Gemini, reconciles a final transcript with
@@ -332,20 +335,28 @@ this destructive path for stuck sessions and cancels locally owned work first.
 
 ### 4.5 Telegram Relay
 
-The relay owns the bot token, transport/event database, and a separate user
-directory containing whitelist handles, TOFU-pinned numeric IDs, reserved user
-and group Kmap root IDs, root readiness, and permanent group decisions. `@taek42` is the only
+Kennedy unlocks the secret vault and passes the bot token into the relay library.
+The relay owns a transport/event database containing private
+session pointers, opaque stable group IDs, chat-ID aliases, membership ledgers,
+group-security decisions, event/message archives, and queue cursors. The
+separate Kennedy user directory owns whitelist handles, TOFU-pinned numeric
+IDs, reserved user and group Kmap root IDs, and root readiness. It maps relay
+group IDs to local roots; the relay database never stores a Kmap root. `@taek42` is the only
 initial unresolved privileged handle; the backend uses the generic directory
 capability rather than a David-specific ID path. Its eventual numeric ID and
 every `/adduser @handle` entry are pinned on first matching observation.
 
 Private chats retain per-user sessions and `/reset`. In groups, Kennedy must be
 an administrator and the observed active-member ledger must exactly match the
-Telegram member count with every identity whitelisted. Unknown/conflicting
-members, an incomplete ledger, or loss of monitoring after activation
-permanently blacklists the chat ID. Each observed group keeps a stable root even
-after blacklisting or a Telegram chat-ID migration. Mentions, replies, and
-scoped group resets queue response work onto a persistent `(group root, user)`
+Telegram member count. Every identity ever observed in the group remains in a
+historical ledger and must be whitelisted even after leaving or being kicked.
+An incomplete roster, unauthorized historical identity, or loss of monitoring
+quarantines the logical group; eligibility is recomputed and becomes allowed
+once the complete history is whitelisted. Message content is discarded before
+text/media handling while quarantined. Each observed group keeps a stable
+opaque relay ID, mapped by Kennedy to a stable root, through quarantine and
+Telegram chat-ID migration. Mentions, replies, and scoped group resets queue
+response work onto a persistent `(relay group ID, user)`
 session with up to 50 messages of initial context. Every allowed group message
 is also archived once and exposed as a durable passive-context stream to every
 open session in the group, including voice notes, supported documents, and
@@ -570,7 +581,7 @@ that other participants have separate sessions. Background 80-message archives
 have no invoker, so they load the
 group root followed by Kennedy's root and register all participant roots before
 ordinary sequential history ingress. Group-root assignments are created when a
-group is first observed and survive permanent blacklisting and Telegram chat-ID
+group is first observed and survive quarantine and Telegram chat-ID
 migration.
 
 Browser recordings and Telegram voice notes follow the same capability-aware

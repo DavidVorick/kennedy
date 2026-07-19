@@ -1,14 +1,3 @@
-CREATE TABLE IF NOT EXISTS authorized_users (
-    bootstrap_username TEXT PRIMARY KEY,
-    telegram_user_id INTEGER UNIQUE,
-    username TEXT,
-    display_name TEXT,
-    chat_id INTEGER,
-    current_conversation_id TEXT,
-    paired_at TEXT,
-    updated_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS telegram_events (
     id TEXT PRIMARY KEY,
     update_id INTEGER NOT NULL UNIQUE,

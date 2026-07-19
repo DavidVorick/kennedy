@@ -3,6 +3,7 @@ mod credentials;
 mod kmap_http;
 mod kmap_size;
 mod rust_lib_tools;
+mod telegram_identity;
 
 use std::path::{Path, PathBuf};
 
@@ -172,7 +173,9 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         "Gemini search and audio transcription",
     )?;
     let telegram_bot_token =
-        resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?;
+        resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?
+            .map(kennedy_telegram_relay::BotToken::new)
+            .transpose()?;
     let codex_catalog_cache =
         kennedy_codex_runtime::CatalogCache::new(kennedy_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) = kmap_http::initialize(
@@ -180,6 +183,11 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.kweb_provenance_artifacts,
         &args.user_database,
     )?;
+    let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
+        &args.user_database,
+        &args.telegram_bootstrap_username,
+    )?);
+    let telegram_directory_router = telegram_identity::router(telegram_identity.clone());
     let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT)
         .with_context(|| format!("opening managed Rust libraries root {RUST_LIBS_ROOT}"))?;
     let history = kennedy_conversation_history::Config {
@@ -195,10 +203,9 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let telegram = kennedy_telegram_relay::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
-        user_database: args.user_database,
         allowed_origins: vec![args.frontend_origin.clone()],
         bot_token: telegram_bot_token,
-        bootstrap_usernames: vec![args.telegram_bootstrap_username],
+        identity_sink: telegram_identity,
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
     let audio_ingress = kennedy_audio_ingress::Config {
@@ -216,6 +223,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             args.frontend_dir,
             args.system_prompts_dir,
             rust_lib_tools,
+            telegram_directory_router,
             kweb_listener,
         ),
         kennedy_intelligence::serve(

@@ -11,7 +11,7 @@ import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, runAgentLoop } 
 import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
 import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
-import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, KwebAPI, RustLibsAPI, TelegramRelayAPI, newIdempotencyId } from "../public/js/api.js";
+import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, KwebAPI, RustLibsAPI, TelegramDirectoryAPI, TelegramRelayAPI, newIdempotencyId } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
 import { contextUsageMeasurement, formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
@@ -2979,10 +2979,10 @@ test("background Telegram group ingress directly loads the group and Kennedy roo
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
   assert.match(app, /const directRoots = \[batch\.groupRootNodeId, kennedyRootNodeId\]/);
   assert.match(app, /groupRootNodeId: batch\.groupRootNodeId/);
-  assert.match(app, /if \(!batch\.groupRootReady\)/);
+  assert.match(app, /provisionGroupRoot\(batch\.groupId\)/);
 });
 
-test("Telegram relay client exposes identity provisioning and group-ingress queues", async () => {
+test("Telegram directory and relay clients keep user management off the relay API", async () => {
   const originalFetch = globalThis.fetch;
   const requests = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -2995,32 +2995,33 @@ test("Telegram relay client exposes identity provisioning and group-ingress queu
     };
   };
   try {
-    const api = TelegramRelayAPI("http://telegram");
-    await api.provisioningUsers();
-    await api.userByHandle("@Taek42");
-    await api.completeHandleRoot("taek42", id(1));
-    await api.userById(42);
-    await api.provisioningGroups();
-    await api.groupById(-100);
-    await api.completeGroupRoot(-100, id(2));
-    await api.groupIngress();
-    await api.completeGroupIngress("batch");
-    await api.groupSessionUpdates();
-    await api.acknowledgeGroupContext("019f5ca7-020f-7b63-be2f-82785fb68c03", 51);
-    await api.completeSilentGroupReset("019f5ca7-020f-7b63-be2f-82785fb68c03");
-    await api.groupMessageMedia(-100, 50);
-    await api.saveGroupMessagePreparation(-100, 50, { text: "Prepared", model: "transcriber" });
+    const directory = TelegramDirectoryAPI("http://kennedy");
+    await directory.provisioningUsers();
+    await directory.userByHandle("@Taek42");
+    await directory.completeHandleRoot("taek42", id(1));
+    await directory.userById(42);
+    await directory.provisioningGroups();
+    await directory.groupById("stable-group");
+    await directory.completeGroupRoot("stable-group", id(2));
+    const relay = TelegramRelayAPI("http://telegram");
+    await relay.groupIngress();
+    await relay.completeGroupIngress("batch");
+    await relay.groupSessionUpdates();
+    await relay.acknowledgeGroupContext("019f5ca7-020f-7b63-be2f-82785fb68c03", 51);
+    await relay.completeSilentGroupReset("019f5ca7-020f-7b63-be2f-82785fb68c03");
+    await relay.groupMessageMedia(-100, 50);
+    await relay.saveGroupMessagePreparation(-100, 50, { text: "Prepared", model: "transcriber" });
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(requests.map(request => request.url), [
-    "http://telegram/api/v1/users/provisioning",
-    "http://telegram/api/v1/users/by-handle/%40Taek42",
-    "http://telegram/api/v1/users/by-handle/taek42/root-ready",
-    "http://telegram/api/v1/users/42",
-    "http://telegram/api/v1/groups/provisioning",
-    "http://telegram/api/v1/groups/-100",
-    "http://telegram/api/v1/groups/-100/root-ready",
+    "http://kennedy/api/v1/telegram-directory/users/provisioning",
+    "http://kennedy/api/v1/telegram-directory/users/by-handle/%40Taek42",
+    "http://kennedy/api/v1/telegram-directory/users/by-handle/taek42/root-ready",
+    "http://kennedy/api/v1/telegram-directory/users/42",
+    "http://kennedy/api/v1/telegram-directory/groups/provisioning",
+    "http://kennedy/api/v1/telegram-directory/groups/stable-group",
+    "http://kennedy/api/v1/telegram-directory/groups/stable-group/root-ready",
     "http://telegram/api/v1/group-ingress",
     "http://telegram/api/v1/group-ingress/batch/complete",
     "http://telegram/api/v1/group-sessions/updates",

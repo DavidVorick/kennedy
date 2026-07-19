@@ -1978,6 +1978,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "hex",
  "kcode-rust-libs",
  "kennedy-audio-ingress",
  "kennedy-codex-runtime",
@@ -1985,6 +1986,7 @@ dependencies = [
  "kennedy-intelligence",
  "kennedy-telegram-relay",
  "kweb-db-core",
+ "rand 0.9.5",
  "rpassword",
  "rusqlite",
  "rustls",
@@ -2008,9 +2010,6 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
- "hex",
- "http",
- "rand 0.9.5",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2019,6 +2018,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

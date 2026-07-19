@@ -676,3 +676,42 @@ canonical documents; this file is not an append-only log.
   complete that event as a timeout, clear only its matching session pointer,
   notify the Telegram chat on a best-effort basis, and close any saved pending
   turn into history ingress so later events in that stream can proceed.
+
+## Telegram Repository and Storage Separation
+
+- Prepare the Telegram implementation to become a Rust library in a completely
+  separate repository; no Telegram implementation source should remain in this
+  repository after that later extraction.
+- Keep user management in Kennedy. The future Telegram library supplies handles
+  and numeric Telegram IDs when known, accepts whitelist/security inputs from
+  its consumer, and does not own Kennedy users or Kmap-root policy.
+- Split persistence before extracting the repository. Telegram transport owns
+  private session pointers, opaque stable group IDs, chat-ID history, member
+  ledgers, group-security decisions, cursors, events, and message/ingress
+  archives. Kennedy's user directory owns whitelists, observed identity, user
+  roots, and the mapping from an opaque Telegram group ID to a local group root.
+  Kmap root IDs must not be persisted in Telegram transport storage.
+- Perform this data transition during one explicitly scheduled pause: create a
+  recoverable backup, update the code, migrate all existing data, validate it,
+  and restart on the separated schema without requiring a multi-release online
+  migration.
+- The extracted Telegram crate is a pure library. Kennedy unlocks and retains
+  the encrypted credential vault, then passes the Telegram bot token into the
+  library's initializer; the library does not open the vault or own secret
+  storage.
+- Supersede permanent group blacklisting with a reversible, fail-closed
+  historical-membership gate. Retain every human identity ever observed in a
+  logical group's membership history even after departure or removal. Kennedy
+  may interact only when the roster is known complete and every historical
+  identity is currently whitelisted. A newly observed unauthorized identity
+  returns the group to quarantine; whitelisting all historical identities makes
+  it eligible again.
+- While a group is quarantined or its roster is incomplete, discard its message
+  updates before inspecting, downloading, logging, archiving, or exposing their
+  content to Kennedy. Membership/service updates may still be processed so the
+  gate can eventually become satisfied. Because the Telegram Bot API cannot
+  enumerate ordinary members, inability to prove the initial roster complete
+  must remain fail-closed rather than silently enabling the group.
+- Kennedy will always be made an administrator of every Telegram group she is
+  added to. The relay must still verify that status at runtime and fail closed
+  if Telegram reports otherwise.

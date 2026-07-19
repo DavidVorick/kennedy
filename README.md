@@ -14,10 +14,10 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
 - `kennedy-conversation-history` checkpoints active conversations and durably
   stores complete conversation and history-ingress recovery archives, with
   multiple live conversations and a serialized history-ingress queue.
-- `kennedy-telegram-relay` uses `teloxide` plus a separate user-directory SQLite
-  database to enforce TOFU whitelists/permanent group decisions and queue
-  authorized private or group work while the browser remains the visible
-  Chatend owner.
+- `kennedy-telegram-relay` is a transplantable library built on `teloxide` and owns Telegram transport, opaque
+  group identity, membership, and group-security state. Kennedy's separate user
+  directory owns TOFU whitelists and Kmap-root mappings; the browser remains the
+  visible Chatend owner.
 - `kennedy-audio-ingress` durably owns content-addressed vnotes, restartable
   Gemini/Sol transcript preparation, and timestamped Kennedy-ingress pieces.
 - `Frontend/public` owns live conversations, context, tool execution, durable
@@ -346,8 +346,10 @@ without an invocation. Voice
 notes sent as replies and supported documents sent by caption mention or reply
 use the same transcription/extraction paths as DMs. More than 100 uninvoked group messages queues the oldest 80
 for background ingress with the group and Kennedy roots loaded. Groups require Kennedy to be an
-administrator and are permanently blacklisted on an unknown/conflicting member
-or incomplete membership ledger. The browser composer also has a microphone button; both sources
+administrator. The relay quarantines a group unless its observed active ledger matches Telegram's
+member count and every current or departed historical member is whitelisted. Quarantined message
+content is discarded before text/media handling; the group becomes eligible when the complete
+historical ledger is whitelisted. The browser composer also has a microphone button; both sources
 preserve the original audio with the paid transcription.
 
 The browser conversation composer also offers `Send & end`: it checkpoints one
@@ -400,7 +402,7 @@ thread-ID validation, and search-source extraction.
 
 ## MVP boundaries
 
-The MVP intentionally has a small code-seeded Telegram whitelist with one
+The MVP intentionally has a small Kennedy-owned, code-seeded Telegram whitelist with one
 `/adduser` administrator, trusted shared-Kmap access without per-root access
 controls, no streaming, and no manual memory editing or deletion. Active conversations and unfinished
 history ingress survive an abrupt UI close; transient provider-chain and tool

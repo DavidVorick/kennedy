@@ -12,6 +12,7 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 flate2.workspace = true
+hex.workspace = true
 kennedy-audio-ingress = { path = "../AudioIngress" }
 kennedy-codex-runtime = { path = "../CodexRuntime" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
@@ -20,6 +21,7 @@ kcode-rust-libs = "=0.1.2"
 kweb-db-core = "=0.2.2"
 kennedy-telegram-relay = { path = "../TelegramRelay" }
 rusqlite.workspace = true
+rand.workspace = true
 rustls.workspace = true
 rpassword.workspace = true
 serde.workspace = true
