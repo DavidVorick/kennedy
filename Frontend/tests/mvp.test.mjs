@@ -13,7 +13,7 @@ import { formatContextNode, formatKmapContext, formatToolResult } from "../publi
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, KwebAPI, RustLibsAPI, TelegramRelayAPI, newIdempotencyId } from "../public/js/api.js";
 import { formatDuration } from "../public/js/timing.js";
-import { formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
+import { contextUsageMeasurement, formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
 import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
 import { FREE_TIME_CONTINUATION_MINIMUM_MS, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, MAX_SELF_TIME_PROMPT_CHARACTERS, freeTimeCanStartNewSession, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeTiming, freeTimeTurnContinuationMessage, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "../public/js/self_time.js";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventDeadlineMs, telegramEventTimeoutMs } from "../public/js/telegram_timing.js";
@@ -81,9 +81,11 @@ class MockKweb {
 test("Kmap client uses namespaced storage routes and derives active context", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const connectionSummaries = values => values.map(summary);
   const stored = new Map([
-    [id(1), { id: id(1), short_name: "Root Node", short_description: "", long_description: "", last_modified_by: "test", last_modified_at: "2026-07-18T00:00:00Z", owner_node_id: id(1), fixed_connections: [id(3)], recent_connections: [id(2)] }],
-    [id(2), { id: id(2), short_name: "Active Node", short_description: "", long_description: "", last_modified_by: "test", last_modified_at: "2026-07-18T00:00:00Z", owner_node_id: id(1), fixed_connections: [], recent_connections: [] }],
+    [id(1), { id: id(1), short_name: "Root Node", short_description: "", long_description: "", last_modified_by: "test", last_modified_at: "2026-07-18T00:00:00Z", owner_node_id: id(1), fixed_connections: [id(3)], recent_connections: [id(2), id(4), id(5), id(6), id(7), id(8), id(9), id(10), id(11)], connection_summaries: connectionSummaries([2, 3, 4, 5, 6, 7, 8, 9, 10, 11]) }],
+    [id(2), { id: id(2), short_name: "Active Node", short_description: "", long_description: "", last_modified_by: "test", last_modified_at: "2026-07-18T00:00:00Z", owner_node_id: id(1), fixed_connections: [], recent_connections: [id(12), id(13), id(14), id(15), id(16), id(17), id(18), id(19), id(20)], connection_summaries: connectionSummaries([12, 13, 14, 15, 16, 17, 18, 19, 20]) }],
+    ...[4, 5, 6, 7, 8, 9, 10].map(value => [id(value), { id: id(value), short_name: `Active Node ${value}`, short_description: "", long_description: "", last_modified_by: "test", last_modified_at: "2026-07-18T00:00:00Z", owner_node_id: id(1), fixed_connections: [], recent_connections: [], connection_summaries: [] }]),
   ]);
   globalThis.fetch = async url => {
     calls.push(String(url));
@@ -95,11 +97,14 @@ test("Kmap client uses namespaced storage routes and derives active context", as
     assert.deepEqual(calls, [
       `http://local/api/v1/kmap/nodes/${id(1)}`,
       `http://local/api/v1/kmap/nodes/${id(2)}`,
+      ...[4, 5, 6, 7, 8, 9, 10].map(value => `http://local/api/v1/kmap/nodes/${id(value)}`),
     ]);
-    assert.deepEqual(payload.requested_node.fixed_connections, [{ id: id(3), slot: 1 }]);
-    assert.deepEqual(payload.requested_node.active_connections, [{ id: id(2) }]);
+    assert.deepEqual(payload.requested_node.fixed_connections, [{ ...summary(3), slot: 1 }]);
+    assert.deepEqual(payload.requested_node.active_connections[0], summary(2));
+    assert.deepEqual(payload.requested_node.fanout_connections, [summary(11)]);
     assert.equal(Object.hasOwn(payload.requested_node, "recent_connections"), false);
     assert.equal(payload.active_connection_nodes[0].short_name, "Active Node");
+    assert.deepEqual(payload.active_connection_nodes[0].fanout_connections, [summary(20)]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -226,19 +231,26 @@ test("Kweb provenance artifacts are fetched from their encoded namespaced path",
   }
 });
 
-test("short IDs are stable within a context and reset from one", async () => {
-  const api = new MockKweb([node(1, [3]), node(2), node(3)]);
+test("short IDs remain bound to the same nodes across context resets", async () => {
+  const api = new MockKweb([node(1, [3]), node(2), node(3), node(4), node(5)]);
   const context = new KwebContext(api, [id(1), id(2)]);
   await context.initialize();
   assert.equal(context.shortId(id(1)), 1);
   assert.equal(context.shortId(id(2)), 2);
-  assert.equal(context.shortId(id(2)), 2);
   assert.equal(context.shortId(id(3)), 3);
+  await context.loadDurable(id(4));
+  assert.equal(context.shortId(id(4)), 4);
   await context.reset([id(3)]);
   assert.equal(context.shortId(id(1)), 1);
   assert.equal(context.shortId(id(2)), 2);
-  assert.deepEqual(context.loadedNodeIds, [id(1), id(2), id(3)]);
-  assert.equal(context.resolve(context.shortId(id(3))), id(3));
+  assert.equal(context.shortId(id(3)), 3);
+  assert.equal(context.resolve(4), id(4));
+  const restored = new KwebContext(api, [id(1), id(2)]);
+  restored.restore(context.archive());
+  assert.equal(restored.resolve(4), id(4));
+  assert.equal(restored.shortId(id(5)), 5);
+  await restored.loadDurable(restored.resolve(4));
+  assert.deepEqual(restored.loadedNodeIds, [id(1), id(2), id(3), id(4)]);
 });
 
 test("all declared roots load automatically and survive every reset", async () => {
@@ -1248,7 +1260,7 @@ test("a pre-boundary Codex thread is replayed from the full visible Chatend", as
   assert.match(requests[1].chatend, /new question/);
 });
 
-test("concise context usage is model-visible and stale thread usage is cleared on reset", () => {
+test("concise context usage preserves the latest successful LLM measurement across thread resets", () => {
   const usage = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
   assert.equal(
     formatContextWindowProgress(usage.snapshot()),
@@ -1264,29 +1276,51 @@ test("concise context usage is model-visible and stale thread usage is cleared o
     "context window usage: 201,000 / 258,400",
   );
   usage.resetThread();
-  assert.equal(usage.snapshot().contextKnown, false);
-  assert.equal(formatContextWindowProgress(usage.snapshot()), "context window usage: unknown / 258,400");
+  assert.equal(usage.snapshot().contextKnown, true);
+  assert.equal(formatContextWindowProgress(usage.snapshot()), "context window usage: 201,000 / 258,400");
   assert.equal(usage.snapshot().totalInputTokens, 200000);
+  assert.equal(usage.snapshot().providerThreadTotals, null);
 });
 
-test("cumulative multi-pass usage is never presented as current context occupancy", () => {
+test("cumulative usage is differenced into latest-call occupancy when explicit last-pass fields are absent", () => {
   const usage = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
+  usage.record({
+    input_tokens: 140000, output_tokens: 100, cached_tokens: 70000,
+    cache_write_tokens: 0, reasoning_tokens: 0, cumulative: true,
+  });
+  assert.equal(usage.snapshot().contextKnown, true);
+  assert.equal(usage.snapshot().contextTokens, 140100);
   usage.record({
     input_tokens: 281555, output_tokens: 238, cached_tokens: 140032,
     cache_write_tokens: 0, reasoning_tokens: 0, cumulative: true,
-  });
-  assert.equal(usage.snapshot().contextKnown, false);
-  assert.equal(usage.snapshot().contextTokens, 0);
-  assert.equal(usage.snapshot().last.inputTokens, 281555);
+  }, { continued: true });
+  assert.equal(usage.snapshot().contextTokens, 141693);
   assert.equal(usage.snapshot().totalInputTokens, 281555);
-  assert.equal(formatContextWindowProgress(usage.snapshot()), "context window usage: unknown / 258,400");
+  assert.equal(formatContextWindowProgress(usage.snapshot()), "context window usage: 141,693 / 258,400");
 
   const restored = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
   restored.restore({
-    totalInputTokens: 281555,
-    last: { inputTokens: 281555, outputTokens: 238 },
+    totalInputTokens: 140857,
+    last: { inputTokens: 140857, outputTokens: 92 },
+    contextKnown: false,
   });
-  assert.equal(restored.snapshot().contextKnown, false);
+  assert.equal(restored.snapshot().contextKnown, true);
+  assert.equal(restored.snapshot().contextTokens, 140949);
+  assert.equal(formatContextWindowProgress(restored.snapshot()), "context window usage: 140,949 / 258,400");
+
+  const legacyArchiveUsage = {
+    contextWindowTokens: 258400,
+    contextKnown: false,
+    contextTokens: 0,
+    last: { inputTokens: 140857, outputTokens: 92 },
+  };
+  assert.deepEqual(contextUsageMeasurement(legacyArchiveUsage), {
+    contextKnown: true,
+    contextTokens: 140949,
+    contextWindowTokens: 258400,
+    contextRemaining: 117451,
+  });
+  assert.equal(formatContextWindowProgress(legacyArchiveUsage), "context window usage: 140,949 / 258,400");
 
   const exact = new UsageTracker({ contextWindowTokens: 258400, maxInputTokens: 258400 });
   exact.record({
@@ -1462,7 +1496,7 @@ test("a structured Chatend archive retains activity while refreshing current man
   const kweb = new MockKweb([node(1), node(2), node(3)]);
   const source = new ConversationSession({
     kweb, intelligence: {}, manuals: promptManuals("Shared"),
-    rootNodeId: id(1), provider: "p", model: "m", onUpdate: () => {},
+    rootNodeId: id(1), provider: "p", model: "m", contextWindowTokens: 258400, onUpdate: () => {},
   });
   await source.initialize();
   await source.context.loadDurable(id(2));
@@ -1476,7 +1510,7 @@ test("a structured Chatend archive retains activity while refreshing current man
 
   const restored = new ConversationSession({
     kweb, intelligence: {}, manuals: promptManuals("Changed"),
-    rootNodeIds: [id(1), id(3)], provider: "p", model: "m", onUpdate: () => {},
+    rootNodeIds: [id(1), id(3)], provider: "p", model: "m", contextWindowTokens: 258400, onUpdate: () => {},
   });
   await restored.initialize(saved);
   assert.match(restored.chatend.messages[0].content, /Changed/);
@@ -1489,6 +1523,9 @@ test("a structured Chatend archive retains activity while refreshing current man
     { name: "LoadNode", ok: true },
   ]);
   assert.equal(restored.usage.snapshot().totalInputTokens, 12);
+  assert.equal(restored.usage.snapshot().contextKnown, true);
+  assert.equal(restored.usage.snapshot().contextTokens, 15);
+  assert.equal(formatContextWindowProgress(restored.usage.snapshot()), "context window usage: 15 / 258,400");
   assert.deepEqual(restored.chatend.historySegments, source.chatend.historySegments);
 });
 

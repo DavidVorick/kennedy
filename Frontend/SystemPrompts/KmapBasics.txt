@@ -1,4 +1,4 @@
-Kmap nodes have positive integer identifiers. An identifier is valid only in the current session and only until ResetContext is called. Do not use identifiers outside tool calls.
+Kmap nodes have positive integer identifiers. An identifier is valid only in the current session. Once assigned, it remains bound to the same node across every ResetContext call and session restoration; a node that is no longer displayed can still be loaded with its identifier. Prefer node names in prose and notes to yourself for readability, but any identifier you mention continues to name the same node for the rest of the session.
 
 The session's root nodes are always loaded automatically in the order declared by the current Kmap context. ResetContext preserves every root even when it is not listed in the call.
 

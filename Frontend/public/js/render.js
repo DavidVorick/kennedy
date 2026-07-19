@@ -1,5 +1,5 @@
 import { formatKmapContext } from "./human_format.js?v=20260719.1";
-import { formatChatend } from "./chatend_format.js?v=20260718.2";
+import { contextUsageMeasurement, formatChatend } from "./chatend_format.js?v=20260719.2";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
 
@@ -835,16 +835,17 @@ export function renderUsage(container, diagnostic) {
     container.append(element("span", "context-usage-primary", "Usage unavailable"));
     return;
   }
-  const contextPercent = usage.contextWindowTokens ? 100 * usage.contextTokens / usage.contextWindowTokens : 0;
+  const { contextKnown, contextTokens, contextWindowTokens, contextRemaining } = contextUsageMeasurement(usage);
+  const contextPercent = contextWindowTokens ? 100 * contextTokens / contextWindowTokens : 0;
   const cachePercent = usage.cacheReadPercent || 0;
-  const primary = usage.contextWindowTokens && usage.contextKnown === false
-    ? `Current unknown / ${exactTokenCount(usage.contextWindowTokens)}`
-    : usage.contextWindowTokens
-    ? `${exactTokenCount(usage.contextTokens)} / ${exactTokenCount(usage.contextWindowTokens)}`
-    : `${exactTokenCount(usage.contextTokens)} used`;
-  const remaining = usage.contextKnown === false
-    ? usage.last ? "last-pass usage unavailable" : "fresh thread"
-    : usage.contextRemaining === null ? "window unknown" : `${exactTokenCount(usage.contextRemaining)} remaining`;
+  const primary = contextWindowTokens && !contextKnown
+    ? `Current unknown / ${exactTokenCount(contextWindowTokens)}`
+    : contextWindowTokens
+    ? `${exactTokenCount(contextTokens)} / ${exactTokenCount(contextWindowTokens)}`
+    : `${exactTokenCount(contextTokens)} used`;
+  const remaining = !contextKnown
+    ? "no successful LLM usage yet"
+    : contextRemaining === null ? "window unknown" : `${exactTokenCount(contextRemaining)} remaining`;
   const text = element("div", "context-usage-text");
   text.append(
     element("strong", "context-usage-primary", primary),
@@ -855,9 +856,9 @@ export function renderUsage(container, diagnostic) {
   fill.style.width = `${Math.max(0, Math.min(100, contextPercent))}%`;
   track.append(fill);
   container.title = [
-    usage.contextKnown === false
-      ? "Current context occupancy is not available"
-      : `${exactTokenCount(usage.contextTokens)} tokens currently in context`,
+    !contextKnown
+      ? "Context occupancy is not available before the first successful LLM usage report"
+      : `${exactTokenCount(contextTokens)} tokens in the latest successful LLM call`,
     `${remaining}`,
     `${exactTokenCount(usage.totalInputTokens)} cumulative input tokens`,
     `${exactTokenCount(usage.totalOutputTokens)} cumulative output tokens`,

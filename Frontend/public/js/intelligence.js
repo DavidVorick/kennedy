@@ -1,6 +1,6 @@
 import { END_TURN_NAME, TOOL_CHECK_NAME, parseToolCalls, TOOL_CALL_PREFIX, truncateToolResponse } from "./tools.js?v=20260719.1";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { formatChatend } from "./chatend_format.js?v=20260718.2";
+import { formatChatend } from "./chatend_format.js?v=20260719.2";
 
 export const AGENT_LOOP_ROUND_LIMIT = 100;
 export const AGENT_LOOP_TURN_ENDED = Symbol("agent-loop-turn-ended");
@@ -75,12 +75,16 @@ export class UsageTracker {
           inputTokens: Math.max(0, Number(usage.last_input_tokens)),
           outputTokens: Math.max(0, Number(usage.last_output_tokens)),
         }
-      : usage.cumulative === true ? null : normalized;
+      : {
+          inputTokens: normalized.inputTokens,
+          outputTokens: normalized.outputTokens,
+        };
   }
 
   resetThread() {
-    this.last = null;
-    this.lastContext = null;
+    // A new provider thread resets only the baseline used to difference
+    // cumulative counters. The latest successful LLM measurement remains the
+    // best available context reading until another LLM response replaces it.
     this.providerThreadTotals = null;
   }
 
@@ -93,7 +97,17 @@ export class UsageTracker {
     this.totalCacheWriteTokens = Number(snapshot.totalCacheWriteTokens) || 0;
     this.totalReasoningTokens = Number(snapshot.totalReasoningTokens) || 0;
     this.last = snapshot.last && typeof snapshot.last === "object" ? { ...snapshot.last } : null;
-    this.lastContext = snapshot.lastContext && typeof snapshot.lastContext === "object" ? { ...snapshot.lastContext } : null;
+    const savedContext = snapshot.lastContext && typeof snapshot.lastContext === "object"
+      ? snapshot.lastContext
+      : this.last;
+    this.lastContext = savedContext
+      && Number.isFinite(Number(savedContext.inputTokens))
+      && Number.isFinite(Number(savedContext.outputTokens))
+      ? {
+          inputTokens: Math.max(0, Number(savedContext.inputTokens)),
+          outputTokens: Math.max(0, Number(savedContext.outputTokens)),
+        }
+      : null;
     this.providerThreadTotals = snapshot.providerThreadTotals && typeof snapshot.providerThreadTotals === "object" ? { ...snapshot.providerThreadTotals } : null;
   }
 

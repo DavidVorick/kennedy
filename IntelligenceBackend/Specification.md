@@ -174,9 +174,10 @@ reasoning tokens. Codex's values are cumulative for the provider thread; the
 response marks them as cumulative so the frontend can difference continuation
 rounds. When the JSON event includes an optional `last_token_usage` object or
 equivalent last-input/output fields, the bridge also exposes those individual
-model-pass counts as `last_input_tokens` and `last_output_tokens`; the frontend
-uses only those fields for context occupancy. Cache-write tokens are reported
-as zero because Codex JSONL does not expose that measurement.
+model-pass counts as `last_input_tokens` and `last_output_tokens`. The frontend
+prefers those fields for context occupancy and otherwise uses the per-call delta
+it already derives from the cumulative counters. Cache-write tokens are
+reported as zero because Codex JSONL does not expose that measurement.
 
 `quality` and `balanced` web search start a new ephemeral Codex thread with
 `--search`, retain the same read-only/no-shell restrictions, and retain the
@@ -247,9 +248,11 @@ the bridge does not pass the key to the CLI.
 
 The frontend ends the string with
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
-Usage comes from the latest completed provider response; fresh threads use
-`unknown`. The intelligence backend treats this terse line like every other
-part of the canonical plaintext and does not rewrite it.
+Usage comes from the latest completed provider response. `unknown` is used only
+before the session has received its first successful usage report; a fresh
+provider thread retains the previous call's measurement until its own first
+successful response. The intelligence backend treats this terse line like
+every other part of the canonical plaintext and does not rewrite it.
 
 Successful responses contain:
 

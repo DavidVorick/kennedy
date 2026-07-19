@@ -204,12 +204,13 @@ The frontend can rebuild a chatend from:
    requested nodes and active-connection expansions after direct loads.
 
 `ResetContext` first resolves all supplied short identifiers to durable IDs.
-It then clears loaded Kweb data and short-ID mappings, reloads every session
-root in its declared order followed by the supplied nodes, and rebuilds the chatend. When a
+It then clears loaded Kweb data while preserving the session's short-ID
+assignments and allocation counter, reloads every session root in its declared
+order followed by the supplied nodes, and rebuilds the chatend. When a
 `selfMessage` is supplied, the frontend retains it as an assistant-role note
 immediately before the new Kweb context. Before that note, it places the compact
-ResetContext history. Node names are used because short identifiers are rebuilt
-by every reset; repeated node sets are collapsed into counted lines. Previous
+ResetContext history. Node names keep that history readable; repeated node sets
+are collapsed into counted lines. Previous
 Kweb context and other tool activity are omitted. The clean transcript or
 provenance input and notes from prior resets remain.
 During an active tool loop, the rebuilt chatend ends with the assistant's
@@ -232,24 +233,23 @@ reads.
 The frontend aggregates provider-reported input, output, reasoning, cache-read,
 and cache-write tokens. Codex reports cumulative thread usage, so continuation
 rounds are differenced before per-call and session totals are updated. Current
-context occupancy is the latest individual model request's input plus output
-tokens; remaining capacity uses the effective context window that Codex
-advertises for the selected model. Multi-pass or cumulative aggregates remain
-accounting telemetry and are never displayed as context occupancy, even when
-their sum happens to fit under the window. If the provider transport does not
-expose an individual-request measurement, occupancy is unknown. These figures
-are informative and never trigger compaction, truncation, or an automatic
-reset. Every Codex invocation suppresses automatic compaction; only an explicit
-ResetContext tool request rebuilds context.
+context occupancy is the latest successful model request's input plus output
+tokens; explicit `last_input_tokens` and `last_output_tokens` are preferred,
+with the already-differenced per-call usage used as the fallback. Remaining
+capacity uses the effective context window that Codex advertises for the
+selected model. These figures are informative and never trigger compaction,
+truncation, or an automatic reset. Every Codex invocation suppresses automatic
+compaction; only an explicit ResetContext tool request rebuilds context.
 
 Every generation request ends with exactly one terse context clue:
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
 The numbers use thousands separators and no token labels, percentages,
-remaining-token prose, or other explanation. A new, reset, or recovered fresh
-thread uses `unknown` rather than presenting usage from the abandoned thread.
-The Full inspector uses the same formatter and line. A known measurement comes
-from the previous completed response, so it does not include the newly appended
-suffix being submitted with it.
+remaining-token prose, or other explanation. `unknown` appears only before the
+session has received any successful LLM usage report. Starting a fresh provider
+thread, restoring a session, or calling `ResetContext` preserves the most recent
+measurement until the next successful LLM response replaces it. The Full
+inspector uses the same formatter and line. The measurement therefore does not
+include messages, tool results, or loaded nodes appended since that response.
 
 The frontend also measures wall-clock latency at the browser boundary. Each LLM
 response is followed by one compact timing line, every tool result includes one
@@ -260,9 +260,11 @@ These entries are persisted in the Chatend for later model turns.
 ## 6. Context Glue
 
 The Kmap API returns complete nodes whose fixed and recent connections are
-ordered durable-ID arrays. The frontend treats the first eight recent IDs as
-active, the remainder as fanout, fetches active node bodies as needed, and
-converts every node exposed to Kennedy into an in-context node:
+ordered durable-ID arrays, plus an additive name-and-description summary for
+every unique referenced node. The frontend joins those summaries onto all
+fixed and recent references, treats the first eight recent IDs as active, the
+remainder as fanout, fetches active node bodies as needed, and converts every
+node exposed to Kennedy into an in-context node:
 
 ```json
 {
@@ -287,9 +289,11 @@ converts every node exposed to Kennedy into an in-context node:
 when a legacy database row has no owner.
 
 Short identifiers are positive integers allocated in first-seen order. A
-durable node receives one short identifier per context, even if it appears in
-multiple LoadNode results. Durable IDs are never included in LLM-visible tool
-results or prompt context.
+durable node receives one short identifier per session, even if it appears in
+multiple LoadNode results or is unloaded by ResetContext. The complete mapping
+and next allocation value are checkpointed with the session; resetting context
+does not recycle or reassign an identifier. Durable IDs are never included in
+LLM-visible tool results or prompt context.
 
 `lastModifiedBy` is backend-owned metadata identifying the model and thinking
 mode responsible for the node's latest mutation. It is shown in readable Kmap
@@ -440,8 +444,9 @@ Text-protocol arguments:
 }
 ```
 
-The frontend resolves the identifiers before clearing the old map, then reloads
-all roots in their declared order followed by the supplied nodes in their given
+The frontend resolves the identifiers, clears loaded node material while
+preserving every existing session-local identifier assignment, then reloads all
+roots in their declared order followed by the supplied nodes in their given
 order. No root may appear in the argument list, and the resulting direct-load
 set must not exceed ten nodes. A private/web session has two roots and therefore
 accepts at most eight IDs; a group invocation has three roots and accepts at
@@ -1071,9 +1076,10 @@ the model context-window size, exact remaining tokens, and the percentage of
 input tokens served by prompt-cache reads. Hover details include cumulative
 input/output tokens, cache-read tokens, and cache-write tokens. Values come
 from provider usage rather than client-side token estimates; before the first
-provider response occupancy is explicitly unmeasured while the advertised
-effective limit remains visible. Multi-pass aggregates are not shown in the
-context-window numerator or percentage.
+successful provider usage report occupancy is explicitly unmeasured while the
+advertised effective limit remains visible. Thereafter the most recent
+successful LLM call remains visible across reloads and provider-thread resets
+until a newer successful call replaces it.
 
 ### 11.3 Audio Ingress History
 

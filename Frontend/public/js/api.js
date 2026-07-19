@@ -74,19 +74,32 @@ export async function requestFormJSON(base, path, form) {
   return payload;
 }
 
+export function hydrateStoredNodeConnections(node) {
+  const summariesById = new Map((node?.connection_summaries || []).map(summary => [summary.id, summary]));
+  const hydrate = connection => {
+    const stored = typeof connection === "string" ? { id: connection } : connection;
+    return { ...(summariesById.get(stored.id) || {}), ...stored };
+  };
+  return {
+    fixedConnections: (node?.fixed_connections || []).map((connection, index) => ({ ...hydrate(connection), slot: connection.slot || index + 1 })),
+    recentConnections: (node?.recent_connections || []).map(hydrate),
+  };
+}
+
 function contextNode(node) {
   const {
-    fixed_connections: fixedIds = [],
-    recent_connections: recentIds = [],
+    fixed_connections: _fixedConnections = [],
+    recent_connections: _recentConnections = [],
+    connection_summaries: _connectionSummaries = [],
     ...stored
   } = node;
-  const recent = recentIds.map(id => ({ id }));
+  const { fixedConnections, recentConnections } = hydrateStoredNodeConnections(node);
   return {
     ...stored,
     owner_root_node_id: node.owner_node_id,
-    fixed_connections: fixedIds.map((id, index) => ({ id, slot: index + 1 })),
-    active_connections: recent.slice(0, 8),
-    fanout_connections: recent.slice(8),
+    fixed_connections: fixedConnections,
+    active_connections: recentConnections.slice(0, 8),
+    fanout_connections: recentConnections.slice(8),
   };
 }
 
@@ -97,7 +110,7 @@ export const KwebAPI = (base) => ({
   node: (id) => requestJSON(base, `/api/v1/kmap/nodes/${id}`),
   context: async (id) => {
     const requested = await requestJSON(base, `/api/v1/kmap/nodes/${id}`);
-    const activeIds = (requested.recent_connections || []).slice(0, 8);
+    const activeIds = hydrateStoredNodeConnections(requested).recentConnections.slice(0, 8).map(connection => connection.id);
     const active = await Promise.all(activeIds.map(activeId => requestJSON(base, `/api/v1/kmap/nodes/${activeId}`)));
     return { requested_node: contextNode(requested), active_connection_nodes: active.map(contextNode) };
   },

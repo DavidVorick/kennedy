@@ -6,16 +6,39 @@ function exactTokens(value) {
   return new Intl.NumberFormat("en-US").format(Math.max(0, Number(value) || 0));
 }
 
+export function contextUsageMeasurement(usage) {
+  const contextWindowTokens = Math.max(0, Number(usage?.contextWindowTokens) || 0);
+  const storedContextTokens = Number(usage?.contextTokens);
+  const storedKnown = usage?.contextKnown === true && Number.isFinite(storedContextTokens);
+  const tokenPair = value => {
+    const inputTokens = Number(value?.inputTokens);
+    const outputTokens = Number(value?.outputTokens);
+    return Number.isFinite(inputTokens) && Number.isFinite(outputTokens)
+      ? { inputTokens: Math.max(0, inputTokens), outputTokens: Math.max(0, outputTokens) }
+      : null;
+  };
+  const previousCall = tokenPair(usage?.lastContext) || tokenPair(usage?.last);
+  const previousKnown = Boolean(previousCall);
+  const contextKnown = storedKnown || previousKnown;
+  const contextTokens = storedKnown
+    ? Math.max(0, storedContextTokens)
+    : previousKnown ? previousCall.inputTokens + previousCall.outputTokens : 0;
+  return {
+    contextKnown,
+    contextTokens,
+    contextWindowTokens,
+    contextRemaining: contextKnown && contextWindowTokens
+      ? Math.max(0, contextWindowTokens - contextTokens)
+      : null,
+  };
+}
+
 export function formatContextWindowProgress(usage) {
-  const contextWindowTokens = Number(usage?.contextWindowTokens) || 0;
+  const { contextKnown, contextTokens, contextWindowTokens } = contextUsageMeasurement(usage);
   if (contextWindowTokens <= 0) return "context window usage: unknown";
-  const contextKnown = usage?.contextKnown === false
-    ? false
-    : usage?.contextKnown === true || Boolean(usage?.last);
   if (!contextKnown) {
     return `context window usage: unknown / ${exactTokens(contextWindowTokens)}`;
   }
-  const contextTokens = Math.max(0, Number(usage?.contextTokens) || 0);
   return `context window usage: ${exactTokens(contextTokens)} / ${exactTokens(contextWindowTokens)}`;
 }
 

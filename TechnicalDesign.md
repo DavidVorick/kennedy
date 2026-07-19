@@ -192,8 +192,10 @@ expansion are unique name-only references. The structured snapshot remains
 richer for recovery and the interactive memory tree.
 The canonical request and Full inspector end with the terse line
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
-It uses the previous completed response's exact provider usage; fresh/reset
-threads use `unknown` so abandoned-thread data cannot mislead Kennedy.
+It uses the latest completed response's provider usage. Reloads and fresh/reset
+provider threads retain that last successful measurement until a newer LLM
+response replaces it; only a session with no successful usage report displays
+`unknown`.
 Each LLM response and readable tool result also carries one compact measured
 duration line; the end of a turn contains only total and combined LLM/tool time.
 The server emits one concise log per LLM call and tool call plus an aggregate
@@ -230,10 +232,14 @@ protection or transaction spanning multiple calls.
 
 `kennedy-server` wraps one library handle in a mutex, exposes it under
 `/api/v1/kmap`, serves frontend/prompt files, and stores the `user` and
-`kennedy` role mappings in the separate identity database. The frontend owns
-recent-connection ordering and implements multi-node graph operations through
-sequential complete-node updates. It interprets the first eight recent IDs as
-active expansions and the remainder as fanout summaries.
+`kennedy` role mappings in the separate identity database. Each node read and
+mutation response enriches the library's ordered connection IDs with an
+additive summary projection containing the connected nodes' names and short
+descriptions. The frontend owns recent-connection ordering and implements
+multi-node graph operations through sequential complete-node updates. It joins
+that metadata onto each connection, interprets the first eight recent IDs as
+active expansions, and treats the remainder as fanout summaries. The same
+hydration path feeds model context and the interactive memory explorer.
 
 The prompt route accepts safe plain `.txt` basenames from the configured prompt
 directory instead of duplicating the frontend's filename manifest in Rust.
@@ -412,14 +418,16 @@ fresh Codex thread.
 
 The Kweb portion of the chatend accumulates during the conversation. A
 `ResetContext` call resolves its arguments, validates its optional 400,000
-character note to self, removes all Kweb context, resets short identifiers,
-reloads the roots and requested nodes, and rebuilds the chatend while retaining
+character note to self, removes all loaded Kweb material while preserving the
+session's short-identifier ledger, reloads the roots and requested nodes, and
+rebuilds the chatend while retaining
 the clean transcript, prior reset notes, and the current shared context-loading
 counter. LoadNode and ResetContext consume the same per-turn or per-session
 context-loading budget, while ResetContext's internal node loads consume no
 extra calls. The rebuild places a complete, duplicate-grouped reset history
-before the latest note, using node names because short identifiers are unstable
-across resets. The latest note precedes the new Kweb context; root nodes precede
+before the latest note, using node names for readability. Existing identifiers
+remain resolvable after the reset, while newly seen nodes receive monotonically
+increasing identifiers. The latest note precedes the new Kweb context; root nodes precede
 explicitly requested nodes. The Full inspector and next fresh-thread request
 are formatted from this rebuilt list, so wiped Kmap material is absent from
 both.

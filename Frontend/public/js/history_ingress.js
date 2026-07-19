@@ -1,10 +1,10 @@
 import { Chatend } from "./chatend.js?v=20260717.6";
-import { KwebContext } from "./kweb_context.js?v=20260718.1";
+import { KwebContext } from "./kweb_context.js?v=20260719.3";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
 import { ToolExecutor, ensureInitialToolCheck } from "./tools.js?v=20260719.1";
-import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260719.1";
+import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260719.2";
 import { createTurnTiming, elapsedMs } from "./timing.js?v=20260715.2";
-import { formatChatend } from "./chatend_format.js?v=20260718.2";
+import { formatChatend } from "./chatend_format.js?v=20260719.2";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));

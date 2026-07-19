@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path as FilePath, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -531,10 +532,8 @@ async fn create_node(
         .node_id
         .unwrap_or_else(|| generated_node_id(input.idempotency_id));
     let owner = parse_owner(&input.owner_node_id)?;
-    let node = state
-        .kmap
-        .lock()
-        .map_err(ApiError::internal)?
+    let mut kmap = state.kmap.lock().map_err(ApiError::internal)?;
+    let node = kmap
         .create_node(
             input.idempotency_id,
             CreateNode {
@@ -550,7 +549,8 @@ async fn create_node(
             },
         )
         .map_err(ApiError::from)?;
-    Ok((StatusCode::CREATED, Json(json!({"node":node}))))
+    let response = node_response(&mut kmap, &node)?;
+    Ok((StatusCode::CREATED, Json(json!({"node":response}))))
 }
 
 fn generated_node_id(idempotency_id: IdempotencyId) -> NodeId {
@@ -566,18 +566,44 @@ fn generated_node_id(idempotency_id: IdempotencyId) -> NodeId {
     NodeId::from_hex(&encoded).expect("SHA-256 prefix is a valid Kmap node identifier")
 }
 
+fn node_response(kmap: &mut Kmap, node: &kweb::Node) -> Result<Value, ApiError> {
+    let mut seen = HashSet::new();
+    let mut connection_summaries = Vec::new();
+    for connection_id in node
+        .fixed_connections
+        .iter()
+        .chain(node.recent_connections.iter())
+        .copied()
+    {
+        if !seen.insert(connection_id) {
+            continue;
+        }
+        let connection = kmap.get_node(connection_id).map_err(ApiError::from)?;
+        connection_summaries.push(json!({
+            "id": connection.id,
+            "short_name": connection.short_name,
+            "short_description": connection.short_description,
+        }));
+    }
+    let mut response = serde_json::to_value(node).map_err(ApiError::internal)?;
+    response
+        .as_object_mut()
+        .expect("a serialized Kmap node is an object")
+        .insert(
+            "connection_summaries".into(),
+            Value::Array(connection_summaries),
+        );
+    Ok(response)
+}
+
 async fn get_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<kweb::Node>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let id = NodeId::from_hex(&id).map_err(ApiError::from)?;
-    let node = state
-        .kmap
-        .lock()
-        .map_err(ApiError::internal)?
-        .get_node(id)
-        .map_err(ApiError::from)?;
-    Ok(Json(node))
+    let mut kmap = state.kmap.lock().map_err(ApiError::internal)?;
+    let node = kmap.get_node(id).map_err(ApiError::from)?;
+    Ok(Json(node_response(&mut kmap, &node)?))
 }
 
 async fn update_node(
@@ -587,10 +613,8 @@ async fn update_node(
 ) -> Result<Json<Value>, ApiError> {
     let id = NodeId::from_hex(&id).map_err(ApiError::from)?;
     let owner = parse_owner(&input.owner_node_id)?;
-    let node = state
-        .kmap
-        .lock()
-        .map_err(ApiError::internal)?
+    let mut kmap = state.kmap.lock().map_err(ApiError::internal)?;
+    let node = kmap
         .update_node(
             input.idempotency_id,
             id,
@@ -606,7 +630,8 @@ async fn update_node(
             },
         )
         .map_err(ApiError::from)?;
-    Ok(Json(json!({"node":node})))
+    let response = node_response(&mut kmap, &node)?;
+    Ok(Json(json!({"node":response})))
 }
 
 async fn get_history(
@@ -808,6 +833,44 @@ mod tests {
         let history: Value =
             serde_json::from_str(history.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(history["provenance_ids"].as_array().unwrap().len(), 1);
+
+        let connected_node_body = json!({
+            "idempotency_id":IdempotencyId::random(),
+            "provenance_id":provenance_id,
+            "owner_node_id":"self",
+            "model_attribution":"http-test",
+            "short_name":"HTTP Connected Node",
+            "short_description":"Connection metadata test",
+            "long_description":"",
+            "fixed_connections":[],
+            "recent_connections":[node_id(&first_node)],
+        })
+        .to_string();
+        let connected_node =
+            http_request(address, "POST", "/api/v1/kmap/nodes", &connected_node_body).await;
+        assert!(connected_node.starts_with("HTTP/1.1 201 Created"));
+        let connected_node_json: Value =
+            serde_json::from_str(connected_node.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            connected_node_json["node"]["connection_summaries"][0]["short_name"],
+            "HTTP Replay Node"
+        );
+        let connected_node_get = http_request(
+            address,
+            "GET",
+            &format!(
+                "/api/v1/kmap/nodes/{}",
+                connected_node_json["node"]["id"].as_str().unwrap()
+            ),
+            "",
+        )
+        .await;
+        let connected_node_get: Value =
+            serde_json::from_str(connected_node_get.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            connected_node_get["connection_summaries"][0]["short_description"],
+            ""
+        );
 
         let multipart_id = IdempotencyId::random();
         let boundary = "kweb-artifact-boundary";

@@ -1,4 +1,5 @@
-import { element } from "./render.js?v=20260718.4";
+import { element } from "./render.js?v=20260719.2";
+import { hydrateStoredNodeConnections } from "./api.js?v=20260719.3";
 
 export class MemoryExplorer {
   constructor({ api, rootNodeIds, content, backButton, forwardButton }) {
@@ -26,8 +27,7 @@ export class MemoryExplorer {
   updateButtons() { this.backButton.disabled = !this.back.length; this.forwardButton.disabled = !this.forward.length; }
 
   renderNode(node, history) {
-    const fixedConnections = (node.fixed_connections || []).map((id, index) => ({ id, slot: index + 1 }));
-    const recentConnections = (node.recent_connections || []).map(id => ({ id }));
+    const { fixedConnections, recentConnections } = hydrateStoredNodeConnections(node);
     const root = document.createDocumentFragment();
     root.append(
       element("h2", "", node.short_name),

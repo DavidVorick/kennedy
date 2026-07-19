@@ -36,8 +36,10 @@ claiming to reveal inaccessible provider prompts. It includes one concise latenc
 total and combined call time so Kennedy can reason about response latency
 without a repeated step list. Every request also ends with the terse line
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
-A fresh or reset thread uses `unknown` rather than reusing the abandoned
-thread's number.
+It uses the most recent successful LLM call's reported occupancy, even after a
+reload or provider-thread reset, and uses `unknown` only before any successful
+LLM usage report exists. The value can lag behind subsequently appended
+messages, tool results, or loaded memory until the next LLM call.
 
 'Backend' refers to any of the backend services that are providing APIs to the
 frontend.
@@ -177,8 +179,9 @@ and recovery; those repeated names and descriptions are not sent to the model.
 Because we don't want the chatend to have to deal with complex details like
 large randomized identifiers, the frontend provides an abstraction where it
 gives short identifiers to the chatend, and then maintains a mapping from short
-identifer to unique identifier. This mapping is fully ephemeral, and resets
-when the session or context resets.
+identifier to unique identifier. This mapping is session-local and is preserved
+across ResetContext calls and session recovery. Once assigned, a short
+identifier continues to refer to the same node until the session ends.
 
 ## The Primary Functions
 
@@ -216,9 +219,10 @@ listed once rather than nested under every direct node, and fanout references
 receive only the detail appropriate to their distance from a directly loaded
 node.
 
-Because the on-disk representation does not have the short names for the active
-connections and fanout connections, those names will need to be fetched from
-the database.
+Because the stored connection arrays contain durable identifiers rather than
+duplicated names, the Kmap HTTP read projection fetches each connection's short
+name and description from the database alongside the node. The frontend uses
+that metadata for active and fanout rendering without loading the full node.
 
 The call signature is simply LoadNode(shortIdentifier)
 
@@ -246,8 +250,9 @@ retained in a two-root session and at most seven in a three-root group session.
 Each reset consumes one call from the shared 20-call
 LoadNode/ResetContext budget; the automatic node loads inside it consume no
 additional calls. The rebuilt Chatend contains a compact history of every
-successful reset, grouped by the names of requested nodes so that
-Kennedy can recognize repeated exploration after short identifiers change.
+successful reset, grouped by the names of requested nodes so that Kennedy can
+recognize repeated exploration. Existing short identifiers remain bound to the
+same nodes even when those nodes are not retained in the rebuilt context.
 
 The call signature is ResetContext(shortIdentifier[], optional selfMessage)
 

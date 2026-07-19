@@ -1,9 +1,9 @@
-import { KwebAPI, RustLibsAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260718.6";
+import { KwebAPI, RustLibsAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260719.3";
 import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
-import { ConversationSession } from "./conversation.js?v=20260719.1";
-import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260719.1";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260718.3";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260718.4";
+import { ConversationSession } from "./conversation.js?v=20260719.3";
+import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260719.3";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260719.3";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260719.2";
 import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260719.1";
 import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventTimeoutMs } from "./telegram_timing.js?v=20260717.1";
 

@@ -380,8 +380,9 @@ canonical documents; this file is not an append-only log.
   mandatory roots and explicitly retained nodes. Count each ResetContext as one
   call against the same 20-call conversation-turn or 50-call ingress-session
   budget as LoadNode. Keep a compact Chatend history of every successful reset,
-  grouping duplicate retained-node name sets so Kennedy can
-  recognize loops despite short-ID reassignment.
+  grouping duplicate retained-node name sets so Kennedy can recognize loops.
+  Preserve every short-ID assignment for the life of the session across resets
+  and recovery, even when its node is not retained in the rebuilt context.
 - Keep the 100-model-round history-ingress safety limit cumulative across
   checkpoints and retries. A reset starts a fresh provider thread but does not
   reset that session-wide guard.
@@ -519,7 +520,7 @@ canonical documents; this file is not an append-only log.
   prompt layers assembled in this order: Kennedy identity, one session type,
   Kmap basics, read-only tools, writable tools when allowed, and current
   runtime details.
-- Keep temporary identifier rules, always-loaded-root behavior, and the exact
+- Keep session-local identifier stability rules, always-loaded-root behavior, and the exact
   tool-call text protocol in `KmapBasics.txt`. That layer must also tell Kennedy
   that additional tools and more detailed tool documentation may be available
   in the Kmap.

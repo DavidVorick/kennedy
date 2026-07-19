@@ -56,17 +56,30 @@ A node response is:
   "last_modified_at": "2026-07-18T00:00:00Z",
   "owner_node_id": "40-lowercase-hex or null",
   "fixed_connections": ["40-lowercase-hex"],
-  "recent_connections": ["40-lowercase-hex"]
+  "recent_connections": ["40-lowercase-hex"],
+  "connection_summaries": [
+    {
+      "id": "40-lowercase-hex",
+      "short_name": "Connected node name",
+      "short_description": "Connected node summary"
+    }
+  ]
 }
 ```
 
-Create and update requests contain every field above except the two generated
-modification fields. They use `provenance_id`, `model_attribution`, and
-`owner_node_id`; the owner input is a durable ID, `self`, or `unowned`.
+`fixed_connections` and `recent_connections` remain the canonical ordered ID
+arrays. `connection_summaries` is an additive read projection containing each
+unique referenced node once, in first-reference order, so clients can render
+fixed, active, and fanout links without fetching every full connected node.
+
+Create and update requests contain every stored field above except the two
+generated modification fields, and omit the read-only `connection_summaries`
+projection. They use `provenance_id`, `model_attribution`, and `owner_node_id`;
+the owner input is a durable ID, `self`, or `unowned`.
 They also require `idempotency_id`, represented by exactly 32 lowercase
 hexadecimal characters (16 random bytes). Creation may additionally supply
-`node_id`. Create/update responses wrap the node as `{ "node": ... }`; a
-direct get returns the node itself.
+`node_id`. Create/update responses wrap the same enriched node representation as
+`{ "node": ... }`; a direct get returns that representation itself.
 
 Provenance creation accepts required `idempotency_id` plus `data`, `source`,
 and `source_created_at`, and returns `{ "id": ... }`. A provenance read

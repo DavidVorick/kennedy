@@ -4,14 +4,15 @@ export const ACTIVE_CONNECTION_LIMIT = 8;
 function normalizeNode(node) {
   if (!node) return node;
   if (Array.isArray(node.recent_connections)) {
+    const summariesById = new Map((node.connection_summaries || []).map(summary => [summary.id, summary]));
+    const hydrateConnection = connection => {
+      const stored = typeof connection === "string" ? { id: connection } : connection;
+      return { ...(summariesById.get(stored.id) || {}), ...stored };
+    };
     const fixedConnections = (node.fixed_connections || []).map((connection, index) => (
-      typeof connection === "string"
-        ? { id: connection, slot: index + 1 }
-        : { ...connection, slot: connection.slot || index + 1 }
+      { ...hydrateConnection(connection), slot: connection.slot || index + 1 }
     ));
-    const recentConnections = node.recent_connections.map(connection => (
-      typeof connection === "string" ? { id: connection } : connection
-    ));
+    const recentConnections = node.recent_connections.map(hydrateConnection);
     return {
       ...node,
       owner_root_node_id: node.owner_node_id,
@@ -58,14 +59,16 @@ export class KwebContext {
     this.clear();
   }
 
-  clear() {
+  clear({ preserveIdentifiers = false } = {}) {
     this.loadedNodeIds = [];
     this.fullNodeIds = new Set();
     this.nodeOrigins = new Map();
     this.nodesById = new Map();
-    this.shortToDurable = new Map();
-    this.durableToShort = new Map();
-    this.nextShortId = 1;
+    if (!preserveIdentifiers) {
+      this.shortToDurable = new Map();
+      this.durableToShort = new Map();
+      this.nextShortId = 1;
+    }
   }
 
   shortId(durableId) {
@@ -158,7 +161,7 @@ export class KwebContext {
     if (durableIds.some(id => this.rootNodeIds.includes(id))) throw Object.assign(new Error("Root nodes are loaded automatically and must not be listed."), { code: "root_in_reset" });
     if (new Set(durableIds).size !== durableIds.length) throw Object.assign(new Error("Reset identifiers must be distinct."), { code: "duplicate_identifier" });
     if (durableIds.length + this.rootNodeIds.length > MAX_DIRECTLY_LOADED_NODES) throw Object.assign(new Error("Reset would exceed the ten directly loaded node limit."), { code: "loaded_node_limit" });
-    this.clear();
+    this.clear({ preserveIdentifiers: true });
     const loads = await this.ensureRootsLoaded();
     for (const id of durableIds) loads.push(await this.loadDurable(id));
     return { loads, context: this.snapshot() };
