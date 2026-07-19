@@ -2982,6 +2982,12 @@ test("background Telegram group ingress directly loads the group and Kennedy roo
   assert.match(app, /provisionGroupRoot\(batch\.groupId\)/);
 });
 
+test("the first arriving Telegram conversation is selected when the TG view is empty", async () => {
+  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+  assert.match(app, /activeView === "telegram" && !recordsForView\("telegram"\)\.some\(item => item\.id === selectedConversationId\)/);
+  assert.match(app, /selectedByView\.telegram = record\.id/);
+});
+
 test("Telegram directory and relay clients keep user management off the relay API", async () => {
   const originalFetch = globalThis.fetch;
   const requests = [];

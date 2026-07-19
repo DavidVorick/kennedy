@@ -242,7 +242,7 @@ fn random_unassigned_node_id(database: &Connection) -> anyhow::Result<String> {
             "SELECT EXISTS(
                  SELECT 1 FROM whitelist_entries WHERE root_node_id=?1
                  UNION ALL SELECT 1 FROM telegram_group_roots WHERE root_node_id=?1
-                 UNION ALL SELECT 1 FROM kmap_system_roots WHERE node_id=?1
+                 UNION ALL SELECT 1 FROM kmap_system_roots WHERE root_node_id=?1
              )",
             [&candidate],
             |row| row.get::<_, i64>(0),
@@ -583,8 +583,14 @@ mod tests {
         let database = Connection::open_in_memory().unwrap();
         database
             .execute_batch(
-                "CREATE TABLE kmap_system_roots(role TEXT PRIMARY KEY,node_id TEXT UNIQUE NOT NULL);
-                 INSERT INTO kmap_system_roots VALUES('user','1111111111111111111111111111111111111111');",
+                "CREATE TABLE kmap_system_roots(
+                     role TEXT PRIMARY KEY CHECK(role IN ('user','kennedy')),
+                     root_node_id TEXT NOT NULL UNIQUE CHECK(length(root_node_id)=40),
+                     created_at TEXT NOT NULL
+                 );
+                 INSERT INTO kmap_system_roots VALUES(
+                     'user','1111111111111111111111111111111111111111','2026-01-01T00:00:00Z'
+                 );",
             )
             .unwrap();
         database.execute_batch(IDENTITY_MIGRATION).unwrap();
@@ -593,6 +599,39 @@ mod tests {
         };
         directory.seed_bootstrap_user("@taek42").unwrap();
         directory
+    }
+
+    #[test]
+    fn opens_against_the_identity_schema_created_by_kmap_startup() {
+        let directory = std::env::temp_dir().join(format!(
+            "kennedy-telegram-identity-startup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let user_database = directory.join("users.sqlite3");
+        let initialized = crate::kmap_http::initialize(
+            &directory.join("kmap.sqlite3"),
+            &directory.join("artifacts"),
+            &user_database,
+        )
+        .unwrap();
+        drop(initialized);
+
+        let identity = Directory::open(&user_database, "@taek42").unwrap();
+        assert!(
+            identity
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM whitelist_entries WHERE handle='taek42')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                != 0
+        );
+        drop(identity);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -625,6 +664,31 @@ mod tests {
                 .unwrap()
                 .telegram_user_ids
                 .contains(&43)
+        );
+    }
+
+    #[test]
+    fn identity_migration_removes_legacy_anonymous_group_pseudo_user() {
+        let directory = directory();
+        let database = directory.lock().unwrap();
+        database
+            .execute(
+                "INSERT INTO observed_identities(
+                     telegram_user_id,current_username,display_name,first_seen_at,last_seen_at
+                 ) VALUES(1087968824,'GroupAnonymousBot','Group',?1,?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        database.execute_batch(IDENTITY_MIGRATION).unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM observed_identities WHERE telegram_user_id=1087968824",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
     }
 

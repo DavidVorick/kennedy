@@ -34,3 +34,9 @@ CREATE TABLE IF NOT EXISTS telegram_group_roots (
     updated_at TEXT NOT NULL,
     UNIQUE(root_node_id)
 );
+
+-- Telegram uses this transport-only pseudo-user for anonymous group authorship.
+-- It must never become a Kennedy identity or whitelist candidate.
+DELETE FROM observed_identities
+WHERE telegram_user_id = 1087968824
+   OR lower(COALESCE(current_username, '')) = 'groupanonymousbot';

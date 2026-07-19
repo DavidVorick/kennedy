@@ -425,6 +425,17 @@ fn apply_migrations(db: &Connection) -> anyhow::Result<()> {
     db.execute_batch(TRANSPORT_MIGRATION)?;
     ensure_group_id_columns(db)?;
     migrate_group_eligibility(db)?;
+    remove_anonymous_group_pseudo_members(db)?;
+    Ok(())
+}
+
+fn remove_anonymous_group_pseudo_members(db: &Connection) -> anyhow::Result<()> {
+    db.execute(
+        "DELETE FROM telegram_group_members
+         WHERE telegram_user_id=1087968824
+            OR lower(COALESCE(username,''))='groupanonymousbot'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -3063,6 +3074,32 @@ mod tests {
                 "{table} leaked into relay storage"
             );
         }
+    }
+
+    #[test]
+    fn migrations_remove_legacy_anonymous_group_pseudo_members() {
+        let database = database();
+        let identities = TestIdentitySink::default();
+        let group = ensure_group(&database, &identities, -100, "Friends").unwrap();
+        upsert_group_member(
+            &database,
+            &group.group_id,
+            1_087_968_824,
+            Some("GroupAnonymousBot"),
+            "Group",
+            "member",
+        )
+        .unwrap();
+
+        apply_migrations(&database).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM telegram_group_members", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

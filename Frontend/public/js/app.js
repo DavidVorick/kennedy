@@ -1565,6 +1565,11 @@ async function createTelegramConversation(event) {
   session.persist = (state, metadata) => persistSession(record.id, state, metadata);
   liveSessions.set(record.id, session);
   upsertHistory(record);
+  if (activeView === "telegram" && !recordsForView("telegram").some(item => item.id === selectedConversationId)) {
+    selectedConversationId = record.id;
+    selectedByView.telegram = record.id;
+  }
+  update();
   return { record, session };
 }
 
