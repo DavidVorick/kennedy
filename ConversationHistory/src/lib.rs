@@ -7,7 +7,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderName, HeaderValue, Method, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
@@ -15,10 +15,6 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    trace::TraceLayer,
-};
 use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
@@ -39,9 +35,7 @@ const SUMMARY_TEXT_LIMIT: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub bind: String,
     pub database: PathBuf,
-    pub allowed_origins: Vec<String>,
     pub max_request_bytes: usize,
 }
 
@@ -219,37 +213,18 @@ struct RecordIngressFailure {
     context_window_tokens: Option<u64>,
 }
 
-pub async fn serve(config: Config) -> anyhow::Result<()> {
+pub fn router(config: Config) -> anyhow::Result<Router> {
     let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
     )?;
     apply_migrations(&connection).context("applying conversation history migrations")?;
-    let origins = config
-        .allowed_origins
-        .iter()
-        .map(|origin| {
-            origin
-                .parse::<HeaderValue>()
-                .with_context(|| format!("invalid allowed origin {origin}"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([HeaderName::from_static("content-type")]);
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
     };
     let app = Router::new()
-        .route("/health", get(health))
+        .route("/api/v1/conversations/health", get(health))
         .route(
             "/api/v1/conversations",
             get(list_conversations).post(create_conversation),
@@ -329,13 +304,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(retry_ingress),
         )
         .layer(DefaultBodyLimit::max(config.max_request_bytes))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    tracing::info!(address=%config.bind, "History ready");
-    axum::serve(listener, app).await?;
-    Ok(())
+    Ok(app)
+}
+
+async fn health(State(state): State<AppState>) -> Response {
+    match state.db.lock().ok().and_then(|db| {
+        db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .ok()
+    }) {
+        Some(_) => Json(json!({"service":"conversation-history","status":"ok"})).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"service":"conversation-history","status":"unavailable"})),
+        )
+            .into_response(),
+    }
 }
 
 fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
@@ -368,20 +352,6 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch("DROP INDEX IF EXISTS one_unfinished_conversation;")?;
     backfill_missing_summaries(connection)?;
     Ok(())
-}
-
-async fn health(State(state): State<AppState>) -> Response {
-    match state.db.lock().ok().and_then(|db| {
-        db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-            .ok()
-    }) {
-        Some(_) => Json(json!({"service":"conversation-history","status":"ok"})).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"service":"conversation-history","status":"unavailable"})),
-        )
-            .into_response(),
-    }
 }
 
 fn validate_started_at(value: &str) -> Result<(), ApiError> {

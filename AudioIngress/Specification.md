@@ -1,6 +1,6 @@
 # Audio Ingress Specification
 
-The audio-ingress service is Kennedy's durable loopback pipeline for vnote WAV
+The audio-ingress router is Kennedy's durable loopback pipeline for vnote WAV
 recordings. It does not access the Kmap, conversation database, or intelligence
 backend. Its persistent state is `kennedy-audio.sqlite3` plus the private
 `kennedy-audio-ingress/` media tree.
@@ -41,11 +41,19 @@ original, completed chunk transcript, final transcript, or ingress checkpoint.
 Structurally invalid or truncated WAV input is terminal instead of being
 retried forever; its accepted original and diagnostic remain available.
 
-Only WAV input is processed. Windows are equalized for the whole recording,
+Only WAV input is processed. The accepted original is archived byte-for-byte.
+Windows are equalized for the whole recording,
 are at most 240 seconds, and overlap their neighbors by 15 seconds. Each window
-is a durable WAV under `chunks/{recording_id}/` and has an ordered database row
-with recording-relative bounds. Gemini Files API media is deleted after each
-interaction; the local original and results remain.
+is a restartable working WAV under `chunks/{recording_id}/` and has an ordered
+database row with recording-relative bounds. Immediately before a request, the
+working WAV is decoded and resampled to the encoder's 48 kHz input rate entirely
+in memory, without changing its mono or stereo channel count. It is encoded as
+Ogg Opus at 192 kbps per channel (384 kbps for stereo). `kcode-gemini-api` sends
+those bytes inline and requests the transcription JSON with a response schema;
+neither an Opus file nor a Gemini Files API object is created. Once every
+Kennedy-ingress piece completes, the local working WAV directory is deleted
+while the raw original and all database transcript/history results remain.
+Startup performs the same cleanup for older completed recordings.
 
 `gemini-3.1-pro-preview` receives up to four independent windows concurrently
 and returns structured utterances with relative timestamps, chunk-local
@@ -96,7 +104,8 @@ identifier when claiming work, and the backend rejects claims from older
 clients. It runs the normal mutation tool loop with the additional
 audio-ingress prompt policy. The frontend uses one Web Lock for conversation
 and audio ingress, providing global browser-side Kmap mutation serialization.
-Completing the final piece atomically marks the recording complete.
+Completing the final piece atomically marks the recording complete and then
+removes its generated local WAV shards.
 The completion endpoint independently requires a successful
 `EndTurn` entry in the persisted history-ingress tool log. Historical
 pieces identified as prematurely completed remain terminal with
@@ -109,7 +118,7 @@ retry.
 
 ## API summary
 
-- `GET /health`
+- `GET /api/v1/audio-ingress/health`
 - `POST /api/v1/audio-ingress`
 - `GET /api/v1/audio-ingress?limit=N`
 - `GET /api/v1/audio-ingress/{recording_id}`

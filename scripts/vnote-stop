@@ -4,7 +4,7 @@ set -u
 set -o pipefail
 
 VNOTE_DIR="${KENNEDY_VNOTE_DIR:-/home/user/media/vnotes}"
-AUDIO_API="${KENNEDY_AUDIO_API:-http://127.0.0.1:4325/api/v1/audio-ingress}"
+AUDIO_API="${KENNEDY_AUDIO_API:-http://127.0.0.1:4321/api/v1/audio-ingress}"
 AUDIO_API="${AUDIO_API%/}"
 STABILITY_SECONDS=2
 

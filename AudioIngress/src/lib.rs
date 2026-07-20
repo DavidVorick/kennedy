@@ -1,7 +1,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -10,45 +9,40 @@ use anyhow::{Context, ensure};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
-    http::{HeaderName, HeaderValue, Method, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{StreamExt, stream};
 use hound::{SampleFormat, WavReader, WavWriter};
-use kennedy_codex_runtime::{CatalogCache, DEFAULT_CODEX_EXECUTABLE, model_catalog_config};
-use reqwest::{Client, header};
+use kcode_codex_runtime::{CatalogCache, Codex, CodexConfig, GenerationRequest, ReasoningEffort};
+use kcode_gemini_api::{
+    CompletionStatus, GEMINI_31_PRO, Gemini, GenerationOptions, MediaInput, MultimodalRequest,
+    ServiceTier, StructuredOutput, ThinkingLevel,
+};
+use ruopus::encode_ogg_opus;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, process::Command};
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    trace::TraceLayer,
-};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const RELEASE_DEFERRED_INGRESS_MIGRATION: &str =
     include_str!("../migrations/002_release_deferred_ingress.sql");
-const GEMINI_INTERACTIONS_URL: &str =
-    "https://generativelanguage.googleapis.com/v1beta/interactions";
-const GEMINI_FILES_UPLOAD_URL: &str =
-    "https://generativelanguage.googleapis.com/upload/v1beta/files";
-const GEMINI_FILES_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
+const GEMINI_MODEL: &str = GEMINI_31_PRO;
 const RECONCILIATION_MODEL: &str = "gpt-5.6-sol";
 const RECONCILIATION_REASONING: &str = "xhigh";
-const CODEX_EXECUTABLE: &str = DEFAULT_CODEX_EXECUTABLE;
-const CODEX_PROMPT_BOUNDARY_SENTINEL: &str =
-    "KENNEDY_AUDIO_CODEX_PROMPT_BOUNDARY_SENTINEL_4A92E1D7";
 const MAX_CHUNK_MILLISECONDS: u64 = 4 * 60 * 1_000;
 const CHUNK_OVERLAP_MILLISECONDS: u64 = 15 * 1_000;
 const MAX_INGRESS_TOKENS: u64 = 50_000;
 const ESTIMATED_CHARACTERS_PER_TOKEN: u64 = 4;
 const MAX_CONCURRENT_GEMINI_CHUNKS: usize = 4;
+const OPUS_SAMPLE_RATE: u32 = 48_000;
+const OPUS_MAX_CHANNELS: usize = 2;
+const OPUS_BITRATE_PER_CHANNEL_BPS: u32 = 192_000;
 const INGRESS_BREAK: &str = "<!-- KENNEDY_INGRESS_BREAK -->";
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
@@ -56,10 +50,8 @@ const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-turn-v1";
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub bind: String,
     pub database: PathBuf,
     pub media_directory: PathBuf,
-    pub allowed_origins: Vec<String>,
     pub max_upload_bytes: usize,
     pub gemini_api_key: Option<String>,
 }
@@ -68,8 +60,8 @@ pub struct Config {
 struct AppState {
     config: Arc<Config>,
     db: Arc<Mutex<Connection>>,
-    client: Client,
-    codex_model_catalog: Arc<PathBuf>,
+    gemini: Option<Gemini>,
+    codex: Codex,
 }
 
 struct TemporaryUpload(PathBuf);
@@ -259,7 +251,10 @@ struct RecordIngressFailure {
     context_window_tokens: Option<u64>,
 }
 
-pub async fn serve(config: Config, codex_catalog_cache: CatalogCache) -> anyhow::Result<()> {
+pub async fn router(
+    mut config: Config,
+    codex_catalog_cache: CatalogCache,
+) -> anyhow::Result<Router> {
     ensure!(
         MAX_CHUNK_MILLISECONDS > CHUNK_OVERLAP_MILLISECONDS,
         "audio chunk overlap must be smaller than the chunk limit"
@@ -268,28 +263,11 @@ pub async fn serve(config: Config, codex_catalog_cache: CatalogCache) -> anyhow:
         config.max_upload_bytes > 0,
         "audio upload limit must be positive"
     );
-    let codex_catalog = codex_catalog_cache.load().await?;
-    ensure!(
-        codex_catalog.executable() == CODEX_EXECUTABLE,
-        "audio reconciliation uses {CODEX_EXECUTABLE} but the shared Codex catalog belongs to {}",
-        codex_catalog.executable()
-    );
-    ensure!(
-        codex_catalog.model_limits(RECONCILIATION_MODEL).is_some(),
-        "audio reconciliation model {RECONCILIATION_MODEL} is absent from the Codex model catalog"
-    );
-    let boundary_scope = format!(
-        "kennedy-audio-prompt-boundary-v1:{CODEX_EXECUTABLE}:{RECONCILIATION_MODEL}:{RECONCILIATION_REASONING}"
-    );
-    if codex_catalog.validation_is_cached(&boundary_scope).await? {
-        tracing::info!(
-            model = RECONCILIATION_MODEL,
-            "Using cached audio Codex prompt-boundary validation"
-        );
-    } else {
-        probe_codex_prompt_boundary(codex_catalog.path()).await?;
-        codex_catalog.cache_validation(&boundary_scope).await?;
-    }
+    let mut codex_config = CodexConfig::new(RECONCILIATION_MODEL);
+    codex_config.validation_reasoning_effort = ReasoningEffort::XHigh;
+    let codex = Codex::open(codex_config, codex_catalog_cache)
+        .await
+        .context("opening Codex audio-reconciliation runtime")?;
     ensure_private_directory(&config.media_directory)?;
     let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
@@ -297,33 +275,36 @@ pub async fn serve(config: Config, codex_catalog_cache: CatalogCache) -> anyhow:
         "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
     )?;
     apply_migrations(&connection).context("applying audio-ingress migrations")?;
+    let completed_recording_ids = {
+        let mut statement = connection
+            .prepare("SELECT id FROM audio_recordings WHERE status='complete'")
+            .context("selecting completed recordings for shard cleanup")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for recording_id in completed_recording_ids {
+        if let Err(error) =
+            remove_completed_chunk_files(&config.media_directory, &recording_id).await
+        {
+            tracing::warn!(%recording_id, %error, "Could not remove completed audio shards");
+        }
+    }
 
-    let origins = config
-        .allowed_origins
-        .iter()
-        .map(|origin| {
-            origin
-                .parse::<HeaderValue>()
-                .with_context(|| format!("invalid allowed origin {origin}"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
-        .allow_headers([HeaderName::from_static("content-type")]);
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(20 * 60))
-        .build()
-        .context("building audio-ingress provider client")?;
+    let gemini = config
+        .gemini_api_key
+        .take()
+        .map(Gemini::open)
+        .transpose()
+        .context("opening Gemini audio-transcription client")?;
     let state = AppState {
         config: Arc::new(config),
         db: Arc::new(Mutex::new(connection)),
-        client,
-        codex_model_catalog: Arc::new(codex_catalog.path().to_owned()),
+        gemini,
+        codex,
     };
     let app = Router::new()
-        .route("/health", get(health))
+        .route("/api/v1/audio-ingress/health", get(health))
         .route(
             "/api/v1/audio-ingress",
             get(list_recordings).post(upload_recording),
@@ -370,17 +351,42 @@ pub async fn serve(config: Config, codex_catalog_cache: CatalogCache) -> anyhow:
             post(retry_ingress),
         )
         .layer(DefaultBodyLimit::max(state.config.max_upload_bytes))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(&state.config.bind).await?;
-    tracing::info!(address=%state.config.bind, media=%state.config.media_directory.display(), "Audio ingress ready");
-    let worker = tokio::spawn(worker_loop(state));
-    let server_result = axum::serve(listener, app).await;
-    worker.abort();
-    server_result?;
-    Ok(())
+    tracing::info!(media=%state.config.media_directory.display(), "Audio ingress initialized");
+    tokio::spawn(worker_loop(state));
+    Ok(app)
+}
+
+async fn health(State(state): State<AppState>) -> Response {
+    let database_ready = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .ok()
+        })
+        .is_some();
+    let status = if database_ready { "ok" } else { "unavailable" };
+    let http = if database_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        http,
+        Json(json!({
+            "service":"audio-ingress",
+            "status":status,
+            "gemini":if state.gemini.is_some() { "ready" } else { "unconfigured" },
+            "gemini_model":GEMINI_MODEL,
+            "reconciliation_model":RECONCILIATION_MODEL,
+            "chunk_seconds":MAX_CHUNK_MILLISECONDS / 1000,
+            "overlap_seconds":CHUNK_OVERLAP_MILLISECONDS / 1000,
+        })),
+    )
+        .into_response()
 }
 
 fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
@@ -403,6 +409,28 @@ fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
             .with_context(|| format!("setting private permissions on {}", path.display()))?;
     }
     Ok(())
+}
+
+async fn remove_completed_chunk_files(
+    media_directory: &Path,
+    recording_id: &str,
+) -> anyhow::Result<()> {
+    let canonical_id = Uuid::parse_str(recording_id)
+        .with_context(|| format!("invalid audio recording identifier {recording_id:?}"))?
+        .to_string();
+    ensure!(
+        canonical_id == recording_id,
+        "audio recording identifier is not canonical"
+    );
+    let directory = media_directory.join("chunks").join(canonical_id);
+    match tokio::fs::remove_dir_all(&directory).await {
+        Ok(()) => {
+            tracing::info!(%recording_id, path=%directory.display(), "Removed completed audio shards");
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", directory.display())),
+    }
 }
 
 fn set_private_file(path: &Path) -> anyhow::Result<()> {
@@ -432,37 +460,6 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
         .sync_all()
         .with_context(|| format!("syncing directory {}", path.display()))?;
     Ok(())
-}
-
-async fn health(State(state): State<AppState>) -> Response {
-    let database_ready = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| {
-            db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-                .ok()
-        })
-        .is_some();
-    let status = if database_ready { "ok" } else { "unavailable" };
-    let http = if database_ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (
-        http,
-        Json(json!({
-            "service":"audio-ingress",
-            "status":status,
-            "gemini":if state.config.gemini_api_key.is_some() { "ready" } else { "unconfigured" },
-            "gemini_model":GEMINI_MODEL,
-            "reconciliation_model":RECONCILIATION_MODEL,
-            "chunk_seconds":MAX_CHUNK_MILLISECONDS / 1000,
-            "overlap_seconds":CHUNK_OVERLAP_MILLISECONDS / 1000,
-        })),
-    )
-        .into_response()
 }
 
 async fn upload_recording(
@@ -1147,9 +1144,13 @@ async fn transcribe_pending_chunks(
         )?;
         return Ok(());
     }
-    let api_key = state.config.gemini_api_key.as_deref().context(
-        "Gemini audio transcription is not configured; store gemini-api-key in Kennedy's vault",
-    )?;
+    let gemini = state
+        .gemini
+        .as_ref()
+        .context(
+            "Gemini audio transcription is not configured; store gemini-api-key in Kennedy's vault",
+        )?
+        .clone();
     tracing::info!(
         recording_id = %recording.id,
         chunks = chunks.len(),
@@ -1159,9 +1160,10 @@ async fn transcribe_pending_chunks(
     );
     let mut transcriptions = stream::iter(chunks.into_iter().map(|chunk| {
         let path = state.config.media_directory.join(&chunk.relative_path);
+        let gemini = gemini.clone();
         async move {
             let index = chunk.index;
-            let result = transcribe_chunk(&state.client, api_key, &path, recording, &chunk).await;
+            let result = transcribe_chunk(&gemini, &path, recording, &chunk).await;
             (index, result)
         }
     }))
@@ -1219,120 +1221,39 @@ async fn transcribe_pending_chunks(
 }
 
 async fn transcribe_chunk(
-    client: &Client,
-    api_key: &str,
+    gemini: &Gemini,
     path: &Path,
     recording: &WorkRecording,
     chunk: &ChunkRecord,
 ) -> anyhow::Result<String> {
-    let bytes = tokio::fs::read(path)
+    let source = path.to_owned();
+    let opus = tokio::task::spawn_blocking(move || wav_to_opus(&source))
         .await
-        .with_context(|| format!("reading {}", path.display()))?;
-    let start = client
-        .post(GEMINI_FILES_UPLOAD_URL)
-        .header("x-goog-api-key", api_key)
-        .header("X-Goog-Upload-Protocol", "resumable")
-        .header("X-Goog-Upload-Command", "start")
-        .header("X-Goog-Upload-Header-Content-Length", bytes.len())
-        .header("X-Goog-Upload-Header-Content-Type", "audio/wav")
-        .json(&json!({"file":{"display_name":format!("kennedy-{}-{:05}.wav",recording.id,chunk.index)}}))
-        .send()
-        .await
-        .context("starting Gemini file upload")?;
-    ensure!(
-        start.status().is_success(),
-        "Gemini rejected file-upload initialization: HTTP {}",
-        start.status()
+        .context("joining in-memory Opus encoder")??;
+    let media = MediaInput::audio("audio/ogg", opus)
+        .context("preparing inline Ogg Opus audio for Gemini")?;
+    let mut request = MultimodalRequest::new(transcription_prompt(recording, chunk), vec![media]);
+    request.options = GenerationOptions {
+        max_output_tokens: Some(32_768),
+        temperature: None,
+        thinking_level: Some(ThinkingLevel::High),
+        service_tier: ServiceTier::Standard,
+    };
+    request.structured_output = Some(
+        StructuredOutput::new(transcription_schema())
+            .context("validating audio-transcription output schema")?,
     );
-    let upload_url = start
-        .headers()
-        .get("x-goog-upload-url")
-        .and_then(|value| value.to_str().ok())
-        .context("Gemini file-upload initialization omitted its upload URL")?
-        .to_owned();
-    let uploaded = client
-        .post(upload_url)
-        .header(header::CONTENT_LENGTH, bytes.len())
-        .header("X-Goog-Upload-Offset", "0")
-        .header("X-Goog-Upload-Command", "upload, finalize")
-        .body(bytes)
-        .send()
+    let response = gemini
+        .infer_pro_multimodal(request)
         .await
-        .context("uploading Gemini audio file")?;
-    let upload_status = uploaded.status();
-    let upload_body = uploaded
-        .text()
-        .await
-        .context("reading Gemini upload response")?;
+        .context("requesting Gemini audio transcription")?;
     ensure!(
-        upload_status.is_success(),
-        "Gemini audio upload failed with HTTP {upload_status}: {}",
-        concise_text(&upload_body, 500, "no detail")
+        response.status == CompletionStatus::Completed,
+        "Gemini transcription did not complete"
     );
-    let upload: Value =
-        serde_json::from_str(&upload_body).context("Gemini upload returned invalid JSON")?;
-    let uri = upload
-        .pointer("/file/uri")
-        .and_then(Value::as_str)
-        .context("Gemini upload returned no file URI")?;
-    let file_name = upload
-        .pointer("/file/name")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-
-    let prompt = transcription_prompt(recording, chunk);
-    let request = json!({
-        "model": GEMINI_MODEL,
-        "input": [
-            {"type":"text","text":prompt},
-            {"type":"audio","uri":uri,"mime_type":"audio/wav"}
-        ],
-        "generation_config":{"thinking_level":"high","max_output_tokens":32768},
-        "response_format":{
-            "type":"text",
-            "mime_type":"application/json",
-            "schema":transcription_schema()
-        },
-        "store":false
-    });
-    let response = client
-        .post(GEMINI_INTERACTIONS_URL)
-        .header("x-goog-api-key", api_key)
-        .json(&request)
-        .send()
-        .await
-        .context("requesting Gemini audio transcription");
-    if let Some(name) = file_name {
-        let delete_url = format!("{GEMINI_FILES_URL}/{name}");
-        let _ = client
-            .delete(delete_url)
-            .header("x-goog-api-key", api_key)
-            .send()
-            .await;
-    }
-    let response = response?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("reading Gemini transcription response")?;
-    ensure!(
-        status.is_success(),
-        "Gemini transcription failed with HTTP {status}: {}",
-        concise_text(&body, 800, "no detail")
-    );
-    let interaction: Value = serde_json::from_str(&body)
-        .context("Gemini transcription returned invalid response JSON")?;
-    ensure!(
-        interaction.get("status").and_then(Value::as_str) == Some("completed"),
-        "Gemini transcription did not complete: {}",
-        interaction
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    );
-    let text =
-        interaction_output_text(&interaction).context("Gemini transcription returned no text")?;
+    let text = response
+        .text
+        .context("Gemini transcription returned no structured text")?;
     let transcript: Value = serde_json::from_str(&text)
         .context("Gemini transcription returned invalid structured JSON")?;
     ensure!(
@@ -1343,6 +1264,126 @@ async fn transcribe_chunk(
         "Gemini transcript omitted utterances"
     );
     serde_json::to_string_pretty(&transcript).context("serializing Gemini transcript")
+}
+
+fn wav_to_opus(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut reader =
+        WavReader::open(path).with_context(|| format!("opening WAV audio {}", path.display()))?;
+    let spec = reader.spec();
+    ensure!(
+        spec.sample_rate > 0 && spec.channels > 0,
+        "WAV audio metadata is invalid"
+    );
+    let samples = match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .map(|sample| sample.context("reading 32-bit float WAV sample"))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        (SampleFormat::Int, 1..=8) => {
+            let scale = 2.0_f32.powi(i32::from(spec.bits_per_sample) - 1);
+            reader
+                .samples::<i8>()
+                .map(|sample| {
+                    sample
+                        .map(|value| f32::from(value) / scale)
+                        .context("reading 8-bit WAV sample")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        }
+        (SampleFormat::Int, 9..=16) => {
+            let scale = 2.0_f32.powi(i32::from(spec.bits_per_sample) - 1);
+            reader
+                .samples::<i16>()
+                .map(|sample| {
+                    sample
+                        .map(|value| f32::from(value) / scale)
+                        .context("reading 16-bit WAV sample")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        }
+        (SampleFormat::Int, 17..=32) => {
+            let scale = 2.0_f64.powi(i32::from(spec.bits_per_sample) - 1) as f32;
+            reader
+                .samples::<i32>()
+                .map(|sample| {
+                    sample
+                        .map(|value| value as f32 / scale)
+                        .context("reading high-resolution integer WAV sample")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        }
+        _ => anyhow::bail!(
+            "unsupported WAV sample format: {:?} with {} bits",
+            spec.sample_format,
+            spec.bits_per_sample
+        ),
+    };
+    let channels = usize::from(spec.channels);
+    ensure!(
+        (1..=OPUS_MAX_CHANNELS).contains(&channels),
+        "Ogg Opus encoding supports mono or stereo WAV audio; source has {channels} channels"
+    );
+    ensure!(
+        samples.len().is_multiple_of(channels),
+        "WAV audio ended with an incomplete sample frame"
+    );
+    ensure!(!samples.is_empty(), "WAV audio contains no samples");
+    ensure!(
+        samples.iter().all(|sample| sample.is_finite()),
+        "WAV audio contains a non-finite sample"
+    );
+
+    let pcm = samples
+        .into_iter()
+        .map(|sample| sample.clamp(-1.0, 1.0))
+        .collect::<Vec<_>>();
+    let pcm = resample_interleaved(&pcm, spec.sample_rate, channels)?;
+    let bitrate = OPUS_BITRATE_PER_CHANNEL_BPS * u32::from(spec.channels);
+    Ok(encode_ogg_opus(&pcm, channels, bitrate))
+}
+
+fn resample_interleaved(
+    source: &[f32],
+    source_rate: u32,
+    channels: usize,
+) -> anyhow::Result<Vec<f32>> {
+    ensure!(source_rate > 0, "WAV sample rate must be positive");
+    ensure!(
+        (1..=OPUS_MAX_CHANNELS).contains(&channels),
+        "Ogg Opus encoding supports mono or stereo PCM"
+    );
+    ensure!(
+        source.len().is_multiple_of(channels),
+        "PCM ended with an incomplete frame"
+    );
+    ensure!(!source.is_empty(), "PCM contains no samples");
+    if source_rate == OPUS_SAMPLE_RATE {
+        return Ok(source.to_vec());
+    }
+    let source_frames = source.len() / channels;
+    let output_frames = usize::try_from(
+        (source_frames as u128 * u128::from(OPUS_SAMPLE_RATE)).div_ceil(u128::from(source_rate)),
+    )
+    .context("resampled audio is too large for this platform")?;
+    let output_samples = output_frames
+        .checked_mul(channels)
+        .context("resampled audio is too large for this platform")?;
+    let mut output = Vec::with_capacity(output_samples);
+    for output_frame in 0..output_frames {
+        let source_position = output_frame as u128 * u128::from(source_rate);
+        let lower = usize::try_from(source_position / u128::from(OPUS_SAMPLE_RATE))
+            .context("resampling position is too large for this platform")?
+            .min(source_frames - 1);
+        let upper = (lower + 1).min(source_frames - 1);
+        let fraction =
+            (source_position % u128::from(OPUS_SAMPLE_RATE)) as f32 / OPUS_SAMPLE_RATE as f32;
+        for channel in 0..channels {
+            let lower_sample = source[lower * channels + channel];
+            let upper_sample = source[upper * channels + channel];
+            output.push(lower_sample + (upper_sample - lower_sample) * fraction);
+        }
+    }
+    Ok(output)
 }
 
 fn transcription_prompt(recording: &WorkRecording, chunk: &ChunkRecord) -> String {
@@ -1384,35 +1425,6 @@ fn transcription_schema() -> Value {
     })
 }
 
-fn interaction_output_text(interaction: &Value) -> Option<String> {
-    if let Some(text) = interaction
-        .get("output_text")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Some(text.to_owned());
-    }
-    let mut output = Vec::new();
-    for step in interaction.get("steps")?.as_array()? {
-        if step.get("type").and_then(Value::as_str) != Some("model_output") {
-            continue;
-        }
-        for content in step
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if content.get("type").and_then(Value::as_str) == Some("text")
-                && let Some(text) = content.get("text").and_then(Value::as_str)
-            {
-                output.push(text);
-            }
-        }
-    }
-    (!output.is_empty()).then(|| output.join("\n"))
-}
-
 async fn reconcile_recording(state: &AppState, recording: &WorkRecording) -> anyhow::Result<()> {
     let chunks = {
         let db = state
@@ -1438,13 +1450,13 @@ async fn reconcile_recording(state: &AppState, recording: &WorkRecording) -> any
         "recording has incomplete transcription chunks"
     );
     let prompt = reconciliation_prompt(recording, &chunks);
-    let mut transcript = run_sol(&state.codex_model_catalog, &prompt).await?;
+    let mut transcript = run_sol(&state.codex, &prompt).await?;
     let mut pieces = parse_ingress_pieces(&transcript);
     if pieces
         .iter()
         .any(|piece| estimate_tokens(piece) > MAX_INGRESS_TOKENS)
     {
-        transcript = run_sol(&state.codex_model_catalog, &split_prompt(&transcript)).await?;
+        transcript = run_sol(&state.codex, &split_prompt(&transcript)).await?;
         pieces = parse_ingress_pieces(&transcript);
     }
     ensure!(!pieces.is_empty(), "Sol returned an empty final transcript");
@@ -1522,264 +1534,17 @@ fn estimate_tokens(value: &str) -> u64 {
     (value.chars().count() as u64).div_ceil(ESTIMATED_CHARACTERS_PER_TOKEN)
 }
 
-async fn run_sol(model_catalog: &Path, prompt: &str) -> anyhow::Result<String> {
-    let mut command = Command::new(CODEX_EXECUTABLE);
-    command
-        .args([
-            "-a",
-            "never",
-            "exec",
-            "--json",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--model",
-            RECONCILIATION_MODEL,
-            "--ephemeral",
-        ])
-        .arg("-C")
-        .arg(std::env::temp_dir())
-        .args(["--sandbox", "read-only"]);
-    add_codex_config(&mut command, model_catalog);
-    command
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY")
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("starting codex-safe for transcript reconciliation")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("opening Codex transcript input")?;
-    tokio::time::timeout(Duration::from_secs(60), stdin.write_all(prompt.as_bytes()))
+async fn run_sol(codex: &Codex, prompt: &str) -> anyhow::Result<String> {
+    let mut request = GenerationRequest::new(prompt, RECONCILIATION_MODEL);
+    request.reasoning_effort = ReasoningEffort::XHigh;
+    request.ephemeral = true;
+    request.timeout = Duration::from_secs(30 * 60);
+    codex
+        .generate(request)
         .await
-        .context("Codex did not accept the transcript prompt in time")??;
-    drop(stdin);
-    let output = tokio::time::timeout(Duration::from_secs(30 * 60), child.wait_with_output())
-        .await
-        .context("Sol did not finish transcript processing within 30 minutes")??;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    ensure!(
-        output.status.success(),
-        "Sol transcript processing failed: {}",
-        codex_error(&stdout, &stderr)
-    );
-    parse_codex_answer(&stdout).context("Sol returned no final transcript")
+        .map(|response| response.answer)
+        .context("Sol transcript processing failed")
 }
-
-fn add_codex_config(command: &mut Command, model_catalog: &Path) {
-    command
-        .arg("-c")
-        .arg(format!(
-            "model_reasoning_effort=\"{RECONCILIATION_REASONING}\""
-        ))
-        .arg("-c")
-        .arg("instructions=\"\"")
-        .arg("-c")
-        .arg("developer_instructions=\"\"")
-        .arg("-c")
-        .arg("personality=\"none\"")
-        .arg("-c")
-        .arg("project_doc_max_bytes=0")
-        .arg("-c")
-        .arg("approval_policy=\"never\"")
-        .arg("-c")
-        .arg("sandbox_mode=\"read-only\"")
-        .arg("-c")
-        .arg("include_permissions_instructions=false")
-        .arg("-c")
-        .arg("include_apps_instructions=false")
-        .arg("-c")
-        .arg("include_collaboration_mode_instructions=false")
-        .arg("-c")
-        .arg("include_environment_context=false")
-        .arg("-c")
-        .arg("skills.include_instructions=false")
-        .arg("-c")
-        .arg("features.multi_agent=false")
-        .arg("-c")
-        .arg("features.multi_agent_v2=false")
-        .arg("-c")
-        .arg("features.apps=false")
-        .arg("-c")
-        .arg("features.shell_tool=false")
-        .arg("-c")
-        .arg("features.unified_exec=false")
-        .arg("-c")
-        .arg("features.code_mode=false")
-        .arg("-c")
-        .arg("features.code_mode_host=false")
-        .arg("-c")
-        .arg("features.code_mode_only=false")
-        .arg("-c")
-        .arg("features.current_time_reminder=false")
-        .arg("-c")
-        .arg("features.goals=false")
-        .arg("-c")
-        .arg("features.hooks=false")
-        .arg("-c")
-        .arg("features.plugins=false")
-        .arg("-c")
-        .arg("features.remote_plugin=false")
-        .arg("-c")
-        .arg("features.plugin_sharing=false")
-        .arg("-c")
-        .arg("features.personality=false")
-        .arg("-c")
-        .arg("features.browser_use=false")
-        .arg("-c")
-        .arg("features.browser_use_external=false")
-        .arg("-c")
-        .arg("features.browser_use_full_cdp_access=false")
-        .arg("-c")
-        .arg("features.computer_use=false")
-        .arg("-c")
-        .arg("features.in_app_browser=false")
-        .arg("-c")
-        .arg("features.image_generation=false")
-        .arg("-c")
-        .arg("features.memories=false")
-        .arg("-c")
-        .arg("features.mentions_v2=false")
-        .arg("-c")
-        .arg("features.request_permissions_tool=false")
-        .arg("-c")
-        .arg("features.tool_suggest=false")
-        .arg("-c")
-        .arg("features.workspace_dependencies=false")
-        .arg("-c")
-        .arg("features.shell_snapshot=false")
-        .arg("-c")
-        .arg("features.skill_mcp_dependency_install=false")
-        .arg("-c")
-        .arg("features.guardian_approval=false")
-        .arg("-c")
-        .arg("features.auth_elicitation=false")
-        .arg("-c")
-        .arg("features.tool_call_mcp_elicitation=false")
-        .arg("-c")
-        .arg("features.terminal_visualization_instructions=false")
-        .arg("-c")
-        .arg("features.use_agent_identity=false")
-        .arg("-c")
-        .arg("tools.experimental_request_user_input.enabled=false")
-        .arg("-c")
-        .arg("tools.view_image=false")
-        .arg("-c")
-        .arg("tools_view_image=false")
-        .arg("-c")
-        .arg("features.default_mode_request_user_input=false")
-        .arg("-c")
-        .arg("features.remote_compaction_v2=false")
-        .arg("-c")
-        .arg("web_search=\"disabled\"")
-        .arg("-c")
-        .arg(format!("model_auto_compact_token_limit={}", i64::MAX))
-        .arg("-c")
-        .arg(model_catalog_config(model_catalog));
-}
-
-fn verify_codex_prompt_input(output: &[u8]) -> anyhow::Result<()> {
-    let inputs: Vec<Value> =
-        serde_json::from_slice(output).context("Codex returned invalid prompt-input JSON")?;
-    ensure!(
-        inputs.len() == 1,
-        "Codex reported {} model-visible prompt items instead of the supplied transcript prompt",
-        inputs.len()
-    );
-    let input = inputs[0]
-        .as_object()
-        .context("Codex prompt-input item is not an object")?;
-    let content = input
-        .get("content")
-        .and_then(Value::as_array)
-        .context("Codex prompt-input item has no content array")?;
-    ensure!(
-        input.get("type").and_then(Value::as_str) == Some("message")
-            && input.get("role").and_then(Value::as_str) == Some("user")
-            && content.len() == 1
-            && content[0].get("type").and_then(Value::as_str) == Some("input_text")
-            && content[0].get("text").and_then(Value::as_str)
-                == Some(CODEX_PROMPT_BOUNDARY_SENTINEL),
-        "Codex altered the supplied transcript prompt item"
-    );
-    Ok(())
-}
-
-async fn probe_codex_prompt_boundary(model_catalog: &Path) -> anyhow::Result<()> {
-    let mut command = Command::new(CODEX_EXECUTABLE);
-    command
-        .args(["debug", "prompt-input"])
-        .arg("-c")
-        .arg(format!(
-            "model={}",
-            serde_json::to_string(RECONCILIATION_MODEL)
-                .expect("serializing a model name cannot fail")
-        ));
-    add_codex_config(&mut command, model_catalog);
-    let output = command
-        .arg(CODEX_PROMPT_BOUNDARY_SENTINEL)
-        .current_dir(std::env::temp_dir())
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY")
-        .output()
-        .await
-        .context("starting the audio Codex prompt-boundary probe")?;
-    ensure!(
-        output.status.success(),
-        "audio Codex prompt-boundary probe failed"
-    );
-    verify_codex_prompt_input(&output.stdout)
-        .context("audio reconciliation exposed model-visible content outside its supplied prompt")
-}
-
-fn parse_codex_answer(stdout: &str) -> Option<String> {
-    stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|event| event.get("type").and_then(Value::as_str) == Some("item.completed"))
-        .filter(|event| {
-            event.pointer("/item/type").and_then(Value::as_str) == Some("agent_message")
-        })
-        .filter_map(|event| {
-            event
-                .pointer("/item/text")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .next_back()
-        .filter(|answer| !answer.trim().is_empty())
-}
-
-fn codex_error(stdout: &str, stderr: &str) -> String {
-    let detail = stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|event| {
-            event
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| event.pointer("/error/message").and_then(Value::as_str))
-                .map(str::to_owned)
-        })
-        .next_back()
-        .or_else(|| {
-            stderr
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "Codex returned no error detail".to_owned());
-    concise_text(&detail, 500, "Codex returned no error detail")
-}
-
 fn concise_text(value: &str, limit: usize, fallback: &str) -> String {
     let clean = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let bounded = clean.chars().take(limit).collect::<String>();
@@ -1866,9 +1631,7 @@ fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
         })
 }
 
-async fn release_ingress_repairs(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let mut db = state.db.lock().map_err(ApiError::internal)?;
     let tx = db.transaction().map_err(ApiError::internal)?;
     let now = Utc::now().to_rfc3339();
@@ -1879,8 +1642,7 @@ async fn release_ingress_repairs(
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(ApiError::internal)?;
-        rows
-            .collect::<Result<Vec<_>, _>>()
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(ApiError::internal)?
     };
     let released = tx
@@ -1979,47 +1741,56 @@ async fn ingress_completed(
     Json(input): Json<VersionedTransition>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
     validate_version(input.expected_version)?;
-    let mut db = state.db.lock().map_err(ApiError::internal)?;
-    let existing = fetch_piece(&db, &id)?;
-    if existing.phase == "complete" {
-        return Ok(Json(existing));
+    let (completed_piece, recording_id, recording_complete) = {
+        let mut db = state.db.lock().map_err(ApiError::internal)?;
+        let existing = fetch_piece(&db, &id)?;
+        if existing.phase == "complete" {
+            return Ok(Json(existing));
+        }
+        if !history_ingress_was_explicitly_ended(&existing.state) {
+            return Err(ApiError::conflict(
+                "Audio history ingress cannot complete without a successful EndTurn tool call.",
+            ));
+        }
+        let tx = db.transaction().map_err(ApiError::internal)?;
+        let now = Utc::now().to_rfc3339();
+        let changed=tx.execute("UPDATE audio_ingress_pieces SET phase='complete',state_json=json_remove(state_json,'$.historyIngressRepairRequired'),updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3",params![now,id,input.expected_version]).map_err(ApiError::internal)?;
+        if changed == 0 {
+            return Err(ApiError::conflict(
+                "Audio transcript piece is not in the expected ingress state.",
+            ));
+        }
+        let recording_id = existing.recording_id.clone();
+        let remaining: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM audio_ingress_pieces WHERE recording_id=?1 AND phase<>'complete'",
+                [&recording_id],
+                |row| row.get(0),
+            )
+            .map_err(ApiError::internal)?;
+        if remaining == 0 {
+            tx.execute(
+                "UPDATE audio_recordings SET status='complete',next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
+                params![now, &recording_id],
+            )
+            .map_err(ApiError::internal)?;
+        } else {
+            tx.execute(
+                "UPDATE audio_recordings SET next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
+                params![now, &recording_id],
+            )
+            .map_err(ApiError::internal)?;
+        }
+        tx.commit().map_err(ApiError::internal)?;
+        (fetch_piece(&db, &id)?, recording_id, remaining == 0)
+    };
+    if recording_complete
+        && let Err(error) =
+            remove_completed_chunk_files(&state.config.media_directory, &recording_id).await
+    {
+        tracing::warn!(%recording_id, %error, "Could not remove completed audio shards");
     }
-    if !history_ingress_was_explicitly_ended(&existing.state) {
-        return Err(ApiError::conflict(
-            "Audio history ingress cannot complete without a successful EndTurn tool call.",
-        ));
-    }
-    let tx = db.transaction().map_err(ApiError::internal)?;
-    let now = Utc::now().to_rfc3339();
-    let changed=tx.execute("UPDATE audio_ingress_pieces SET phase='complete',state_json=json_remove(state_json,'$.historyIngressRepairRequired'),updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3",params![now,id,input.expected_version]).map_err(ApiError::internal)?;
-    if changed == 0 {
-        return Err(ApiError::conflict(
-            "Audio transcript piece is not in the expected ingress state.",
-        ));
-    }
-    let recording_id = existing.recording_id;
-    let remaining: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM audio_ingress_pieces WHERE recording_id=?1 AND phase<>'complete'",
-            [&recording_id],
-            |row| row.get(0),
-        )
-        .map_err(ApiError::internal)?;
-    if remaining == 0 {
-        tx.execute(
-            "UPDATE audio_recordings SET status='complete',next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
-            params![now, recording_id],
-        )
-        .map_err(ApiError::internal)?;
-    } else {
-        tx.execute(
-            "UPDATE audio_recordings SET next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
-            params![now, recording_id],
-        )
-        .map_err(ApiError::internal)?;
-    }
-    tx.commit().map_err(ApiError::internal)?;
-    Ok(Json(fetch_piece(&db, &id)?))
+    Ok(Json(completed_piece))
 }
 
 async fn ingress_failure(
@@ -2181,39 +1952,24 @@ mod tests {
         db
     }
 
-    #[test]
-    fn audio_codex_config_removes_hidden_prompts() {
-        let mut command = Command::new("codex-safe");
-        let catalog = Path::new("/tmp/kennedy-codex-catalogs/audio-models.json");
-        add_codex_config(&mut command, catalog);
-        let arguments = command
-            .as_std()
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert!(arguments.contains(&"instructions=\"\"".into()));
-        assert!(arguments.contains(&"developer_instructions=\"\"".into()));
-        assert!(arguments.contains(&model_catalog_config(catalog)));
-        assert!(arguments.contains(&"tools.view_image=false".into()));
-        assert_eq!(
-            arguments
-                .iter()
-                .filter(|argument| argument.starts_with("instructions="))
-                .collect::<Vec<_>>(),
-            vec![&"instructions=\"\"".to_owned()]
-        );
-    }
+    #[tokio::test]
+    async fn completed_audio_cleanup_removes_shards_and_keeps_originals() {
+        let root = std::env::temp_dir().join(format!("kennedy-audio-cleanup-{}", Uuid::new_v4()));
+        let recording_id = Uuid::new_v4().to_string();
+        let chunk_directory = root.join("chunks").join(&recording_id);
+        let original = root.join("originals").join("recording.wav");
+        fs::create_dir_all(&chunk_directory).unwrap();
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        fs::write(chunk_directory.join("chunk-00000.wav"), b"temporary shard").unwrap();
+        fs::write(&original, b"raw original").unwrap();
 
-    #[test]
-    fn audio_codex_prompt_boundary_rejects_extra_model_visible_items() {
-        let exact = format!(
-            r#"[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{CODEX_PROMPT_BOUNDARY_SENTINEL}"}}]}}]"#
-        );
-        verify_codex_prompt_input(exact.as_bytes()).unwrap();
-        let hidden = format!(
-            r#"[{{"type":"message","role":"developer","content":[{{"type":"input_text","text":"hidden"}}]}},{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{CODEX_PROMPT_BOUNDARY_SENTINEL}"}}]}}]"#
-        );
-        assert!(verify_codex_prompt_input(hidden.as_bytes()).is_err());
+        remove_completed_chunk_files(&root, &recording_id)
+            .await
+            .unwrap();
+
+        assert!(!chunk_directory.exists());
+        assert!(original.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2314,6 +2070,46 @@ mod tests {
         assert_eq!(chunks[0].audio_end_ms - chunks[1].audio_start_ms, 15_000);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wav_audio_preserves_source_channels_in_ogg_opus() {
+        for channels in [1_u16, 2_u16] {
+            let root = std::env::temp_dir()
+                .join(format!("kennedy-opus-test-{channels}-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            let source = root.join("source.wav");
+            let mut writer = WavWriter::create(
+                &source,
+                hound::WavSpec {
+                    channels,
+                    sample_rate: 44_100,
+                    bits_per_sample: 16,
+                    sample_format: SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for frame in 0..4_410 {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 44_100.0;
+                for channel in 0..channels {
+                    let amplitude = 8_192.0 - f32::from(channel) * 1_024.0;
+                    writer
+                        .write_sample((phase.sin() * amplitude) as i16)
+                        .unwrap();
+                }
+            }
+            writer.finalize().unwrap();
+
+            let opus = wav_to_opus(&source).unwrap();
+            assert_eq!(&opus[..4], b"OggS");
+            let (decoded, head) = ruopus::decode_ogg_opus(&opus).unwrap();
+            assert_eq!(u16::from(head.channel_count), channels);
+            assert_eq!(head.input_sample_rate, OPUS_SAMPLE_RATE);
+            assert!(decoded.len() >= 4_600 * usize::from(channels));
+            assert!(decoded.len() <= 4_800 * usize::from(channels));
+
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

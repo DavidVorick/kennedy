@@ -1,4 +1,4 @@
-/target/
+**/target/
 /backups/
 /kennedy-audio-ingress/
 /kweb-provenance-artifacts/

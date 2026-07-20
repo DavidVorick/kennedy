@@ -270,10 +270,7 @@ impl KmapContext {
         self.full_node_ids = string_array(archive.get("fullNodeIds"))?
             .into_iter()
             .collect();
-        self.nodes_by_id = pairs(archive.get("nodesById"))?
-            .into_iter()
-            .map(|(key, value)| (key, value))
-            .collect();
+        self.nodes_by_id = pairs(archive.get("nodesById"))?.into_iter().collect();
         self.node_origins = pairs(archive.get("nodeOrigins"))?
             .into_iter()
             .map(|(key, value)| {

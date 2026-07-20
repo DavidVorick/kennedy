@@ -10,14 +10,13 @@ axum.workspace = true
 chrono.workspace = true
 futures.workspace = true
 hound.workspace = true
-http.workspace = true
-kennedy-codex-runtime = { path = "../CodexRuntime" }
-reqwest.workspace = true
+kcode-codex-runtime.workspace = true
+kcode-gemini-api.workspace = true
 rusqlite.workspace = true
+ruopus = { version = "0.1.2", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true

@@ -20,11 +20,11 @@ The MVP has seven logical runtime components:
    library that owns only SQLite persistence and per-node history invariants.
    `kennedy-server` imports it and owns the versioned Kmap HTTP routes, static
    frontend assets, root-role mappings, and transport policy.
-4. **Intelligence backend**: a Rust HTTP service. It translates a complete LLM
+4. **Intelligence adapter**: an in-process Rust router. It translates a complete LLM
    request into a provider request, performs bounded web research and public
    page retrieval, and normalizes the results. It is stateless between
    requests.
-5. **Conversation history backend**: a Rust HTTP service. It durably checkpoints
+5. **Conversation history library**: an in-process Rust router. It durably checkpoints
    all conversations, stores idempotent web/self-time start intents, exposes
    per-conversation command heads, and owns the history-ingress state machine.
 6. **`kcode-tg-kennedy-bot` Telegram transport**: an exact-version crates.io Rust library built on `teloxide`. It long-polls
@@ -34,24 +34,24 @@ The MVP has seven logical runtime components:
    without constructing prompts or running Kennedy itself. Kennedy passes the bot token and an identity
    callback into the library; Kennedy's user directory separately owns
    whitelist/TOFU identity, `/adduser` capability, and Kmap-root assignments.
-7. **Audio ingress backend**: a Rust HTTP service. It durably accepts vnote WAV
+7. **Audio ingress library**: an in-process Rust router. It durably accepts vnote WAV
    files, owns content-hash idempotency and restartable preparation, transcribes
    ordered overlapping chunks with Gemini, reconciles a final transcript with
    Sol, and queues timestamped transcript pieces for Kennedy ingress.
 
 The Rust services are library crates compiled into one `kennedy-server`
-executable, whose Tokio runtime also runs the native Rust orchestrator. Kmap is
-the deliberate exception to the former service-isolation
-rule: its separately publishable storage crate is imported by the main binary,
-which serves its HTTP adapter. All Kennedy coordination happens in the
-backend orchestrator through the same public HTTP APIs used for durable
-boundaries. A later routing consolidation may serve all API domains on one
-listener without changing the storage crate.
+executable, whose Tokio runtime also runs the native Rust orchestrator. Kmap,
+intelligence, conversation history, audio ingress, Telegram identity, and the
+frontend are merged into one Axum application on port 4321. All Kennedy
+coordination happens in the backend orchestrator through the same public HTTP
+APIs used for durable boundaries. The published Telegram transport remains on
+port 4324 until its crate exposes a mergeable router instead of owning a
+listener.
 
 `kennedy-server` also owns a generic named credential vault stored as the
 passphrase-encrypted `kennedy-secrets.age` file. At startup the server unlocks
-the vault and passes the conventionally named OpenAI, Gemini, Telegram, and
-crates.io values directly to their trusted connectors. The vault has terminal-only
+the vault and passes the conventionally named OpenAI, Gemini, and Telegram
+values directly to their trusted connectors. The vault has terminal-only
 set/remove/list/passphrase commands and no HTTP, browser, Kennedy-tool, Codex,
 or reveal surface. Stable runtime policy is compiled into code; only
 deployment-specific listeners, paths, limits, and the vault location are CLI
@@ -69,10 +69,9 @@ The backend appends the provider-reported current model and thinking mode.
 
 - The backend orchestration worker is the single authority for every live
   session Chatend; the frontend owns only unsent local draft/capture state.
-- `ConversationSession` owns one backend Chatend, while
-  `MemoryIngressCoordinator` supplies conversation/audio ingress mechanics and
-  the top-level orchestrator places those mechanics plus self time and root
-  provisioning behind one Kmap-writer gate.
+- Each native `Session` owns one backend Chatend, while the orchestration worker
+  supplies conversation/audio ingress mechanics and places those mechanics plus
+  self time and root provisioning behind one Kmap-writer gate.
 - Ordinary web command heads and Telegram stream heads launch as independent
   asynchronous tasks. They share no global read-session lock and do not wait
   for unrelated conversations; durable per-conversation/per-stream ordering is
@@ -126,44 +125,34 @@ the audited version or revision and its conclusion so the pin and audit are
 verifiable together. Automated vulnerability or license scans may supplement
 this review but do not replace it.
 
-Audit record: `kcode-rust-libs` `0.2.0` was fully source-audited on 2026-07-20
-before adoption. The published crate has no dependencies or build script. It
-keeps the supplied crates.io token in a private, redacted in-memory value,
-never discovers or writes credential files, excludes the token from validation
-containers and process arguments, passes it by environment only to the final
-`cargo publish --no-verify` container, and redacts it from publication errors.
-The version is approved for Kennedy's `cratesio-key` credential.
-
 ## 3. Runtime Topology
 
 ```text
 One kennedy-server process
   ├─ Encrypted credential vault -------- kennedy-secrets.age
-  ├─ Main HTTP adapter :4321 ------------ kweb-db-core.sqlite3 + kweb-provenance-artifacts/ + kennedy-users.sqlite3
+  ├─ Main HTTP application :4321
   │    ├─ /api/v1/kmap/* via kweb-db-core
-  │    └─ serves frontend and manuals
-  ├─ Intelligence API :4322 ------------ Podman Codex + OpenAI transcription + public web
-  ├─ Conversation History API :4323 ---- kennedy-conversations.sqlite3
-  ├─ Telegram Relay API :4324 ---------- kennedy-telegram.sqlite3 + kennedy-users.sqlite3 + Telegram long polling
-  └─ Audio Ingress API :4325 ----------- kennedy-audio.sqlite3 + kennedy-audio-ingress/
+  │    ├─ intelligence routes via kcode libraries
+  │    ├─ conversation history routes --- kennedy-conversations.sqlite3
+  │    ├─ audio ingress routes ----------- kennedy-audio.sqlite3 + kennedy-audio-ingress/
+  │    ├─ Telegram identity routes ------- kennedy-users.sqlite3
+  │    └─ frontend and manuals
+  └─ Telegram Relay API :4324 ---------- kennedy-telegram.sqlite3 + Telegram long polling
 
-Browser frontend calls all API domains directly. The main adapter calls the
-Kmap library in-process; no other backend calls it.
+Browser frontend calls the main application and Telegram relay directly. The
+main application calls its storage libraries in-process.
 ```
 
 Default addresses:
 
 | Component | Address |
 | --- | --- |
-| Main frontend/Kmap adapter | `http://127.0.0.1:4321` |
-| Intelligence backend | `http://127.0.0.1:4322` |
-| Conversation history backend | `http://127.0.0.1:4323` |
+| Main frontend and owned APIs | `http://127.0.0.1:4321` |
 | Telegram relay | `http://127.0.0.1:4324` |
-| Audio ingress backend | `http://127.0.0.1:4325` |
 
-The browser calls all API domains directly. Cross-origin backends permit
-requests from the Kweb frontend origin. Every listener binds to loopback by
-default.
+All owned browser requests are same-origin. Only the Telegram relay is
+cross-origin and permits requests from the frontend origin. Both listeners
+bind to loopback by default.
 
 The encrypted vault is portable rather than machine-bound. Copying it with the
 five databases and audio media preserves configured credentials and queued
@@ -301,37 +290,25 @@ conversation chat, ordinary history ingress, audio preparation, or audio
 history inspection. Conversation and audio ingress queue polls also isolate
 transient failures from one another.
 
-### 4.3 Intelligence Backend
+### 4.3 Intelligence Adapter and Standalone Libraries
 
-`kennedy-codex-runtime` owns the process-wide, Codex-versioned sanitized model
-catalog cache shared by Intelligence and AudioIngress. It has no HTTP surface.
-Kennedy launches all long-running service futures concurrently; within
-Intelligence, live login validation also runs concurrently with the shared
-catalog load. Only version-dependent discovery, sanitization, and verification
-remain ordered because each consumes the previous step's output.
+`kcode-codex-runtime` owns Codex generation, native Codex web search, login and
+prompt-boundary validation, and the process-wide versioned sanitized model
+catalog cache shared with AudioIngress. `kcode-gemini-api` owns Gemini grounded
+search, `kcode-openai-api` owns paid transcription and image generation,
+`kcode-web-fetch` owns safe bounded local HTTP fetching, and
+`kcode-doc-extraction` owns local PDF, DOCX, spreadsheet, and text extraction.
+Each is standalone and can be moved to its own repository and crates.io without
+Kennedy code.
 
-The intelligence backend owns:
+KennedyServer's thin intelligence adapter owns:
 
-- validating ChatGPT Codex login and loading model/CLI configuration,
-- obtaining each configured model's effective context window from the shared,
-  Codex-versioned sanitized catalog cache rather than a local constant,
-- validating the canonical plaintext generation request,
-- passing canonical plaintext and continuation controls into bounded,
-  read-only non-interactive Codex turns,
-- enforcing an allowlisted non-Chatend prompt boundary through exactly one
-  fixed Kennedy tool-harness base instruction, empty developer instructions,
-  suppressed optional instruction/tool/plugin features, a mandatory sanitized
-  catalog with blank provider prompt fields, and a prompt-input probe cached
-  for each Codex/configuration identity,
-- suppressing Codex auto-compaction beyond every reachable context so Kmap
-  material is never silently summarized,
-- translating Codex text, thread IDs, errors, and detailed token usage
-  into one response shape,
-- routing isolated WebSearch runs across compiled Codex and Gemini tiers,
-- safely fetching and extracting bounded text from public pages for WebFetch,
-- publishing model input modalities and using paid OpenAI
-  `gpt-4o-transcribe` only when the selected model transport does not accept
-  native audio.
+- Kennedy's provider/model allowlist and response DTOs,
+- HTTP request validation and provider-error normalization,
+- active-operation cancellation and current-process Codex thread admission,
+- the fixed `quality`, `balanced`, and `fast` search profiles and deadlines,
+- publishing model input modalities and selecting paid OpenAI transcription
+  only when the configured model transport does not accept native audio.
 
 It stores no local LLM session and never parses Kennedy's tool envelopes. The
 normal generation path has no enabled shell, file-mutation, app, multi-agent,
@@ -342,7 +319,9 @@ recognizes WebSearch and WebFetch text calls, invokes the corresponding
 intelligence API, then appends their readable results to the main conversation
 chain. Quality and balanced search runs are fresh ephemeral Codex threads; fast
 search is a stateless Gemini 3.1 Flash-Lite interaction with Google Search
-grounding. None can alter the conversation continuation chain.
+grounding. Callers cannot override search deadlines, and the adapter does not
+cap source count or ask Gemini for an artificial output-token ceiling. None can
+alter the conversation continuation chain.
 
 ### 4.4 Conversation History Backend
 
@@ -434,12 +413,16 @@ historical imports; filename changes do not create duplicate ingestion.
 Its restartable worker advances one oldest job through `chunking`,
 `transcribing`, `reconciling`, and `ready_for_ingress`. WAV chunks are equalized
 for a recording, never exceed four minutes, and overlap adjacent windows by
-fifteen seconds. Each ordered chunk is uploaded through Gemini's Files API and
-transcribed by `gemini-3.1-pro-preview` into structured utterances with local
-speaker labels, original language, English translation, timestamps,
-annotations, and confidence. Remote temporary files are deleted after the
-request. Failed provider stages retain their exact durable stage and retry with
-bounded exponential delay after restart.
+fifteen seconds. The archived original is the byte-for-byte uploaded WAV. For
+each request, AudioIngress resamples a working WAV to 48 kHz only inside the
+in-memory Ogg Opus conversion, retains its mono or stereo channel count, and
+encodes at 192 kbps per channel (384 kbps for stereo). `kcode-gemini-api` sends
+the Opus bytes inline to `gemini-3.1-pro-preview` and applies the JSON response
+schema for utterances with local speaker labels, original language, English
+translation, timestamps, annotations, and confidence. No compressed audio is
+persisted and no Gemini Files API object is created. Failed provider stages
+retain their exact durable stage and retry with bounded exponential delay after
+restart.
 
 One fresh ephemeral `gpt-5.6-sol`/`xhigh` turn receives all chunk transcripts
 in exact chronological order, reconciles speakers, removes repeated overlap,
@@ -449,6 +432,10 @@ used if a resulting piece exceeds the shared estimate of one token per four
 Unicode characters and hard limit of 50,000 estimated tokens. The database
 then owns one independently checkpointed Kennedy-ingress row per final piece.
 The service calls neither Kweb nor the intelligence backend.
+After every Kennedy-ingress row reaches `complete`, the service deletes the
+recording's generated WAV shard directory. The raw content-addressed original,
+chunk transcript JSON, canonical transcript, and ingress history remain
+durable; startup also removes shard directories left by older completed jobs.
 
 ## 5. Session Model
 
@@ -632,14 +619,14 @@ group is first observed and survive quarantine and Telegram chat-ID
 migration.
 
 Browser recordings and Telegram voice notes follow the same capability-aware
-path. The frontend preserves the original recording and asks the intelligence
-backend to transcribe it only when the selected transport lacks native audio.
+path. The frontend preserves the original recording and asks KennedyServer's
+intelligence route to transcribe it only when the selected transport lacks native audio.
 For the configured text/image-only `gpt-5.6-sol` transport this uses the paid
 OpenAI `gpt-4o-transcribe` API, then adds a clearly labeled transcription to the
 ordinary text Chatend.
 
-Browser and Telegram document uploads share a local intelligence-backend
-extraction endpoint. Searchable PDFs use PDF text extraction, DOCX uses its
+Browser and Telegram document uploads share a KennedyServer endpoint backed by
+`kcode-doc-extraction`. Searchable PDFs use PDF text extraction, DOCX uses its
 OpenXML document body, spreadsheets become sheet-labeled tabular text, and
 plain-text formats are normalized directly. Group voice notes invoke by replying
 to Kennedy; group documents may use a bot mention in their caption or a reply.
@@ -778,8 +765,6 @@ specification.
 ```text
 UserSpecification.md
 TechnicalDesign.md
-CodexRuntime/
-  Specification.md
 ConversationHistory/
   Specification.md
 Frontend/
@@ -794,11 +779,10 @@ Frontend/
     ReadTools.txt
     WriteTools.txt
   public/
-IntelligenceBackend/
-  Specification.md
 KennedyServer/
   KmapHttp.md
   src/main.rs
+  src/intelligence/
   src/orchestration.rs
   src/orchestration/
     context.rs
@@ -809,8 +793,10 @@ KennedyServer/
 ```
 
 Implementation code belongs under its owning component directory.
-The Kweb storage implementation is the external, exact-version dependency
-[`kweb-db-core`](https://crates.io/crates/kweb-db-core), not a workspace member.
+The Kweb storage and five kcode libraries are external crates.io dependencies,
+not workspace members. Credential-bearing provider libraries use exact version
+requirements; the other kcode libraries use compatible version requirements
+resolved by the workspace lockfile.
 
 ## 9. MVP Non-Goals
 

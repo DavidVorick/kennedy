@@ -7,10 +7,14 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   SQLite rows, per-node history invariants, and durable mutation-idempotency
   receipts. `kennedy-server` imports it and serves `/api/v1/kmap`, the UI, and
   prompt manuals.
-- `kennedy-intelligence` is a local Codex bridge with thread continuation,
-  token/cache telemetry, web research, and safe public page extraction.
-- `kennedy-codex-runtime` gives Intelligence and AudioIngress one process-wide,
-  versioned sanitized-model-catalog cache and compatibility-validation ledger.
+- `kcode-codex-runtime` is a standalone Codex execution and web-search library,
+  including the versioned sanitized-model-catalog cache used by Kennedy and
+  AudioIngress.
+- `kcode-gemini-api` and `kcode-openai-api` own the direct provider calls used
+  by the intelligence adapter;
+  `kcode-web-fetch` and `kcode-doc-extraction` own bounded local fetching and
+  document parsing. `kennedy-server` adds only Kennedy's HTTP contract,
+  cancellation registry, and fixed search-mode policy.
 - `kennedy-conversation-history` checkpoints active conversations and durably
   stores complete conversation and history-ingress recovery archives. It also
   owns idempotent start intents and per-conversation command queues.
@@ -27,12 +31,13 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   history and diagnostics, retains unsent local drafts/media capture, and sends
   explicit start/message/retry/end/stop or ingress-retry requests.
 
-One `kennedy-server` binary hosts the native Tokio orchestration runtime. Kmap
-is deliberately in-process through its separately publishable library; the
-other service domains retain separate listeners, state, and databases. A later
-routing consolidation can put all API domains on one port without changing
-Kmap storage. JavaScript runs only in the browser; the server does not launch or
-depend on Node.js.
+One `kennedy-server` binary hosts the native Tokio orchestration runtime. Kmap,
+intelligence, conversation history, audio ingress, Telegram identity, and the
+frontend share its main HTTP listener on port 4321 while retaining separate
+databases. The published Telegram relay currently remains on port 4324 because
+its crate API owns its listener. Provider and content-processing implementations
+are separately publishable libraries. JavaScript runs only in the browser; the
+server does not launch or depend on Node.js.
 
 ## First run
 
@@ -55,9 +60,9 @@ complete user turns have their own concise duration logs and matching Chatend
 latency entries.
 
 The launcher must also make the backend-created
-`${TMPDIR:-/tmp}/kennedy-codex-catalogs` directory visible inside the Codex
+`${TMPDIR:-/tmp}/kcode-codex-catalogs` directory visible inside the Codex
 container at the same absolute path, read-only. For example, set
-`catalog_dir="${TMPDIR:-/tmp}/kennedy-codex-catalogs"` and add
+`catalog_dir="${TMPDIR:-/tmp}/kcode-codex-catalogs"` and add
 `--mount type=bind,src="$catalog_dir",dst="$catalog_dir",ro` to the container's
 `podman run` or `podman create` arguments. If the launcher uses a persistent
 container, recreate that container with the bind mount. Kennedy creates the
@@ -106,18 +111,6 @@ audio, and safety defaults are compiled into the codebase. Deployment-specific
 listener addresses, database paths, frontend paths, and the encrypted vault
 path remain ordinary `kennedy-server` CLI options; run with `--help` to inspect
 or override them.
-
-The managed Rust-library service requires a crates.io API key at startup. Store
-it in Kennedy's generic passphrase-encrypted credential vault under the
-conventional name `cratesio-key`:
-
-```sh
-cargo run -p kennedy-server -- secrets set cratesio-key
-```
-
-Kennedy retrieves this key from the vault and passes it directly to the pinned
-`kcode-rust-libs` dependency; the managed libraries directory contains no
-credential file.
 
 No OpenAI API key is required for ordinary Kennedy generation. Startup rejects
 API-key-only Codex authentication so a
@@ -176,10 +169,11 @@ Open `http://127.0.0.1:4321`. The Kweb and conversation databases are created
 as `kweb-db-core.sqlite3`, `kennedy-conversations.sqlite3`,
 `kennedy-telegram.sqlite3`, `kennedy-users.sqlite3`, and
 `kennedy-audio.sqlite3` on first run. Large Kweb provenance payloads and media
-live in the sibling `kweb-provenance-artifacts/` tree. Original
-vnotes and restartable working chunks live under `kennedy-audio-ingress/`. The
-five APIs bind to loopback ports 4321 through 4325. Without a Telegram token,
-port 4324 reports the relay as disabled and the rest of Kennedy remains usable.
+live in the sibling `kweb-provenance-artifacts/` tree. Original vnotes live
+under `kennedy-audio-ingress/`; temporary transcription shards exist there only
+until all Kennedy ingress pieces complete. All Kennedy-owned HTTP routes use
+port 4321. The published Telegram relay remains on loopback port 4324; without
+a Telegram token it reports disabled and the rest of Kennedy remains usable.
 
 ## Durable vnote ingress
 
@@ -226,11 +220,16 @@ only while the file's device, inode, size, modification time, and change time
 still match, so later backlog scans do not reread unchanged large recordings.
 Deleting the cache is safe; the next scan simply rebuilds it.
 
-After acceptance, the server hashes and stores the original WAV, creates equal
+After acceptance, the server hashes and stores the original WAV byte-for-byte, creates equal
 four-minute-or-shorter windows with fifteen seconds of neighboring overlap,
 and transcribes up to four windows concurrently with
-`gemini-3.1-pro-preview`. Successful chunk results are stored immediately and
-retries send only unfinished chunks. `gpt-5.6-sol` with `xhigh` reasoning
+`gemini-3.1-pro-preview`. Each WAV window is resampled to 48 kHz only inside the
+in-memory Ogg Opus encoder, retaining the source's mono or stereo channel count
+at 192 kbps per channel (384 kbps for stereo), and sent inline through
+`kcode-gemini-api` with a structured-output schema; the Opus bytes are discarded
+after the response.
+Successful chunk results are stored immediately and retries send only
+unfinished chunks. `gpt-5.6-sol` with `xhigh` reasoning
 receives the stored transcripts in chronological order, reconciles speakers,
 removes repeated overlap, preserves annotations and translations, and produces
 the canonical final transcript. If needed, Sol inserts sensible boundaries so
@@ -240,6 +239,10 @@ identity. Processing stages, transcripts, retries, and Kennedy ingress
 checkpoints are SQLite-backed and resume after server restarts. Kmap mutation
 runs in the supervised backend worker and remains serialized with ordinary and
 Telegram conversation-history ingress plus self time.
+
+Once every Kennedy ingress piece is complete, the generated local WAV shards
+are deleted. The raw content-addressed original and all transcript/history
+metadata remain archived.
 
 Recordings are idempotent by content hash. Check one with
 `GET /api/v1/audio-ingress/by-sha256/{sha256}` or inspect the entire durable
@@ -300,7 +303,7 @@ history, provenance, connections, and every non-node table are excluded.
 The compiled defaults use `gpt-5.6-sol` with `xhigh` reasoning effort and
 execute each turn through `codex-safe`, which invokes non-interactive
 `codex exec` inside Podman. If the deployment needs another compatible model,
-change the provider model constants in `IntelligenceBackend/src/defaults.rs`;
+change the provider model constants in `KennedyServer/src/intelligence/defaults.rs`;
 the usable context window is always read from Codex's advertised metadata.
 
 ## Editing Kennedy
@@ -330,8 +333,9 @@ so tool requests and results are visible in the chatend. Every session can read
 Kmap memory and use WebSearch/WebFetch. Live conversations cannot mutate the
 Kmap; the serialized, offline history-ingress worker owns memory mutation. Kennedy
 chooses `quality`, `balanced`, or `fast` for each WebSearch call; the concrete
-provider, model, reasoning, context, deadline, and retrieval bounds for those
-modes stay in the intelligence backend. The UI also reports provider token
+provider, model, reasoning, context, and fixed deadline for those modes stay in
+KennedyServer's intelligence adapter. Search responses retain every distinct
+source returned by the provider. The UI also reports provider token
 usage, context-window headroom, and prompt-cache reads and writes in the
 Chatend header, and shows history ingress as it runs. The Chatend inspector can
 display the complete context, just the system prompts, or an expandable tree

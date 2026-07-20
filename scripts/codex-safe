@@ -6,7 +6,7 @@ program=${0##*/}
 podman=${CODEX_SAFE_PODMAN:-podman}
 image=${CODEX_SAFE_IMAGE:-${CODEX_IMAGE:-local/codex}}
 state=${CODEX_SAFE_STATE_DIR:-/home/user/podman/codex-state}
-catalog_dir=${CODEX_SAFE_CATALOG_DIR:-${TMPDIR:-/tmp}/kennedy-codex-catalogs}
+catalog_dir=${CODEX_SAFE_CATALOG_DIR:-${TMPDIR:-/tmp}/kcode-codex-catalogs}
 empty_workspace=${CODEX_SAFE_EMPTY_WORKSPACE:-${state}-empty-workspace}
 container_user=${CODEX_SAFE_CONTAINER_USER:-1000:1000}
 

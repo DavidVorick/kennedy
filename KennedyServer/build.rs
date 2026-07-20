@@ -11,7 +11,6 @@ fn main() {
         "../Cargo.lock",
         "../ConversationHistory/src",
         "../ConversationHistory/migrations",
-        "../IntelligenceBackend/src",
         "../Frontend/public/js",
         "../Frontend/SystemPrompts",
     ] {

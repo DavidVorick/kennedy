@@ -112,9 +112,11 @@ impl Orchestrator {
         let (kweb, intelligence, history, telegram, audio) = tokio::join!(
             self.api.health(&self.api.kweb, "/api/v1/kmap/health"),
             self.api.health(&self.api.intelligence, "/health"),
-            self.api.health(&self.api.history, "/health"),
+            self.api
+                .health(&self.api.history, "/api/v1/conversations/health"),
             self.api.health(&self.api.telegram, "/health"),
-            self.api.health(&self.api.audio, "/health"),
+            self.api
+                .health(&self.api.audio, "/api/v1/audio-ingress/health"),
         );
         kweb?;
         intelligence?;
@@ -305,13 +307,6 @@ impl Orchestrator {
                 "status":"ending",
                 "abandonedPendingTurn":abandoned_pending_turn,
             });
-            if let Some(session_id) = state
-                .get("rustLibSessionId")
-                .or_else(|| state.pointer("/archive/rustLibSessionId"))
-                .and_then(Value::as_str)
-            {
-                self.api.release_rust_libs(session_id).await;
-            }
             self.request_conversation_ingress(&record, Some(state))
                 .await?;
             self.complete_command(&command_id, json!({"status":"closed"}))
@@ -465,7 +460,7 @@ impl Orchestrator {
                     );
                 }
                 persist_record(&self.api, &record, session.snapshot()?, true).await?;
-                self.close_conversation(&record, &session).await?;
+                self.close_conversation(&record).await?;
                 json!({"status":"closed"})
             }
             _ => anyhow::bail!("Unsupported browser conversation command {kind}"),
@@ -533,12 +528,7 @@ impl Orchestrator {
         .await
     }
 
-    async fn close_conversation(
-        &self,
-        record: &Arc<Mutex<Value>>,
-        session: &Session,
-    ) -> anyhow::Result<Value> {
-        session.release_rust_libs().await;
+    async fn close_conversation(&self, record: &Arc<Mutex<Value>>) -> anyhow::Result<Value> {
         self.request_conversation_ingress(record, None).await
     }
 
@@ -693,7 +683,6 @@ impl Orchestrator {
 
     async fn process_conversation_ingress(&self, mut record: Value) -> anyhow::Result<()> {
         let id = required_string(&record, "id")?;
-        let rust_session_id = format!("kennedy:history-ingress:{id}");
         let mut stage = "prepare";
         let result = async {
             if record.get("phase").and_then(Value::as_str) == Some("ingress_pending") {
@@ -783,7 +772,6 @@ impl Orchestrator {
                     .or_else(|| archive.get("channel").and_then(|channel| channel.get("groupContext")))
                     .cloned()
                     .unwrap_or(Value::Null),
-                rust_lib_session_id: Some(rust_session_id.clone()),
             };
             let restored = state.get("historyIngress");
             let mut session = Session::new(
@@ -859,7 +847,6 @@ impl Orchestrator {
                 .ok();
             return Err(error);
         }
-        self.api.release_rust_libs(&rust_session_id).await;
         Ok(())
     }
 
@@ -891,7 +878,6 @@ impl Orchestrator {
 
     async fn process_audio_ingress(&self, mut piece: Value) -> anyhow::Result<()> {
         let id = required_string(&piece, "id")?;
-        let rust_session_id = format!("kennedy:audio-ingress:{id}");
         let mut stage = "prepare";
         let result = async {
             if piece.get("phase").and_then(Value::as_str) == Some("ingress_pending") {
@@ -931,7 +917,7 @@ impl Orchestrator {
                 session_type: "history-ingress".into(),
                 root_node_ids: vec![runtime.user_root_node_id.clone(), runtime.kennedy_root_node_id.clone()],
                 reference_root_node_ids: Vec::new(), channel:Value::Null, free_time:Value::Null, orchestration:Value::Null,
-                provenance_id:Some(provenance_id.clone()),mode:AgentMode::Ingress{record_id:None},source_session_type:Some("audio".into()),group_context:Value::Null,rust_lib_session_id:Some(rust_session_id.clone()),
+                provenance_id:Some(provenance_id.clone()),mode:AgentMode::Ingress{record_id:None},source_session_type:Some("audio".into()),group_context:Value::Null,
             };
             let state=piece.get("state").cloned().unwrap_or_else(||json!({}));
             let mut session=Session::new(self.api.clone(),runtime.manuals,runtime.model,options,state.get("historyIngress")).await?;
@@ -962,7 +948,6 @@ impl Orchestrator {
             }
             return Err(error);
         }
-        self.api.release_rust_libs(&rust_session_id).await;
         Ok(())
     }
 
@@ -1069,7 +1054,6 @@ impl Orchestrator {
         };
         session.finalize_free_time(&reason)?;
         persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
-        session.release_rust_libs().await;
         let mut locked = record_arc.lock().await;
         let completed=self.api.post(&self.api.history,&format!("/api/v1/conversations/{}/complete",encode_path(&id)),json!({"expected_version":version(&locked)?,"state":locked.get("state").cloned().unwrap_or(Value::Null)})).await?;
         *locked = completed;
@@ -1098,18 +1082,18 @@ impl Orchestrator {
                 .unwrap_or_default()
                 + 1
         );
-        free.as_object_mut().map(|object| {
+        if let Some(object) = free.as_object_mut() {
             object.remove("sliceEndedReason");
             object.remove("sliceEndedAt");
             object.remove("warningNoticeAt");
             object.remove("expiredNoticeAt");
-        });
+        }
         if let Some(message) = free.get("nextSessionMessage").cloned() {
             free["handoffMessage"] = message;
         }
-        free.as_object_mut().map(|object| {
+        if let Some(object) = free.as_object_mut() {
             object.remove("nextSessionMessage");
-        });
+        }
         free["deadlineAt"] = json!(deadline.to_rfc3339());
         let mut options = SessionOptions::conversation(
             "free-time",
@@ -1527,13 +1511,12 @@ impl Orchestrator {
                     )
                     .await;
                 let conversation = conversation_id.lock().await.clone();
-                if let Some(conversation_id) = &conversation {
-                    if let Err(error) = self
+                if let Some(conversation_id) = &conversation
+                    && let Err(error) = self
                         .transition_timed_out_telegram_to_ingress(conversation_id)
                         .await
-                    {
-                        tracing::error!(event_id=%id,error=%error,"Timed-out Telegram conversation could not be queued for ingress");
-                    }
+                {
+                    tracing::error!(event_id=%id,error=%error,"Timed-out Telegram conversation could not be queued for ingress");
                 }
                 let _ = self
                     .api
@@ -1650,9 +1633,6 @@ impl Orchestrator {
                 json!({"expected_version":version(&record)?,"state":state}),
             )
             .await?;
-        if let Some(session_id) = state.get("rustLibSessionId").and_then(Value::as_str) {
-            self.api.release_rust_libs(session_id).await;
-        }
         Ok(())
     }
 
@@ -1891,8 +1871,6 @@ impl Orchestrator {
             self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
             return Ok(());
         }
-        let session = self.session_for_record(&record).await?;
-        session.release_rust_libs().await;
         self.api.post(&self.api.history,&format!("/api/v1/conversations/{}/request-ingress",encode_path(conversation_id)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
         self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session."})).await?;
         Ok(())
@@ -1961,7 +1939,7 @@ impl Orchestrator {
         let record = Arc::new(Mutex::new(record));
         persist_record(&self.api, &record, session.snapshot()?, false).await?;
         if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
-            self.close_conversation(&record, &session).await?;
+            self.close_conversation(&record).await?;
             self.api
                 .post(
                     &self.api.telegram,
@@ -2217,13 +2195,7 @@ fn recoverable_self_time_slice(histories: &[Value]) -> Option<Value> {
         let free_time = state
             .get("freeTime")
             .or_else(|| state.pointer("/archive/freeTime"))?;
-        if free_time
-            .get("sliceEndedAt")
-            .and_then(Value::as_str)
-            .is_none()
-        {
-            return None;
-        }
+        free_time.get("sliceEndedAt").and_then(Value::as_str)?;
         let run_id = free_time.get("runId").and_then(Value::as_str)?;
         let slice = free_time
             .get("sliceIndex")
@@ -2252,10 +2224,9 @@ fn select_ingress(
         (Some(conversation), Some(audio)) => {
             if conversation.get("phase").and_then(Value::as_str) == Some("ingress_in_progress") {
                 Some(("conversation", conversation))
-            } else if audio.get("phase").and_then(Value::as_str) == Some("ingress_in_progress") {
-                Some(("audio", audio))
-            } else if audio.get("source_created_at").and_then(Value::as_str)
-                < conversation.get("started_at").and_then(Value::as_str)
+            } else if audio.get("phase").and_then(Value::as_str) == Some("ingress_in_progress")
+                || audio.get("source_created_at").and_then(Value::as_str)
+                    < conversation.get("started_at").and_then(Value::as_str)
             {
                 Some(("audio", audio))
             } else {
@@ -2398,7 +2369,7 @@ mod tests {
         let deadline = (Utc::now() + ChronoDuration::minutes(10)).to_rfc3339();
         let first = json!({"id":"first","phase":"complete","state":{"sessionType":"free-time","freeTime":{"runId":"run","sliceIndex":1,"sliceEndedAt":Utc::now().to_rfc3339(),"deadlineAt":deadline}}});
         assert_eq!(
-            recoverable_self_time_slice(&[first.clone()])
+            recoverable_self_time_slice(std::slice::from_ref(&first))
                 .unwrap()
                 .get("id")
                 .and_then(Value::as_str),

@@ -303,16 +303,6 @@ impl Api {
             .await
     }
 
-    pub async fn release_rust_libs(&self, session_id: &str) {
-        let _ = self
-            .post(
-                &self.kweb,
-                "/api/v1/rust-libs/release",
-                json!({"session_id": session_id}),
-            )
-            .await;
-    }
-
     pub async fn transcribe(
         &self,
         provider: &str,
@@ -430,23 +420,6 @@ pub(crate) fn string_at<'a>(value: &'a Value, key: &str) -> Result<&'a str, ApiE
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durable_work_uses_stable_valid_idempotency_ids() {
-        let first = stable_idempotency_id("audio-ingress", "piece-1");
-        assert_eq!(first, stable_idempotency_id("audio-ingress", "piece-1"));
-        assert_ne!(
-            first,
-            stable_idempotency_id("conversation-ingress", "piece-1")
-        );
-        assert_eq!(first.len(), 32);
-        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    }
-}
-
 pub(crate) fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", BASE64.encode(bytes))
 }
@@ -549,4 +522,21 @@ pub(crate) fn file_name(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("file")
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_work_uses_stable_valid_idempotency_ids() {
+        let first = stable_idempotency_id("audio-ingress", "piece-1");
+        assert_eq!(first, stable_idempotency_id("audio-ingress", "piece-1"));
+        assert_ne!(
+            first,
+            stable_idempotency_id("conversation-ingress", "piece-1")
+        );
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 }

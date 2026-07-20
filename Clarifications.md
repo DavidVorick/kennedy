@@ -6,9 +6,9 @@ canonical documents; this file is not an append-only log.
 
 ## Standalone Gemini Library
 
-- Build Gemini support as a fully separated kcode Rust library that will later
-  become a `kennedy-server` dependency; do not change or rewire existing
-  Kennedy code during this first library-development step.
+- Name the fully separated kcode Rust library `kcode-gemini-api` (Rust crate
+  path `kcode_gemini_api`). It is published independently on crates.io; Kennedy
+  consumes the published crate rather than retaining a local source copy.
 - Open the library with a Gemini API key and expose object methods for Gemini
   3.1 Flash-Lite and 3.1 Pro inference, Nano Banana Pro with optional image
   input and library-fixed 2K output, and 3.1 Pro inference with image and/or
@@ -19,36 +19,51 @@ canonical documents; this file is not an append-only log.
 - Return ordinary typed Rust reporting values. Do not add HTTP routes,
   route-oriented serialization, or a wire contract to this standalone library;
   `kennedy-server` can choose its own adapter when it later adopts the crate.
+- Treat the literal package version in `Cargo.toml` as canonical; do not require
+  or include a redundant `Version.txt` in this managed library.
 
 ## Frontend Conversation-History Recovery
 
 - Restore visible, selectable conversation history first so the user can talk
   to Kennedy again. Keep unrelated frontend issues out of this repair.
 
-## Kmap-Documented Rust Library Tools
+## Repository Cleanup and Audio Retention
 
-- Give Kennedy `CreateRustLib`, `OpenRustLib`, `WriteRustLib`, `CheckRustLib`,
-  and `PublishRustLib`. Keep their complete Kennedy-facing documentation in an
-  ingressable Kmap document rather than any static prompt asset.
-- Import the already-published `kcode-rust-libs` crate. Hardcode
-  `/home/user/dev/kennedy/kcode/kcode-rust-libs` as its managed libraries root;
-  the self-hosted library is the `kcode-rust-libs` child within that root.
-- Call the crate directly inside `kennedy-server`. Because Kennedy's current
-  tool loop runs in browser JavaScript, use only one narrow same-origin RPC
-  bridge into that in-process adapter rather than an independent REST service.
-- Allow one Kennedy session to own each opened library at a time and release
-  its handles at session end. Expire idle ownership from an abandoned session
-  after 24 hours, matching the allowed lifetime of other sessions. Keep the
-  ownership/session identifier out of Kennedy-controlled arguments. The five
-  coding tools are always available in every Kennedy execution mode, including
-  conversation, Telegram, self time, history ingress, and audio ingress.
+- Remove the obsolete Rust-library publishing tools and their HTTP, session,
+  frontend, documentation, credential, and dependency surface. Rust tools are
+  now published inside Kennedy sessions through Kmap-available facilities.
+- Remove `CodexRuntime`, `IntelligenceBackend`, and the frontend's
+  `legacy_orchestration` test implementation. The five extracted kcode
+  libraries are now published on crates.io; remove their local source
+  directories and consume their registry releases.
+- Serve Kmap, intelligence, conversation history, audio ingress, Telegram
+  identity, and the frontend from the main `127.0.0.1:4321` listener. The
+  published Telegram relay currently remains on `4324` only because version
+  `0.1.0` exposes a self-binding server rather than a mergeable Axum router.
+- Preserve each raw audio original. Generated transcription shards are working
+  data: delete their files after every ingress piece for the recording is
+  complete, while retaining transcript metadata in SQLite. Also remove stale
+  shard directories for already-completed recordings during startup.
+- The intended AudioIngress provider path is inline Opus through
+  `kcode-gemini-api`; the Opus buffer is never persisted. Preserve the uploaded
+  raw original byte-for-byte. Resample only inside the ephemeral Opus
+  conversion, retain the source's mono or stereo channel count, and encode at
+  192 kbps per channel (384 kbps for stereo). Reject unsupported channel counts
+  rather than silently remixing them. Use the published library's Gemini
+  top-level structured-output response schema support while preserving the
+  speaker, timestamp, language, translation, annotation, and confidence
+  contract.
+- Exact-pin dependencies that receive provider credentials. Ordinary
+  dependencies such as the Opus codec should use compatible semantic-version
+  requirements and the workspace lockfile rather than an unnecessary exact
+  requirement.
+- Leave the externally published Telegram relay unchanged for now.
 
 ## Kmap DB Core
 
 - The `kweb-db-core` crate is a standalone Rust library package that owns only
   Kmap storage. `kennedy-server` imports its published release and exposes the HTTP adapter under
-  `/api/v1/kmap`; a later consolidation may place every application API on one
-  listener.
+  `/api/v1/kmap`; the Kennedy-owned application routers share that listener.
 - The core API is limited to opening/initializing a database path, creating
   provenance, creating/updating nodes with an existing provenance ID, reading
   nodes/provenance/full provenance history, and returning extensible stats.
@@ -231,7 +246,7 @@ canonical documents; this file is not an append-only log.
   it. Probe the sanitized catalog and model-visible prompt through the launcher;
   abort startup rather than falling back if either boundary cannot be verified.
 - The `codex-safe` container boundary must expose the host temporary directory's
-  `kennedy-codex-catalogs` subdirectory at the same absolute path, read-only.
+  `kcode-codex-catalogs` subdirectory at the same absolute path, read-only.
   This lets the backend pass the verified live catalog without copying mutable
   provider state into the application.
 - Reuse Codex threads and report cache reads where Codex exposes them. Do not

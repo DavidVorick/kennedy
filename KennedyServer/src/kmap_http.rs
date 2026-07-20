@@ -24,8 +24,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
-use crate::rust_lib_tools;
-
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -232,13 +230,35 @@ pub(crate) fn initialize(
     Ok((kmap, roots))
 }
 
+pub(crate) struct MergedRouters {
+    telegram_directory: Router,
+    intelligence: Router,
+    conversation_history: Router,
+    audio_ingress: Router,
+}
+
+impl MergedRouters {
+    pub(crate) fn new(
+        telegram_directory: Router,
+        intelligence: Router,
+        conversation_history: Router,
+        audio_ingress: Router,
+    ) -> Self {
+        Self {
+            telegram_directory,
+            intelligence,
+            conversation_history,
+            audio_ingress,
+        }
+    }
+}
+
 pub(crate) async fn serve_with_listener(
     kmap: Kmap,
     roots: SystemRoots,
     frontend_dir: PathBuf,
     system_prompts_dir: PathBuf,
-    rust_lib_tools: rust_lib_tools::RustLibToolService,
-    telegram_directory: Router,
+    merged_routers: MergedRouters,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let artifact_directory = kmap.artifact_path().to_owned();
@@ -272,8 +292,10 @@ pub(crate) async fn serve_with_listener(
         )
         .route("/system-prompts/{filename}", get(get_prompt))
         .with_state(state)
-        .merge(rust_lib_tools::router(rust_lib_tools))
-        .merge(telegram_directory)
+        .merge(merged_routers.telegram_directory)
+        .merge(merged_routers.intelligence)
+        .merge(merged_routers.conversation_history)
+        .merge(merged_routers.audio_ingress)
         .fallback_service(ServeDir::new(frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -695,44 +717,26 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let rust_lib_tools = rust_lib_tools::RustLibToolService::new(
-            directory.join("rust-libs"),
-            "test-crates-io-key",
-        )
-        .unwrap();
+        let intelligence = Router::new().route(
+            "/api/v1/test-intelligence",
+            get(|| async { Json(json!({"service":"intelligence"})) }),
+        );
         let server = tokio::spawn(serve_with_listener(
             kmap,
             roots,
             directory.join("frontend"),
             directory.join("prompts"),
-            rust_lib_tools,
-            Router::new(),
+            MergedRouters::new(Router::new(), intelligence, Router::new(), Router::new()),
             listener,
         ));
         let response = http_request(address, "GET", "/api/v1/kmap/roots", "").await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(&roots.user.to_string()));
         assert!(response.contains(&roots.kennedy.to_string()));
-        let rust_lib_body = json!({
-            "session_id":"conversation:http-test",
-            "name":"CreateRustLib",
-            "arguments":{"name":"http-test-lib"},
-        })
-        .to_string();
-        let rust_lib_response =
-            http_request(address, "POST", "/api/v1/rust-libs/execute", &rust_lib_body).await;
-        assert!(rust_lib_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(rust_lib_response.contains("http-test-lib"));
-        let release_response = http_request(
-            address,
-            "POST",
-            "/api/v1/rust-libs/release",
-            r#"{"session_id":"conversation:http-test"}"#,
-        )
-        .await;
-        assert!(release_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(release_response.contains(r#""released":1"#));
-
+        let intelligence_response =
+            http_request(address, "GET", "/api/v1/test-intelligence", "").await;
+        assert!(intelligence_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(intelligence_response.contains("\"service\":\"intelligence\""));
         let idempotency_id = IdempotencyId::random();
         let body = json!({
             "idempotency_id":idempotency_id,

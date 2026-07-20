@@ -1,5 +1,5 @@
 [workspace]
-members = ["AudioIngress", "CodexRuntime", "ConversationHistory", "IntelligenceBackend", "KennedyServer"]
+members = ["AudioIngress", "ConversationHistory", "KennedyServer"]
 resolver = "2"
 
 [workspace.package]
@@ -16,10 +16,14 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 hex = "0.4"
 http = "1"
+kcode-codex-runtime = "0.1.0"
+kcode-doc-extraction = "0.1.0"
+kcode-gemini-api = "=0.1.0"
+kcode-openai-api = "=0.1.0"
+kcode-web-fetch = "0.1.1"
 rand = "0.9"
 rpassword = "7.5.4"
 reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "multipart", "rustls-no-provider"] }
-html2text = "0.16"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,8 +38,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.9"
 futures = "0.3"
 hound = "3.5"
-teloxide = { version = "0.17", default-features = false, features = ["rustls", "rustls-native-roots", "tracing"] }
-calamine = "0.35"
-pdf-extract = "0.12"
-quick-xml = "0.41"
-zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.test]
+debug = 1
+incremental = false

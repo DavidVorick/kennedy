@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-AUDIO_API="${KENNEDY_AUDIO_API:-http://127.0.0.1:4325/api/v1/audio-ingress}"
+AUDIO_API="${KENNEDY_AUDIO_API:-http://127.0.0.1:4321/api/v1/audio-ingress}"
 AUDIO_API="${AUDIO_API%/}"
 VNOTE_LIMIT=5
 VNOTE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"

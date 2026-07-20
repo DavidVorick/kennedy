@@ -5,10 +5,10 @@ import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, par
 
 const CONFIG = {
   kwebBase: window.location.origin,
-  intelligenceBase: "http://127.0.0.1:4322",
-  conversationHistoryBase: "http://127.0.0.1:4323",
+  intelligenceBase: window.location.origin,
+  conversationHistoryBase: window.location.origin,
   telegramRelayBase: "http://127.0.0.1:4324",
-  audioIngressBase: "http://127.0.0.1:4325",
+  audioIngressBase: window.location.origin,
 };
 
 const ui = Object.fromEntries([

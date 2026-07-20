@@ -161,17 +161,6 @@ export const KwebAPI = (base) => ({
   updateNode: (id, body) => requestKmapMutation(base, `/api/v1/kmap/nodes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
 });
 
-export const RustLibsAPI = (base) => ({
-  execute: (sessionId, name, args) => requestJSON(base, "/api/v1/rust-libs/execute", {
-    method: "POST",
-    body: JSON.stringify({ session_id: sessionId, name, arguments: args }),
-  }).then(payload => payload.result),
-  release: (sessionId) => requestJSON(base, "/api/v1/rust-libs/release", {
-    method: "POST",
-    body: JSON.stringify({ session_id: sessionId }),
-  }),
-});
-
 export const IntelligenceAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   providers: () => requestJSON(base, "/api/v1/providers"),
@@ -207,7 +196,7 @@ export const IntelligenceAPI = (base) => ({
 });
 
 export const ConversationHistoryAPI = (base) => ({
-  health: () => requestJSON(base, "/health"),
+  health: () => requestJSON(base, "/api/v1/conversations/health"),
   list: () => requestJSON(base, "/api/v1/conversations/summaries"),
   start: (body) => requestJSON(base, "/api/v1/conversations/start", { method: "POST", body: JSON.stringify(body) }),
   commandHeads: () => requestJSON(base, "/api/v1/conversation-commands"),
@@ -233,7 +222,7 @@ export const ConversationHistoryAPI = (base) => ({
 });
 
 export const AudioIngressAPI = (base) => ({
-  health: () => requestJSON(base, "/health"),
+  health: () => requestJSON(base, "/api/v1/audio-ingress/health"),
   list: (limit = 100) => requestJSON(base, `/api/v1/audio-ingress?limit=${encodeURIComponent(limit)}`),
   get: (id) => requestJSON(base, `/api/v1/audio-ingress/${id}`),
   history: (id) => requestJSON(base, `/api/v1/audio-ingress/${id}/history`),

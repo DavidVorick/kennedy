@@ -7,9 +7,9 @@ durable backend-owned web and Telegram conversation checkpoints, idempotent
 web/self-time start intents, per-conversation command queues, and the queue of
 conversations that must undergo history ingress. Autonomous self-time records are retained here
 but complete without entering that queue because their live sessions already
-write to the Kmap. The backend shares a deployment binary with the Kweb and
-intelligence backends but has its own listener, router, state, SQLite database,
-and crate. It imports neither backend and calls neither backend.
+write to the Kmap. The backend shares `kennedy-server`'s main listener but has
+its own router, state, SQLite database, and crate. It imports no other Kennedy
+backend and calls no other backend.
 
 ## 2. Data Model
 
@@ -152,7 +152,7 @@ by itself.
 
 ## 4. API
 
-- `GET /health`
+- `GET /api/v1/conversations/health`
 - `GET|POST /api/v1/conversations`
 - `POST /api/v1/conversations/start`
 - `GET /api/v1/conversation-commands`
@@ -225,11 +225,11 @@ restoring, displaying, retrying, or otherwise mutating a summarized record.
 
 ## 5. Deployment and Isolation
 
-The default listener is `127.0.0.1:4323` and the default database is
-`kennedy-conversations.sqlite3`. SQLite uses WAL mode and a busy timeout, so
+The router is merged into `kennedy-server`'s default `127.0.0.1:4321` listener
+and the default database is `kennedy-conversations.sqlite3`. SQLite uses WAL mode and a busy timeout, so
 Kmap reads can continue while the separate Kweb database is being updated.
-Only the frontend origin is allowed by CORS. The server accepts request bodies
-up to 128 MiB for structured Chatend archives and future inline media.
+The server accepts request bodies up to 128 MiB for structured Chatend archives
+and future inline media.
 
 ## 6. Verification
 

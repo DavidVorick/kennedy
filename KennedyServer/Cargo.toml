@@ -14,10 +14,12 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 kennedy-audio-ingress = { path = "../AudioIngress" }
-kennedy-codex-runtime = { path = "../CodexRuntime" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
-kennedy-intelligence = { path = "../IntelligenceBackend" }
-kcode-rust-libs = "=0.2.0"
+kcode-codex-runtime.workspace = true
+kcode-doc-extraction.workspace = true
+kcode-gemini-api.workspace = true
+kcode-openai-api.workspace = true
+kcode-web-fetch.workspace = true
 kweb-db-core = "=0.2.2"
 kcode-tg-kennedy-bot = "=0.1.0"
 rusqlite.workspace = true

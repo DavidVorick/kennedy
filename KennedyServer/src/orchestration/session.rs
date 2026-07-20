@@ -17,13 +17,6 @@ use super::{
 const TOOL_PREFIX: &str = "KENNEDY_TOOL_CALLS";
 const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
 const CHATEND_SEPARATOR: &str = "\n\n────────────────────────\n\n";
-const RUST_LIB_TOOLS: [&str; 5] = [
-    "CreateRustLib",
-    "OpenRustLib",
-    "WriteRustLib",
-    "CheckRustLib",
-    "PublishRustLib",
-];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -44,7 +37,6 @@ pub(crate) struct SessionOptions {
     pub mode: AgentMode,
     pub source_session_type: Option<String>,
     pub group_context: Value,
-    pub rust_lib_session_id: Option<String>,
 }
 
 impl SessionOptions {
@@ -60,7 +52,6 @@ impl SessionOptions {
             mode: AgentMode::Conversation,
             source_session_type: None,
             group_context: Value::Null,
-            rust_lib_session_id: None,
         }
     }
 }
@@ -73,7 +64,6 @@ pub(crate) struct Session {
     pub free_time: Value,
     pub orchestration: Value,
     pub provenance_id: Option<String>,
-    pub rust_lib_session_id: String,
     pub root_node_ids: Vec<String>,
     pub reference_root_node_ids: Vec<String>,
     pub started_at: String,
@@ -271,13 +261,6 @@ impl Session {
                     .and_then(|entry| entry.get("role"))
                     .and_then(Value::as_str)
                     == Some("user"));
-        let rust_lib_session_id = restored
-            .and_then(|state| state.get("rustLibSessionId"))
-            .or_else(|| archive.and_then(|archive| archive.get("rustLibSessionId")))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(options.rust_lib_session_id)
-            .unwrap_or_else(|| format!("kennedy:{}", Uuid::new_v4()));
         let usage = archive
             .and_then(|archive| archive.get("usage"))
             .cloned()
@@ -295,7 +278,6 @@ impl Session {
             free_time: options.free_time,
             orchestration: options.orchestration,
             provenance_id: options.provenance_id,
-            rust_lib_session_id,
             root_node_ids: options.root_node_ids,
             reference_root_node_ids: options.reference_root_node_ids,
             started_at,
@@ -682,11 +664,6 @@ impl Session {
                 "provider":self.runtime.provider,
                 "model":self.runtime.model,
                 "chatend":chatend,
-                "prompt_cache_key":match self.mode {
-                    AgentMode::Ingress{..} => "kennedy-ingress-prompt-v5",
-                    AgentMode::FreeTime => "kennedy-free-time-prompt-v5",
-                    AgentMode::Conversation => "kennedy-conversation-prompt-v5",
-                },
                 "operation_id":operation_id,
             });
             if let Some(timeout) = self.free_time_request_timeout_seconds() {
@@ -925,9 +902,6 @@ impl Session {
             "SetFixedConnection" => self.set_fixed_connection(&call.arguments).await?,
             "CreateNode" => self.create_node(&call.arguments).await?,
             "UpdateNode" => self.update_node(&call.arguments).await?,
-            name if RUST_LIB_TOOLS.contains(&name) => {
-                self.rust_lib_tool(name, &call.arguments).await?
-            }
             _ => anyhow::bail!("Tool {} is not available.", call.name),
         };
         let duration = started.elapsed().as_millis() as u64;
@@ -1269,34 +1243,6 @@ impl Session {
             .context("Kmap update response omitted node")
     }
 
-    async fn rust_lib_tool(&self, name: &str, args: &Value) -> anyhow::Result<Value> {
-        validate_arguments(
-            args,
-            if name == "WriteRustLib" {
-                &["name", "files"]
-            } else {
-                &["name"]
-            },
-            &[],
-        )?;
-        let name_value = nonempty_string(args, "name", 255)?;
-        anyhow::ensure!(
-            name_value
-                .chars()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_')),
-            "invalid Rust library name"
-        );
-        let payload = self
-            .api
-            .post(
-                &self.api.kweb,
-                "/api/v1/rust-libs/execute",
-                json!({"session_id":self.rust_lib_session_id,"name":name,"arguments":args}),
-            )
-            .await?;
-        Ok(payload.get("result").cloned().unwrap_or(Value::Null))
-    }
-
     fn consume_load_budget(&mut self) -> anyhow::Result<()> {
         self.load_calls += 1;
         anyhow::ensure!(
@@ -1507,7 +1453,7 @@ impl Session {
         let archive = self.archive()?;
         Ok(json!({
             "stateVersion":2,"sessionType":self.session_type,"channel":self.channel,"freeTime":self.free_time,"orchestration":self.orchestration,
-            "provenanceId":self.provenance_id,"rustLibSessionId":self.rust_lib_session_id,"rootNodeIds":self.root_node_ids,"referenceRootNodeIds":self.reference_root_node_ids,
+            "provenanceId":self.provenance_id,"rootNodeIds":self.root_node_ids,"referenceRootNodeIds":self.reference_root_node_ids,
             "startedAt":self.started_at,"transcript":self.transcript,"media":self.media,"loadedNodeIds":self.context.loaded_node_ids,
             "pendingTurn":self.pending_turn,"pendingExternalEventId":self.pending_external_event_id,"lastContextWarningBand":self.last_context_warning_band,"archive":archive,
         }))
@@ -1517,7 +1463,7 @@ impl Session {
         Ok(json!({
             "format":"kennedy-chatend","version":2,"sessionType":if matches!(self.mode, AgentMode::Ingress{..}) {"history-ingress"} else {self.session_type.as_str()},
             "sourceSessionType":self.source_session_type,"channel":self.channel,"freeTime":self.free_time,"orchestration":self.orchestration,
-            "provenanceId":self.provenance_id,"rustLibSessionId":self.rust_lib_session_id,"rootNodeIds":self.root_node_ids,"referenceRootNodeIds":self.reference_root_node_ids,
+            "provenanceId":self.provenance_id,"rootNodeIds":self.root_node_ids,"referenceRootNodeIds":self.reference_root_node_ids,
             "groupContext":self.group_context,"startedAt":self.started_at,"provider":self.runtime.provider,"model":self.runtime.model,"systemPrompt":self.system_prompt,
             "retained":self.retained,"transcript":self.transcript,"messages":self.messages,"fullHistory":{"segments":self.full_history_segments},
             "context":{"snapshot":self.context.snapshot()?,"diagnostics":self.context.diagnostics(),"state":self.context.archive()},
@@ -1525,10 +1471,6 @@ impl Session {
             "usage":self.usage,"pendingExternalEventId":self.pending_external_event_id,"lastContextWarningBand":self.last_context_warning_band,"media":self.media,
             "completed":self.completed,"roundsUsed":self.rounds_used,
         }))
-    }
-
-    pub(crate) async fn release_rust_libs(&self) {
-        self.api.release_rust_libs(&self.rust_lib_session_id).await;
     }
 }
 
@@ -1770,8 +1712,6 @@ fn tool_result_message(name: &str, content: Value, duration: u64) -> Value {
         "Control tool result"
     } else if matches!(name, "WebSearch" | "WebFetch") {
         "Web tool result"
-    } else if RUST_LIB_TOOLS.contains(&name) {
-        "Coding tool result"
     } else {
         "Memory tool result"
     };

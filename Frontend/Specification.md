@@ -4,7 +4,8 @@
 
 The frontend is a browser-native HTML, CSS, and JavaScript application. It has
 no Node.js dependency, package manager, bundler, TypeScript, or compile step.
-The main Rust server serves it on localhost beside the Kmap HTTP adapter.
+The main Rust server serves it on localhost beside the Kmap and intelligence
+HTTP routes.
 
 The frontend owns Kennedy's UI only. It observes backend-owned durable records,
 submits explicit start/message/retry/end/stop and ingress-retry requests, keeps
@@ -41,6 +42,9 @@ Frontend/
       self_time.js
 KennedyServer/
   src/
+    intelligence/
+      mod.rs
+      defaults.rs
     orchestration.rs
     orchestration/
       context.rs
@@ -60,11 +64,8 @@ server neither executes browser modules nor launches a JavaScript runtime.
 
 The frontend defaults to:
 
-- Main static origin and `/api/v1/kmap` adapter: `http://127.0.0.1:4321`
-- Intelligence API: `http://127.0.0.1:4322`
-- Conversation history API: `http://127.0.0.1:4323`
-- Telegram relay API: `http://127.0.0.1:4324`
-- Audio ingress API: `http://127.0.0.1:4325`
+- Main static origin and all Kennedy-owned APIs: `http://127.0.0.1:4321`
+- Published Telegram relay API: `http://127.0.0.1:4324`
 
 The values are defined once in `app.js` so alternate local ports do not require
 changes throughout the codebase.
@@ -584,7 +585,9 @@ simple latency-sensitive lookups where reduced research quality is acceptable;
 `quality` is for difficult, high-stakes, cross-source, or conflict-resolution
 research. Geographic, language, freshness, and source requirements belong in
 the question. Concrete provider, model, reasoning effort, search context,
-timeout, query expansion, and result limits remain intelligence-layer policy.
+fixed timeout, and query expansion remain intelligence-layer policy. The caller
+cannot shorten or extend the profile deadline, and returned sources are not
+reduced to a caller-selected count.
 The backend calls `POST /api/v1/web/search` with the active provider/model and
 returns the normalized research answer and source URLs as a readable Web tool
 result. This research request is not part of the conversation's provider
@@ -644,48 +647,11 @@ Every corrected conversation or audio claim also supplies
 `completion_protocol: "end-turn-v1"`, allowing the backend to reject
 an older backend build before it can consume newly released repair work.
 
-### 8.12 Kmap-documented Rust library tools
-
-`CreateRustLib`, `OpenRustLib`, `WriteRustLib`, `CheckRustLib`, and
-`PublishRustLib` are always available in every Kennedy execution mode,
-including browser conversation, private/group Telegram, self time, history
-ingress, and audio ingress. Their Kennedy-facing contracts are absent from the
-static prompt assets and live entirely in the Kmap; `KmapBasics.txt` only
-provides the existing generic discovery notice and text-call protocol.
-
-The backend executor validates the model-visible name and complete-file write
-shapes, then sends the call to the main Rust server through one narrow
-same-origin RPC route. It automatically attaches a durable tool-session
-identifier—random for interactive sessions and record-derived for ingress—that
-never appears in Kennedy's arguments or diagnostic tool log.
-The server calls the synchronous published `kcode-rust-libs` crate in-process
-on blocking workers. Create/open results contain every sorted UTF-8 file;
-write results contain the accepted complete-file paths and canonical version;
-check results distinguish `passed: false` quality failures from infrastructure
-errors; and publish results contain only the crate name and version, never its
-operator-provisioned token.
-
-The hidden tool-session identifier survives Chatend and ingress recovery. The
-server owns at most one open handle per library across all Kennedy sessions. A
-second session receives a conflict until the owner ends. Conversation close,
-Telegram close/reset/timeout, self-time slice completion, history/audio ingress
-completion or terminal failure, purge, and stale live-session reconciliation
-all release the owning session's handles. The server also expires abandoned
-idle ownership after 24 hours; a restored Kennedy session can call
-`OpenRustLib` again. There is no Kennedy-facing close, reload, delete, list,
-patch, arbitrary-command, token, root-path, or Podman configuration call.
-
-Rust-library mutations are external filesystem/registry effects and are not
-rolled back when a later Conversation History checkpoint fails. Complete-file
-writes are safely repeatable. After an ambiguous create the agent opens the
-library instead of creating it again; after an ambiguous publish it verifies
-the exact version on crates.io rather than blindly repeating publication.
-
 ### 8.12 Tool Failures
 
 Unknown tools are never executed. Invalid arguments, exhausted budgets, missing
 short IDs, unsafe URLs, and backend failures are returned to Kennedy as failed
-tool results with a readable explanation. Memory, web, and coding operations have
+tool results with a readable explanation. Memory and web operations have
 distinct readable result labels. Machine-readable error codes remain in the
 internal diagnostic tool log; readable requests and failures appear in the
 chatend visualization.
