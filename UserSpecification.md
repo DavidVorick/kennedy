@@ -7,7 +7,7 @@ direction; one node leading to another node does not imply that the other node
 leads back.
 
 All of the knowledge is held in a simple SQLite database. Each core node create
-or update is atomic; frontend workflows that update several nodes are
+or update is atomic; backend workflows that update several nodes are
 deliberately sequential and may partially complete if a later call fails.
 
 An agent named Kennedy is responsible for creating, maintaining, and navigating
@@ -23,8 +23,8 @@ The live parameters in the codebase may be materially different.
 ## Vocabulary
 
 'Frontend' refers to the html/css/js application that is served. The frontend
-has no persistent state, and relies on APIs to various backend services to get
-persistence between sessions.
+has no persistent or execution state, and relies on APIs to submit user intent
+and observe backend state.
 
 'Chatend' refers to the canonical human-readable application text that is
 passed to Codex for Kennedy. The Full inspector displays every
@@ -41,15 +41,16 @@ reload or provider-thread reset, and uses `unknown` only before any successful
 LLM usage report exists. The value can lag behind subsequently appended
 messages, tool results, or loaded memory until the next LLM call.
 
-'Backend' refers to any of the backend services that are providing APIs to the
-frontend.
+'Backend' refers to the Rust services plus the native orchestrator running
+inside `kennedy-server`. The frontend is only an observer/input client; the backend
+owns every live Kennedy session and all work coordination.
 
 Kennedy has five API domains: Kmap, intelligence, conversation history, a
 Telegram relay, and durable audio ingress. Kmap storage is a standalone Rust
 library imported by the main Rust server, which exposes `/api/v1/kmap` and the
 frontend on its local listener. The main server also imports the published
 `kcode-rust-libs` crate and exposes a narrow same-origin transport from the
-browser-owned Kennedy tool loop to that in-process adapter; it is not an
+backend-owned Kennedy tool loop to that in-process adapter; it is not an
 independent backend or provider-facing tool API. The other domains retain
 separate APIs and storage. A future server may route every API domain through
 one port.
@@ -96,8 +97,9 @@ These are the fields for the knowledge node:
 + Ordered list of unique identifiers as recent connections
 + Unique Identifier of a data history node
 
-Storage assigns no active/fanout meaning to recent order. The frontend treats
-the first eight recent identifiers as active and the remainder as fanout. It
+Storage assigns no active/fanout meaning to recent order. The backend session
+treats the first eight recent identifiers as active and the remainder as
+fanout; the frontend mirrors that projection for rendering. It
 also applies any three-slot fixed-connection UI policy. A migrated node without
 a timestamp receives and persists the current time when first loaded.
 
@@ -177,7 +179,7 @@ and recovery; those repeated names and descriptions are not sent to the model.
 ## The Context Glue
 
 Because we don't want the chatend to have to deal with complex details like
-large randomized identifiers, the frontend provides an abstraction where it
+large randomized identifiers, the backend session provides an abstraction where it
 gives short identifiers to the chatend, and then maintains a mapping from short
 identifier to unique identifier. This mapping is session-local and is preserved
 across ResetContext calls and session recovery. Once assigned, a short
@@ -221,7 +223,7 @@ node.
 
 Because the stored connection arrays contain durable identifiers rather than
 duplicated names, the Kmap HTTP read projection fetches each connection's short
-name and description from the database alongside the node. The frontend uses
+name and description from the database alongside the node. The backend uses
 that metadata for active and fanout rendering without loading the full node.
 
 The call signature is simply LoadNode(shortIdentifier)
@@ -260,12 +262,12 @@ The call signature is ResetContext(shortIdentifier[], optional selfMessage)
 
 During history ingress, Kennedy will call ConnectNodes when she identifies a
 subset of in-context nodes with a durable meaningful relationship. The
-frontend prepends every peer to each node's recent list and sends one complete
+backend prepends every peer to each node's recent list and sends one complete
 ordinary update per node.
 
 The call signature is ConnectNodes(shortIdentifier[])
 
-The first eight recent entries are active in frontend context and all later
+The first eight recent entries are active in Kennedy's context and all later
 entries are fanout. Prepending therefore promotes the connected peers and
 demotes older entries by position. Kmap storage imposes no active or fanout
 limit.
@@ -287,7 +289,7 @@ shortIdentifierParent identifies which node is having its fanout consolidated.
 shortIdentifierAggregator identifies which node the fanout is being
 consolidated into. And shortIdnentifierFanoutConnections is an array of nodes
 that are currently part of the parent fanout which will be removed from the
-parent fanout and instead put into the aggregator node. The frontend removes
+parent fanout and instead put into the aggregator node. The backend removes
 those IDs from the parent and appends them to the aggregator's recent list
 through two sequential ordinary updates. Whether an appended entry renders as
 active or fanout follows its final list position. Kmap storage has no
@@ -299,7 +301,7 @@ ConsolidateFanout is available only during history ingress.
 
 The call signature is CreateNode(parentShortIdentifier[], ownerIdentifier, shortName, shortDescription, longDescription)
 
-The frontend creates the node with every parent in its recent list, then
+The backend creates the node with every parent in its recent list, then
 sequentially prepends the new node to every parent's recent list. The owner
 must be a fully available Kennedy, user, or group root.
 
@@ -321,7 +323,7 @@ of the history linked list.
 
 ### SetFixedConnection
 
-SetFixedConnection is frontend policy over the stored fixed-ID array. It lets
+SetFixedConnection is backend orchestration policy over the stored fixed-ID array. It lets
 Kennedy assign any node into one of three numbered positions; if a node already
 exists there it is replaced. Fixed connections are arbitrary and do not
 represent tasks, priority, or completion.
@@ -368,8 +370,9 @@ and ingress sessions.
 
 ### Managed Rust libraries
 
-The main server imports the published `kcode-rust-libs` crate and initializes
-it with the hardcoded managed root
+The main server imports the exact-pinned published `kcode-rust-libs` crate,
+retrieves the required `cratesio-key` value from Kennedy's encrypted credential
+vault, and initializes the crate with that key and the hardcoded managed root
 `/home/user/dev/kennedy/kcode/kcode-rust-libs`. Kennedy uses `CreateRustLib`,
 `OpenRustLib`, `WriteRustLib`, `CheckRustLib`, and `PublishRustLib` to call it.
 Their exact contracts and workflow live only in the Kmap-ingress document
@@ -380,8 +383,9 @@ an open handle for a particular library at a time. The browser adds a hidden
 durable tool-session identifier and the server releases all matching handles
 when that session ends. An abandoned session's idle ownership expires after 24
 hours. The crate owns relative-path validation, complete-file writes, standard
-Podman checks, version alignment, and publication with an operator-provisioned
-token. Kennedy receives no delete, patch, reload, list, arbitrary-command,
+Podman checks, version alignment, and publication with the operator-provisioned
+vault token held in memory. The managed root contains no credential file.
+Kennedy receives no delete, patch, reload, list, arbitrary-command,
 root-path, Podman-image, credential, or close argument.
 
 ## Harness Instructions
@@ -399,15 +403,15 @@ files in this order:
 4. `ReadTools.txt` lists all shared read-only tools, including Kmap reads and
    web research.
 5. Writable ingress and self-time sessions receive `WriteTools.txt`.
-6. The frontend adds the current model, thinking mode, channel, or source
+6. The backend adds the current model, thinking mode, channel, or source
    details that are known only at runtime.
 
 Each fact and tool contract has one prompt-file owner. The session files stay
 minimal, while strategy and expandable harness knowledge live in Kennedy's
 graph rooted at Kennedy's root node.
 
-The frontend dynamically tells Kennedy the exact model and thinking mode for
-the current session. Whenever a model mutates the Kmap, the frontend—not
+The backend dynamically tells Kennedy the exact model and thinking mode for
+the current session. Whenever a model mutates the Kmap, the backend—not
 Kennedy—automatically records that combined identity on every affected node as
 its latest modifier. Node context and the memory explorer display this metadata;
 it is not part of any Kennedy tool signature.
@@ -425,23 +429,26 @@ hard-stop enforcement may still terminate self time externally.
 ## Conversation Persistence
 
 The conversation history backend durably stores active and completed
-conversation records separately from the kweb. Before the frontend sends a new
-user query to an LLM, it must save the query, pending-turn state, and a lossless
+conversation records separately from the kweb. The frontend first submits a
+durable message command. Before the backend sends that query to an LLM, it must
+save the query, pending-turn state, and a lossless
 versioned recovery archive of the whole Chatend: system prompts, structured messages,
 tool requests and results, loaded memory context, usage, and any serializable
 media content or attachment references. If that save fails, generation must
 not begin. This JSON archive is a durability format and is never itself sent to
 Kennedy. Complete tool rounds are checkpointed while a turn is running.
 
-When the UI starts, it retrieves every durable conversation. Every active
-conversation is restored where it left off; if a last user query has no answer,
-Kennedy resumes that turn from a fresh Codex thread. Failed generation and
+When `kennedy-server` starts, its orchestrator retrieves every durable
+conversation. Every active conversation is restored where it left off; if a
+last user query has no answer, Kennedy can resume that turn from a fresh Codex
+thread. Failed generation and
 checkpoint attempts roll back transient Chatend, memory context, tool-log,
 usage, and continuation state to the last durable snapshot before retrying.
 
 The user may keep multiple conversations live, switch freely among them, and
-create another at any time. Each live conversation keeps its own Kennedy turn,
-Kmap context, and in-memory unsent draft. The sidebar clearly distinguishes
+create another at any time. Each live conversation keeps its own independent
+backend Kennedy turn and Kmap context; each browser may also keep an unsent
+local draft. The sidebar clearly distinguishes
 `Live · Continue` records from closed read-only records.
 
 Explicitly ending a conversation creates a durable history-ingress obligation.
@@ -454,10 +461,13 @@ An ingress session that reaches five total failed outer attempts instead moves
 to a terminal failed state. Every attempt keeps a concise durable diagnostic,
 and terminal failures are not selected for automatic retry.
 
-History ingress is sequential: at most one record mutates the Kmap at a time,
-while all live conversations remain readable and writable. SQLite WAL permits
-the live Kmap reads needed by conversations while the ingress worker commits
-memory changes. If the UI closes, startup resumes the queue. A created
+All Kmap-writing work is sequential for now: at most one conversation or
+Telegram history ingress, audio ingress piece, self-time run, or Telegram-root
+provisioning task mutates the Kmap at a time. Every ordinary web conversation
+and Telegram stream is read-only and runs concurrently without a global lock;
+one stream cannot block unrelated sessions. SQLite WAL permits their live Kmap
+reads while the backend writer commits memory changes. Closing the UI has no
+effect; server startup resumes the queue. A created
 provenance ID is reused by every mutation in its ingress session. Every Kmap
 mutation carries a fresh random 16-byte idempotency identifier, and an
 ambiguous network retry reuses the same identifier and request. Exact replays
@@ -484,14 +494,17 @@ The user provides Kennedy with some prompt, and Kennedy first determines
 whether she needs to call LoadNode, ResetContext, WebSearch, or WebFetch.
 Kennedy may call LoadNode up to 20 times per turn to find relevant context.
 
-The frontend checkpoints the pending user query with the conversation history
-backend before the first LLM request. Kennedy's answer and the completed-turn
+The backend checkpoints the pending user query with the conversation history
+service before the first LLM request. Kennedy's answer and the completed-turn
 state are checkpointed again before another query is accepted.
 While Kennedy is responding, the live conversation exposes an explicit stop
 control. Stopping aborts the current model or web request, prevents any further
 tool-loop rounds, rolls the visible session back to its latest durable
 checkpoint, and leaves the unanswered user query available for deliberate
-retry.
+retry. End Conversation is a separate always-available control for every live
+ordinary conversation. It cancels or abandons any unanswered turn and queues
+the preserved conversation for ingress without requiring the user to retry it
+first, including for conversations restored from before backend ownership.
 
 While the conversation session is ongoing, Kennedy may call LoadNode,
 ResetContext, WebSearch, WebFetch, and the five Kmap-documented Rust library
@@ -517,8 +530,8 @@ conversation manual as a UI conversation, but its dynamic system prompt
 explicitly labels it a `telegram session`. The Rust Telegram relay queues
 private and invoked-group text, voice, supported document, and `/reset` events
 and sends Kennedy's final
-conversational text; the browser remains responsible for prompt composition,
-short identifiers, tools, and the inspectable Chatend.
+conversational text; Kennedy's backend orchestrator remains responsible for
+prompt composition, short identifiers, tools, and the inspectable Chatend.
 
 The separate user directory initially whitelists `@taek42` without a numeric
 ID. The first matching observation pins that stable ID under TOFU, and future
@@ -532,11 +545,11 @@ history ingress; the ingress session explicitly knows that its source was
 Telegram. Each newly crossed 100,000-token current-context band produces a
 separate delivery notice containing current and maximum context usage and
 recommending `/reset`. That operational notice is not part of Kennedy's
-Chatend. The browser continues polling and launches each relay queue head
+Chatend. The backend continues polling and launches each relay queue head
 independently, so long model or tool work in one private or group-user stream
 does not delay newly arriving work in another stream. Ordering within one
 stream remains strict. Each event has a durable 30-minute response deadline.
-If Kennedy has not produced a complete response by then, the browser cancels
+If Kennedy has not produced a complete response by then, the backend cancels
 that turn, the relay completes it as a timeout, sends a best-effort notice, and
 allows the next message in that stream to proceed. A stale event binding whose
 Conversation History record disappeared is safely rebound to a fresh record;
@@ -624,14 +637,15 @@ superseded, or then-current statements from knowledge independently marked as
 current. The audio-ingress prompt treats transcription and speaker identity as
 fallible, preserves important uncertainty or contradiction, and permits dated
 clarification notes or concrete follow-up tasks when context is materially
-missing. Preparation is server-side and restartable; Kmap mutation resumes from
-durable checkpoints whenever Kennedy's browser worker is available.
+missing. Preparation and Kmap mutation are server-side and restartable;
+durable checkpoints resume whenever `kennedy-server` is available.
 
 ### Self Time
 
-The browser's dedicated Self Time category tab starts an autonomous run for 30
-minutes by default. It accepts an optional custom prompt, stores that prompt in
-the run metadata, and gives it to Kennedy in every clean-slate slice. The start
+The browser's dedicated Self Time category tab requests a backend-owned
+autonomous run for 30 minutes by default. It accepts an optional custom prompt,
+which the backend stores in run metadata and gives to Kennedy in every
+clean-slate slice. The start
 control visibly enters `Starting…` and disables itself immediately; repeat
 clicks share that one start, and the history backend refuses a second active
 `free-time` record from another browser context. Self-time history titles use
@@ -661,8 +675,8 @@ wrap-up round. The active intelligence
 operation is cancelled at a hard stop two minutes later. Generation and search
 requests retain the intelligence provider's profile-specific allowance, so a
 quality search can run longer than 90 seconds, while the remaining hard-stop
-interval is always the upper bound. A same-origin browser lock prevents two
-tabs from running the autonomous loop concurrently. Every completed clean-slate
+interval is always the upper bound. Conversation History prevents overlapping
+runs, and the backend's single Kmap-writer gate owns execution. Every completed clean-slate
 session is retained as read-only conversation history without ordinary history
 ingress, since self time has already performed its own Kmap memory work under
 the run provenance.

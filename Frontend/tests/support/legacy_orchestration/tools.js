@@ -1,6 +1,7 @@
-import { formatToolResult } from "./human_format.js?v=20260719.1";
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
+import { formatToolResult } from "../../../public/js/human_format.js?v=20260719.1";
 import { elapsedMs, formatDuration } from "./timing.js?v=20260715.2";
-import { newIdempotencyId } from "./api.js?v=20260718.3";
+import { newIdempotencyId } from "../../../public/js/api.js?v=20260718.3";
 
 export const TOOL_CALL_PREFIX = "KENNEDY_TOOL_CALLS";
 export const TOOL_CHECK_NAME = "ToolCheck";

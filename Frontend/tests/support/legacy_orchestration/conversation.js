@@ -1,10 +1,11 @@
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
 import { Chatend } from "./chatend.js?v=20260717.6";
 import { KwebContext } from "./kweb_context.js?v=20260719.3";
 import { composePrompt, formatModelAttribution, formatTelegramGroupContext } from "./prompt_composer.js?v=20260717.9";
 import { END_TURN_NAME, TOOL_CHECK_NAME, ToolExecutor, ensureInitialToolCheck } from "./tools.js?v=20260719.1";
 import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, createCacheKey, runAgentLoop } from "./intelligence.js?v=20260719.2";
 import { addTimingStep, createTurnTiming, elapsedMs, formatDuration, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeTurnContinuationMessage, freeTimeWarningMessage, formatFreeTimeRemaining } from "./self_time.js?v=20260719.1";
+import { freeTimeCanStartNewSession, freeTimeExpiredMessage, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeScheduleText, freeTimeTiming, freeTimeTurnContinuationMessage, freeTimeWarningMessage, formatFreeTimeRemaining } from "../../../public/js/self_time.js?v=20260719.1";
 
 function jsonCopy(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -22,7 +23,7 @@ function turnStoppedError() {
 }
 
 export class ConversationSession {
-  constructor({ kweb, intelligence, rustLibs = null, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, freeTime = null, provenanceId = null, persist = async () => {}, onUpdate = () => {}, now = () => Date.now() }) {
+  constructor({ kweb, intelligence, rustLibs = null, manuals, rootNodeIds, rootNodeId, referenceRootNodeIds = [], provider, providerKind, model, reasoningEffort, contextWindowTokens = 0, maxInputTokens = 0, sessionType = "conversation", channel = null, freeTime = null, orchestration = null, provenanceId = null, persist = async () => {}, onUpdate = () => {}, now = () => Date.now() }) {
     this.kweb = kweb; this.intelligence = intelligence; this.rustLibs = rustLibs; this.manuals = manuals;
     this.rootNodeIds = rootNodeIds || [rootNodeId]; this.rootNodeId = this.rootNodeIds[0];
     this.referenceRootNodeIds = [...new Set(referenceRootNodeIds.filter(id => typeof id === "string" && id && !this.rootNodeIds.includes(id)))];
@@ -32,6 +33,7 @@ export class ConversationSession {
     this.sessionType = sessionType;
     this.channel = channel ? jsonCopy(channel) : null;
     this.freeTime = freeTime ? jsonCopy(freeTime) : null;
+    this.orchestration = orchestration ? jsonCopy(orchestration) : null;
     this.provenanceId = provenanceId;
     this.rustLibSessionId = `kennedy:${crypto.randomUUID()}`;
     this.now = now;
@@ -55,6 +57,7 @@ export class ConversationSession {
       this.sessionType = restored.sessionType || archive?.sessionType || this.sessionType;
       this.channel = jsonCopy(restored.channel || archive?.channel || this.channel);
       this.freeTime = jsonCopy(restored.freeTime || archive?.freeTime || this.freeTime);
+      this.orchestration = jsonCopy(restored.orchestration || archive?.orchestration || this.orchestration);
       this.provenanceId = restored.provenanceId || archive?.provenanceId || this.provenanceId;
       this.rustLibSessionId = restored.rustLibSessionId || archive?.rustLibSessionId || this.rustLibSessionId;
       this.media = jsonCopy(restored.media || archive?.media || []);
@@ -125,6 +128,7 @@ export class ConversationSession {
       sessionType: this.sessionType,
       channel: jsonCopy(this.channel),
       freeTime: jsonCopy(this.freeTime),
+      orchestration: jsonCopy(this.orchestration),
       provenanceId: this.provenanceId,
       rustLibSessionId: this.rustLibSessionId,
       rootNodeIds: [...this.rootNodeIds],
@@ -147,6 +151,7 @@ export class ConversationSession {
       sessionType: this.sessionType,
       channel: jsonCopy(this.channel),
       freeTime: jsonCopy(this.freeTime),
+      orchestration: jsonCopy(this.orchestration),
       provenanceId: this.provenanceId,
       rustLibSessionId: this.rustLibSessionId,
       rootNodeIds: [...this.rootNodeIds],
@@ -193,6 +198,7 @@ export class ConversationSession {
     if (!archive || !Array.isArray(archive.messages) || !archive.context?.state) return;
     this.transcript = jsonCopy(state.transcript || archive.transcript || []);
     this.freeTime = jsonCopy(state.freeTime || archive.freeTime || this.freeTime);
+    this.orchestration = jsonCopy(state.orchestration || archive.orchestration || this.orchestration);
     this.pendingTurn = Boolean(state.pendingTurn) || (!this.freeTime?.sliceEndedAt && transcriptEndsWithUnansweredUser(this.transcript));
     this.pendingExternalEventId = state.pendingExternalEventId || archive.pendingExternalEventId || null;
     this.lastContextWarningBand = Number(state.lastContextWarningBand ?? archive.lastContextWarningBand) || 0;

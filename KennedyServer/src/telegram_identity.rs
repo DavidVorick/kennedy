@@ -9,9 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use kennedy_telegram_relay::{
-    AddUserOutcome, IdentityObservation, IdentitySink, WhitelistSnapshot,
-};
+use kcode_tg_kennedy_bot::{AddUserOutcome, IdentityObservation, IdentitySink, WhitelistSnapshot};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -577,7 +575,7 @@ async fn complete_group_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kennedy_telegram_relay::IdentitySink;
+    use kcode_tg_kennedy_bot::IdentitySink;
 
     fn directory() -> Directory {
         let database = Connection::open_in_memory().unwrap();

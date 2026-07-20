@@ -1,3 +1,4 @@
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
 export const MAX_DIRECTLY_LOADED_NODES = 10;
 export const ACTIVE_CONNECTION_LIMIT = 8;
 

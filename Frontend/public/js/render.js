@@ -1,5 +1,5 @@
-import { formatKmapContext } from "./human_format.js?v=20260719.1";
-import { contextUsageMeasurement, formatChatend } from "./chatend_format.js?v=20260719.2";
+import { formatKmapContext } from "./human_format.js?v=20260720.2";
+import { contextUsageMeasurement, formatChatend } from "./chatend_format.js?v=20260720.2";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
 
@@ -523,7 +523,8 @@ export function conversationControlState({ hasSession, sessionBusy, transitionBu
     composerHidden: viewingHistory,
     inputDisabled: viewingHistory || !hasSession,
     sendDisabled: sessionBusy || transitionBusy || pendingTurn || viewingHistory || !hasSession,
-    endDisabled: sessionBusy || transitionBusy || viewingHistory || !hasSession || (!pendingTurn && !transcriptLength),
+    endDisabled: transitionBusy || viewingHistory || !hasSession,
+    retryHidden: !pendingTurn || sessionBusy || viewingHistory || !hasSession,
     stopHidden: !sessionBusy || viewingHistory || !hasSession,
     newDisabled: transitionBusy,
   };

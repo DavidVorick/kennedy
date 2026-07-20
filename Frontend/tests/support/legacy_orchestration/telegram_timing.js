@@ -1,3 +1,4 @@
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
 export const TELEGRAM_RESPONSE_TIMEOUT_MS = 30 * 60 * 1000;
 
 export function telegramEventDeadlineMs(event, now = Date.now()) {

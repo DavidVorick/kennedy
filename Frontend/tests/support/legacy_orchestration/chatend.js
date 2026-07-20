@@ -1,4 +1,5 @@
-import { formatKmapContext } from "./human_format.js?v=20260719.1";
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
+import { formatKmapContext } from "../../../public/js/human_format.js?v=20260719.1";
 
 const RESET_HISTORY_KIND = "reset-history";
 

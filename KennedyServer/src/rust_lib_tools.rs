@@ -157,10 +157,13 @@ impl IntoResponse for ToolError {
 }
 
 impl RustLibToolService {
-    pub(crate) fn new(root: impl AsRef<Path>) -> kcode_rust_libs::Result<Self> {
+    pub(crate) fn new(
+        root: impl AsRef<Path>,
+        crates_io_registry_token: impl Into<String>,
+    ) -> kcode_rust_libs::Result<Self> {
         Ok(Self {
             inner: Arc::new(ServiceInner {
-                rust_libs: KcodeRustLibs::new(root.as_ref())?,
+                rust_libs: KcodeRustLibs::new(root.as_ref(), crates_io_registry_token)?,
                 registry: Arc::new(RegistryState {
                     entries: Mutex::new(Registry::default()),
                     changed: Condvar::new(),
@@ -494,12 +497,10 @@ fn map_library_error(error: RustLibError) -> ToolError {
         | RustLibError::UnsupportedFileType(_) => ToolError::invalid(
             "The managed Rust library contains an unsupported path, file, symlink, or entry type.",
         ),
-        RustLibError::MissingRegistryToken(_) | RustLibError::InvalidRegistryToken(_) => {
-            ToolError::unavailable(
-                "registry_token_unavailable",
-                "Rust library publication is unavailable because the operator-provisioned crates.io token is missing or invalid.",
-            )
-        }
+        RustLibError::InvalidRegistryToken => ToolError::unavailable(
+            "registry_token_unavailable",
+            "Rust library publication is unavailable because the operator-provisioned crates.io token is missing or invalid.",
+        ),
         RustLibError::CheckFailed(result) => {
             let stage = result
                 .failure()
@@ -561,10 +562,14 @@ mod tests {
         std::env::temp_dir().join(format!("kennedy-rust-lib-tools-test-{}", Uuid::new_v4()))
     }
 
+    fn service(root: &Path) -> RustLibToolService {
+        RustLibToolService::new(root, "test-crates-io-key").unwrap()
+    }
+
     #[tokio::test]
     async fn one_session_owns_a_library_until_release() {
         let root = temporary_root();
-        let service = RustLibToolService::new(&root).unwrap();
+        let service = service(&root);
         let created = service
             .execute(
                 "conversation:first".into(),
@@ -607,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn write_replaces_complete_files_and_reports_canonical_version() {
         let root = temporary_root();
-        let service = RustLibToolService::new(&root).unwrap();
+        let service = service(&root);
         service
             .execute(
                 "conversation:test".into(),

@@ -3,8 +3,9 @@
 ## 1. Scope
 
 The conversation history backend is a logically independent Rust API that owns
-durable browser and Telegram conversation checkpoints and the queue of conversations that
-must undergo history ingress. Autonomous self-time records are retained here
+durable backend-owned web and Telegram conversation checkpoints, idempotent
+web/self-time start intents, per-conversation command queues, and the queue of
+conversations that must undergo history ingress. Autonomous self-time records are retained here
 but complete without entering that queue because their live sessions already
 write to the Kmap. The backend shares a deployment binary with the Kweb and
 intelligence backends but has its own listener, router, state, SQLite database,
@@ -18,7 +19,8 @@ Each conversation record contains:
 - phase: `active`, `ingress_pending`, `ingress_in_progress`, `ingress_failed`,
   or `complete`,
 - conversation start, last-update, last-user-message, and optional end times,
-- opaque JSON frontend state,
+- opaque JSON backend session state,
+- optional unique 32-hex start-request ID for idempotent managed creation,
 - optional opaque Kweb provenance ID,
 - monotonically increasing version for optimistic concurrency.
 - durable history-ingress failure count and a concise JSON log of all attempts
@@ -26,11 +28,18 @@ Each conversation record contains:
   and measured context occupancy when available,
 - optional next-attempt time for a deferred automatic ingress retry.
 
+`conversation_commands` stores a unique 32-hex command ID, conversation ID,
+strict per-conversation sequence, kind (`message`, `retry`, `end`, or
+`send-and-end`), opaque JSON payload, pending/processing/complete status,
+cancellation flag, optional outcome, and timestamps. Different conversations
+may expose and process their heads concurrently; only the earliest unfinished
+command within one conversation is claimable.
+
 SQLite permits any number of ordinary `active` and `ingress_pending` records
 but at most one `ingress_in_progress` record. The create path also atomically
 rejects a second active `free-time` record with
-`free_time_already_active`; this server-side guard covers separate browser
-contexts in addition to the frontend's Web Lock. Completed and failed records
+`free_time_already_active`; this durable server-side guard covers every
+frontend client without a browser lock. Completed and failed records
 remain available as conversation history. A migration removes the older
 one-unfinished-record index; legacy rows receive null activity/end times and
 remain valid.
@@ -39,7 +48,7 @@ A current startup also drops the obsolete singleton index idempotently even
 when `user_version` is already 2. This repairs databases touched by an early v2
 build that could recreate the v1 index after recording the v2 migration.
 
-The frontend state contains recovery metadata and versioned, opaque JSON
+The opaque state contains recovery metadata and versioned JSON
 archives for both the complete conversation Chatend and its history-ingress
 Chatend. It may include the direct root IDs, referenced group-participant root
 IDs, and dynamic channel/group context; these remain opaque to this backend.
@@ -49,7 +58,7 @@ All session types beginning with `telegram`, plus autonomous `free-time`
 sessions, are protected from idle closure and unstarted-record cleanup.
 Private Telegram sessions and persistent `(group root, Telegram user)` sessions
 close through `/reset`; background group batches are explicitly queued by the
-frontend as soon as their independent archive is ready. For legacy safety during
+backend worker as soon as their independent archive is ready. For legacy safety during
 unstarted-record cleanup, it also recognizes user-role entries in the stored
 conversation transcript before deleting a record whose activity timestamp is
 null.
@@ -84,14 +93,14 @@ active -> ingress_pending -> ingress_in_progress -> complete
 - The oldest eligible queued conversation is selected by last user activity,
   falling back to its start time. An actively claimed `ingress_in_progress`
   record wins; deferred records are skipped until their next-attempt time.
-- The frontend creates or retrieves idempotent Kweb provenance, records its ID,
+- The backend orchestrator creates or retrieves idempotent Kweb provenance, records its ID,
   supplies the `end-turn-v1` completion-protocol identifier, and
   changes the selected record to `ingress_in_progress`. The backend rejects a
   claim from an older client that does not identify that protocol.
 - Ordinary conversation records change to `complete` only after successful
   history ingress. The completion endpoint independently requires a successful
   `EndTurn` entry in the persisted history-ingress tool log; a normal
-  assistant answer cannot satisfy this transition even if a stale frontend
+  assistant answer cannot satisfy this transition even if a stale worker
   attempts it.
 - Self-time records normally bypass history ingress. A narrowly scoped
   `historyIngressRepairRequired: true` marker allows a historically completed
@@ -101,11 +110,11 @@ active -> ingress_pending -> ingress_in_progress -> complete
   terminal records carrying both the repair marker and its one-time release
   marker to `ingress_pending`, discards their premature history-ingress
   checkpoint, consumes the release marker, and resets their consecutive
-  attempt count. The corrected frontend calls it at startup; until then the
+  attempt count. The corrected backend worker calls it at startup; until then the
   records remain quarantined from stale workers. A repair that exhausts its
   new attempts remains terminal for later explicit retry instead of being
   automatically released again on every frontend load.
-- The frontend records a failed ingress attempt atomically. Attempts one
+- The backend worker records a failed ingress attempt atomically. Attempts one
   through four return the record to `ingress_pending`, release the
   single-worker claim, and defer that record for 15 seconds so other eligible
   conversations or audio pieces can proceed. Attempt five changes it to
@@ -114,7 +123,8 @@ active -> ingress_pending -> ingress_in_progress -> complete
   unchanged checkpoint cannot make it smaller. Failed records remain queryable
   with their diagnostic logs.
 - New and existing active conversations are independent of this queue.
-- A terminal failed record can be explicitly retried. The frontend supplies a
+- A terminal failed record can be explicitly retried. A frontend request may
+  schedule it, while the backend supplies a
   fresh opaque state with the failed history-ingress checkpoint removed, the
   backend resets the consecutive-attempt count, preserves the diagnostic log
   and provenance ID, and returns the record to `ingress_pending`.
@@ -122,23 +132,32 @@ active -> ingress_pending -> ingress_in_progress -> complete
   the row permanently without moving it through `ingress_pending`, so an active
   or queued conversation cannot later be selected for history ingress. It is a
   destructive escape hatch for stuck sessions, not a state-machine phase.
-- On frontend startup, records that have neither recorded user activity nor a
+- On backend startup, legacy records that have neither recorded user activity nor a
   user message in their stored conversation transcript are permanently
   discarded, regardless of phase. This also removes an untouched placeholder
   that was ended or processed without ever becoming a real conversation.
   Every record containing a user message is ineligible. Telegram records,
   including new group sessions/background batches, are also ineligible
   because they can be created and bound or queued just before their first
-  durable checkpoint.
+  durable checkpoint. Managed backend-owned placeholders are protected so the
+  worker can initialize them after the cleanup pass.
 
 Every mutation supplies `expected_version`. Stale browser tabs receive
 `409 state_conflict` rather than overwriting newer state. The unique in-progress
-index serializes memory updates even when several conversations close together.
+index serializes conversation-history claims even when several conversations
+close together. The top-level `kennedy-server` orchestrator additionally uses
+one Kmap-writer gate across this queue, audio ingress, self time, and Telegram
+root provisioning; this service cannot enforce that cross-database invariant
+by itself.
 
 ## 4. API
 
 - `GET /health`
 - `GET|POST /api/v1/conversations`
+- `POST /api/v1/conversations/start`
+- `GET /api/v1/conversation-commands`
+- `POST /api/v1/conversation-commands/{command_id}/claim`
+- `POST /api/v1/conversation-commands/{command_id}/complete`
 - `GET /api/v1/conversations/summaries`
 - `GET /api/v1/conversations/current` (most recently updated active record,
   retained as a compatibility convenience)
@@ -148,6 +167,8 @@ index serializes memory updates even when several conversations close together.
 - `GET /api/v1/conversations/{id}`
 - `DELETE /api/v1/conversations/{id}`
 - `PUT /api/v1/conversations/{id}/checkpoint`
+- `POST /api/v1/conversations/{id}/commands`
+- `POST /api/v1/conversations/{id}/stop`
 - `POST /api/v1/conversations/{id}/request-ingress`
 - `POST /api/v1/conversations/{id}/complete` (self time only; requires an
   explicit end-tool or deadline reason and does not start ingress)
@@ -157,7 +178,23 @@ index serializes memory updates even when several conversations close together.
 - `POST /api/v1/conversations/{id}/ingress-failure`
 - `POST /api/v1/conversations/{id}/retry-ingress`
 
-Create accepts `started_at` plus opaque `state`. Checkpoint accepts
+Managed start accepts a 32-hex `idempotency_id`, `started_at`, and
+`session_type` (`conversation` or `free-time`); self time additionally requires
+bounded `duration_minutes` and accepts a bounded `custom_prompt`. It creates a
+backend-owned queued intent and returns the existing record for an exact
+idempotent replay. A reused ID with different semantics conflicts.
+
+Command submission accepts a 32-hex `idempotency_id`, kind, and object payload.
+Only active ordinary web conversations accept commands; legacy ordinary
+records with a frontend ownership marker are accepted and adopted by the
+backend worker. Claim is idempotent for a processing head, completion stores an
+outcome, and stop marks the active message/retry command for cancellation.
+Queueing `end` atomically marks all earlier unfinished message/retry commands
+for cancellation, so a failed unanswered turn cannot block closure and
+ingress. Completed commands expose the next sequence while unrelated
+conversation heads remain available throughout.
+
+Legacy create accepts `started_at` plus opaque `state`. Checkpoint accepts
 `expected_version`, `state`, and optional `user_activity`. The ingress queue
 endpoint returns `{ "conversation": null }` when empty. Successful
 state-machine mutations return the complete updated record. Purge returns the
@@ -178,8 +215,9 @@ any phase, and returns its ID. A stale expected version returns
 The summaries endpoint returns the same ordering and lifecycle metadata as the
 complete list, but replaces each opaque state with a bounded sidebar summary
 and marks the record with `summary: true`. The summary retains session routing,
-the first durable user message, self-time naming fields, and compact Telegram
-channel identity. It excludes Chatend archives, tool/context history, media,
+the first durable user message, self-time intent/runtime fields, compact
+backend orchestration status, and compact Telegram channel identity. It
+excludes Chatend archives, tool/context history, media,
 and group-message bodies. The service persists this projection beside every
 checkpoint and backfills it once for legacy rows, so listing history never
 loads every complete archive. A client fetches `GET /conversations/{id}` before
@@ -196,6 +234,8 @@ up to 128 MiB for structured Chatend archives and future inline media.
 ## 6. Verification
 
 Tests cover optimistic-version conflicts, multiple active conversations,
+idempotent managed starts, the single-active-self-time guard, parallel command
+heads with strict per-conversation ordering, command cancellation and replay,
 repair of a v2 database containing the legacy singleton index, the
 single-ingress-worker invariant, 24-hour expiry plus pending-response and
 Telegram-session protection,

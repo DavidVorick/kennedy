@@ -1869,9 +1869,30 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-libs"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d14c0b6f7b9ac16bc8a9977cfcdfc733ed8454bfd943e5e1a188b365f60356a"
+checksum = "2d0a15412367e2d56f4784700790fb52bc795c9d7ff31274afdb0e5dcdbcc186"
+
+[[package]]
+name = "kcode-tg-kennedy-bot"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "902027fdcc6bf70fa7be5c17c43024b5457d86fc1ec342234ae61259bba6a27c"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "teloxide",
+ "tokio",
+ "tower-http 0.7.0",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
 
 [[package]]
 name = "keccak"
@@ -1980,13 +2001,14 @@ dependencies = [
  "flate2",
  "hex",
  "kcode-rust-libs",
+ "kcode-tg-kennedy-bot",
  "kennedy-audio-ingress",
  "kennedy-codex-runtime",
  "kennedy-conversation-history",
  "kennedy-intelligence",
- "kennedy-telegram-relay",
  "kweb-db-core",
  "rand 0.9.5",
+ "reqwest 0.13.4",
  "rpassword",
  "rusqlite",
  "rustls",
@@ -1998,25 +2020,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "kennedy-telegram-relay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "futures",
- "rusqlite",
- "serde",
- "serde_json",
- "teloxide",
- "tokio",
- "tower-http 0.7.0",
- "tracing",
+ "urlencoding",
  "uuid",
  "zeroize",
 ]
@@ -4076,6 +4080,12 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf8_iter"

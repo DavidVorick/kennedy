@@ -695,8 +695,11 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let rust_lib_tools =
-            rust_lib_tools::RustLibToolService::new(directory.join("rust-libs")).unwrap();
+        let rust_lib_tools = rust_lib_tools::RustLibToolService::new(
+            directory.join("rust-libs"),
+            "test-crates-io-key",
+        )
+        .unwrap();
         let server = tokio::spawn(serve_with_listener(
             kmap,
             roots,
@@ -710,7 +713,6 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(&roots.user.to_string()));
         assert!(response.contains(&roots.kennedy.to_string()));
-
         let rust_lib_body = json!({
             "session_id":"conversation:http-test",
             "name":"CreateRustLib",

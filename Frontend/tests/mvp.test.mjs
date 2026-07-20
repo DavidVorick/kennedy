@@ -1,22 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { KwebContext } from "../public/js/kweb_context.js";
-import { Chatend } from "../public/js/chatend.js";
-import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, RUST_LIB_TOOL_NAMES, ToolExecutor, ensureInitialToolCheck, parseToolCalls, truncateToolResponse } from "../public/js/tools.js";
-import { ConversationSession } from "../public/js/conversation.js";
-import { runHistoryIngress } from "../public/js/history_ingress.js";
+import { KwebContext } from "./support/legacy_orchestration/kweb_context.js";
+import { Chatend } from "./support/legacy_orchestration/chatend.js";
+import { MAX_RESET_SELF_MESSAGE_CHARACTERS, MAX_SELF_TIME_HANDOFF_MESSAGE_CHARACTERS, RUST_LIB_TOOL_NAMES, ToolExecutor, ensureInitialToolCheck, parseToolCalls, truncateToolResponse } from "./support/legacy_orchestration/tools.js";
+import { ConversationSession } from "./support/legacy_orchestration/conversation.js";
+import { runHistoryIngress } from "./support/legacy_orchestration/history_ingress.js";
 import { audioRecordingTitle, conversationControlState, conversationIngressActivity, conversationTitle, ingressEntryPresentation, ingressMutationSummary, inspectorText, mainViewEntries, reconcileConversationHistory, sortConversationHistory } from "../public/js/render.js";
-import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, runAgentLoop } from "../public/js/intelligence.js";
-import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "../public/js/prompt_composer.js";
+import { AGENT_LOOP_TURN_ENDED, ContinuationState, UsageTracker, runAgentLoop } from "./support/legacy_orchestration/intelligence.js";
+import { composePrompt, formatModelAttribution, loadPromptManuals, promptsReady, requiredPromptKeys } from "./support/legacy_orchestration/prompt_composer.js";
 import { formatContextNode, formatKmapContext, formatToolResult } from "../public/js/human_format.js";
 import { MemoryExplorer } from "../public/js/memory_explorer.js";
 import { AudioIngressAPI, ConversationHistoryAPI, IntelligenceAPI, KwebAPI, RustLibsAPI, TelegramDirectoryAPI, TelegramRelayAPI, newIdempotencyId } from "../public/js/api.js";
-import { formatDuration } from "../public/js/timing.js";
+import { formatDuration } from "./support/legacy_orchestration/timing.js";
 import { contextUsageMeasurement, formatChatend, formatContextWindowProgress } from "../public/js/chatend_format.js";
-import { selectNextMemoryIngress } from "../public/js/memory_ingress_coordinator.js";
+import { selectNextMemoryIngress } from "./support/legacy_orchestration/memory_ingress_coordinator.js";
 import { FREE_TIME_CONTINUATION_MINIMUM_MS, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, MAX_SELF_TIME_PROMPT_CHARACTERS, freeTimeCanStartNewSession, freeTimeNoAnswerContinuationMessage, freeTimeOpeningMessage, freeTimeRequestTimeoutSeconds, freeTimeTiming, freeTimeTurnContinuationMessage, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "../public/js/self_time.js";
-import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventDeadlineMs, telegramEventTimeoutMs } from "../public/js/telegram_timing.js";
+import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventDeadlineMs, telegramEventTimeoutMs } from "./support/legacy_orchestration/telegram_timing.js";
 
 const id = n => n.toString(16).padStart(40, "0");
 const summary = n => ({ id: id(n), short_name: `Node ${n}`, short_description: `Summary ${n}` });
@@ -1729,7 +1729,7 @@ test("conversation sidebar distinguishes continuable and closed records", async 
 test("the selected history row exposes a guarded force-purge action", async () => {
   const [app, coordinator, render] = await Promise.all([
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
-    readFile(new URL("../public/js/memory_ingress_coordinator.js", import.meta.url), "utf8"),
+    readFile(new URL("./support/legacy_orchestration/memory_ingress_coordinator.js", import.meta.url), "utf8"),
     readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
   ]);
   assert.match(render, /record\.id === selectedId/);
@@ -1740,8 +1740,8 @@ test("the selected history row exposes a guarded force-purge action", async () =
   assert.match(coordinator, /beforeMutation: async \(\) =>/);
   const select = app.match(/async function selectConversation\(id\) \{[\s\S]*?\n\}/)?.[0];
   assert.ok(select);
-  assert.ok(select.indexOf("selectedConversationId = id") < select.indexOf("await buildConversation(record)"));
-  assert.match(select, /You can still purge it/);
+  assert.ok(select.indexOf("selectedConversationId = id") < select.indexOf("await hydrateHistoryRecord(record || id)"));
+  assert.doesNotMatch(app, /buildConversation\(/);
 });
 
 test("conversation history keeps live, finalizing, and finalized records in separate groups", () => {
@@ -1806,7 +1806,7 @@ test("next message stays editable but cannot send while Kennedy is working", () 
   });
   assert.equal(controls.inputDisabled, false);
   assert.equal(controls.sendDisabled, true);
-  assert.equal(controls.endDisabled, true);
+  assert.equal(controls.endDisabled, false);
   assert.equal(controls.newDisabled, false);
   assert.equal(controls.stopHidden, false);
 });
@@ -1818,12 +1818,14 @@ test("a saved unanswered query is retryable only when no response is in flight",
   });
   assert.equal(idle.endDisabled, false);
   assert.equal(idle.sendDisabled, true);
+  assert.equal(idle.retryHidden, false);
 
   const responding = conversationControlState({
     hasSession: true, sessionBusy: true, transitionBusy: false,
     pendingTurn: true, viewingHistory: false, transcriptLength: 1,
   });
-  assert.equal(responding.endDisabled, true);
+  assert.equal(responding.endDisabled, false);
+  assert.equal(responding.retryHidden, true);
   assert.equal(responding.stopHidden, false);
 });
 
@@ -1836,7 +1838,8 @@ test("closed conversations do not render a message composer", async () => {
   assert.equal(controls.inputDisabled, true);
   assert.equal(controls.stopHidden, true);
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  assert.match(app, /message_form\.classList\.toggle\("hidden", controls\.composerHidden\)/);
+  assert.match(app, /const composerHidden = !activeConversation/);
+  assert.match(app, /message_form\.classList\.toggle\("hidden", composerHidden\)/);
 });
 
 test("message composer supports manual resizing and a large editor mode", async () => {
@@ -1890,7 +1893,7 @@ test("history ingress activity belongs only to its selected conversation", () =>
 test("history ingress worker records five failures before abandoning a poisoned session", async () => {
   const [app, coordinator] = await Promise.all([
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
-    readFile(new URL("../public/js/memory_ingress_coordinator.js", import.meta.url), "utf8"),
+    readFile(new URL("./support/legacy_orchestration/memory_ingress_coordinator.js", import.meta.url), "utf8"),
   ]);
   assert.match(coordinator, /const INGRESS_FAILURE_LIMIT = 5/);
   assert.match(coordinator, /conversationHistory\.ingressFailure/);
@@ -1950,7 +1953,7 @@ test("audio ingress UI exposes an always-visible terminal retry and durable retr
   assert.match(app, /audioIngress\.retryIngress\(piece\.id/);
   assert.match(app, /onRetryIngress: retryAudioIngressRecording/);
   assert.match(app, /state: freshIngressState\(piece\.state\)/);
-  assert.match(app, /kickHistoryIngress\(\)/);
+  assert.doesNotMatch(app, /kickHistoryIngress\(\)/);
   assert.match(render, /piece\.phase === "ingress_failed"/);
   assert.match(render, /const retryPanel = element\("section", "audio-retry-panel"\)/);
   assert.match(render, /container\.append\(retryPanel\)/);
@@ -2017,11 +2020,11 @@ test("Full History treats conversation provenance as a collapsed disclosure entr
 });
 
 test("Telegram documents are acknowledged on extraction failure so the queue can advance", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  assert.match(app, /else if \(event\.kind === "document"\)/);
-  assert.match(app, /document = await telegramDocumentInput\(event\);\s*\} catch \(error\) \{\s*await telegramRelay\.reply\(/s);
-  assert.match(app, /if \(document\) await session\.send\(document\.text, document\.metadata\)/);
-  assert.match(app, /Please try sending it again\./);
+  const worker = await readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8");
+  assert.match(worker, /"document"\s*=>/);
+  assert.match(worker, /extract_document/);
+  assert.match(worker, /couldn't read/);
+  assert.match(worker, /Please try sending it again/);
 });
 
 test("conversation checkpoints the pending query before any model request", async () => {
@@ -2208,29 +2211,43 @@ test("a restored user tail is retryable even when an older checkpoint omitted pe
   assert.equal(session.busy, false);
 });
 
-test("cold start leaves saved conversation retries under explicit user control", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+test("cold start offers retry separately while end always closes the conversation", async () => {
+  const [html, app] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+  ]);
   assert.doesNotMatch(app, /for \(const record of activeRecords\)[\s\S]{0,240}resumeSavedQuery\(record\.id\)/);
-  assert.match(app, /end_button\.addEventListener\("click", \(\) => selectedSession\(\)\?\.pendingTurn \? resumeSavedQuery\(\) : endConversation\(\)\)/);
+  assert.match(html, /id="retry-button"[^>]*>Retry saved query<\/button>/);
+  assert.match(app, /end_button\.addEventListener\("click", \(\) => endConversation\(\)\)/);
+  assert.match(app, /retry_button\.addEventListener\("click", \(\) => resumeSavedQuery\(\)\)/);
 });
 
-test("ending a conversation keeps its ingress record selected until New is explicit", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  const closeConversation = app.match(/async function closeConversation\(id, session, record\) \{[\s\S]*?\n\}/)?.[0];
-  assert.ok(closeConversation);
-  assert.match(closeConversation, /selectedConversationId = id;/);
-  assert.match(closeConversation, /selectedByView\.conversation = id;/);
-  assert.match(closeConversation, /kickHistoryIngress\(\);/);
-  assert.doesNotMatch(closeConversation, /historyRecords\.find\(item => item\.phase === "active"/);
-  assert.doesNotMatch(closeConversation, /createNewConversation\(\)/);
+test("ending a conversation is a durable backend command and does not create a replacement", async () => {
+  const [app, worker] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
+  ]);
+  const endConversation = app.match(/async function endConversation\(\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(endConversation);
+  assert.match(endConversation, /conversationHistory\.queueCommand\(id/);
+  assert.match(endConversation, /kind: "end"/);
+  assert.doesNotMatch(endConversation, /resumeSavedQuery/);
+  assert.doesNotMatch(endConversation, /createNewConversation\(\)/);
+  assert.match(worker, /if kind == "end"/);
+  assert.doesNotMatch(worker.match(/if kind == "end"[\s\S]*?return Ok\(\(\)\);/)?.[0] || "", /saved query must finish|session_for_record/);
+  assert.match(worker, /self\.request_conversation_ingress\(&record, Some\(state\)\)/);
 });
 
-test("ending self time archives it without waking history ingress", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  const closeSelfTime = app.match(/async function closeFreeTimeSession\(id, session\) \{[\s\S]*?\n\}/)?.[0];
+test("the backend completes self time without sending it through history ingress", async () => {
+  const [app, worker] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
+  ]);
+  assert.doesNotMatch(app, /completeWithoutIngress|runSelfTimeRecord|closeSelfTimeRecord/);
+  const closeSelfTime = worker.match(/async fn process_self_time[\s\S]*?async fn create_next_self_time_slice/)?.[0];
   assert.ok(closeSelfTime);
-  assert.match(closeSelfTime, /conversationHistory\.completeWithoutIngress\(id,/);
-  assert.doesNotMatch(closeSelfTime, /requestIngress|kickHistoryIngress/);
+  assert.match(closeSelfTime, /\/complete/);
+  assert.doesNotMatch(closeSelfTime, /request-ingress/);
 });
 
 test("a structured pending Chatend resumes from cold start without duplicating its user query", async () => {
@@ -2403,7 +2420,7 @@ test("system prompt composition uses readable sections rather than markup wrappe
     writeTools: "Write tools.",
   };
   const prompt = composePrompt(manuals, "conversation", { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
-  assert.equal(prompt, "Kennedy's identity\n\nIdentity.\n\nSession type\n\nConversation session.\n\nChannel: Kennedy's browser UI.\n\nKmap basics\n\nKmap basics.\n\nRead-only tools\n\nKmap read tools.\n\nWeb tools.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
+  assert.equal(prompt, "Kennedy's identity\n\nIdentity.\n\nSession type\n\nConversation session.\n\nChannel: Kennedy's web UI. The user submitted this message through the frontend, while Kennedy's backend owns and persists the Chatend and tool loop.\n\nKmap basics\n\nKmap basics.\n\nRead-only tools\n\nKmap read tools.\n\nWeb tools.\n\nCurrent runtime\n\nYou are currently running on gpt-5.6-sol with xhigh thinking mode.");
   assert.match(composePrompt(manuals, "conversation", { sessionType: "telegram" }), /Channel: Telegram/);
   const freeTime = composePrompt(manuals, "conversation", {
     sessionType: "free-time",
@@ -2728,19 +2745,22 @@ test("user-visible errors are logged below history instead of inside the chat pa
   assert.match(render, /previous\?\.dataset\.message === text/);
 });
 
-test("frontend initialization and ingress queues degrade by feature", async () => {
-  const [app, coordinator] = await Promise.all([
+test("frontend initialization observes independent services while backend owns prompt and ingress readiness", async () => {
+  const [app, coordinator, worker, prompts] = await Promise.all([
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
-    readFile(new URL("../public/js/memory_ingress_coordinator.js", import.meta.url), "utf8"),
+    readFile(new URL("./support/legacy_orchestration/memory_ingress_coordinator.js", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/prompts.rs", import.meta.url), "utf8"),
   ]);
   assert.doesNotMatch(app, /Promise\.all\(\[kweb\.health\(\), kweb\.user\(\), loadPromptManuals/);
-  assert.match(app, /audioIngressReady && audioPromptsReady\(\)/);
+  assert.doesNotMatch(app, /loadPromptManuals|MemoryIngressCoordinator|audioPromptsReady|promptsReady/);
   assert.match(coordinator, /conversationHistory\.nextIngress\(\)\.catch/);
   assert.match(coordinator, /audioIngress\.nextIngress\(\)\.catch/);
-  assert.match(app, /Audio preparation and history remain available, but audio memory ingress is paused/);
-  assert.match(app, /providerKind = selected\.kind/);
-  assert.match(app, /promptsReady\(manuals, "conversation", \{ providerKind \}\)/);
-  assert.match(app, /provider, providerKind, model, reasoningEffort/);
+  assert.match(worker, /Manuals::load\(&self\.config\.system_prompts_directory\)/);
+  assert.match(worker, /RuntimeModel::from_provider_payload\(&providers\)/);
+  assert.match(worker, /process_conversation_ingress/);
+  assert.match(worker, /process_audio_ingress/);
+  assert.match(prompts, /compose_conversation/);
 });
 
 test("frontend defaults to main with full and full-history inspectors and retains both Kmap root controls", async () => {
@@ -2748,34 +2768,35 @@ test("frontend defaults to main with full and full-history inspectors and retain
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
   ]);
-  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "user-log-section", "clear-log", "tg-tab", "audio-tab", "voice-button", "stop-button", "send-end-button"]) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ["usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "user-log-section", "clear-log", "tg-tab", "audio-tab", "voice-button", "stop-button", "retry-button", "send-end-button"]) assert.match(html, new RegExp(`id="${id}"`));
   for (const id of ["inspector-system", "inspector-tools", "inspector-memory"]) assert.doesNotMatch(html, new RegExp(`id="${id}"`));
   assert.match(app, /const INSPECTOR_MODES = \["main", "full", "history"\]/);
   assert.match(app, /let inspectorMode = "main"/);
   assert.match(app, /record\?\.state\?\.historyIngress/);
-  assert.match(app, /mode: "history ingress"/);
-  assert.match(app, /new MemoryExplorer\(\{ api: kweb, rootNodeIds,/);
+  assert.match(app, /archivedDiagnostic\(archive, "history ingress"\)/);
+  assert.match(app, /new MemoryExplorer\(\{\s*api: kweb,\s*rootNodeIds,/);
   assert.match(app, /memory_kennedy_home\.addEventListener\("click", \(\) => explorer\?\.kennedyHome\(\)\)/);
-  const initialize = app.match(/async function initialize\(\) \{[\s\S]*?\n\}\n\nui\.message_form/)?.[0];
+  const initialize = app.match(/async function initialize\(\) \{[\s\S]*?\n\}\s*ui\.message_form/)?.[0];
   assert.ok(initialize);
-  assert.ok(initialize.indexOf("await conversationHistory.discardUnstarted()") < initialize.indexOf("conversationHistory.list()"));
+  assert.doesNotMatch(initialize, /discardUnstarted|releaseIngressRepairs/);
   assert.match(app, /renderAudioHistory\(ui\.conversation_history, audioRecords/);
   assert.match(app, /const detail = selectedAudioDetail\(\)/);
   assert.match(app, /renderAudioRecording\(ui\.transcript, detail/);
-  assert.match(app, /session\.stopPendingTurn\(\)/);
+  assert.match(app, /conversationHistory\.stop\(id\)/);
   assert.match(app, /stop_button\.addEventListener\("click"/);
   assert.match(app, /send_end_button\.addEventListener\("click", \(\) => sendAndEndConversation\(\)\)/);
-  assert.match(app, /session\.appendFinalUserMessage\(text, metadata\)/);
+  assert.match(app, /kind: "send-and-end"/);
   assert.match(html, /id="stop-button"[^>]*>Stop Kennedy<\/button>/);
   assert.match(html, /id="send-end-button"[^>]*>Send &amp; end<\/button>/);
   assert.match(html, /\/js\/app\.js\?v=\d{8}\.\d+/);
   assert.match(html, /\/css\/styles\.css\?v=\d{8}\.\d+/);
 });
 
-test("the browser exposes self time in a dedicated tab with a durable custom prompt", async () => {
-  const [html, app, manual] = await Promise.all([
+test("the browser submits a durable self-time intent and the backend owns its run", async () => {
+  const [html, app, worker, manual] = await Promise.all([
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
     readFile(new URL("../SystemPrompts/SelfTimeSession.txt", import.meta.url), "utf8"),
   ]);
   assert.match(html, /id="self-time-tab"[^>]*>Self Time<\/button>/);
@@ -2785,16 +2806,16 @@ test("the browser exposes self time in a dedicated tab with a durable custom pro
   assert.match(html, /id="start-self-time"[^>]*>Start self time<\/button>/);
   assert.match(app, /if \(sessionType === "free-time"\) return "self-time"/);
   assert.match(app, /customPrompt = parseSelfTimePrompt\(ui\.self_time_prompt\.value\)/);
-  assert.match(app, /customPrompt,/);
-  assert.match(app, /navigator\.locks\.request\("kennedy-free-time"/);
+  assert.match(app, /custom_prompt: customPrompt/);
+  assert.match(app, /conversationHistory\.start\(\{/);
+  assert.match(app, /session_type: "free-time"/);
+  assert.doesNotMatch(app, /navigator\.locks|ConversationSession|runSelfTimeRecord/);
   assert.match(app, /if \(freeTimeStartPromise\) return freeTimeStartPromise/);
-  assert.match(app, /freeTimeStarting = true;\s+update\(\);\s+const work = startFreeTimeCoordinated\(\)/);
-  assert.match(app, /error\?\.code !== "free_time_already_active"/);
-  assert.match(app, /FREE_TIME_HARD_STOP_GRACE_MS/);
-  assert.match(app, /if \(freeTimeCanStartNewSession\(finalMetadata\) && !purgedConversationIds\.has\(id\)\)/);
-  assert.match(app, /if \(!freeTimeCanStartNewSession\(freeTime\)\) \{\s+finishRun\(\)/);
-  assert.match(app, /session\.stageFreeTimeOpening\(\)/);
-  assert.match(app, /chatRuntimeReady\(\) \|\| freeTimeRuntimeReady\(\)/);
+  assert.match(app, /freeTimeStarting = true;\s+update\(\);\s+const work = startFreeTimeIntent\(\)/);
+  assert.match(worker, /ChronoDuration::minutes\(2\)/);
+  assert.match(worker, /ChronoDuration::minutes\(5\)/);
+  assert.match(worker, /session\.stage_free_time_opening\(\)/);
+  assert.match(worker, /async fn process_self_time/);
   assert.match(manual, /free to do whatever you want/i);
   assert.match(manual, /EndTurn/);
   assert.match(manual, /optional message/);
@@ -2816,10 +2837,33 @@ test("audio recording view starts large artifacts collapsed and includes inline 
 });
 
 test("Telegram queue heads run independently without blocking later relay polls", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  assert.match(app, /function launchTelegramEvent\(event\) \{[\s\S]*telegramInFlight\.add\(event\.id\);[\s\S]*void runTelegramEvent\(event\)/);
-  assert.match(app, /for \(const event of events\) launchTelegramEvent\(event\);/);
-  assert.doesNotMatch(app, /await Promise\.all\(events\.map/);
+  const worker = await readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8");
+  assert.match(worker, /events_in_flight/);
+  assert.match(worker, /for event in events/);
+  assert.match(worker, /tokio::spawn\(async move\s*\{\s*worker\.run_telegram_event/);
+});
+
+test("backend orchestration keeps read-only conversations independent behind one Kmap writer", async () => {
+  const [app, worker] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
+  ]);
+  assert.doesNotMatch(app, /ConversationSession|MemoryIngressCoordinator|runAgentLoop|runHistoryIngress|launchEvent\(/);
+  assert.match(worker, /commands_in_flight/);
+  assert.match(worker, /events_in_flight/);
+  assert.match(worker, /writer: Arc<Mutex<\(\)>>/);
+  assert.match(worker, /process_self_time/);
+  assert.match(worker, /process_audio_ingress/);
+  assert.match(worker, /process_conversation_ingress/);
+  assert.match(worker, /self\.writer\.lock\(\)\.await/);
+});
+
+test("backend orchestration dynamically serializes writers and launches web conversations concurrently", async () => {
+  const worker = await readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8");
+  assert.match(worker, /writer_mutex_serializes_tasks_while_other_tasks_remain_independent/);
+  assert.match(worker, /maximum\.load\(Ordering::SeqCst\),\s*1/);
+  assert.match(worker, /Barrier::new\(3\)/);
+  assert.doesNotMatch(worker, /Command::new|node_executable|\.mjs/);
 });
 
 test("Telegram processing has a durable 30-minute deadline and orphan recovery path", async () => {
@@ -2829,12 +2873,12 @@ test("Telegram processing has a durable 30-minute deadline and orphan recovery p
   assert.equal(telegramEventTimeoutMs({ processingStartedAt: "2026-07-17T18:45:00Z" }, now), 15 * 60 * 1000);
   assert.equal(telegramEventTimeoutMs({ processingStartedAt: "2026-07-17T18:00:00Z" }, now), 0);
 
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  assert.match(app, /event\.conversationId !== record\.id \|\| !event\.processingStartedAt/);
-  assert.match(app, /telegramRelay\.bind\(event\.id, record\.id, event\.conversationId \|\| null\)/);
-  assert.match(app, /runtime\.session\.stopPendingTurn\(\)/);
-  assert.match(app, /telegramRelay\.abort\(event\.id, runtime\.conversationId, TELEGRAM_TIMEOUT_NOTICE\)/);
-  assert.match(app, /closeTimedOutTelegramConversation\(runtime\)/);
+  const worker = await readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8");
+  assert.match(worker, /const TELEGRAM_TIMEOUT: Duration = Duration::from_secs\(30 \* 60\)/);
+  assert.match(worker, /processingStartedAt/);
+  assert.match(worker, /\/bind/);
+  assert.match(worker, /\/cancel/);
+  assert.match(worker, /\/abort/);
 });
 
 test("telegram voice sessions archive media, correlate delivery, and emit context notices outside the Chatend", async () => {
@@ -2976,16 +3020,19 @@ test("passive Telegram group context retains other users' media and Kennedy repl
 });
 
 test("background Telegram group ingress directly loads the group and Kennedy roots", async () => {
-  const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  assert.match(app, /const directRoots = \[batch\.groupRootNodeId, kennedyRootNodeId\]/);
-  assert.match(app, /groupRootNodeId: batch\.groupRootNodeId/);
-  assert.match(app, /provisionGroupRoot\(batch\.groupId\)/);
+  const worker = await readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8");
+  assert.match(worker, /let roots\s*=\s*vec!\[\s*required_string\(&group,\s*"rootNodeId"\)\?,\s*runtime\.kennedy_root_node_id/);
+  assert.match(worker, /groupRootNodeId/);
+  assert.match(worker, /self\.directory_group\(&group_id\)\.await/);
 });
 
 test("the first arriving Telegram conversation is selected when the TG view is empty", async () => {
   const app = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
-  assert.match(app, /activeView === "telegram" && !recordsForView\("telegram"\)\.some\(item => item\.id === selectedConversationId\)/);
-  assert.match(app, /selectedByView\.telegram = record\.id/);
+  const refresh = app.match(/async function refreshObservedState\(\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(refresh);
+  assert.match(refresh, /const records = recordsForView\(\)/);
+  assert.match(refresh, /selectedConversationId = records\[0\]\?\.id \|\| null/);
+  assert.match(refresh, /selectedByView\[activeView\] = selectedConversationId/);
 });
 
 test("Telegram directory and relay clients keep user management off the relay API", async () => {
@@ -3040,6 +3087,41 @@ test("Telegram directory and relay clients keep user management off the relay AP
   assert.match(requests[6].options.body, new RegExp(id(2)));
   assert.match(requests[10].options.body, /"throughMessageId":51/);
   assert.match(requests[13].options.body, /"text":"Prepared"/);
+});
+
+test("conversation-history client exposes durable backend start and command boundaries", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({}),
+    };
+  };
+  try {
+    const history = ConversationHistoryAPI("http://history");
+    await history.start({ idempotency_id: "1".repeat(32), started_at: "2026-07-20T00:00:00Z", session_type: "conversation" });
+    await history.commandHeads();
+    await history.queueCommand("conversation", { idempotency_id: "2".repeat(32), kind: "message", payload: { text: "Hello" } });
+    await history.claimCommand("command");
+    await history.completeCommand("command", { status: "answered" });
+    await history.stop("conversation");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requests.map(request => `${request.options.method || "GET"} ${request.url}`), [
+    "POST http://history/api/v1/conversations/start",
+    "GET http://history/api/v1/conversation-commands",
+    "POST http://history/api/v1/conversations/conversation/commands",
+    "POST http://history/api/v1/conversation-commands/command/claim",
+    "POST http://history/api/v1/conversation-commands/command/complete",
+    "POST http://history/api/v1/conversations/conversation/stop",
+  ]);
+  assert.match(requests[0].options.body, /"session_type":"conversation"/);
+  assert.match(requests[2].options.body, /"kind":"message"/);
+  assert.match(requests[4].options.body, /"status":"answered"/);
 });
 
 test("audio, document, durable vnote, and Telegram API clients use their queue endpoints", async () => {

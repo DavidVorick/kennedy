@@ -1,3 +1,4 @@
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
 export const PROMPT_FILES = {
   identity: "KennedyIdentity.txt",
   conversationSession: "ConversationSession.txt",
@@ -56,15 +57,15 @@ export function formatModelAttribution(model, reasoningEffort) {
 function sessionDetail(mode, sessionType, sourceSessionType) {
   if (mode === "conversation") {
     if (sessionType === "free-time") {
-      return "Channel: autonomous self time in Kennedy's browser harness. No live user response is expected. Read, web, and Kmap write tools are all authorized for this session.";
+      return "Channel: autonomous self time in Kennedy's backend harness. No live user response is expected. Read, web, and Kmap write tools are all authorized for this session.";
     }
     if (sessionType === "telegram-group") {
       return "Channel: Telegram group. This is a persistent session scoped to one participant and one group. Every group message accumulates as passive context, but only this participant's direct invocations trigger your response; other participants have separate sessions. Other participant roots are references that you may load if useful.";
     }
     if (sessionType === "telegram") {
-      return "Channel: Telegram private message. The final conversational response is relayed to the user; the visible Chatend and tool loop still run in Kennedy's browser UI.";
+      return "Channel: Telegram private message. The final conversational response is relayed by Kennedy's backend; a browser may observe the durable Chatend but does not run it.";
     }
-    return "Channel: Kennedy's browser UI.";
+    return "Channel: Kennedy's web UI. The user submitted this message through the frontend, while Kennedy's backend owns and persists the Chatend and tool loop.";
   }
   if (sourceSessionType === "audio") return "Source: one chronologically placed piece of a vnote transcript.";
   if (sourceSessionType === "telegram-group") return "Source: an archived Telegram group invocation or background group-chat batch.";

@@ -1,3 +1,4 @@
+// Browser-only HTTP client helpers. Backend orchestration is implemented in Rust.
 export class ApiError extends Error {
   constructor(message, status = 0, code = "network_error") { super(message); this.name = "ApiError"; this.status = status; this.code = code; }
 }
@@ -208,6 +209,12 @@ export const IntelligenceAPI = (base) => ({
 export const ConversationHistoryAPI = (base) => ({
   health: () => requestJSON(base, "/health"),
   list: () => requestJSON(base, "/api/v1/conversations/summaries"),
+  start: (body) => requestJSON(base, "/api/v1/conversations/start", { method: "POST", body: JSON.stringify(body) }),
+  commandHeads: () => requestJSON(base, "/api/v1/conversation-commands"),
+  queueCommand: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/commands`, { method: "POST", body: JSON.stringify(body) }),
+  claimCommand: (id) => requestJSON(base, `/api/v1/conversation-commands/${id}/claim`, { method: "POST", body: "{}" }),
+  completeCommand: (id, outcome = {}) => requestJSON(base, `/api/v1/conversation-commands/${id}/complete`, { method: "POST", body: JSON.stringify({ outcome }) }),
+  stop: (id) => requestJSON(base, `/api/v1/conversations/${id}/stop`, { method: "POST", body: "{}" }),
   current: () => requestJSON(base, "/api/v1/conversations/current"),
   nextIngress: () => requestJSON(base, "/api/v1/conversations/ingress/next"),
   releaseIngressRepairs: () => requestJSON(base, "/api/v1/conversations/ingress/repairs/release", { method: "POST" }),

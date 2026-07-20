@@ -1,3 +1,4 @@
+// Browser-only Chatend rendering helpers.
 export const CHATEND_SEPARATOR = "\n\n────────────────────────\n\n";
 
 const ROLE_LABELS = { system: "System context", user: "David", assistant: "Kennedy" };

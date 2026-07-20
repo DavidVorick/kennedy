@@ -4,6 +4,22 @@ These user-provided decisions supplement the repository specifications and
 technical design. They may be consolidated or removed once represented by the
 canonical documents; this file is not an append-only log.
 
+## Standalone Gemini Library
+
+- Build Gemini support as a fully separated kcode Rust library that will later
+  become a `kennedy-server` dependency; do not change or rewire existing
+  Kennedy code during this first library-development step.
+- Open the library with a Gemini API key and expose object methods for Gemini
+  3.1 Flash-Lite and 3.1 Pro inference, Nano Banana Pro with optional image
+  input and library-fixed 2K output, and 3.1 Pro inference with image and/or
+  audio input. Do not add Gemini 3.5 Flash or Nano Banana 2.
+- Keep usage records, estimated spend, and hourly/daily/monthly spending limits
+  entirely in the live library session. Do not use SQLite or any other
+  persistence; opening a new session starts with no usage or limits.
+- Return ordinary typed Rust reporting values. Do not add HTTP routes,
+  route-oriented serialization, or a wire contract to this standalone library;
+  `kennedy-server` can choose its own adapter when it later adopts the crate.
+
 ## Frontend Conversation-History Recovery
 
 - Restore visible, selectable conversation history first so the user can talk
@@ -715,3 +731,49 @@ canonical documents; this file is not an append-only log.
 - Kennedy will always be made an administrator of every Telegram group she is
   added to. The relay must still verify that status at runtime and fail closed
   if Telegram reports otherwise.
+
+## Backend-Owned Orchestration
+
+- Migrate all Kennedy orchestration out of the browser and into the backend.
+  The frontend should only present backend-owned state and submit durable user
+  intents; it must not own prompt composition, Chatend or session state,
+  agent/tool loops, checkpoints, retries, work queues, self-time execution,
+  Telegram processing, or memory-ingress coordination.
+- Backend workers must continue conversations, Telegram relays, self time, and
+  history/audio memory ingress without an open browser. Multiple browser tabs
+  are independent views of the same authoritative backend state rather than
+  competing orchestrators.
+- Keep only inherently local presentation/input concerns in the frontend, such
+  as rendering, navigation state, unsent drafts, media capture, and forwarding
+  explicit user commands or uploads to the backend.
+- Move the ordinary web-conversation implementation into the backend as well,
+  not only Telegram and ingress. The browser creates durable conversation or
+  self-time intents, queues message/retry/end/stop commands, and polls the
+  resulting checkpoints; `kennedy-server` owns every live Chatend and all
+  continuation, tool-loop, retry, timeout, and close behavior.
+- Run read-only web conversations and Telegram stream heads as independent
+  concurrent backend tasks. There is no global read-session lock: one user,
+  browser conversation, or Telegram stream must not wait for unrelated model
+  or read-tool work, while ordering within one durable conversation/stream is
+  still preserved.
+- Put every Kmap-writing workflow behind one backend single-writer gate for
+  now. This includes ordinary and Telegram history ingress, background group
+  ingress, audio ingress, autonomous self time, and the Kmap mutation needed
+  to provision Telegram user/group roots. The browser never owns or competes
+  for this queue. Read-only sessions remain concurrent while the one active
+  writer completes.
+- Kennedy is a Rust backend with a vanilla browser JavaScript/CSS/HTML
+  frontend. Backend orchestration must be implemented natively in Rust; do not
+  add Node.js or another server-side JavaScript runtime or process. JavaScript
+  remains browser-only.
+
+## Credential-Bearing Dependency Security
+
+- Treat every third-party dependency that receives an API key, access token,
+  bot token, or equivalent reusable credential through any of its APIs as
+  security-critical. Pin it to one exact immutable version or revision; a
+  version range and lockfile alone are insufficient.
+- Closely audit the complete source of the exact version before first importing
+  or using the dependency, and repeat that audit before every version bump.
+  Record the audited version or revision and the safety conclusion; automated
+  scans do not replace the source audit.

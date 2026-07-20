@@ -1,3 +1,4 @@
+// Browser-only formatting helpers.
 function text(value, fallback = "(none)") {
   if (value === null || value === undefined || value === "") return fallback;
   return String(value);

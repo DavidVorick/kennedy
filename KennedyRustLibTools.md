@@ -126,9 +126,9 @@ Publication is an external, durable action. Before publishing:
 5. run `CheckRustLib` and inspect a `passed: true` result; and
 6. call `PublishRustLib` only when the crate name, version, API, documentation, and behavior are ready to become public.
 
-The version in `Version.txt` must equal the literal `[package].version` in the root `Cargo.toml`. Workspace-inherited versions are rejected. `PublishRustLib` runs the full check again even if a previous explicit check passed, then publishes using the operator-provisioned `<rust-libs-root>/cargo_registry_token.txt` credential. Kennedy never sees or supplies that token.
+The version in `Version.txt` must equal the literal `[package].version` in the root `Cargo.toml`. Workspace-inherited versions are rejected. `PublishRustLib` runs the full check again even if a previous explicit check passed, then publishes using the operator-provisioned `cratesio-key` value that the server retrieved from its encrypted vault and supplied to the library at initialization. The managed libraries root contains no credential file. Kennedy never sees or supplies that token.
 
-A successful result confirms the published crate name and version. A validation failure stops publication. Missing or invalid operator credentials and Podman/crates.io failures are infrastructure errors. Do not work around them by placing credentials in library files.
+A successful result confirms the published crate name and version. A validation failure stops publication. Server startup rejects a missing or invalid operator credential; Podman/crates.io failures are infrastructure errors. Do not work around them by placing credentials in library files.
 
 Publication may succeed even if a later browser transport or Chatend checkpoint fails before its success result is retained. Do not blindly repeat an ambiguous `PublishRustLib` call. First verify whether that exact crate version is already present on crates.io, using web research when necessary. The same recovery issue is harmless for complete-file writes because repeating the identical write is idempotent; after an ambiguous create, call `OpenRustLib` rather than creating the same name again.
 

@@ -2,10 +2,14 @@ mod backup;
 mod credentials;
 mod kmap_http;
 mod kmap_size;
+mod orchestration;
 mod rust_lib_tools;
 mod telegram_identity;
 
-use std::path::{Path, PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
+};
 
 use age::secrecy::{ExposeSecret, SecretString};
 use anyhow::Context;
@@ -17,6 +21,7 @@ use zeroize::Zeroize;
 const OPENAI_API_KEY_SECRET: &str = "openai-api-key";
 const GEMINI_API_KEY_SECRET: &str = "gemini-api-key";
 const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
+const CRATES_IO_KEY_SECRET: &str = "cratesio-key";
 const RUST_LIBS_ROOT: &str = "/home/user/dev/kennedy/kcode/kcode-rust-libs";
 
 #[derive(Parser, Debug)]
@@ -100,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "kennedy_server=info,kweb_db_core=info,kennedy_intelligence=info,kennedy_conversation_history=info,kennedy_telegram_relay=info,tower_http=info".into()
+                "kennedy_server=info,kweb_db_core=info,kennedy_intelligence=info,kennedy_conversation_history=info,kcode_tg_kennedy_bot=info,tower_http=info".into()
             }),
         )
         .init();
@@ -158,11 +163,16 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let kweb_listener = tokio::net::TcpListener::bind(&args.kweb_bind)
         .await
         .with_context(|| format!("binding Kweb listener {}", args.kweb_bind))?;
+    let orchestration_kweb_base = internal_http_base(&args.kweb_bind);
+    let orchestration_intelligence_base = internal_http_base(&args.intelligence_bind);
+    let orchestration_history_base = internal_http_base(&args.conversation_history_bind);
+    let orchestration_telegram_base = internal_http_base(&args.telegram_bind);
+    let orchestration_audio_base = internal_http_base(&args.audio_ingress_bind);
     let vault = if vault_path.exists() {
         let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
         CredentialVault::unlock(&vault_path, passphrase)?
     } else {
-        tracing::warn!(path=%vault_path.display(), "Kennedy credential vault does not exist; configured secret-backed features are disabled");
+        tracing::warn!(path=%vault_path.display(), "Kennedy credential vault does not exist; secret-backed features are unavailable");
         CredentialVault::empty()
     };
     let transcription_api_key =
@@ -174,8 +184,10 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     )?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?
-            .map(kennedy_telegram_relay::BotToken::new)
+            .map(kcode_tg_kennedy_bot::BotToken::new)
             .transpose()?;
+    let crates_io_key =
+        resolve_required_secret(&vault, CRATES_IO_KEY_SECRET, "Rust library publication")?;
     let codex_catalog_cache =
         kennedy_codex_runtime::CatalogCache::new(kennedy_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) = kmap_http::initialize(
@@ -188,7 +200,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.telegram_bootstrap_username,
     )?);
     let telegram_directory_router = telegram_identity::router(telegram_identity.clone());
-    let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT)
+    let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT, crates_io_key)
         .with_context(|| format!("opening managed Rust libraries root {RUST_LIBS_ROOT}"))?;
     let history = kennedy_conversation_history::Config {
         bind: args.conversation_history_bind,
@@ -200,7 +212,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         bind: args.intelligence_bind,
         allowed_origins: vec![args.frontend_origin.clone()],
     };
-    let telegram = kennedy_telegram_relay::Config {
+    let telegram = kcode_tg_kennedy_bot::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
         allowed_origins: vec![args.frontend_origin.clone()],
@@ -215,6 +227,15 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         allowed_origins: vec![args.frontend_origin],
         max_upload_bytes: args.audio_ingress_max_upload_bytes,
         gemini_api_key: gemini_api_key.clone(),
+    };
+    let orchestration = orchestration::Config {
+        system_prompts_directory: args.system_prompts_dir.clone(),
+        kweb_base: orchestration_kweb_base,
+        intelligence_base: orchestration_intelligence_base,
+        conversation_history_base: orchestration_history_base,
+        telegram_relay_base: orchestration_telegram_base,
+        audio_ingress_base: orchestration_audio_base,
+        telegram_web_user_handle: args.telegram_bootstrap_username,
     };
     tokio::try_join!(
         kmap_http::serve_with_listener(
@@ -233,10 +254,27 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             codex_catalog_cache.clone(),
         ),
         kennedy_conversation_history::serve(history),
-        kennedy_telegram_relay::serve(telegram),
+        kcode_tg_kennedy_bot::serve(telegram),
         kennedy_audio_ingress::serve(audio_ingress, codex_catalog_cache),
+        orchestration::run(orchestration),
     )?;
     Ok(())
+}
+
+fn internal_http_base(bind: &str) -> String {
+    let bind = bind.trim();
+    let Ok(address) = bind.parse::<SocketAddr>() else {
+        return format!("http://{bind}");
+    };
+    let ip = if address.ip().is_unspecified() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        address.ip()
+    };
+    match ip {
+        IpAddr::V4(ip) => format!("http://{ip}:{}", address.port()),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{}", address.port()),
+    }
 }
 
 fn resolve_optional_secret(
@@ -253,6 +291,25 @@ fn resolve_optional_secret(
         tracing::warn!(secret_name=name, %purpose, "configured Kennedy secret is not present in the vault");
     }
     Ok(secret.map(|value| value.expose_secret().to_owned()))
+}
+
+fn resolve_required_secret(
+    vault: &CredentialVault,
+    configured_name: &str,
+    purpose: &str,
+) -> anyhow::Result<String> {
+    let name = configured_name.trim();
+    if name.is_empty() {
+        anyhow::bail!("the configured secret name for {purpose} is empty");
+    }
+    vault
+        .secret(name)?
+        .map(|value| value.expose_secret().to_owned())
+        .with_context(|| {
+            format!(
+                "{purpose} requires Kennedy secret '{name}'; store it with `kennedy-server secrets set {name}`"
+            )
+        })
 }
 
 fn manage_secrets(command: SecretsCommand, vault_path: &Path) -> anyhow::Result<()> {
@@ -363,6 +420,7 @@ mod tests {
         assert_eq!(OPENAI_API_KEY_SECRET, "openai-api-key");
         assert_eq!(GEMINI_API_KEY_SECRET, "gemini-api-key");
         assert_eq!(TELEGRAM_BOT_TOKEN_SECRET, "telegram-bot-token");
+        assert_eq!(CRATES_IO_KEY_SECRET, "cratesio-key");
         assert_eq!(
             RUST_LIBS_ROOT,
             "/home/user/dev/kennedy/kcode/kcode-rust-libs"
@@ -382,6 +440,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn required_secret_must_be_present() {
+        let mut vault = CredentialVault::empty();
+        let error =
+            resolve_required_secret(&vault, CRATES_IO_KEY_SECRET, "publication").unwrap_err();
+        assert!(error.to_string().contains(CRATES_IO_KEY_SECRET));
+
+        vault
+            .set(CRATES_IO_KEY_SECRET, "test-crates-io-key".into())
+            .unwrap();
+        assert_eq!(
+            resolve_required_secret(&vault, CRATES_IO_KEY_SECRET, "publication").unwrap(),
+            "test-crates-io-key"
+        );
+    }
+
+    #[test]
+    fn internal_service_urls_are_valid_for_wildcard_and_ipv6_binds() {
+        assert_eq!(internal_http_base("0.0.0.0:4321"), "http://127.0.0.1:4321");
+        assert_eq!(internal_http_base("[::]:4322"), "http://127.0.0.1:4322");
+        assert_eq!(internal_http_base("[::1]:4323"), "http://[::1]:4323");
     }
 
     #[tokio::test]

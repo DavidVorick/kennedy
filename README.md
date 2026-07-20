@@ -12,22 +12,27 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
 - `kennedy-codex-runtime` gives Intelligence and AudioIngress one process-wide,
   versioned sanitized-model-catalog cache and compatibility-validation ledger.
 - `kennedy-conversation-history` checkpoints active conversations and durably
-  stores complete conversation and history-ingress recovery archives, with
-  multiple live conversations and a serialized history-ingress queue.
-- `kennedy-telegram-relay` is a transplantable library built on `teloxide` and owns Telegram transport, opaque
+  stores complete conversation and history-ingress recovery archives. It also
+  owns idempotent start intents and per-conversation command queues.
+- `kcode-tg-kennedy-bot` is an exact-version crates.io dependency built on `teloxide` and owns Telegram transport, opaque
   group identity, membership, and group-security state. Kennedy's separate user
-  directory owns TOFU whitelists and Kmap-root mappings; the browser remains the
-  visible Chatend owner.
+  directory owns TOFU whitelists and Kmap-root mappings; Kennedy's backend
+  orchestration worker consumes its durable stream heads.
 - `kennedy-audio-ingress` durably owns content-addressed vnotes, restartable
   Gemini/Sol transcript preparation, and timestamped Kennedy-ingress pieces.
-- `Frontend/public` owns live conversations, context, tool execution, durable
-  recovery orchestration, conversation-history browsing, and automatic
-  background history ingress.
+- `kennedy-server` runs the native Rust backend orchestrator. It owns web and
+  Telegram Chatends, prompt/tool loops, self time, recovery, and one serialized
+  Kmap-writer queue shared by conversation, Telegram, and audio ingress.
+- `Frontend/public` is an observer and command client. It renders durable
+  history and diagnostics, retains unsent local drafts/media capture, and sends
+  explicit start/message/retry/end/stop or ingress-retry requests.
 
-One `kennedy-server` binary hosts the runtime. Kmap is deliberately in-process
-through its separately publishable library; the other service domains retain
-separate listeners, state, and databases. A later routing consolidation can put
-all API domains on one port without changing Kmap storage.
+One `kennedy-server` binary hosts the native Tokio orchestration runtime. Kmap
+is deliberately in-process through its separately publishable library; the
+other service domains retain separate listeners, state, and databases. A later
+routing consolidation can put all API domains on one port without changing
+Kmap storage. JavaScript runs only in the browser; the server does not launch or
+depend on Node.js.
 
 ## First run
 
@@ -102,7 +107,19 @@ listener addresses, database paths, frontend paths, and the encrypted vault
 path remain ordinary `kennedy-server` CLI options; run with `--help` to inspect
 or override them.
 
-No API key is required for ordinary Kennedy generation. Startup rejects
+The managed Rust-library service requires a crates.io API key at startup. Store
+it in Kennedy's generic passphrase-encrypted credential vault under the
+conventional name `cratesio-key`:
+
+```sh
+cargo run -p kennedy-server -- secrets set cratesio-key
+```
+
+Kennedy retrieves this key from the vault and passes it directly to the pinned
+`kcode-rust-libs` dependency; the managed libraries directory contains no
+credential file.
+
+No OpenAI API key is required for ordinary Kennedy generation. Startup rejects
 API-key-only Codex authentication so a
 misconfigured machine cannot silently bill ordinary OpenAI API usage.
 
@@ -220,9 +237,9 @@ the canonical final transcript. If needed, Sol inserts sensible boundaries so
 each Kennedy ingress piece remains at or below an estimated 50,000 tokens.
 Every piece repeats the recording timestamp and shares the recording SHA-256
 identity. Processing stages, transcripts, retries, and Kennedy ingress
-checkpoints are SQLite-backed and resume after server or browser restarts. Kmap
-mutation runs when Kennedy's browser worker is open and remains serialized with
-ordinary conversation-history ingress.
+checkpoints are SQLite-backed and resume after server restarts. Kmap mutation
+runs in the supervised backend worker and remains serialized with ordinary and
+Telegram conversation-history ingress plus self time.
 
 Recordings are idempotent by content hash. Check one with
 `GET /api/v1/audio-ingress/by-sha256/{sha256}` or inspect the entire durable
@@ -300,7 +317,7 @@ Kennedy's live system prompts are deliberately plain-text files in
 - `WriteTools.txt` — ingress-only Kmap mutation tools.
 
 Kennedy's strategy for using her harness is intentionally learned and stored in
-her own Kmap graph rather than embedded in static prompts. The frontend composes
+her own Kmap graph rather than embedded in static prompts. The backend composes
 identity, session type, Kmap basics, read-only tools, optional write tools, and
 the current runtime in that order. Web and private Telegram sessions start with
 the user and Kennedy roots loaded; persistent group-user sessions additionally
@@ -320,14 +337,14 @@ Chatend header, and shows history ingress as it runs. The Chatend inspector can
 display the complete context, just the system prompts, or an expandable tree
 of loaded Kmap memory.
 
-The browser fetches these files at session startup. Edit them and reload the
-page; no compilation is required.
+The backend loads these files when its orchestration worker starts. Edit them
+and restart `kennedy-server`; no frontend compilation is required.
 
 The `TG Bot` view shows private conversations and persistent Telegram-group
-sessions scoped to one user in one group. The
-browser must be open to run Kennedy, but Telegram messages remain durably
-queued while it is closed. Queue heads from different private-user and
-group-user streams run independently. Each has a durable 30-minute response
+sessions scoped to one user in one group. `kennedy-server` continues processing
+Telegram with no browser open. Queue heads from different private-user and
+group-user streams run independently alongside ordinary web conversations.
+Each has a durable 30-minute response
 deadline; an overrun is canceled and completed so the next message can proceed.
 If a queued event points to a missing conversation record, the bridge safely
 rebinds it to a fresh record without discarding saved media or transcription.
@@ -352,9 +369,10 @@ content is discarded before text/media handling; the group becomes eligible when
 historical ledger is whitelisted. The browser composer also has a microphone button; both sources
 preserve the original audio with the paid transcription.
 
-The browser conversation composer also offers `Send & end`: it checkpoints one
-final user message without asking Kennedy to answer, then immediately closes
-the conversation into the normal history-ingress queue.
+The browser conversation composer also offers `Send & end`: it submits one
+durable backend command that checkpoints a final user message without asking
+Kennedy to answer, then closes the conversation into the normal
+history-ingress queue.
 
 Every Kennedy session begins with a genuine retained `ToolCheck({})` exchange
 whose result says `Tool calls are working.` Kennedy can repeat it at any time.
@@ -370,13 +388,14 @@ user prompt that carries into every clean-slate slice. Kennedy receives the
 full read/web/Kmap-write tool set and can call `EndTurn({})`, or pass
 the next session a note with
 `EndTurn({"message":"Continue this investigation."})`, to choose a
-fresh Chatend without giving up any remaining time. Self-time records survive
-a reload and become read-only history directly; they bypass normal history
+fresh Chatend without giving up any remaining time. The complete run is owned
+by the backend and survives browser closure or reload. Self-time records become
+read-only history directly; they bypass normal history
 ingress because the live run already performs Kmap memory work. A notice is
 injected for the last three minutes; at the deadline substantive tools are
 blocked but `ToolCheck` and `EndTurn` remain available for one wrap-up round,
 and a hard cancellation follows two minutes later. Start feedback is
-immediate and both the browser and history service prevent overlapping runs. Model and search
+immediate and the durable history service prevents overlapping runs. Model and search
 requests retain their provider/profile timeout, including long quality
 searches, but can never run past the self-time hard stop.
 
@@ -392,6 +411,10 @@ cargo test --workspace
 node --experimental-default-type=module --test Frontend/tests/*.test.mjs
 ```
 
+The second command is an optional development test harness for the browser
+modules. Node.js is never linked, launched, or required by `kennedy-server`, and
+there is no frontend package-manager or build-time dependency.
+
 The Rust suite covers Kmap storage/migration/history/idempotency integrity, conversation
 state transitions, Telegram authorization/queue behavior, normalized request validation, cached continuation request
 shape, and provider usage normalization. The frontend suite covers short IDs,
@@ -404,6 +427,7 @@ thread-ID validation, and search-source extraction.
 
 The MVP intentionally has a small Kennedy-owned, code-seeded Telegram whitelist with one
 `/adduser` administrator, trusted shared-Kmap access without per-root access
-controls, no streaming, and no manual memory editing or deletion. Active conversations and unfinished
-history ingress survive an abrupt UI close; transient provider-chain and tool
-telemetry are rebuilt rather than restored.
+controls, no streaming, and no manual memory editing or deletion. Active
+conversations, Telegram work, self time, and unfinished history/audio ingress
+continue without an open UI and recover after a server restart; transient
+provider-chain and tool telemetry are rebuilt rather than restored.

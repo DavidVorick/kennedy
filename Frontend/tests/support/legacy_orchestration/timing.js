@@ -1,3 +1,4 @@
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
 export function elapsedMs(started) {
   return Math.max(0, Math.round(performance.now() - started));
 }

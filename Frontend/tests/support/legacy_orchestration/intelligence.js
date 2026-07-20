@@ -1,6 +1,7 @@
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
 import { END_TURN_NAME, TOOL_CHECK_NAME, parseToolCalls, TOOL_CALL_PREFIX, truncateToolResponse } from "./tools.js?v=20260719.1";
 import { addTimingStep, createTurnTiming, elapsedMs, timingMessage, updateTimingSummary } from "./timing.js?v=20260715.2";
-import { formatChatend } from "./chatend_format.js?v=20260719.2";
+import { formatChatend } from "../../../public/js/chatend_format.js?v=20260719.2";
 
 export const AGENT_LOOP_ROUND_LIMIT = 100;
 export const AGENT_LOOP_TURN_ENDED = Symbol("agent-loop-turn-ended");

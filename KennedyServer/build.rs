@@ -12,8 +12,6 @@ fn main() {
         "../ConversationHistory/src",
         "../ConversationHistory/migrations",
         "../IntelligenceBackend/src",
-        "../TelegramRelay/src",
-        "../TelegramRelay/migrations",
         "../Frontend/public/js",
         "../Frontend/SystemPrompts",
     ] {

@@ -1,3 +1,4 @@
+// Browser-only validation and display helpers for backend-owned self time.
 export const DEFAULT_FREE_TIME_MINUTES = 30;
 export const FREE_TIME_WARNING_MS = 3 * 60 * 1000;
 export const FREE_TIME_HARD_STOP_GRACE_MS = 2 * 60 * 1000;

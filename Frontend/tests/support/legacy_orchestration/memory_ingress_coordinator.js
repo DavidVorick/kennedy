@@ -1,4 +1,5 @@
-import { newIdempotencyId } from "./api.js?v=20260718.3";
+// Historical JavaScript behavior retained only as a migration-parity test oracle.
+import { newIdempotencyId } from "../../../public/js/api.js?v=20260718.3";
 import { runHistoryIngress } from "./history_ingress.js?v=20260719.3";
 
 const INGRESS_FAILURE_LIMIT = 5;

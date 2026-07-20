@@ -1,5 +1,5 @@
 import { element } from "./render.js?v=20260719.2";
-import { hydrateStoredNodeConnections } from "./api.js?v=20260719.3";
+import { hydrateStoredNodeConnections } from "./api.js?v=20260720.2";
 
 export class MemoryExplorer {
   constructor({ api, rootNodeIds, content, backButton, forwardButton }) {

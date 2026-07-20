@@ -31,6 +31,7 @@ const SELF_TIME_COMPLETION_MIGRATION: &str =
     include_str!("../migrations/005_self_time_completes_directly.sql");
 const CONVERSATION_SUMMARIES_MIGRATION: &str =
     include_str!("../migrations/006_conversation_summaries.sql");
+const BACKEND_COMMANDS_MIGRATION: &str = include_str!("../migrations/007_backend_commands.sql");
 const INGRESS_FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
 const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-turn-v1";
@@ -133,6 +134,51 @@ struct CreateConversation {
 }
 
 #[derive(Deserialize)]
+struct StartManagedConversation {
+    idempotency_id: String,
+    started_at: String,
+    session_type: String,
+    #[serde(default)]
+    duration_minutes: Option<f64>,
+    #[serde(default)]
+    custom_prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QueueConversationCommand {
+    idempotency_id: String,
+    kind: String,
+    #[serde(default = "empty_json_object")]
+    payload: Value,
+}
+
+fn empty_json_object() -> Value {
+    json!({})
+}
+
+#[derive(Deserialize)]
+struct CompleteConversationCommand {
+    #[serde(default = "empty_json_object")]
+    outcome: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationCommand {
+    id: String,
+    conversation_id: String,
+    sequence: i64,
+    kind: String,
+    payload: Value,
+    status: String,
+    cancel_requested: bool,
+    outcome: Option<Value>,
+    created_at: String,
+    processing_started_at: Option<String>,
+    completed_at: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct CheckpointConversation {
     expected_version: i64,
     state: Value,
@@ -176,7 +222,9 @@ struct RecordIngressFailure {
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
-    connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+    )?;
     apply_migrations(&connection).context("applying conversation history migrations")?;
     let origins = config
         .allowed_origins
@@ -207,6 +255,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(list_conversations).post(create_conversation),
         )
         .route(
+            "/api/v1/conversations/start",
+            post(start_managed_conversation),
+        )
+        .route(
+            "/api/v1/conversation-commands",
+            get(list_conversation_command_heads),
+        )
+        .route(
+            "/api/v1/conversation-commands/{command_id}/claim",
+            post(claim_conversation_command),
+        )
+        .route(
+            "/api/v1/conversation-commands/{command_id}/complete",
+            post(complete_conversation_command),
+        )
+        .route(
             "/api/v1/conversations/summaries",
             get(list_conversation_summaries),
         )
@@ -227,6 +291,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/v1/conversations/{conversation_id}/checkpoint",
             put(checkpoint_conversation),
+        )
+        .route(
+            "/api/v1/conversations/{conversation_id}/commands",
+            post(queue_conversation_command),
+        )
+        .route(
+            "/api/v1/conversations/{conversation_id}/stop",
+            post(request_conversation_stop),
         )
         .route(
             "/api/v1/conversations/{conversation_id}/request-ingress",
@@ -285,6 +357,9 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     }
     if version < 6 {
         connection.execute_batch(CONVERSATION_SUMMARIES_MIGRATION)?;
+    }
+    if version < 7 {
+        connection.execute_batch(BACKEND_COMMANDS_MIGRATION)?;
     }
     // An early v2 build re-ran the v1 migration on every launch. That could recreate
     // this legacy singleton index after user_version had already advanced to 2, at
@@ -433,15 +508,38 @@ fn summarize_state(state: &Value) -> Value {
 
     let free_time = state
         .get("freeTime")
-        .or_else(|| state.pointer("/archive/freeTime"));
+        .or_else(|| state.pointer("/archive/freeTime"))
+        .or_else(|| state.get("selfTimeIntent"));
     if free_time.is_some() {
         let mut compact = serde_json::Map::new();
         copy_summary_fields(
             free_time,
             &mut compact,
-            &["runId", "sliceIndex", "customPrompt"],
+            &[
+                "runId",
+                "sliceIndex",
+                "customPrompt",
+                "durationMinutes",
+                "deadlineAt",
+                "sliceEndedAt",
+                "sliceEndedReason",
+            ],
         );
+        if !compact.contains_key("sliceIndex") {
+            compact.insert("sliceIndex".into(), Value::Number(1.into()));
+        }
         summary.insert("freeTime".into(), Value::Object(compact));
+    }
+
+    let orchestration = state.get("orchestration");
+    if orchestration.is_some() {
+        let mut compact = serde_json::Map::new();
+        copy_summary_fields(
+            orchestration,
+            &mut compact,
+            &["owner", "status", "lastError"],
+        );
+        summary.insert("orchestration".into(), Value::Object(compact));
     }
 
     let channel = state
@@ -456,6 +554,7 @@ fn summarize_state(state: &Value) -> Value {
                 "kind",
                 "telegramUserId",
                 "chatId",
+                "groupId",
                 "username",
                 "displayName",
                 "groupRootNodeId",
@@ -536,6 +635,68 @@ fn fetch_record(db: &Connection, id: &str) -> Result<ConversationRecord, ApiErro
     .ok_or_else(ApiError::not_found)
 }
 
+fn validate_idempotency_id(value: &str) -> Result<(), ApiError> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad(
+            "idempotency_id must be exactly 32 hexadecimal characters.",
+        ));
+    }
+    Ok(())
+}
+
+fn row_command(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationCommand> {
+    let payload_json: String = row.get(4)?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let outcome_json: Option<String> = row.get(7)?;
+    let outcome = outcome_json
+        .map(|encoded| {
+            serde_json::from_str(&encoded).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(ConversationCommand {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        sequence: row.get(2)?,
+        kind: row.get(3)?,
+        payload,
+        status: row.get(5)?,
+        cancel_requested: row.get::<_, i64>(6)? != 0,
+        outcome,
+        created_at: row.get(8)?,
+        processing_started_at: row.get(9)?,
+        completed_at: row.get(10)?,
+    })
+}
+
+fn command_select() -> &'static str {
+    "SELECT id,conversation_id,sequence,kind,payload_json,status,cancel_requested,outcome_json,created_at,processing_started_at,completed_at FROM conversation_commands"
+}
+
+fn fetch_command(db: &Connection, id: &str) -> Result<ConversationCommand, ApiError> {
+    db.query_row(
+        &format!("{} WHERE id=?1", command_select()),
+        [id],
+        row_command,
+    )
+    .optional()
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "command_not_found",
+            "Conversation command not found.",
+        )
+    })
+}
+
 async fn create_conversation(
     State(state): State<AppState>,
     Json(input): Json<CreateConversation>,
@@ -557,6 +718,352 @@ fn insert_conversation(
     let now = Utc::now().to_rfc3339();
     db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,summary_state_json,version) VALUES(?1,'active',?2,?3,?4,?5,1)", params![id,input.started_at,now,state_json,summary_state_json]).map_err(ApiError::internal)?;
     fetch_record(db, &id)
+}
+
+async fn start_managed_conversation(
+    State(state): State<AppState>,
+    Json(input): Json<StartManagedConversation>,
+) -> Result<(StatusCode, Json<ConversationRecord>), ApiError> {
+    validate_idempotency_id(&input.idempotency_id)?;
+    validate_started_at(&input.started_at)?;
+    if !matches!(input.session_type.as_str(), "conversation" | "free-time") {
+        return Err(ApiError::bad(
+            "session_type must be conversation or free-time.",
+        ));
+    }
+    let custom_prompt = input.custom_prompt.unwrap_or_default().trim().to_owned();
+    if custom_prompt.chars().count() > 20_000 {
+        return Err(ApiError::bad(
+            "custom_prompt must be at most 20000 characters.",
+        ));
+    }
+    let duration_minutes = if input.session_type == "free-time" {
+        let duration = input
+            .duration_minutes
+            .ok_or_else(|| ApiError::bad("duration_minutes is required for free-time."))?;
+        if !duration.is_finite() || !(0.1..=10_080.0).contains(&duration) {
+            return Err(ApiError::bad(
+                "duration_minutes must be between 0.1 and 10080.",
+            ));
+        }
+        Some(duration)
+    } else {
+        if input.duration_minutes.is_some() || !custom_prompt.is_empty() {
+            return Err(ApiError::bad(
+                "duration_minutes and custom_prompt are available only for free-time.",
+            ));
+        }
+        None
+    };
+
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    if let Some(existing) = db
+        .query_row(
+            &format!("{} WHERE start_request_id=?1", conversation_select()),
+            [&input.idempotency_id],
+            row_record,
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+    {
+        let same_request = session_type_for_command(&existing.state) == input.session_type
+            && if input.session_type == "free-time" {
+                existing
+                    .state
+                    .pointer("/selfTimeIntent/durationMinutes")
+                    .and_then(Value::as_f64)
+                    == duration_minutes
+                    && existing
+                        .state
+                        .pointer("/selfTimeIntent/customPrompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        == custom_prompt
+            } else {
+                true
+            };
+        if !same_request {
+            return Err(ApiError::conflict(
+                "This start idempotency ID was already used for a different session request.",
+            ));
+        }
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+    if input.session_type == "free-time" && active_free_time(&db)?.is_some() {
+        return Err(ApiError::free_time_active());
+    }
+    let intent = if let Some(duration_minutes) = duration_minutes {
+        json!({
+            "stateVersion": 2,
+            "sessionType": "free-time",
+            "selfTimeIntent": {
+                "durationMinutes": duration_minutes,
+                "customPrompt": custom_prompt,
+                "requestedAt": input.started_at,
+                "provenanceIdempotencyId": input.idempotency_id,
+            },
+            "orchestration": {"owner":"backend","status":"queued"},
+            "transcript": [],
+        })
+    } else {
+        json!({
+            "stateVersion": 2,
+            "sessionType": "conversation",
+            "orchestration": {"owner":"backend","status":"queued"},
+            "transcript": [],
+        })
+    };
+    let (state_json, summary_state_json) = serialize_state(&intent)?;
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    tx.execute(
+        "INSERT INTO conversations(id,phase,started_at,updated_at,state_json,summary_state_json,version,start_request_id)
+         VALUES(?1,'active',?2,?3,?4,?5,1,?6)",
+        params![id, input.started_at, now, state_json, summary_state_json, input.idempotency_id],
+    )
+    .map_err(|error| {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+            if input.session_type == "free-time" {
+                ApiError::free_time_active()
+            } else {
+                ApiError::conflict("This conversation start request already exists.")
+            }
+        } else {
+            ApiError::internal(error)
+        }
+    })?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok((StatusCode::CREATED, Json(fetch_record(&db, &id)?)))
+}
+
+async fn queue_conversation_command(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Json(input): Json<QueueConversationCommand>,
+) -> Result<(StatusCode, Json<ConversationCommand>), ApiError> {
+    validate_idempotency_id(&input.idempotency_id)?;
+    if !matches!(
+        input.kind.as_str(),
+        "message" | "retry" | "end" | "send-and-end"
+    ) {
+        return Err(ApiError::bad(
+            "kind must be message, retry, end, or send-and-end.",
+        ));
+    }
+    if !input.payload.is_object() {
+        return Err(ApiError::bad("payload must be a JSON object."));
+    }
+    if matches!(input.kind.as_str(), "message" | "send-and-end") {
+        let text_present = input
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty());
+        let attachments_present = input
+            .payload
+            .pointer("/metadata/attachments")
+            .and_then(Value::as_array)
+            .is_some_and(|attachments| !attachments.is_empty());
+        if !text_present && !attachments_present {
+            return Err(ApiError::bad(
+                "A message command must contain text or at least one attachment.",
+            ));
+        }
+    } else if input
+        .payload
+        .as_object()
+        .is_some_and(|payload| !payload.is_empty())
+    {
+        return Err(ApiError::bad(
+            "retry and end commands do not accept a payload.",
+        ));
+    }
+
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    match fetch_command(&db, &input.idempotency_id) {
+        Ok(existing) => {
+            if existing.conversation_id != conversation_id
+                || existing.kind != input.kind
+                || existing.payload != input.payload
+            {
+                return Err(ApiError::conflict(
+                    "This command idempotency ID was already used for a different command.",
+                ));
+            }
+            return Ok((StatusCode::OK, Json(existing)));
+        }
+        Err(error) if error.code == "command_not_found" => {}
+        Err(error) => return Err(error),
+    }
+    let conversation = fetch_record(&db, &conversation_id)?;
+    if conversation.phase != "active" || !is_browser_conversation(&conversation.state) {
+        return Err(ApiError::conflict(
+            "Commands can be queued only for an active browser conversation.",
+        ));
+    }
+    let payload_json = serde_json::to_string(&input.payload).map_err(ApiError::internal)?;
+    let now = Utc::now().to_rfc3339();
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let sequence = tx
+        .query_row(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_commands WHERE conversation_id=?1",
+            [&conversation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(ApiError::internal)?;
+    if input.kind == "end" {
+        tx.execute(
+            "UPDATE conversation_commands SET cancel_requested=1
+             WHERE conversation_id=?1
+               AND status IN ('pending','processing')
+               AND kind IN ('message','retry')",
+            [&conversation_id],
+        )
+        .map_err(ApiError::internal)?;
+    }
+    tx.execute(
+        "INSERT INTO conversation_commands(id,conversation_id,sequence,kind,payload_json,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![input.idempotency_id, conversation_id, sequence, input.kind, payload_json, now],
+    )
+    .map_err(ApiError::internal)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(fetch_command(&db, &input.idempotency_id)?),
+    ))
+}
+
+fn session_type_for_command(state: &Value) -> &str {
+    state
+        .get("sessionType")
+        .or_else(|| state.pointer("/archive/sessionType"))
+        .and_then(Value::as_str)
+        .unwrap_or("conversation")
+}
+
+fn is_browser_conversation(state: &Value) -> bool {
+    session_type_for_command(state) == "conversation"
+}
+
+async fn list_conversation_command_heads(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let mut statement = db
+        .prepare(&format!(
+            "{} c
+             WHERE c.status IN ('pending','processing')
+               AND NOT EXISTS (
+                 SELECT 1 FROM conversation_commands earlier
+                 WHERE earlier.conversation_id=c.conversation_id
+                   AND earlier.status<>'complete'
+                   AND earlier.sequence<c.sequence
+               )
+             ORDER BY datetime(c.created_at),c.conversation_id,c.sequence",
+            command_select()
+        ))
+        .map_err(ApiError::internal)?;
+    let commands = statement
+        .query_map([], row_command)
+        .map_err(ApiError::internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({"commands":commands})))
+}
+
+async fn claim_conversation_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<String>,
+) -> Result<Json<ConversationCommand>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let existing = fetch_command(&db, &command_id)?;
+    if existing.status == "processing" {
+        return Ok(Json(existing));
+    }
+    if existing.status != "pending" {
+        return Err(ApiError::conflict(
+            "This conversation command is already complete.",
+        ));
+    }
+    let changed = db
+        .execute(
+            "UPDATE conversation_commands
+             SET status='processing',processing_started_at=?1
+             WHERE id=?2 AND status='pending'
+               AND NOT EXISTS (
+                 SELECT 1 FROM conversation_commands earlier
+                 WHERE earlier.conversation_id=conversation_commands.conversation_id
+                   AND earlier.status<>'complete'
+                   AND earlier.sequence<conversation_commands.sequence
+               )",
+            params![Utc::now().to_rfc3339(), command_id],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "An earlier command must complete before this command can start.",
+        ));
+    }
+    Ok(Json(fetch_command(&db, &command_id)?))
+}
+
+async fn complete_conversation_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<String>,
+    Json(input): Json<CompleteConversationCommand>,
+) -> Result<Json<ConversationCommand>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let existing = fetch_command(&db, &command_id)?;
+    if existing.status == "complete" {
+        return Ok(Json(existing));
+    }
+    if existing.status != "processing" {
+        return Err(ApiError::conflict(
+            "This conversation command has not been claimed.",
+        ));
+    }
+    let outcome_json = serde_json::to_string(&input.outcome).map_err(ApiError::internal)?;
+    let changed = db
+        .execute(
+            "UPDATE conversation_commands
+             SET status='complete',outcome_json=?1,completed_at=?2
+             WHERE id=?3 AND status='processing'",
+            params![outcome_json, Utc::now().to_rfc3339(), command_id],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "This conversation command changed before completion.",
+        ));
+    }
+    Ok(Json(fetch_command(&db, &command_id)?))
+}
+
+async fn request_conversation_stop(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let conversation = fetch_record(&db, &conversation_id)?;
+    if conversation.phase != "active" || !is_browser_conversation(&conversation.state) {
+        return Err(ApiError::conflict(
+            "Only an active browser conversation can be stopped.",
+        ));
+    }
+    let changed = db
+        .execute(
+            "UPDATE conversation_commands SET cancel_requested=1
+             WHERE id=(
+               SELECT id FROM conversation_commands
+               WHERE conversation_id=?1 AND status='processing' AND kind IN ('message','retry')
+               ORDER BY sequence LIMIT 1
+             )",
+            [&conversation_id],
+        )
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({"stop_requested":changed > 0})))
 }
 
 async fn list_conversations(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -630,6 +1137,15 @@ fn is_free_time_session(state: &Value) -> bool {
     free_time(state.get("sessionType")) || free_time(state.pointer("/archive/sessionType"))
 }
 
+fn is_backend_owned_session(state: &Value) -> bool {
+    state
+        .get("orchestration")
+        .or_else(|| state.pointer("/archive/orchestration"))
+        .and_then(|value| value.get("owner"))
+        .and_then(Value::as_str)
+        == Some("backend")
+}
+
 fn requires_history_ingress_repair(state: &Value) -> bool {
     state
         .get("historyIngressRepairRequired")
@@ -698,7 +1214,10 @@ fn discard_unstarted(db: &mut Connection) -> Result<Vec<String>, ApiError> {
     for (id, summary_state_json) in candidates {
         let state =
             serde_json::from_str::<Value>(&summary_state_json).map_err(ApiError::internal)?;
-        if state_contains_user_message(&state) || is_idle_protected_session(&state) {
+        if state_contains_user_message(&state)
+            || is_idle_protected_session(&state)
+            || is_backend_owned_session(&state)
+        {
             continue;
         }
         let changed = tx
@@ -747,9 +1266,7 @@ async fn next_ingress(State(state): State<AppState>) -> Result<Json<Value>, ApiE
     Ok(Json(json!({"conversation":fetch_next_ingress(&db)?})))
 }
 
-async fn release_ingress_repairs(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
     let released = db
         .execute(
@@ -960,8 +1477,7 @@ fn complete_self_time(
             "Self time can complete only after EndTurn or the shared deadline.",
         ));
     }
-    if ended_reason == Some("tool")
-        && !tool_log_has_success(state, "/archive/tools/log", "EndTurn")
+    if ended_reason == Some("tool") && !tool_log_has_success(state, "/archive/tools/log", "EndTurn")
     {
         return Err(ApiError::bad(
             "Self time cannot complete from a tool ending without a successful EndTurn receipt.",
@@ -1241,8 +1757,311 @@ mod tests {
 
     fn database() -> Connection {
         let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         apply_migrations(&db).unwrap();
         db
+    }
+
+    fn app_state() -> AppState {
+        AppState {
+            db: Arc::new(Mutex::new(database())),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_starts_are_idempotent_and_survive_unstarted_cleanup() {
+        let state = app_state();
+        let request_id = "11111111111111111111111111111111";
+        let (status, Json(first)) = start_managed_conversation(
+            State(state.clone()),
+            Json(StartManagedConversation {
+                idempotency_id: request_id.into(),
+                started_at: "2026-07-20T12:00:00Z".into(),
+                session_type: "conversation".into(),
+                duration_minutes: None,
+                custom_prompt: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(first.state["orchestration"]["owner"], "backend");
+        assert_eq!(first.state["orchestration"]["status"], "queued");
+
+        let (status, Json(replayed)) = start_managed_conversation(
+            State(state.clone()),
+            Json(StartManagedConversation {
+                idempotency_id: request_id.into(),
+                started_at: "2026-07-20T12:00:00Z".into(),
+                session_type: "conversation".into(),
+                duration_minutes: None,
+                custom_prompt: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed.id, first.id);
+
+        let mismatch = start_managed_conversation(
+            State(state.clone()),
+            Json(StartManagedConversation {
+                idempotency_id: request_id.into(),
+                started_at: "2026-07-20T12:00:00Z".into(),
+                session_type: "free-time".into(),
+                duration_minutes: Some(30.0),
+                custom_prompt: Some("Explore".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch.code, "state_conflict");
+
+        let mut db = state.db.lock().unwrap();
+        assert!(discard_unstarted(&mut db).unwrap().is_empty());
+        assert_eq!(fetch_record(&db, &first.id).unwrap().phase, "active");
+    }
+
+    #[tokio::test]
+    async fn managed_self_time_has_one_active_run_and_preserves_its_intent() {
+        let state = app_state();
+        let first_id = "22222222222222222222222222222222";
+        let request = || StartManagedConversation {
+            idempotency_id: first_id.into(),
+            started_at: "2026-07-20T12:00:00Z".into(),
+            session_type: "free-time".into(),
+            duration_minutes: Some(45.5),
+            custom_prompt: Some("  Review current plans.  ".into()),
+        };
+        let (_, Json(first)) = start_managed_conversation(State(state.clone()), Json(request()))
+            .await
+            .unwrap();
+        assert_eq!(first.state["selfTimeIntent"]["durationMinutes"], 45.5);
+        assert_eq!(
+            first.state["selfTimeIntent"]["customPrompt"],
+            "Review current plans."
+        );
+
+        let (status, Json(replayed)) =
+            start_managed_conversation(State(state.clone()), Json(request()))
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed.id, first.id);
+
+        let conflict = start_managed_conversation(
+            State(state),
+            Json(StartManagedConversation {
+                idempotency_id: "33333333333333333333333333333333".into(),
+                started_at: "2026-07-20T12:01:00Z".into(),
+                session_type: "free-time".into(),
+                duration_minutes: Some(10.0),
+                custom_prompt: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.code, "free_time_already_active");
+    }
+
+    #[tokio::test]
+    async fn command_heads_are_parallel_between_conversations_and_ordered_within_each_one() {
+        let state = app_state();
+        let start = |id: &'static str| StartManagedConversation {
+            idempotency_id: id.into(),
+            started_at: "2026-07-20T12:00:00Z".into(),
+            session_type: "conversation".into(),
+            duration_minutes: None,
+            custom_prompt: None,
+        };
+        let (_, Json(first)) = start_managed_conversation(
+            State(state.clone()),
+            Json(start("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+        )
+        .await
+        .unwrap();
+        let (_, Json(second)) = start_managed_conversation(
+            State(state.clone()),
+            Json(start("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+        )
+        .await
+        .unwrap();
+        let message = |id: &'static str, text: &'static str| QueueConversationCommand {
+            idempotency_id: id.into(),
+            kind: "message".into(),
+            payload: json!({"text":text,"metadata":{}}),
+        };
+        let (_, Json(first_head)) = queue_conversation_command(
+            State(state.clone()),
+            Path(first.id.clone()),
+            Json(message("cccccccccccccccccccccccccccccccc", "First A")),
+        )
+        .await
+        .unwrap();
+        let (_, Json(first_tail)) = queue_conversation_command(
+            State(state.clone()),
+            Path(first.id.clone()),
+            Json(message("dddddddddddddddddddddddddddddddd", "Second A")),
+        )
+        .await
+        .unwrap();
+        let (_, Json(second_head)) = queue_conversation_command(
+            State(state.clone()),
+            Path(second.id.clone()),
+            Json(message("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "First B")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_head.sequence, 1);
+        assert_eq!(first_tail.sequence, 2);
+        assert_eq!(second_head.sequence, 1);
+
+        let Json(heads) = list_conversation_command_heads(State(state.clone()))
+            .await
+            .unwrap();
+        let head_ids = heads["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(head_ids.len(), 2);
+        assert!(head_ids.contains(&first_head.id.as_str()));
+        assert!(head_ids.contains(&second_head.id.as_str()));
+        assert!(!head_ids.contains(&first_tail.id.as_str()));
+
+        let Json(claimed_a) =
+            claim_conversation_command(State(state.clone()), Path(first_head.id.clone()))
+                .await
+                .unwrap();
+        let Json(claimed_b) =
+            claim_conversation_command(State(state.clone()), Path(second_head.id.clone()))
+                .await
+                .unwrap();
+        assert_eq!(claimed_a.status, "processing");
+        assert_eq!(claimed_b.status, "processing");
+
+        let _ = complete_conversation_command(
+            State(state.clone()),
+            Path(first_head.id.clone()),
+            Json(CompleteConversationCommand {
+                outcome: json!({"status":"answered"}),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(heads) = list_conversation_command_heads(State(state.clone()))
+            .await
+            .unwrap();
+        let head_ids = heads["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(head_ids.contains(&first_tail.id.as_str()));
+        assert!(head_ids.contains(&second_head.id.as_str()));
+
+        let _ = claim_conversation_command(State(state.clone()), Path(first_tail.id.clone()))
+            .await
+            .unwrap();
+        let Json(stopped) = request_conversation_stop(State(state.clone()), Path(first.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(stopped["stop_requested"], true);
+        assert!(
+            fetch_command(&state.db.lock().unwrap(), &first_tail.id)
+                .unwrap()
+                .cancel_requested
+        );
+
+        let (status, Json(replayed)) = queue_conversation_command(
+            State(state.clone()),
+            Path(second.id.clone()),
+            Json(message("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "First B")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed.id, second_head.id);
+        let mismatch = queue_conversation_command(
+            State(state),
+            Path(second.id),
+            Json(message(
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "Changed payload",
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch.code, "state_conflict");
+    }
+
+    #[tokio::test]
+    async fn ending_a_legacy_conversation_cancels_its_failed_turn_and_exposes_end_next() {
+        let state = app_state();
+        let legacy = {
+            let db = state.db.lock().unwrap();
+            insert_conversation(
+                &db,
+                CreateConversation {
+                    started_at: "2026-07-20T12:00:00Z".into(),
+                    state: json!({
+                        "sessionType":"conversation",
+                        "orchestration":{"owner":"frontend","status":"stopped"},
+                        "pendingTurn":true,
+                        "transcript":[{"role":"user","content":"Unanswered query"}]
+                    }),
+                },
+            )
+            .unwrap()
+        };
+        let (_, Json(failed_turn)) = queue_conversation_command(
+            State(state.clone()),
+            Path(legacy.id.clone()),
+            Json(QueueConversationCommand {
+                idempotency_id: "11111111111111111111111111111111".into(),
+                kind: "retry".into(),
+                payload: json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(failed_turn) =
+            claim_conversation_command(State(state.clone()), Path(failed_turn.id.clone()))
+                .await
+                .unwrap();
+        assert_eq!(failed_turn.status, "processing");
+
+        let (_, Json(end)) = queue_conversation_command(
+            State(state.clone()),
+            Path(legacy.id.clone()),
+            Json(QueueConversationCommand {
+                idempotency_id: "22222222222222222222222222222222".into(),
+                kind: "end".into(),
+                payload: json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fetch_command(&state.db.lock().unwrap(), &failed_turn.id)
+                .unwrap()
+                .cancel_requested
+        );
+
+        let _ = complete_conversation_command(
+            State(state.clone()),
+            Path(failed_turn.id),
+            Json(CompleteConversationCommand {
+                outcome: json!({"status":"stopped"}),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(heads) = list_conversation_command_heads(State(state)).await.unwrap();
+        assert_eq!(heads["commands"][0]["id"], end.id);
+        assert_eq!(heads["commands"][0]["kind"], "end");
     }
 
     #[test]
@@ -1259,6 +2078,7 @@ mod tests {
                         "kind":"telegram-group",
                         "telegramUserId":42,
                         "chatId":-100,
+                        "groupId":"group-opaque",
                         "groupRootNodeId":"group-root",
                         "groupContext":{
                             "groupTitle":"Kennedy workshop",
@@ -1296,9 +2116,29 @@ mod tests {
             summary.state["channel"]["groupContext"]["groupTitle"],
             "Kennedy workshop"
         );
+        assert_eq!(summary.state["channel"]["groupId"], "group-opaque");
         assert!(encoded.len() < 4_000);
         assert!(!encoded.contains("data:audio"));
         assert!(!encoded.contains(&"x".repeat(1_000)));
+    }
+
+    #[test]
+    fn self_time_summary_keeps_only_compact_restart_metadata() {
+        let summary = summarize_state(&json!({
+            "sessionType":"free-time",
+            "freeTime":{
+                "runId":"run",
+                "sliceIndex":3,
+                "deadlineAt":"2026-07-20T06:00:00Z",
+                "sliceEndedAt":"2026-07-20T05:30:00Z",
+                "sliceEndedReason":"tool",
+                "nextSessionMessage":"large handoff intentionally omitted"
+            }
+        }));
+        assert_eq!(summary["freeTime"]["sliceIndex"], 3);
+        assert_eq!(summary["freeTime"]["deadlineAt"], "2026-07-20T06:00:00Z");
+        assert_eq!(summary["freeTime"]["sliceEndedReason"], "tool");
+        assert!(summary["freeTime"].get("nextSessionMessage").is_none());
     }
 
     #[test]
@@ -1318,7 +2158,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_in_progress','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
     }
@@ -1348,7 +2188,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
     }
 
@@ -1419,7 +2259,10 @@ mod tests {
         assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "conversation");
 
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time-repair','ingress_pending','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z','{\"sessionType\":\"free-time\",\"historyIngressRepairRequired\":true}',1)", []).unwrap();
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "self-time-repair");
+        assert_eq!(
+            fetch_next_ingress(&db).unwrap().unwrap().id,
+            "self-time-repair"
+        );
     }
 
     #[test]
@@ -1593,7 +2436,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('new','active','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
     }

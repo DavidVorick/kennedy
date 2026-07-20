@@ -6,10 +6,12 @@ The frontend is a browser-native HTML, CSS, and JavaScript application. It has
 no Node.js dependency, package manager, bundler, TypeScript, or compile step.
 The main Rust server serves it on localhost beside the Kmap HTTP adapter.
 
-The frontend owns Kennedy's UI and live orchestration: the clean
-transcript, the complete chatend, context glue, prompt composition, agent tool
-loops, recovery coordination, and the memory explorer. It does not own durable
-data, but it does own graph policy over the storage library's ordered ID arrays.
+The frontend owns Kennedy's UI only. It observes backend-owned durable records,
+submits explicit start/message/retry/end/stop and ingress-retry requests, keeps
+unsent drafts and browser capture state, and renders the memory explorer. The
+native Rust `kennedy-server` orchestrator owns clean transcripts,
+Chatends, context glue, prompt composition, agent/tool loops, checkpoints,
+recovery, Telegram, self time, graph policy, and ingress coordination.
 
 ## 2. Source Layout
 
@@ -32,24 +34,27 @@ Frontend/
     js/
       api.js
       app.js
-      chatend.js
-      conversation.js
-      self_time.js
-      history_ingress.js
-      intelligence.js
-      kweb_context.js
-      memory_ingress_coordinator.js
+      chatend_format.js
+      human_format.js
       memory_explorer.js
-      prompt_composer.js
       render.js
-      tools.js
+      self_time.js
+KennedyServer/
+  src/
+    orchestration.rs
+    orchestration/
+      context.rs
+      http.rs
+      prompts.rs
+      session.rs
+      worker.rs
 ```
 
-Files under `public/js` are browser-native ES modules. `app.js` wires UI and
-transport events, `conversation.js` owns a live session, and
-`memory_ingress_coordinator.js` owns the serialized conversation/audio memory
-workflow. UI rendering, API transport, Chatend state, tool execution, and
-ingress lifecycle must remain separate concerns.
+Files under `public/js` are browser-native presentation modules. `app.js` wires
+UI events to durable backend commands and polls view state. The native Rust
+modules under `KennedyServer/src/orchestration` own live sessions, tool
+execution, Telegram handling, self time, and the serialized ingress queue. The
+server neither executes browser modules nor launches a JavaScript runtime.
 
 ## 3. Backend Addresses
 
@@ -70,28 +75,14 @@ Live application state is held in JavaScript memory:
 
 ```js
 {
-  activeView: "conversation", // conversation | telegram | memory
+  activeView: "conversation", // conversation | self-time | telegram | audio | memory
   selectedConversationId: null,
-  selectedByView: { conversation: null, telegram: null },
+  selectedByView: { conversation: null, "self-time": null, telegram: null },
   historyRecords: [],
-  liveSessions: new Map(), // durable ID -> independent ConversationSession
-  freeTimeRun: null,       // shared run ID, deadline, provenance, and slice
   drafts: new Map(),       // durable ID -> unsent composer text
   voiceDrafts: new Map(),  // durable ID -> original audio + transcription metadata
-  telegramBridge: {
-    webLock: "kennedy-telegram-bridge",
-    inFlightEventIds: new Set()
-  },
-  roots: {
-    webUserHandle: "taek42",
-    webUserRootNodeId: null,
-    kennedyRootNodeId: null
-  },
-  ingressWorker: {
-    running: false,
-    activeRecord: null,
-    diagnostic: null
-  },
+  attachmentDrafts: new Map(),
+  audioDetails: new Map(),
   explorer: {
     currentNodeId: null,
     back: [],
@@ -100,7 +91,7 @@ Live application state is held in JavaScript memory:
 }
 ```
 
-Each `ConversationSession` owns its clean transcript, complete Chatend, Kweb
+Each backend `ConversationSession` owns its clean transcript, complete Chatend, Kweb
 context and short-ID maps, LoadNode counter, tool log, usage, continuation,
 start time, pending-turn flag, busy state, configured model and reasoning effort,
 their combined model-attribution value, its own direct root IDs, and any
@@ -111,7 +102,7 @@ Self-time sessions (durably typed as `free-time`) additionally own persisted run
 run-level mutation provenance ID.
 
 The frontend does not use local storage, IndexedDB, cookies, or service-worker
-caches for persistence. Instead it checkpoints an opaque recovery snapshot to
+caches for persistence. The backend checkpoints an opaque recovery snapshot to
 the conversation history API. The versioned snapshot contains recovery fields
 plus a lossless JSON recovery archive: composed system prompt, retained
 content, structured messages, structured Kmap snapshot and durable-ID
@@ -130,18 +121,18 @@ transcript-only snapshots remain readable and recover through the old rebuild
 path.
 
 The recovery archive also contains an inspector-only Full History. Immediately
-before every successful `ResetContext` rebuild, the frontend snapshots the
+before every successful `ResetContext` rebuild, the backend snapshots the
 outgoing structured messages, Kmap snapshot, and usage state as one completed
 context segment. These segments are durable UI history only: they are never
 restored into the active Chatend, formatted into generation input, or included
 when history ingress extracts the archived conversation's model-readable final
 Chatend.
 
-It loads all durable records for the conversation-history sidebar and keeps a
-`ConversationSession` plus an independent in-memory composer draft for every
-active record. The user may switch freely among active sessions or create a
-new one while Kennedy is working elsewhere. Closed records are read-only.
-Draft text is not durable until submitted.
+It loads durable summaries for the conversation-history sidebar and hydrates
+the selected record. The browser keeps only an independent in-memory composer
+draft per web conversation. The user may switch freely among active sessions
+or create a new one while Kennedy is working elsewhere. Closed records are
+read-only. Draft text is not durable until submitted as a backend command.
 
 ## 5. Chatend Model
 
@@ -166,14 +157,14 @@ It contains:
 Canonical formatting labels system messages `System context`, user messages
 `David`, and assistant messages `Kennedy` unless a message supplies a more
 specific visible role. Nonempty messages are separated by
-`────────────────────────`. The frontend submits the entire formatted Chatend
+`────────────────────────`. The backend submits the entire formatted Chatend
 when starting a Codex thread. Later requests use `previous_response_id` as the
 Codex thread ID and submit the canonically formatted newly appended suffix;
 the preceding Chatend is already in that provider thread. System instructions
 are prose sections, Kmap context is YAML-like text, tool requests are ordinary
 assistant text, and local tool results are readable memory updates.
 If the backend rejects a continuation because its thread predates the current
-verified prompt boundary, the frontend clears that continuation and immediately
+verified prompt boundary, the backend clears that continuation and immediately
 replays the complete visible Chatend into a fresh thread.
 
 The clean transcript is maintained separately for the uncluttered conversation
@@ -183,14 +174,14 @@ moves every top-level media `dataUrl` into a multipart artifact that preserves
 its filename and content type, and replaces it with
 `provenanceArtifactIndex`. It never mutates the live recovery archive. The
 Kweb client retries one ambiguous multipart failure with the same FormData and
-`IdempotencyId`, so the server receives identical bytes. During history ingress the frontend parses
+`IdempotencyId`, so the server receives identical bytes. During history ingress the backend parses
 the archive and canonically formats its `messages` array as the `Archived
 Chatend`; the archive object itself, media data URLs, counters, usage,
 diagnostics, and other recovery fields are not sent to Kennedy.
 
 ### 5.1 Context Rebuild
 
-The frontend can rebuild a chatend from:
+The backend can rebuild a Chatend from:
 
 1. the active system-prompt manuals,
 2. session content that must survive reset—the clean conversation transcript
@@ -207,7 +198,7 @@ The frontend can rebuild a chatend from:
 It then clears loaded Kweb data while preserving the session's short-ID
 assignments and allocation counter, reloads every session root in its declared
 order followed by the supplied nodes, and rebuilds the chatend. When a
-`selfMessage` is supplied, the frontend retains it as an assistant-role note
+`selfMessage` is supplied, the backend retains it as an assistant-role note
 immediately before the new Kweb context. Before that note, it places the compact
 ResetContext history. Node names keep that history readable; repeated node sets
 are collapsed into counted lines. Previous
@@ -230,7 +221,7 @@ threads and does not consume those keys. Append-only generations continue with
 the latest Codex thread ID, keeping unchanged prefixes eligible for Codex cache
 reads.
 
-The frontend aggregates provider-reported input, output, reasoning, cache-read,
+The backend aggregates provider-reported input, output, reasoning, cache-read,
 and cache-write tokens. Codex reports cumulative thread usage, so continuation
 rounds are differenced before per-call and session totals are updated. Current
 context occupancy is the latest successful model request's input plus output
@@ -251,7 +242,7 @@ measurement until the next successful LLM response replaces it. The Full
 inspector uses the same formatter and line. The measurement therefore does not
 include messages, tool results, or loaded nodes appended since that response.
 
-The frontend also measures wall-clock latency at the browser boundary. Each LLM
+The backend also measures wall-clock latency at the orchestration boundary. Each LLM
 response is followed by one compact timing line, every tool result includes one
 duration line, and each completed turn ends with one line containing total time
 and combined LLM/tool time. It does not repeat the calls in a summary step list.
@@ -261,7 +252,7 @@ These entries are persisted in the Chatend for later model turns.
 
 The Kmap API returns complete nodes whose fixed and recent connections are
 ordered durable-ID arrays, plus an additive name-and-description summary for
-every unique referenced node. The frontend joins those summaries onto all
+every unique referenced node. The backend joins those summaries onto all
 fixed and recent references, treats the first eight recent IDs as active, the
 remainder as fanout, fetches active node bodies as needed, and converts every
 node exposed to Kennedy into an in-context node:
@@ -304,7 +295,7 @@ from nodes that appear only as connection summaries. Summary-only nodes still
 receive short identifiers so Kennedy can load them, but they are not treated as
 fully materialized knowledge.
 
-A directly loaded node is one for which the frontend executed the LoadNode
+A directly loaded node is one for which the backend executed the LoadNode
 operation. Active connections returned alongside it are in context and receive
 short identifiers, but do not count toward the ten-directly-loaded-node limit.
 
@@ -336,7 +327,7 @@ declared order.
 
 ## 7. Prompt Composition
 
-The frontend fetches composable prompt assets from
+The backend fetches composable prompt assets from
 `/system-prompts/{filename}`. It assembles every session in this order:
 
 1. `KennedyIdentity.txt`,
@@ -345,10 +336,10 @@ The frontend fetches composable prompt assets from
 3. `KmapBasics.txt`,
 4. `ReadTools.txt`, containing the Kmap and web read-only tools,
 5. `WriteTools.txt` only for history ingress, audio ingress, and self time,
-6. `CodexHarness.txt` only when the frontend-selected provider kind is `codex`,
+6. `CodexHarness.txt` only when the backend-selected provider kind is `codex`,
 7. a dynamic runtime section with the configured model and thinking mode.
 
-The frontend selects its inference provider from the intelligence backend's
+The backend selects its inference provider from the intelligence backend's
 provider metadata before composing the prompt, so this condition uses the same
 provider choice sent with generation requests rather than inferring transport
 from a model name. The Codex-only layer concisely explains that Kennedy runs in
@@ -392,7 +383,7 @@ next generation request. `ResetContext` and `EndTurn` must each be the only
 call in their envelope.
 The marker must be the first response text; Markdown fences, commentary, and
 status text before it remain invalid. After the first valid JSON object's
-closing brace, the frontend truncates every trailing character without reading
+closing brace, the backend truncates every trailing character without reading
 or preserving it. This includes commentary, final-answer text, and later
 `KENNEDY_TOOL_CALLS` blocks, so only the first valid envelope is considered.
 Malformed first envelopes and text before the marker still produce readable
@@ -444,7 +435,7 @@ Text-protocol arguments:
 }
 ```
 
-The frontend resolves the identifiers, clears loaded node material while
+The backend session resolves the identifiers, clears loaded node material while
 preserving every existing session-local identifier assignment, then reloads all
 roots in their declared order followed by the supplied nodes in their given
 order. No root may appear in the argument list, and the resulting direct-load
@@ -482,11 +473,11 @@ LLM schema:
 Every identifier must refer to a node whose full payload is in context. This
 includes directly loaded nodes, their full active-connection expansions, and
 full nodes returned by create or update operations; it excludes summary-only
-connection references. The frontend resolves the IDs. For each node in order
+connection references. The backend resolves the IDs. For each node in order
 it prepends every peer to that node's recent-ID array and sends the complete
 replacement node to `PUT /api/v1/kmap/nodes/{durable_id}`. Updated nodes
 refresh matching context records. The tool result reports their in-context
-shapes. The frontend adds current model attribution to each request; it is not
+shapes. The backend adds current model attribution to each request; it is not
 part of Kennedy's arguments. It also generates a distinct random 16-byte
 idempotency identifier for every node update and reuses the request unchanged
 for an ambiguous network retry. Individual calls are therefore idempotent;
@@ -506,7 +497,7 @@ Available only during history ingress.
 ```
 
 The parent and aggregator must be full nodes. The moved identifiers may be
-known fanout summaries. The frontend verifies that the aggregator and moved
+known fanout summaries. The backend verifies that the aggregator and moved
 IDs are currently after the first eight parent recent IDs, removes the moved
 IDs from the parent, and appends them to the aggregator. It persists the parent
 and aggregator through two sequential complete-node updates. Final list
@@ -526,7 +517,7 @@ Available only during history ingress.
 ```
 
 The parent and child must be full nodes and slot is 1, 2, or 3. The string
-`blank` in `childIdentifier` clears the selected position. The frontend edits
+`blank` in `childIdentifier` clears the selected position. The backend edits
 the parent's fixed-ID array and persists that parent with
 `PUT /api/v1/kmap/nodes/{durable_id}`. Fixed connections are arbitrary
 Kennedy-controlled placements with no priority or task meaning. Because
@@ -547,13 +538,13 @@ Available only during history ingress.
 }
 ```
 
-The frontend resolves the parents and root owner and calls
+The backend resolves the parents and root owner and calls
 `POST /api/v1/kmap/nodes`, supplying the current provenance ID and every parent
 as the new node's recent array. It then sequentially prepends the new ID to
 every parent's recent array with ordinary node updates. The created node is
 assigned a short identifier and marked as full before it is returned to
 Kennedy. Creation does not make the node directly loaded unless a later
-LoadNode call loads it. The frontend supplies current model attribution to
+LoadNode call loads it. The backend supplies current model attribution to
 every mutation and refreshes the affected full records.
 
 ### 8.7 `UpdateNode`
@@ -570,11 +561,11 @@ Available only during history ingress.
 }
 ```
 
-The frontend resolves the node and root owner and calls
+The backend resolves the node and root owner and calls
 `PUT /api/v1/kmap/nodes/{durable_id}` with the current provenance ID, requested
 fields, and the node's complete existing fixed/recent arrays. It refreshes the
 in-context representation and returns the updated node. The request also
-receives the frontend's current model attribution automatically.
+receives the backend's current model attribution automatically.
 
 ### 8.8 `WebSearch`
 
@@ -594,7 +585,7 @@ simple latency-sensitive lookups where reduced research quality is acceptable;
 research. Geographic, language, freshness, and source requirements belong in
 the question. Concrete provider, model, reasoning effort, search context,
 timeout, query expansion, and result limits remain intelligence-layer policy.
-The frontend calls `POST /api/v1/web/search` with the active provider/model and
+The backend calls `POST /api/v1/web/search` with the active provider/model and
 returns the normalized research answer and source URLs as a readable Web tool
 result. This research request is not part of the conversation's provider
 continuation chain.
@@ -609,7 +600,7 @@ Available during live conversation, history ingress, and audio ingress.
 }
 ```
 
-The frontend calls `POST /api/v1/web/fetch`. It returns final source metadata,
+The backend calls `POST /api/v1/web/fetch`. It returns final source metadata,
 a truncation indicator, and readable page text. Kennedy uses it to inspect a
 particular source page-by-page. Fetched content is untrusted evidence, cannot
 override system instructions, and may fail when a page is unsafe, binary,
@@ -644,14 +635,14 @@ only if another clean-slate slice can open. With less than five minutes left,
 the self-time run ends and no message is forwarded. The old session-specific
 end-tool names are not exposed or accepted.
 
-At startup, the frontend asks both durable ingress services to release records
+At startup, the backend asks both durable ingress services to release records
 carrying the one-time historical repair marker. A release failure is shown as a
 repair-specific warning but does not make ordinary conversation history or
 audio browsing unavailable; the marked records remain safely quarantined until
 the corrected service is reachable.
 Every corrected conversation or audio claim also supplies
 `completion_protocol: "end-turn-v1"`, allowing the backend to reject
-an older frontend before it can consume newly released repair work.
+an older backend build before it can consume newly released repair work.
 
 ### 8.12 Kmap-documented Rust library tools
 
@@ -662,7 +653,7 @@ ingress, and audio ingress. Their Kennedy-facing contracts are absent from the
 static prompt assets and live entirely in the Kmap; `KmapBasics.txt` only
 provides the existing generic discovery notice and text-call protocol.
 
-The browser executor validates the model-visible name and complete-file write
+The backend executor validates the model-visible name and complete-file write
 shapes, then sends the call to the main Rust server through one narrow
 same-origin RPC route. It automatically attaches a durable tool-session
 identifier—random for interactive sessions and record-derived for ingress—that
@@ -703,60 +694,49 @@ chatend visualization.
 
 ### 9.1 Start
 
-Startup is feature-isolated rather than one all-or-nothing transaction.
+Browser startup is feature-isolated and read-only except for an explicit
+request to create the initial web conversation.
 
 1. Check Kweb and load the two root identifiers. If it succeeds, initialize the
-   memory explorer and fetch every system-prompt manual independently.
+   memory explorer.
 2. Check conversation history and load its sidebar records independently.
 3. Check audio ingress and load its recording history independently.
-4. Check intelligence and fetch `GET /api/v1/providers`.
-   Retain the selected provider's configured reasoning effort alongside its
-   model.
-5. Ask the conversation-history backend to permanently discard every record
-   that has never received a user message, then fetch
-   `GET /api/v1/conversations` for the sidebar. This resets abandoned “New
-   conversation” placeholders on every page load without deleting any
-   conversation that actually started.
-6. Restore every `active` record as an independently continuable session. Resume
-   each saved pending query from a fresh Codex thread, including in the
-   background when another conversation is selected. Active self-time records
-   resume autonomously under their saved absolute deadline and browser lock.
-7. Select the most recently updated active record, or create a new durable
-   active record if none exists.
-8. Start the sequential history-ingress worker for the queue without blocking
-   any active conversation.
+4. Check Telegram and intelligence only to expose feature status and local
+   browser media capabilities.
+5. Select the most recently updated active web record, or submit an idempotent
+   `conversation` start intent if none exists.
+6. Poll summaries and hydrate the selected conversation/audio record so the UI
+   follows backend checkpoints.
 
-Each feature starts when only its own prompt dependencies are ready. Missing
-identity, Kmap basics, or shared read tools disables every model session. A
-missing conversation session disables live conversation and Telegram only; a
-missing self-time session disables only self time. A
-missing history-ingress session pauses only conversation
-memory ingress. A missing audio-ingress session pauses only audio-to-Kmap
-mutation. Missing write tools pauses both ingress modes and self time. Read-only history,
-audio preparation, and the complete audio history remain available, and a
-failure of one ingress queue's poll does not prevent the other from being
-checked.
+Backend startup independently checks prompt/model dependencies, releases
+repair claims, removes truly abandoned legacy placeholders, restores every
+active session, polls Telegram, and starts its Kmap-writer scheduler. Those
+operations continue with no browser open.
 
 ### 9.2 User Turn
 
-1. Append the user message to the clean transcript and chatend.
-2. Set the per-turn LoadNode counter to zero.
-3. Checkpoint the pending query and recovery snapshot through the conversation
-   history API with `user_activity: true`. If this fails, do not contact the
-   LLM. The backend may atomically time out other eligible idle conversations.
-4. Submit the canonical plaintext for newly appended messages, the previous
+1. The frontend submits an idempotent `message` command containing text and
+   prepared media metadata, then returns to polling durable state.
+2. Conversation History exposes that command only when every earlier command
+   for the same conversation is complete; heads for other conversations remain
+   independently claimable.
+3. The backend appends the user message, resets the per-turn LoadNode counter,
+   and checkpoints the pending query with `user_activity: true`. If this fails,
+   it does not contact the LLM.
+4. The backend submits the canonical plaintext for newly appended messages, the previous
    response ID when available, a stable session-type cache key, and the
    configured model to the intelligence backend. The first request sends the
    complete formatted Chatend.
-5. If Kennedy emits a tool envelope, append the visible assistant text, execute
+5. If Kennedy emits a tool envelope, the backend appends the visible assistant text, executes
    every call sequentially in array order, append readable result messages, and
    continue from the returned response ID. State changes from one call are
    visible to the next call in the same response.
    After every complete response-sized tool round, checkpoint the updated full
    recovery archive before requesting another model response.
 6. Continue until Kennedy returns final text.
-7. Append final text to the clean transcript and chatend and checkpoint the
-   completed turn before accepting another query.
+7. The backend appends final text to the clean transcript and Chatend,
+   checkpoints the completed turn, and completes the durable command before
+   accepting the next command for that conversation.
 
 If generation or a response-sized checkpoint fails, restore the last durable
 Chatend, Kmap context, tool log, counters, and usage before allowing a retry,
@@ -766,13 +746,19 @@ conversation backend never saved. A cold-start retry follows the same fresh
 provider-chain path and sends the pending user query exactly once.
 
 A conversation permits at most 20 model-requested LoadNode calls per user turn.
-The UI remains in a busy state for the entire tool loop.
+The UI derives busy/stop/retry state from the durable checkpoint for the entire
+tool loop. A stop request marks the processing message/retry command for
+cancellation; the backend owns the actual cancellation.
 
 ### 9.3 End
 
 Starting a new conversation simply creates another durable active record and
 selects it; it does not end or block any existing live conversation. When the
-user explicitly ends the selected conversation:
+user explicitly ends the selected conversation, the frontend queues an `end`
+command. End Conversation remains available while a message is queued,
+running, stopped, or failed; retrying an unanswered query is a separate action.
+Queueing `end` atomically requests cancellation of every earlier unfinished
+message/retry command for that conversation, and the backend then:
 
 1. atomically checkpoint its final state and transition the
    history record from `active` to `ingress_pending`,
@@ -804,12 +790,12 @@ four times. The fifth total failure transitions the record to
 `ingress_failed`, excludes it from queue selection, releases the serialized
 worker for the next record, and leaves its complete diagnostic log visible on
 the conversation. These failures do not disable live conversation submission.
-A `MemoryIngressCoordinator` owns queue selection and the complete provenance,
+A backend `MemoryIngressCoordinator` owns queue selection and the complete provenance,
 claim, checkpoint, failure, cancellation, and completion sagas for both
 conversation and audio sources. It resumes any already-in-progress source
 first, otherwise compares source timestamps, and runs one item at a time. A
-same-origin browser lock and each backend's unique in-progress invariant
-prevent concurrent tabs from running two ingress workers.
+process-wide Kmap-writer gate and each backend's unique in-progress invariant
+prevent any second Kmap-writing workflow from overlapping it.
 
 An active conversation also moves to `ingress_pending` when it has been idle
 for more than 24 hours and the user successfully sends a message in a different
@@ -833,12 +819,11 @@ The dedicated Self Time category tab has a start panel that accepts 0.1 through
 10,080 minutes, defaults to 30, and accepts an optional custom prompt up to
 20,000 characters. On the first click it immediately disables the prompt,
 duration, and button, labels the button `Starting…`, and shares one in-page
-start promise across any repeated click handlers. It creates a `free-time`
-Conversation History record with a run UUID, run start, duration, absolute
-deadline, slice index, trimmed custom prompt, and an
-run-level Kmap provenance ID. The backend rejects record creation if a
-free-time record is already active; the frontend then adopts that existing
-record instead of creating an overlap. The initial autonomous instruction is
+start promise across any repeated click handlers. It submits an idempotent
+`free-time` intent containing duration and the trimmed custom prompt. The
+backend creates the Conversation History run metadata, absolute deadline,
+slice index, and run-level Kmap provenance ID. Conversation History rejects a
+second active `free-time` record. The initial autonomous instruction is
 checkpointed as a pending turn before generation begins. Its first user-role
 message says only which self-time session opened and how much of the shared run
 remains. The optional launch prompt follows as its own user-role message in
@@ -849,8 +834,9 @@ inspectable. The live status says `One run · slice N`; history rows use the
 launch prompt plus the session number, falling back to `Self time · session N`
 when no prompt was supplied.
 
-One same-origin `kennedy-free-time` Web Lock owns execution across tabs. Only a
-successful `EndTurn`, the shared deadline, or its hard-stop grace
+The backend's single Kmap-writer gate owns the complete run; browser tabs do
+not execute or lock it. Only a successful `EndTurn`, the shared deadline, or
+its hard-stop grace
 finalizes the current record directly into read-only `complete` history without
 submitting its Chatend to history ingress: the live self-time session already
 performs Kmap memory work with its run-level provenance. An ordinary final
@@ -865,8 +851,8 @@ persisted deadline, the controller increments the slice index and creates a new
 record with a fresh Chatend, context, continuation, counters, and the unchanged
 run deadline/provenance. An optional end-tool message is durably promoted to
 that next record and removed before any later rollover. With less than five
-minutes left, the run ends and no message is forwarded. Startup restores an
-active pending slice and reacquires the lock; other provider or checkpoint
+minutes left, the run ends and no message is forwarded. Backend startup
+restores an active pending slice; other provider or checkpoint
 failures retry the same durable turn.
 
 Before every model round and immediately after every model response, the
@@ -876,8 +862,8 @@ deadline it appends the expiry message, rejects further ordinary tools and
 Kmap mutations, and marks the next model request as the final wrap-up round.
 Generation and search requests preserve the intelligence backend's
 provider/profile timeout, including the longer quality-search allowance, but
-the frontend supplies the shorter remaining deadline plus two-minute grace
-when necessary. A browser timer also aborts and cancels the operation at that
+the backend supplies the shorter remaining deadline plus two-minute grace
+when necessary. A backend timer also aborts and cancels the operation at that
 hard stop.
 Finalization clears `pendingTurn` and checkpoints the complete slice archive
 without waking the normal memory-ingress coordinator.
@@ -915,7 +901,7 @@ file as a streamed response. Ordinary history-ingress text does not fetch media.
 Prompt composition and every history-ingress mutation use the selected model
 and provider-reported reasoning effort. The combined attribution format is
 `{model}-{reasoning_effort}`, for example `gpt-5.6-sol-xhigh`. The value is
-derived ephemerally by the frontend and sent only to the Kweb mutation API; it
+derived ephemerally by the backend and sent only to the Kweb mutation API; it
 is not Chatend state and is never exposed as a model-controlled tool argument.
 
 At most 50 model-requested LoadNode/ResetContext calls are allowed across the
@@ -927,8 +913,8 @@ CreateNode or UpdateNode calls is valid.
 
 Provider, checkpoint, provenance, and completion errors count toward the same
 five-attempt outer-session failure allowance. Each retry restores the last
-durable ingress archive. Conversation retries are scheduled by the browser
-worker after the backend's short durable defer; audio retries use the
+durable ingress archive. Conversation retries are scheduled by the backend
+worker after the history service's short durable defer; audio retries use the
 recording's durable 15-second next-attempt timestamp. A failed job releases its
 durable claim before waiting, allowing the shared worker to select another
 eligible conversation or recording. Ingress uses the normal Codex generation
@@ -937,12 +923,13 @@ intervention instead of repeating an identical oversized request five times.
 
 ### 10.1 Audio-ingress pieces
 
-The same browser Web Lock polls both conversation and audio queues. A claimed
-item from either queue completes before the next Kmap-mutating item starts. An
+The backend's single Kmap-writer gate polls both conversation and audio queues
+and also serializes self time and Telegram root provisioning. A claimed item
+from either queue completes before the next Kmap-mutating item starts. An
 in-progress item has priority; otherwise the oldest source time wins, and audio
 pieces with the same source time remain ordered by their persisted piece index.
 
-For audio, the frontend creates `audio-vnote` provenance with the
+For audio, the backend creates `audio-vnote` provenance with the
 recording-start `source_created_at`; the recording hash and piece index remain
 inside the provenance content. The
 retained content is the Sol-produced final transcript piece, not Gemini JSON or
@@ -990,14 +977,17 @@ fully completed records last. Within each group, the most recently updated
 record appears first.
 
 The message composer is not rendered while a closed record is selected. Its
-textarea, Send, Send & end, and End Conversation controls return only after the user
-selects or creates a live conversation.
+textarea, Send, Send & end, and End Conversation controls return whenever the
+user selects or creates an active ordinary conversation, including a legacy
+pre-backend-orchestration record whose saved ownership marker says `frontend`.
 
-While Kennedy is working, Stop Kennedy remains available even though Send,
-Send & end, and End Conversation are disabled. It aborts the active generation or web request,
-prevents another tool-loop round from starting, restores the latest durable
-turn checkpoint, and exposes Retry Saved Query. A user-requested stop is normal
-control flow and does not add a red activity-log failure.
+While Kennedy is working, Stop Kennedy and End Conversation remain available
+even though Send and Send & end are disabled. Stop aborts the active generation
+or web request, prevents another tool-loop round from starting, restores the
+latest durable turn checkpoint, and exposes the separate Retry Saved Query
+action. End cancels or abandons that unanswered turn and sends the preserved
+conversation to ingress without requiring a retry. A user-requested stop is
+normal control flow and does not add a red activity-log failure.
 
 In a live conversation, the textarea has a visible larger/compact toggle for
 long messages and remains vertically resizable using either its top-edge grip
@@ -1159,30 +1149,30 @@ private Telegram, persistent per-user Telegram groups, and group-source history
 ingress. Shared prompt assets describe an arbitrary always-loaded root set;
 dynamic group context supplies the session-specific root roles and order.
 
-At startup the frontend reads the user and Kennedy roles from
-`GET /api/v1/kmap/roots`,
-then asks the relay for unprovisioned whitelist entries and group roots. It maps
-the configured web handle `taek42` to the user root and creates every other
-reserved root by creating provenance and then posting the exact reserved node
-ID to `/api/v1/kmap/nodes`; it marks each directory entry ready afterward.
+At backend startup the orchestrator reads the user and Kennedy roles from
+`GET /api/v1/kmap/roots`, then asks the relay for unprovisioned whitelist
+entries and group roots. It maps the configured web handle `taek42` to the user
+root and creates every other reserved root through the same single Kmap-writer
+gate used by ingress and self time; it marks each directory entry ready
+afterward.
 User roots start as `User Root`; group roots start as
 `Group Root`. This is the only David-specific mapping; neither backend uses a
 sentinel David ID. New `/adduser` entries and newly observed groups are
-discovered and provisioned by the same bridge loop before their events run.
+discovered and provisioned by the same backend loop before their events run.
 
-One browser tab holds the `kennedy-telegram-bridge` Web Lock. It polls the
-relay's durable per-private-user/per-group-user head events, binds each event to its Conversation
-History ID, runs the normal read-only conversation session, and returns only
-Kennedy's final conversational output. Each fetched queue head runs as an
-independent in-flight task; the bridge keeps polling while long model or tool
+The supervised backend polls the relay's durable
+per-private-user/per-group-user head events, binds each event to its
+Conversation History ID, runs the normal read-only conversation session, and
+returns only Kennedy's final conversational output. Each fetched queue head
+runs as an independent in-flight task; the worker keeps polling while long model or tool
 work continues, allowing newly available heads from other private users or
 group-user pairs to start without violating the relay's per-stream ordering.
 The relay's persisted processing start gives each event a 30-minute hard
-deadline that survives reloads. On expiry the frontend stops the active
+deadline that survives restarts. On expiry the backend stops the active
 conversation turn, asks the relay to complete the event as timed out, and
 transitions a saved pending conversation into history ingress; a best-effort
 Telegram notice explains that the request was stopped. If an event points to a
-Conversation History record that is missing or no longer active, the frontend
+Conversation History record that is missing or no longer active, the backend
 creates a replacement and compare-and-swap rebinds from the exact stale ID,
 preserving already stored voice transcription and media and restarting the
 deadline for the recovered attempt.
@@ -1197,7 +1187,7 @@ composition and provenance source identify the source as Telegram or UI.
 A group event reuses the active Conversation History record keyed by the stable
 group root and invoking Telegram user. Its direct roots are that user's
 directory root, the group's reserved root, and Kennedy's root in that order.
-The frontend assigns short identifiers to every other participant root without
+The backend session assigns short identifiers to every other participant root without
 loading it. The first invocation includes up to 50 recent messages. Later,
 every accepted group message is appended to every open group-user session's
 Chatend through an independent durable cursor, without triggering Kennedy. The
@@ -1215,7 +1205,7 @@ detaches that session and queues a silent reset. The bridge checkpoints the
 remaining range and transitions the old record to history ingress without any
 Telegram output. The user's next invocation starts a fresh group session.
 
-The bridge also polls durable 80-message group-ingress batches. It creates a
+The backend also polls durable 80-message group-ingress batches. It creates a
 recoverable `telegram-group` archive with the group root followed by Kennedy's
 root direct, registers all participant roots as references, and immediately
 queues it in Conversation History. There is no user root because nobody invoked

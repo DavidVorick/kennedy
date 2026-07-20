@@ -1,11 +1,7 @@
-import { KwebAPI, RustLibsAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, TelegramDirectoryAPI, newIdempotencyId } from "./api.js?v=20260719.4";
-import { loadPromptManuals, promptsReady } from "./prompt_composer.js?v=20260717.9";
-import { ConversationSession } from "./conversation.js?v=20260719.3";
-import { MemoryIngressCoordinator } from "./memory_ingress_coordinator.js?v=20260719.3";
+import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260720.2";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260719.3";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationControlState, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260719.2";
-import { DEFAULT_FREE_TIME_MINUTES, FREE_TIME_HARD_STOP_GRACE_MS, FREE_TIME_WARNING_MS, formatFreeTimeRemaining, freeTimeCanStartNewSession, freeTimeTiming, nextFreeTimeSlice, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260719.1";
-import { TELEGRAM_RESPONSE_TIMEOUT_MS, telegramEventTimeoutMs } from "./telegram_timing.js?v=20260717.1";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260719.2";
+import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260720.2";
 
 const CONFIG = {
   kwebBase: window.location.origin,
@@ -13,37 +9,27 @@ const CONFIG = {
   conversationHistoryBase: "http://127.0.0.1:4323",
   telegramRelayBase: "http://127.0.0.1:4324",
   audioIngressBase: "http://127.0.0.1:4325",
-  webUserHandle: "taek42",
 };
 
 const ui = Object.fromEntries([
-  "service-status", "self-time-panel", "self-time-prompt", "self-time-minutes", "start-self-time", "self-time-status", "chat-view", "memory-view", "chat-tab", "self-time-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "send-end-button", "stop-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
+  "service-status", "self-time-panel", "self-time-prompt", "self-time-minutes", "start-self-time", "self-time-status", "chat-view", "memory-view", "chat-tab", "self-time-tab", "tg-tab", "audio-tab", "memory-tab", "transcript", "error-banner", "user-log-section", "clear-log", "message-form", "message-input", "message-resize-handle", "message-size-button", "send-button", "send-end-button", "retry-button", "stop-button", "voice-button", "attach-button", "attachment-input", "attachment-status", "clear-attachments", "end-button", "activity", "context-inspector", "copy-context", "usage-metrics", "inspector-main", "inspector-full", "inspector-history", "memory-content", "memory-back", "memory-forward", "memory-home", "memory-kennedy-home", "new-conversation", "conversation-history", "history-eyebrow", "history-title", "chatend-title",
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["main", "full", "history"];
 const kweb = KwebAPI(CONFIG.kwebBase);
-const rustLibs = RustLibsAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
 const telegramRelay = TelegramRelayAPI(CONFIG.telegramRelayBase);
-const telegramDirectory = TelegramDirectoryAPI(CONFIG.kwebBase);
 const audioIngress = AudioIngressAPI(CONFIG.audioIngressBase);
 
-let manuals = {};
 let rootNodeIds = null;
-let legacyUserRootNodeId = null;
-let kennedyRootNodeId = null;
-let webDirectoryUser = null;
 let provider = null;
-let providerKind = null;
 let model = null;
-let reasoningEffort = null;
-let contextWindowTokens = 0;
-let maxInputTokens = 0;
 let inputModalities = ["text"];
 let transcriptionAvailable = false;
 let explorer = null;
 let historyRecords = [];
+let conversationCommandHeads = new Map();
 let selectedConversationId = null;
 let selectedByView = { conversation: null, "self-time": null, telegram: null };
 let audioRecords = [];
@@ -57,7 +43,6 @@ let retryingConversationIds = new Set();
 let purgingConversationIds = new Set();
 let purgedConversationIds = new Set();
 let activeView = "conversation";
-let liveSessions = new Map();
 let drafts = new Map();
 let conversationErrors = new Map();
 let endingIds = new Set();
@@ -69,86 +54,21 @@ let recordingStream = null;
 let voiceDrafts = new Map();
 let attachmentDrafts = new Map();
 let extractingAttachments = new Set();
-let freeTimeRun = null;
 let freeTimeStarting = false;
 let freeTimeStartPromise = null;
-let freeTimeRunnerIds = new Set();
-let freeTimeContinuationRuns = new Set();
-let telegramBridgeRunning = false;
-let telegramInFlight = new Set();
-const telegramGroupPreparations = new Map();
+let backgroundRefreshRunning = false;
 let kwebReady = false;
 let conversationHistoryReady = false;
 let intelligenceReady = false;
 let audioIngressReady = false;
 let telegramRelayReady = false;
 
-function conversationPromptsReady() {
-  return promptsReady(manuals, "conversation", { providerKind });
-}
-
-function freeTimePromptsReady() {
-  return promptsReady(manuals, "conversation", { providerKind, sessionType: "free-time" });
-}
-
-function historyPromptsReady() {
-  return promptsReady(manuals, "ingress", { sourceSessionType: "conversation", providerKind });
-}
-
-function audioPromptsReady() {
-  return promptsReady(manuals, "ingress", { sourceSessionType: "audio", providerKind });
-}
-
 function chatRuntimeReady() {
-  return kwebReady && conversationHistoryReady && intelligenceReady && conversationPromptsReady();
+  return conversationHistoryReady;
 }
 
 function freeTimeRuntimeReady() {
-  return kwebReady && conversationHistoryReady && intelligenceReady && freeTimePromptsReady();
-}
-
-function memoryIngressRuntimeReady() {
-  return kwebReady && intelligenceReady && (
-    (conversationHistoryReady && historyPromptsReady())
-    || (audioIngressReady && audioPromptsReady())
-  );
-}
-
-const memoryIngress = new MemoryIngressCoordinator({
-  kweb,
-  intelligence,
-  rustLibs,
-  conversationHistory,
-  audioIngress,
-  telegramRelay,
-  getRuntime: () => ({
-    manuals,
-    rootNodeIds,
-    provider,
-    providerKind,
-    model,
-    reasoningEffort,
-    contextWindowTokens,
-    maxInputTokens,
-    conversationIngressReady: conversationHistoryReady && historyPromptsReady(),
-    audioIngressReady: audioIngressReady && audioPromptsReady(),
-  }),
-  isReady: memoryIngressRuntimeReady,
-  rootsForRecord,
-  referencesForRecord,
-  groupContextOf,
-  upsertHistory,
-  refreshHistory,
-  refreshAudioHistory: () => refreshAudioHistory(activeView === "audio"),
-  onUpdate: update,
-  onError: message => showError(ui.error_banner, message),
-  onStatus: message => { ui.service_status.textContent = message; },
-  isConversationPurging: id => purgingConversationIds.has(id),
-  isConversationPurged: id => purgedConversationIds.has(id),
-});
-
-function kickHistoryIngress() {
-  memoryIngress.kick();
+  return conversationHistoryReady;
 }
 
 function sessionTypeOf(record) {
@@ -169,19 +89,24 @@ function activeFreeTimeRecord() {
 }
 
 function renderSelfTimeControls() {
-  const metadata = freeTimeRun || freeTimeOf(activeFreeTimeRecord());
-  const active = Boolean(metadata);
+  const activeRecord = activeFreeTimeRecord();
+  const metadata = freeTimeOf(activeRecord);
+  const active = Boolean(activeRecord);
   ui.self_time_prompt.disabled = active || freeTimeStarting;
   ui.self_time_minutes.disabled = active || freeTimeStarting;
   ui.start_self_time.disabled = active || freeTimeStarting || !freeTimeRuntimeReady();
   ui.start_self_time.textContent = freeTimeStarting ? "Starting…" : active ? "Self time running" : "Start self time";
   ui.start_self_time.setAttribute("aria-busy", String(freeTimeStarting));
   if (!metadata) {
-    ui.self_time_status.textContent = freeTimeStarting ? "Reserving one run…" : "";
+    ui.self_time_status.textContent = active || freeTimeStarting ? "Backend is starting self time…" : "";
     return;
   }
   const savedPrompt = String(metadata.customPrompt || "");
   if (ui.self_time_prompt.value !== savedPrompt) ui.self_time_prompt.value = savedPrompt;
+  if (!metadata.deadlineAt) {
+    ui.self_time_status.textContent = "Backend is starting self time…";
+    return;
+  }
   try {
     const timing = freeTimeTiming(metadata);
     ui.self_time_status.textContent = timing.expired
@@ -196,115 +121,8 @@ function recordsForView(view = activeView) {
   return sortConversationHistory(historyRecords.filter(record => viewForSessionType(sessionTypeOf(record)) === view));
 }
 
-function groupContextOf(record) {
-  return record?.state?.channel?.groupContext
-    || record?.state?.archive?.channel?.groupContext
-    || record?.state?.historyIngress?.groupContext
-    || null;
-}
-
-function channelOf(record) {
-  return record?.state?.channel || record?.state?.archive?.channel || null;
-}
-
-function groupSessionMatches(record, event) {
-  if (sessionTypeOf(record) !== "telegram-group") return false;
-  const channel = channelOf(record);
-  const sameUser = String(channel?.telegramUserId) === String(event.telegramUserId);
-  const eventGroupId = event.groupId || event.groupContext?.groupId;
-  const channelGroupId = channel?.groupId || channel?.groupContext?.groupId;
-  const sameGroup = eventGroupId && channelGroupId
-    ? eventGroupId === channelGroupId
-    : String(channel?.chatId) === String(event.chatId);
-  return sameUser && sameGroup;
-}
-
-function rootsForRecord(record) {
-  const archived = record?.state?.archive;
-  const saved = record?.state?.rootNodeIds || archived?.rootNodeIds;
-  return Array.isArray(saved) && saved.length ? [...saved] : [...rootNodeIds];
-}
-
-function referencesForGroup(groupContext, directRoots) {
-  if (!Array.isArray(groupContext?.participants)) return [];
-  return [...new Set(groupContext.participants
-    .map(participant => participant?.rootNodeId)
-    .filter(id => typeof id === "string" && id && !directRoots.includes(id)))];
-}
-
-function referencesForRecord(record, directRoots = rootsForRecord(record)) {
-  const archived = record?.state?.archive;
-  const saved = record?.state?.referenceRootNodeIds || archived?.referenceRootNodeIds;
-  return Array.isArray(saved) ? [...saved] : referencesForGroup(groupContextOf(record), directRoots);
-}
-
-async function provisionDirectoryRoots() {
-  if (!kwebReady || !telegramRelayReady) return;
-  const [pendingUsers, pendingGroups] = await Promise.all([
-    telegramDirectory.provisioningUsers(),
-    telegramDirectory.provisioningGroups(),
-  ]);
-  for (const entry of pendingUsers.users || []) {
-    const isWebUser = String(entry.handle).toLowerCase() === CONFIG.webUserHandle.toLowerCase();
-    const targetRoot = isWebUser ? legacyUserRootNodeId : entry.rootNodeId;
-    if (!isWebUser) await kweb.bootstrapNode(targetRoot);
-    await telegramDirectory.completeHandleRoot(entry.handle, targetRoot);
-  }
-  for (const group of pendingGroups.groups || []) {
-    await kweb.bootstrapNode(group.rootNodeId, "Group Root");
-    await telegramDirectory.completeGroupRoot(group.groupId, group.rootNodeId);
-  }
-  webDirectoryUser = await telegramDirectory.userByHandle(CONFIG.webUserHandle);
-  rootNodeIds = [webDirectoryUser.rootNodeId, kennedyRootNodeId];
-}
-
-async function directoryUserForEvent(event) {
-  await provisionDirectoryRoots();
-  const user = await telegramDirectory.userById(event.telegramUserId);
-  if (!user.rootReady) {
-    await kweb.bootstrapNode(user.rootNodeId);
-    return telegramDirectory.completeUserRoot(user.telegramUserId, user.rootNodeId);
-  }
-  return user;
-}
-
-async function provisionGroupRoot(groupId) {
-  await provisionDirectoryRoots();
-  if (typeof groupId !== "string" || !groupId) throw new Error("Telegram group identity is missing.");
-  let group = await telegramDirectory.groupById(groupId);
-  if (!group.rootReady) {
-    await kweb.bootstrapNode(group.rootNodeId, "Group Root");
-    group = await telegramDirectory.completeGroupRoot(group.groupId, group.rootNodeId);
-  }
-  return group;
-}
-
-async function directoryGroupForEvent(event) {
-  return event.sessionKind === "group" ? provisionGroupRoot(event.groupId) : null;
-}
-
-async function decorateGroupContextWithDirectory(groupContext, groupId, directoryGroup = null) {
-  if (!groupContext) return groupContext;
-  const group = directoryGroup || await provisionGroupRoot(groupId);
-  const participants = await Promise.all((groupContext.participants || []).map(async participant => {
-    const user = await directoryUserForEvent(participant);
-    return { ...participant, rootNodeId: user.rootNodeId, rootReady: user.rootReady };
-  }));
-  return {
-    ...groupContext,
-    groupId,
-    groupRootNodeId: group.rootNodeId,
-    groupRootReady: group.rootReady,
-    participants,
-  };
-}
-
 function selectedRecord() {
   return historyRecords.find(record => record.id === selectedConversationId) || null;
-}
-
-function selectedSession() {
-  return liveSessions.get(selectedConversationId) || null;
 }
 
 function selectedAudioDetail() {
@@ -333,20 +151,7 @@ function archivedDiagnostic(archive, mode, transcript = []) {
   };
 }
 
-function conversationDiagnostic(record, session) {
-  if (session) {
-    return {
-      mode: session.sessionType === "free-time" ? "self time" : "conversation", provider, model,
-      chatend: session.chatend?.messages || [],
-      context: session.context?.diagnostics() || {},
-      loadCalls: session.executor?.loadCalls || 0,
-      loadLimit: session.executor?.loadLimit || 20,
-      toolLog: session.executor?.toolLog || [],
-      usage: session.usage?.snapshot() || null,
-      memory: session.context?.snapshot() || EMPTY_MEMORY,
-      historySegments: session.chatend?.historySegments || [],
-    };
-  }
+function conversationDiagnostic(record) {
   if (!record) return null;
   const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
   const archive = record.state?.archive?.format === "kennedy-chatend" ? record.state.archive : null;
@@ -354,19 +159,6 @@ function conversationDiagnostic(record, session) {
 }
 
 function historyIngressDiagnostic(record) {
-  if (record?.id === memoryIngress.activeRecord?.id && memoryIngress.diagnostic) {
-    return {
-      mode: "history ingress", provider, model,
-      chatend: memoryIngress.diagnostic.chatend?.messages || [],
-      context: memoryIngress.diagnostic.context?.diagnostics?.() || {},
-      loadCalls: memoryIngress.diagnostic.executor?.loadCalls || 0,
-      loadLimit: memoryIngress.diagnostic.executor?.loadLimit || 50,
-      toolLog: memoryIngress.diagnostic.executor?.toolLog || [],
-      usage: memoryIngress.diagnostic.usage?.snapshot?.() || null,
-      memory: memoryIngress.diagnostic.context?.snapshot?.() || EMPTY_MEMORY,
-      historySegments: memoryIngress.diagnostic.chatend?.historySegments || [],
-    };
-  }
   const archive = record?.state?.historyIngress;
   return archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
     ? archivedDiagnostic(archive, "history ingress")
@@ -393,7 +185,7 @@ function historyPhase(label, status, source) {
 function diagnostic() {
   if (activeView === "audio") return audioRecordingDiagnostic();
   const record = selectedRecord();
-  const conversation = conversationDiagnostic(record, selectedSession());
+  const conversation = conversationDiagnostic(record);
   const ingress = historyIngressDiagnostic(record);
   const status = ingressStatus(record, ingress);
   const current = ingress || conversation || {
@@ -407,19 +199,6 @@ function diagnostic() {
 }
 
 function audioPieceDiagnostic(piece) {
-  if (piece?.id === memoryIngress.activeAudioPiece?.id && memoryIngress.diagnostic) {
-    return {
-      mode: "audio ingress", provider, model,
-      chatend: memoryIngress.diagnostic.chatend?.messages || [],
-      context: memoryIngress.diagnostic.context?.diagnostics?.() || {},
-      loadCalls: memoryIngress.diagnostic.executor?.loadCalls || 0,
-      loadLimit: memoryIngress.diagnostic.executor?.loadLimit || 50,
-      toolLog: memoryIngress.diagnostic.executor?.toolLog || [],
-      usage: memoryIngress.diagnostic.usage?.snapshot?.() || null,
-      memory: memoryIngress.diagnostic.context?.snapshot?.() || EMPTY_MEMORY,
-      historySegments: memoryIngress.diagnostic.chatend?.historySegments || [],
-    };
-  }
   const archive = piece?.state?.historyIngress;
   return archive?.format === "kennedy-chatend"
     ? archivedDiagnostic(archive, "audio ingress")
@@ -427,21 +206,15 @@ function audioPieceDiagnostic(piece) {
 }
 
 function audioPieceIngressActivity(piece) {
-  const currentPiece = piece?.id === memoryIngress.activeAudioPiece?.id
-    ? memoryIngress.activeAudioPiece
-    : piece;
+  const currentPiece = piece;
   let diagnostic = null;
-  if (currentPiece?.id === memoryIngress.activeAudioPiece?.id && memoryIngress.diagnostic) {
-    diagnostic = memoryIngress.diagnostic;
-  } else {
-    const archive = currentPiece?.state?.historyIngress;
-    if (archive?.format === "kennedy-chatend") {
-      diagnostic = {
-        chatend: { messages: archive.messages || [] },
-        usage: { snapshot: () => archive.usage || null },
-        toolLog: archive.tools?.log || [],
-      };
-    }
+  const archive = currentPiece?.state?.historyIngress;
+  if (archive?.format === "kennedy-chatend") {
+    diagnostic = {
+      chatend: { messages: archive.messages || [] },
+      usage: { snapshot: () => archive.usage || null },
+      toolLog: archive.tools?.log || [],
+    };
   }
   const failed = currentPiece?.phase === "ingress_failed";
   const active = currentPiece?.phase === "ingress_pending" || currentPiece?.phase === "ingress_in_progress";
@@ -484,11 +257,7 @@ function audioRecordingDiagnostic() {
 }
 
 function visibleIngressActivity() {
-  return conversationIngressActivity({
-    record: selectedRecord(),
-    liveRecordId: memoryIngress.activeRecord?.id,
-    liveDiagnostic: memoryIngress.diagnostic,
-  });
+  return conversationIngressActivity({ record: selectedRecord() });
 }
 
 function update() {
@@ -536,24 +305,23 @@ function update() {
     return;
   }
   const record = selectedRecord();
-  const session = selectedSession();
-  const viewingHistory = Boolean(record && (record.phase !== "active" || !session));
+  const viewingHistory = Boolean(record);
   const telegramView = activeView === "telegram";
   const selfTimeView = activeView === "self-time";
   const freeTimeView = sessionTypeOf(record) === "free-time";
   const ingressActivity = visibleIngressActivity();
   renderTranscript(
     ui.transcript,
-    viewingHistory ? (record?.state?.transcript || []) : (session?.transcript || []),
+    record?.state?.transcript || [],
     ingressActivity,
     `${activeView}:${selectedConversationId || "none"}`,
     record?.phase === "ingress_failed"
       ? { retrying: retryingConversationIds.has(record.id), onRetry: () => retryConversationIngress(record) }
       : null,
   );
-  if (telegramView && !(viewingHistory ? record?.state?.transcript : session?.transcript)?.length && !ingressActivity?.diagnostic) {
-    ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Keep this page open: the relay queues messages while it is closed, and this visible UI owns Kennedy's Chatend and tool loop."));
-  } else if (selfTimeView && !(viewingHistory ? record?.state?.transcript : session?.transcript)?.length && !ingressActivity?.diagnostic) {
+  if (telegramView && !(record?.state?.transcript || []).length && !ingressActivity?.diagnostic) {
+    ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Kennedy's backend continues answering even when no browser is open."));
+  } else if (selfTimeView && !(record?.state?.transcript || []).length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "empty-state", "Start a self-time run above. Kennedy can follow your optional prompt or explore freely, and every clean-slate slice will remain visible here."));
   }
   renderConversationHistory(ui.conversation_history, recordsForView(), {
@@ -579,34 +347,42 @@ function update() {
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   }
-  const controls = conversationControlState({
-    hasSession: Boolean(session),
-    sessionBusy: Boolean(session?.busy),
-    transitionBusy: creatingConversation || endingIds.has(selectedConversationId),
-    pendingTurn: Boolean(session?.pendingTurn),
-    viewingHistory: viewingHistory || telegramView || selfTimeView || freeTimeView,
-    transcriptLength: session?.transcript.length || 0,
-  });
+  const activeConversation = activeView === "conversation" && record?.phase === "active"
+    && sessionTypeOf(record) === "conversation";
+  const pendingTurn = Boolean(record?.state?.pendingTurn || record?.state?.archive?.pendingTurn);
+  const backendStatus = record?.state?.orchestration?.status || record?.state?.archive?.orchestration?.status;
+  const commandHead = conversationCommandHeads.get(record?.id) || null;
+  const busy = Boolean(commandHead) || (pendingTurn && backendStatus !== "stopped");
+  const retryable = pendingTurn && backendStatus === "stopped" && !commandHead;
+  const stoppable = commandHead?.status === "processing"
+    && ["message", "retry"].includes(commandHead.kind)
+    && !commandHead.cancelRequested;
+  const transitionBusy = creatingConversation || endingIds.has(selectedConversationId);
+  const endingConversation = endingIds.has(selectedConversationId)
+    || ["end", "send-and-end"].includes(commandHead?.kind);
+  const composerHidden = !activeConversation || telegramView || selfTimeView || freeTimeView;
   const extractingAttachment = extractingAttachments.has(selectedConversationId);
-  ui.message_form.classList.toggle("hidden", controls.composerHidden);
-  ui.message_input.disabled = controls.inputDisabled;
-  ui.send_button.disabled = controls.sendDisabled || extractingAttachment;
-  ui.send_end_button.disabled = controls.sendDisabled || extractingAttachment;
-  ui.end_button.disabled = controls.endDisabled;
-  ui.stop_button.classList.toggle("hidden", controls.stopHidden || !session?.canStop);
-  ui.stop_button.disabled = Boolean(session?.stopping);
-  ui.stop_button.textContent = session?.stopping ? "Stopping…" : "Stop Kennedy";
-  ui.new_conversation.disabled = controls.newDisabled || !chatRuntimeReady();
+  ui.message_form.classList.toggle("hidden", composerHidden);
+  ui.message_input.disabled = !activeConversation || transitionBusy;
+  ui.send_button.disabled = !activeConversation || busy || transitionBusy || extractingAttachment;
+  ui.send_end_button.disabled = !activeConversation || busy || transitionBusy || extractingAttachment;
+  ui.end_button.disabled = !activeConversation || transitionBusy || endingConversation;
+  ui.retry_button.classList.toggle("hidden", !activeConversation || !retryable);
+  ui.retry_button.disabled = !activeConversation || !retryable || transitionBusy;
+  ui.stop_button.classList.toggle("hidden", !activeConversation || !stoppable);
+  ui.stop_button.disabled = false;
+  ui.stop_button.textContent = "Stop Kennedy";
+  ui.new_conversation.disabled = creatingConversation || !chatRuntimeReady();
   ui.new_conversation.classList.toggle("hidden", telegramView || selfTimeView);
-  ui.voice_button.disabled = controls.sendDisabled || !transcriptionAvailable
+  ui.voice_button.disabled = !activeConversation || busy || transitionBusy || !transcriptionAvailable
     || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function";
   const attachments = attachmentDrafts.get(selectedConversationId) || [];
-  ui.attach_button.disabled = controls.sendDisabled || extractingAttachment;
+  ui.attach_button.disabled = !activeConversation || busy || transitionBusy || extractingAttachment;
   ui.attachment_status.textContent = attachments.length
     ? `${attachments.length} attached: ${attachments.map(item => item.fileName).join(", ")}`
     : "PDF, Word, spreadsheet, or text";
   ui.clear_attachments.classList.toggle("hidden", !attachments.length);
-  ui.clear_attachments.disabled = controls.sendDisabled || extractingAttachment;
+  ui.clear_attachments.disabled = !activeConversation || busy || transitionBusy || extractingAttachment;
   ui.history_eyebrow.textContent = telegramView ? "TELEGRAM SESSIONS" : selfTimeView ? "SELF-TIME SESSIONS" : "YOUR CONVERSATIONS";
   ui.history_title.textContent = telegramView ? "Bot chats" : selfTimeView ? "Self time" : "History";
   ui.chatend_title.textContent = currentDiagnostic.mode === "history ingress"
@@ -615,22 +391,20 @@ function update() {
     : telegramView ? "Telegram Chatend" : currentDiagnostic.ingressStatus
       ? `Chatend · ingress ${currentDiagnostic.ingressStatus}`
       : "Chatend";
-  ui.end_button.textContent = session?.pendingTurn ? "Retry saved query" : "End conversation";
+  ui.end_button.textContent = endingConversation ? "Ending conversation…" : "End conversation";
   ui.activity.textContent = freeTimeView
-    ? session?.stopping ? "Self time reached its hard stop"
-      : session?.busy ? "Kennedy is enjoying self time"
-        : "This self-time session is closing"
+    ? record?.phase === "active" ? "Kennedy's backend is running self time" : "This self-time session is closed"
     : telegramView
-    ? session?.busy ? "Kennedy is answering this Telegram message" : "Messages are delivered automatically"
-    : viewingHistory
-    ? record?.phase === "active" ? "Chat is unavailable; this saved conversation is read only" : "This conversation is closed and read only"
-    : session?.stopping
-      ? "Stopping Kennedy — the saved query will remain retryable"
-    : session?.busy
-      ? "Kennedy is working — you can draft your next message"
-      : session?.pendingTurn
-        ? "Saved query needs a response — you can keep drafting"
-      : "";
+    ? pendingTurn ? "Kennedy's backend is answering a Telegram message" : "Messages are delivered automatically"
+    : record?.phase !== "active"
+      ? "This conversation is closed and read only"
+      : commandHead?.cancelRequested
+          ? "Kennedy's backend is stopping"
+          : commandHead?.status === "pending"
+            ? "Your request is queued in Kennedy's backend"
+            : backendStatus === "stopped"
+              ? "Saved query needs a response — retry when ready"
+              : busy ? "Kennedy's backend is working — you can draft your next message" : "";
 }
 
 function upsertHistory(record) {
@@ -649,11 +423,14 @@ async function hydrateHistoryRecord(recordOrId) {
 }
 
 function saveDraft() {
-  if (activeView === "conversation" && selectedSession()) drafts.set(selectedConversationId, ui.message_input.value);
+  if (activeView === "conversation" && selectedRecord()?.phase === "active") drafts.set(selectedConversationId, ui.message_input.value);
 }
 
 function restoreDraft() {
-  ui.message_input.value = selectedSession() ? (drafts.get(selectedConversationId) || "") : "";
+  const record = selectedRecord();
+  ui.message_input.value = activeView === "conversation" && record?.phase === "active"
+    ? (drafts.get(selectedConversationId) || "")
+    : "";
 }
 
 function composerHeightBounds() {
@@ -708,7 +485,7 @@ async function attachSelectedFiles() {
   const id = selectedConversationId;
   const files = Array.from(ui.attachment_input.files || []);
   ui.attachment_input.value = "";
-  if (!files.length || !selectedSession() || activeView !== "conversation") return;
+  if (!files.length || selectedRecord()?.phase !== "active" || activeView !== "conversation") return;
   const existing = attachmentDrafts.get(id) || [];
   if (existing.length + files.length > MAX_ATTACHMENT_FILES) {
     showError(ui.error_banner, `Attach at most ${MAX_ATTACHMENT_FILES} files to one message.`);
@@ -746,7 +523,9 @@ async function attachSelectedFiles() {
         extractionDurationMs: Math.max(0, Math.round(performance.now() - started)),
       });
     }
-    if (liveSessions.has(id)) attachmentDrafts.set(id, [...existing, ...extracted]);
+    if (selectedConversationId === id && selectedRecord()?.phase === "active") {
+      attachmentDrafts.set(id, [...existing, ...extracted]);
+    }
   } catch (error) {
     showError(ui.error_banner, `Attachment could not be read: ${error.message}`);
   } finally {
@@ -828,20 +607,29 @@ async function toggleVoiceRecording() {
   }
 }
 
-async function reconcileLiveSessions(records) {
+function reconcileHistory(records) {
   historyRecords = reconcileConversationHistory(historyRecords, records);
-  const activeIds = new Set(historyRecords.filter(record => record.phase === "active").map(record => record.id));
-  for (const [id, session] of liveSessions.entries()) {
-    if (!activeIds.has(id)) {
-      await session.releaseRustLibs().catch(() => {});
-      liveSessions.delete(id);
+  for (const id of endingIds) {
+    if (!historyRecords.some(record => record.id === id && record.phase === "active")) {
+      endingIds.delete(id);
     }
   }
 }
 
 async function refreshHistory() {
-  const records = (await conversationHistory.list()).conversations || [];
-  await reconcileLiveSessions(records);
+  const [history, commands] = await Promise.all([
+    conversationHistory.list(),
+    conversationHistory.commandHeads(),
+  ]);
+  const records = history.conversations || [];
+  conversationCommandHeads = new Map((commands.commands || []).map(command => [command.conversationId, command]));
+  reconcileHistory(records);
+  const selected = historyRecords.find(record => record.id === selectedConversationId);
+  if (selected?.summary) {
+    try { await hydrateHistoryRecord(selected); } catch (error) {
+      if (error?.code !== "not_found") throw error;
+    }
+  }
   update();
 }
 
@@ -892,7 +680,6 @@ async function retryAudioIngressPiece(piece) {
       state: freshIngressState(piece.state),
     });
     await refreshAudioHistory(true);
-    kickHistoryIngress();
   } catch (error) {
     showError(ui.error_banner, `Audio memory ingress could not be retried: ${error.message}`);
   } finally {
@@ -921,7 +708,6 @@ async function retryAudioIngressRecording(record) {
       expected_version: piece.version,
       state: freshIngressState(piece.state),
     })));
-    kickHistoryIngress();
   } catch (error) {
     showError(ui.error_banner, `Audio memory ingress could not be retried: ${error.message}`);
   } finally {
@@ -947,7 +733,6 @@ async function retryConversationIngress(record) {
       state: freshIngressState(latest.state),
     });
     upsertHistory(retried);
-    kickHistoryIngress();
   } catch (error) {
     showError(ui.error_banner, `History ingress could not be retried: ${error.message}`);
   } finally {
@@ -970,7 +755,6 @@ function purgeWarning(record) {
 function removePurgedConversation(id) {
   const purged = historyRecords.find(record => record.id === id);
   historyRecords = historyRecords.filter(record => record.id !== id);
-  liveSessions.delete(id);
   drafts.delete(id);
   voiceDrafts.delete(id);
   attachmentDrafts.delete(id);
@@ -978,12 +762,6 @@ function removePurgedConversation(id) {
   conversationErrors.delete(id);
   endingIds.delete(id);
   retryingConversationIds.delete(id);
-  memoryIngress.clearConversation(id);
-  const sameActiveRunRemains = historyRecords.some(record => record.phase === "active" && freeTimeOf(record)?.runId === freeTimeOf(purged)?.runId);
-  if (sessionTypeOf(purged) === "free-time" && !sameActiveRunRemains && freeTimeRun?.runId === freeTimeOf(purged)?.runId) {
-    freeTimeRun = null;
-    freeTimeContinuationRuns.delete(freeTimeOf(purged)?.runId);
-  }
   if (selectedConversationId === id) {
     const replacement = recordsForView()[0]?.id || null;
     selectedConversationId = replacement;
@@ -993,10 +771,7 @@ function removePurgedConversation(id) {
 }
 
 async function cancelConversationWork(id) {
-  const session = liveSessions.get(id);
-  if (session?.canStop) await session.stopPendingTurn();
-  await memoryIngress.cancelConversation(id);
-  if (session) await session.releaseRustLibs();
+  await conversationHistory.stop(id).catch(() => null);
 }
 
 async function forcePurgeConversation(record) {
@@ -1046,61 +821,18 @@ async function forcePurgeConversation(record) {
   }
 }
 
-async function persistSession(id, state, metadata = {}) {
-  let record = historyRecords.find(item => item.id === id);
-  if (!record || record.phase !== "active") throw new Error("This conversation is no longer live.");
-  const body = { expected_version: record.version, state, user_activity: Boolean(metadata.userActivity) };
-  try {
-    record = await conversationHistory.checkpoint(id, body);
-  } catch (error) {
-    if (error.code !== "state_conflict") throw error;
-    const latest = await conversationHistory.get(id);
-    upsertHistory(latest);
-    if (latest.phase !== "active" || JSON.stringify(latest.state) !== JSON.stringify(state)) throw error;
-    record = latest;
-  }
-  upsertHistory(record);
-  if (metadata.userActivity) {
-    await refreshHistory();
-    kickHistoryIngress();
-  }
-}
-
-async function buildConversation(record) {
-  record = await hydrateHistoryRecord(record);
-  const sessionType = sessionTypeOf(record);
-  const sessionRoots = rootsForRecord(record);
-  const referenceRootNodeIds = referencesForRecord(record, sessionRoots);
-  const session = new ConversationSession({
-    kweb, intelligence, rustLibs, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
-    sessionType,
-    channel: record.state?.channel || record.state?.archive?.channel || null,
-    freeTime: freeTimeOf(record),
-    provenanceId: record.state?.provenanceId || record.state?.archive?.provenanceId || null,
-    persist: (state, metadata) => persistSession(record.id, state, metadata),
-    onUpdate: update,
-  });
-  await session.initialize(record.state || null);
-  liveSessions.set(record.id, session);
-  return session;
-}
-
 async function createNewConversation() {
   if (creatingConversation) return;
-  if (!chatRuntimeReady()) throw new Error("A new conversation cannot start until Kweb, conversation history, intelligence, and the conversation prompts are available.");
+  if (!chatRuntimeReady()) throw new Error("A new conversation cannot start until conversation history is available.");
   creatingConversation = true;
   saveDraft();
   update();
   try {
-    const session = new ConversationSession({
-      kweb, intelligence, rustLibs, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort, contextWindowTokens, maxInputTokens,
-      sessionType: "conversation",
-      onUpdate: update,
+    const record = await conversationHistory.start({
+      idempotency_id: newIdempotencyId(),
+      started_at: new Date().toISOString(),
+      session_type: "conversation",
     });
-    await session.initialize();
-    const record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
-    session.persist = (state, metadata) => persistSession(record.id, state, metadata);
-    liveSessions.set(record.id, session);
     drafts.set(record.id, "");
     upsertHistory(record);
     selectedConversationId = record.id;
@@ -1115,82 +847,12 @@ async function createNewConversation() {
   }
 }
 
-function freeTimeTimerAt(timestamp, callback) {
-  const delay = Math.max(0, Math.min(2_147_483_647, timestamp - Date.now()));
-  return setTimeout(callback, delay);
-}
-
-async function closeFreeTimeSession(id, session) {
-  await session.releaseRustLibs();
-  let record = historyRecords.find(item => item.id === id) || await conversationHistory.get(id);
-  if (record.phase === "active") {
-    record = await conversationHistory.completeWithoutIngress(id, {
-      expected_version: record.version,
-      state: session.snapshot(),
-    });
-    upsertHistory(record);
-  }
-  liveSessions.delete(id);
-  drafts.delete(id);
-  voiceDrafts.delete(id);
-  attachmentDrafts.delete(id);
-  update();
-  return record;
-}
-
-async function createFreeTimeSlice(freeTime, { select = false } = {}) {
-  const session = new ConversationSession({
-    kweb, intelligence, rustLibs, manuals, rootNodeIds, provider, providerKind, model, reasoningEffort,
-    contextWindowTokens, maxInputTokens, sessionType: "free-time", freeTime,
-    provenanceId: freeTime.provenanceId, onUpdate: update,
-  });
-  await session.initialize();
-  session.stageFreeTimeOpening();
-  let record;
-  try {
-    record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
-  } catch (error) {
-    if (error?.code !== "free_time_already_active") throw error;
-    await refreshHistory();
-    record = activeFreeTimeRecord();
-    if (!record) throw error;
-    freeTimeRun = freeTimeOf(record);
-    if (!liveSessions.has(record.id)) await buildConversation(record);
-    if (select) {
-      if (activeView !== "self-time") showView("self-time");
-      selectedConversationId = record.id;
-      selectedByView["self-time"] = record.id;
-      restoreDraft();
-    }
-    update();
-    launchFreeTimeRecord(record.id);
-    return record;
-  }
-  session.persist = (state, metadata) => persistSession(record.id, state, metadata);
-  liveSessions.set(record.id, session);
-  drafts.set(record.id, "");
-  upsertHistory(record);
-  await session.persistSnapshot(session.snapshot(), { userActivity: true });
-  session.pendingCheckpointed = true;
-  record = historyRecords.find(item => item.id === record.id) || record;
-  freeTimeRun = freeTime;
-  if (select) {
-    if (activeView !== "self-time") showView("self-time");
-    selectedConversationId = record.id;
-    selectedByView["self-time"] = record.id;
-    restoreDraft();
-  }
-  update();
-  launchFreeTimeRecord(record.id);
-  return record;
-}
-
 async function startFreeTime() {
   if (freeTimeStartPromise) return freeTimeStartPromise;
-  if (freeTimeRun || activeFreeTimeRecord()) return null;
+  if (activeFreeTimeRecord()) return null;
   freeTimeStarting = true;
   update();
-  const work = startFreeTimeCoordinated();
+  const work = startFreeTimeIntent();
   freeTimeStartPromise = work;
   try {
     return await work;
@@ -1201,180 +863,24 @@ async function startFreeTime() {
   }
 }
 
-async function startFreeTimeCoordinated() {
-  if (navigator.locks?.request) {
-    return navigator.locks.request("kennedy-free-time-start", async () => {
-      await refreshHistory();
-      return startFreeTimeUnlocked();
-    });
-  }
+async function startFreeTimeIntent() {
   await refreshHistory();
-  return startFreeTimeUnlocked();
-}
-
-async function startFreeTimeUnlocked() {
-  if (freeTimeRun || activeFreeTimeRecord()) return;
-  if (!freeTimeRuntimeReady()) throw new Error("Self time cannot start until Kweb, conversation history, intelligence, and the self-time prompts are available.");
+  if (activeFreeTimeRecord()) return null;
+  if (!freeTimeRuntimeReady()) throw new Error("Self time cannot start until conversation history is available.");
   const durationMinutes = parseFreeTimeMinutes(ui.self_time_minutes.value || DEFAULT_FREE_TIME_MINUTES);
   const customPrompt = parseSelfTimePrompt(ui.self_time_prompt.value);
-  const runStartedAt = new Date().toISOString();
-  const runId = crypto.randomUUID();
-  const freeTime = {
-    runId,
-    runStartedAt,
-    deadlineAt: new Date(Date.now() + Math.round(durationMinutes * 60_000)).toISOString(),
-    durationMinutes,
-    customPrompt,
-    sliceIndex: 1,
-  };
-  const provenance = await kweb.createProvenance({
+  const record = await conversationHistory.start({
     idempotency_id: newIdempotencyId(),
-    data: JSON.stringify({ kind: "free-time", ...freeTime }, null, 2),
-    source: "free-time",
-    source_created_at: runStartedAt,
+    started_at: new Date().toISOString(),
+    session_type: "free-time",
+    duration_minutes: durationMinutes,
+    custom_prompt: customPrompt,
   });
-  freeTime.provenanceId = provenance.id;
-  await createFreeTimeSlice(freeTime, { select: true });
-}
-
-function launchFreeTimeRecord(id) {
-  if (!id || freeTimeRunnerIds.has(id)) return;
-  freeTimeRunnerIds.add(id);
-  const run = () => runFreeTimeRecord(id);
-  const work = navigator.locks?.request
-    ? navigator.locks.request("kennedy-free-time", { ifAvailable: true }, lock => {
-      if (lock) return run();
-      setTimeout(() => launchFreeTimeRecord(id), 2_000);
-      return undefined;
-    })
-    : run();
-  Promise.resolve(work).catch(error => {
-    if (!purgedConversationIds.has(id)) {
-      showError(ui.error_banner, `Self time will retry its saved session: ${error.message}`);
-      setTimeout(() => launchFreeTimeRecord(id), 2_000);
-    }
-  }).finally(() => {
-    freeTimeRunnerIds.delete(id);
-    renderSelfTimeControls();
-  });
-}
-
-function scheduleFreeTimeContinuation(freeTime, select) {
-  if (freeTimeContinuationRuns.has(freeTime.runId)) return;
-  freeTimeContinuationRuns.add(freeTime.runId);
-  freeTimeRun = freeTime;
-  const finishRun = () => {
-    freeTimeContinuationRuns.delete(freeTime.runId);
-    if (freeTimeRun?.runId === freeTime.runId) freeTimeRun = null;
-    update();
-  };
-  const attempt = async () => {
-    if (!freeTimeCanStartNewSession(freeTime)) {
-      finishRun();
-      return;
-    }
-    try {
-      await createFreeTimeSlice(freeTime, { select });
-      freeTimeContinuationRuns.delete(freeTime.runId);
-    } catch (error) {
-      showError(ui.error_banner, `The next self-time session will retry opening: ${error.message}`);
-      setTimeout(attempt, 2_000);
-    }
-  };
-  Promise.resolve(attempt());
-}
-
-async function runFreeTimeRecord(id) {
-  let record = await conversationHistory.get(id);
   upsertHistory(record);
-  if (record.phase !== "active" || sessionTypeOf(record) !== "free-time") {
-    await refreshHistory();
-    const current = activeFreeTimeRecord();
-    if (current) {
-      freeTimeRun = freeTimeOf(current);
-      launchFreeTimeRecord(current.id);
-    } else if (freeTimeRun && !freeTimeCanStartNewSession(freeTimeRun)) {
-      freeTimeRun = null;
-      update();
-    } else if (freeTimeRun) {
-      // Another tab may be between closing one slice and durably creating the
-      // next. Keep following the run instead of leaving this tab's controls in
-      // a stale active state until reload.
-      setTimeout(() => launchFreeTimeRecord(id), 2_000);
-    }
-    return;
-  }
-  let session = liveSessions.get(id);
-  if (!session) session = await buildConversation(record);
-  const metadata = session.freeTime || freeTimeOf(record);
-  const timing = freeTimeTiming(metadata);
-  freeTimeRun = metadata;
-  const warningTimer = freeTimeTimerAt(timing.deadlineMs - FREE_TIME_WARNING_MS, () => {
-    renderSelfTimeControls();
-    if (!session.busy && session.pendingTurn) {
-      session.prepareFreeTimeRound().catch(error => showError(ui.error_banner, `The self-time warning could not be saved: ${error.message}`));
-    }
-  });
-  const deadlineTimer = freeTimeTimerAt(timing.deadlineMs, renderSelfTimeControls);
-  const hardStopTimer = freeTimeTimerAt(timing.hardStopMs, () => {
-    renderSelfTimeControls();
-    if (session.canStop) Promise.resolve(session.stopPendingTurn()).catch(() => {});
-  });
-  const savedReason = session.freeTime?.sliceEndedReason;
-  let reason = ["tool", "deadline", "hard-stop"].includes(savedReason) ? savedReason : null;
-  let lastRetryError = null;
-  try {
-    while (!reason) {
-      const currentTiming = freeTimeTiming(metadata);
-      if (currentTiming.hardExpired) {
-        if (session.canStop) await session.stopPendingTurn().catch(() => {});
-        reason = "hard-stop";
-        break;
-      }
-      if (!session.pendingTurn && !session.transcript.length) {
-        session.stageFreeTimeOpening();
-        await session.persistSnapshot(session.snapshot(), { userActivity: true });
-        session.pendingCheckpointed = true;
-      }
-      if (!session.pendingTurn) {
-        if (session.freeTimeEndReason || currentTiming.expired) {
-          reason = session.freeTimeEndReason || "deadline";
-          break;
-        }
-        await session.continueFreeTimeAfterUnexpectedCompletion();
-        continue;
-      }
-      try {
-        await session.resumePendingTurn();
-        lastRetryError = null;
-      } catch (error) {
-        const stoppedAtHardLimit = error?.code === "turn_stopped" && freeTimeTiming(metadata).hardExpired;
-        if (stoppedAtHardLimit) {
-          reason = "hard-stop";
-          break;
-        }
-        if (lastRetryError !== error.message) {
-          lastRetryError = error.message;
-          showError(ui.error_banner, `Self time is retrying Kennedy's saved round: ${error.message}`);
-        }
-        await new Promise(resolve => setTimeout(resolve, 2_000));
-      }
-    }
-    await session.finalizeFreeTime(reason);
-    const finalMetadata = session.freeTime || metadata;
-    const selectNext = selectedConversationId === id;
-    await closeFreeTimeSession(id, session);
-    if (freeTimeCanStartNewSession(finalMetadata) && !purgedConversationIds.has(id)) {
-      scheduleFreeTimeContinuation(nextFreeTimeSlice(finalMetadata), selectNext);
-    } else if (freeTimeRun?.runId === finalMetadata.runId) {
-      freeTimeRun = null;
-      update();
-    }
-  } finally {
-    clearTimeout(warningTimer);
-    clearTimeout(deadlineTimer);
-    clearTimeout(hardStopTimer);
-  }
+  if (activeView !== "self-time") showView("self-time");
+  selectedConversationId = record.id;
+  selectedByView["self-time"] = record.id;
+  update();
 }
 
 async function selectConversation(id) {
@@ -1388,27 +894,17 @@ async function selectConversation(id) {
   selectedByView[viewForSessionType(sessionTypeOf(record))] = id;
   restoreDraft();
   update();
-  if (record.phase === "active" && !liveSessions.has(id) && chatRuntimeReady()) {
-    try {
-      await buildConversation(record);
-    } catch (error) {
-      update();
-      throw new Error(`This live conversation could not be restored. You can still purge it: ${error.message}`);
-    }
-  }
-  restoreDraft();
-  update();
   ui.transcript.scrollTop = ui.transcript.scrollHeight;
-  if (selectedSession()) ui.message_input.focus();
+  if (activeView === "conversation" && record.phase === "active") ui.message_input.focus();
   const error = conversationErrors.get(id);
   if (error) showError(ui.error_banner, error);
 }
 
 async function submitMessage(event) {
   event.preventDefault();
-  const session = selectedSession();
+  const record = selectedRecord();
   const id = selectedConversationId;
-  if (!session || session.busy || session.pendingTurn || endingIds.has(id) || extractingAttachments.has(id)) return;
+  if (!record || record.phase !== "active" || endingIds.has(id) || extractingAttachments.has(id)) return;
   const text = ui.message_input.value;
   const attachments = attachmentDrafts.get(id) || [];
   if (!text.trim() && !attachments.length) return;
@@ -1419,14 +915,17 @@ async function submitMessage(event) {
   attachmentDrafts.delete(id);
   conversationErrors.delete(id);
   try {
-    await session.send(text, metadata);
+    const command = await conversationHistory.queueCommand(id, {
+      idempotency_id: newIdempotencyId(),
+      kind: "message",
+      payload: { text, metadata },
+    });
+    conversationCommandHeads.set(id, command);
+    await refreshHistory().catch(error => {
+      showError(ui.error_banner, `The message was queued, but the refreshed backend view is delayed: ${error.message}`);
+    });
   } catch (error) {
-    if (error?.code === "turn_stopped") {
-      conversationErrors.delete(id);
-      update();
-      return;
-    }
-    const message = error.message || "Kennedy could not answer the saved query.";
+    const message = error.message || "The message could not be queued for Kennedy's backend.";
     conversationErrors.set(id, message);
     if (selectedConversationId === id) showError(ui.error_banner, message);
   }
@@ -1434,17 +933,17 @@ async function submitMessage(event) {
 }
 
 async function resumeSavedQuery(id = selectedConversationId) {
-  const session = liveSessions.get(id);
-  if (!session?.pendingTurn || session.busy) return;
+  const record = historyRecords.find(item => item.id === id);
+  if (!record || record.phase !== "active") return;
   conversationErrors.delete(id);
   try {
-    await session.resumePendingTurn();
+    const command = await conversationHistory.queueCommand(id, {
+      idempotency_id: newIdempotencyId(),
+      kind: "retry",
+      payload: {},
+    });
+    conversationCommandHeads.set(id, command);
   } catch (error) {
-    if (error?.code === "turn_stopped") {
-      conversationErrors.delete(id);
-      update();
-      return;
-    }
     const message = `The saved query could not be resumed: ${error.message}`;
     conversationErrors.set(id, message);
     if (selectedConversationId === id) showError(ui.error_banner, message);
@@ -1454,59 +953,47 @@ async function resumeSavedQuery(id = selectedConversationId) {
 
 async function stopConversationTurn() {
   const id = selectedConversationId;
-  const session = selectedSession();
-  if (!session?.canStop) return;
+  if (!selectedRecord() || selectedRecord().phase !== "active") return;
   conversationErrors.delete(id);
   try {
-    await session.stopPendingTurn();
+    const stopped = await conversationHistory.stop(id);
+    const command = conversationCommandHeads.get(id);
+    if (stopped.stop_requested && command) {
+      conversationCommandHeads.set(id, { ...command, cancelRequested: true });
+    }
   } catch (error) {
     showError(ui.error_banner, `Kennedy could not be stopped cleanly: ${error.message}`);
   }
   update();
 }
 
-async function closeConversation(id, session, record) {
-  await session.releaseRustLibs();
-  const latest = historyRecords.find(item => item.id === id) || record;
-  const closed = await conversationHistory.requestIngress(id, {
-    expected_version: latest.version,
-    state: session.snapshot(),
-  });
-  upsertHistory(closed);
-  liveSessions.delete(id);
-  drafts.delete(id);
-  voiceDrafts.delete(id);
-  attachmentDrafts.delete(id);
-  selectedConversationId = id;
-  selectedByView.conversation = id;
-  restoreDraft();
-  update();
-  kickHistoryIngress();
-  return closed;
-}
-
 async function endConversation() {
   const id = selectedConversationId;
-  const session = selectedSession();
   const record = selectedRecord();
-  if (!session || !record || session.busy || session.pendingTurn || endingIds.has(id)) return;
+  if (!record || record.phase !== "active" || endingIds.has(id)) return;
   endingIds.add(id);
   update();
+  let queued = false;
   try {
-    await closeConversation(id, session, record);
+    const command = await conversationHistory.queueCommand(id, {
+      idempotency_id: newIdempotencyId(),
+      kind: "end",
+      payload: {},
+    });
+    conversationCommandHeads.set(id, command);
+    queued = true;
   } catch (error) {
     showError(ui.error_banner, error.message);
   } finally {
-    endingIds.delete(id);
+    if (!queued) endingIds.delete(id);
     update();
   }
 }
 
 async function sendAndEndConversation() {
   const id = selectedConversationId;
-  const session = selectedSession();
   const record = selectedRecord();
-  if (!session || !record || session.busy || session.pendingTurn || endingIds.has(id) || extractingAttachments.has(id)) return;
+  if (!record || record.phase !== "active" || record.state?.pendingTurn || endingIds.has(id) || extractingAttachments.has(id)) return;
   const text = ui.message_input.value;
   const attachments = attachmentDrafts.get(id) || [];
   if (!text.trim() && !attachments.length) return;
@@ -1514,650 +1001,22 @@ async function sendAndEndConversation() {
   endingIds.add(id);
   update();
   try {
-    const appended = await session.appendFinalUserMessage(text, metadata);
-    if (!appended) return;
+    const command = await conversationHistory.queueCommand(id, {
+      idempotency_id: newIdempotencyId(),
+      kind: "send-and-end",
+      payload: { text, metadata },
+    });
+    conversationCommandHeads.set(id, command);
     ui.message_input.value = "";
     drafts.set(id, "");
     voiceDrafts.delete(id);
     attachmentDrafts.delete(id);
-    await closeConversation(id, session, record);
   } catch (error) {
     showError(ui.error_banner, `The final message was not fully closed into history ingress: ${error.message}`);
   } finally {
     endingIds.delete(id);
     update();
   }
-}
-
-async function createTelegramConversation(event) {
-  const directoryUser = await directoryUserForEvent(event);
-  const sessionType = event.sessionKind === "group" ? "telegram-group" : "telegram";
-  const directoryGroup = await directoryGroupForEvent(event);
-  const sessionRoots = directoryGroup
-    ? [directoryUser.rootNodeId, directoryGroup.rootNodeId, kennedyRootNodeId]
-    : [directoryUser.rootNodeId, kennedyRootNodeId];
-  const directoryGroupContext = sessionType === "telegram-group" && event.groupContext
-    ? await decorateGroupContextWithDirectory(event.groupContext, event.groupId, directoryGroup)
-    : null;
-  const latestGroupMessageId = (directoryGroupContext?.messages || [])
-    .reduce((latest, message) => Math.max(latest, Number(message.messageId) || 0), 0);
-  const groupContext = directoryGroupContext
-    ? { ...directoryGroupContext, messages: directoryGroupContext.messages.filter(message => String(message.messageId) !== String(event.messageId)) }
-    : null;
-  const referenceRootNodeIds = referencesForGroup(groupContext, sessionRoots);
-  const channel = {
-    kind: sessionType,
-    telegramUserId: event.telegramUserId,
-    chatId: event.chatId,
-    groupId: event.groupId || null,
-    username: event.username || null,
-    displayName: event.displayName,
-    groupRootNodeId: directoryGroup?.rootNodeId || null,
-    groupContext,
-    lastGroupContextMessageId: latestGroupMessageId,
-  };
-  const session = new ConversationSession({
-    kweb, intelligence, rustLibs, manuals, rootNodeIds: sessionRoots, referenceRootNodeIds, provider, providerKind, model, reasoningEffort,
-    contextWindowTokens, maxInputTokens, sessionType, channel, onUpdate: update,
-  });
-  await session.initialize();
-  const record = await conversationHistory.create({ started_at: session.startedAt, state: session.snapshot() });
-  session.persist = (state, metadata) => persistSession(record.id, state, metadata);
-  liveSessions.set(record.id, session);
-  upsertHistory(record);
-  if (activeView === "telegram" && !recordsForView("telegram").some(item => item.id === selectedConversationId)) {
-    selectedConversationId = record.id;
-    selectedByView.telegram = record.id;
-  }
-  update();
-  return { record, session };
-}
-
-async function telegramConversationFor(event, runtime = null) {
-  const group = event.sessionKind === "group";
-  let record = event.conversationId
-    ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
-    : null;
-  if (record && group && !groupSessionMatches(record, event)) record = null;
-  if (!record && !group) {
-    record = historyRecords.find(item => item.phase === "active"
-      && sessionTypeOf(item) === "telegram"
-      && String(item.state?.channel?.telegramUserId) === String(event.telegramUserId));
-  }
-  if (!record && group) {
-    record = historyRecords.find(item => item.phase === "active" && groupSessionMatches(item, event));
-  }
-  let session = record?.phase === "active" ? liveSessions.get(record.id) : null;
-  if (record?.phase === "active" && !session) session = await buildConversation(record);
-  let created = false;
-  if (!record || record.phase !== "active") {
-    ({ record, session } = await createTelegramConversation(event));
-    created = true;
-  }
-  if (runtime) {
-    runtime.record = record;
-    runtime.session = session;
-  }
-  if (event.conversationId !== record.id || !event.processingStartedAt) {
-    await telegramRelay.bind(event.id, record.id, event.conversationId || null);
-  }
-  if (runtime) runtime.conversationId = record.id;
-  if (group && !created) {
-    const groupContext = await decorateGroupContextWithDirectory(
-      event.groupContext,
-      event.groupId,
-    );
-    session.channel = {
-      ...(session.channel || {}),
-      username: event.username || null,
-      displayName: event.displayName,
-      groupId: event.groupId,
-      groupRootNodeId: groupContext?.groupRootNodeId || session.channel?.groupRootNodeId || null,
-    };
-    session.refreshTelegramGroupContext(groupContext, event.messageId);
-    await session.persistSnapshot(session.snapshot());
-  }
-  return { record, session };
-}
-
-async function processTelegramReset(event, runtime = null) {
-  const group = event.sessionKind === "group";
-  let record = event.conversationId
-    ? historyRecords.find(item => item.id === event.conversationId) || await conversationHistory.get(event.conversationId).catch(() => null)
-    : null;
-  if (record && group && !groupSessionMatches(record, event)) record = null;
-  if (!record || record.phase !== "active") {
-    record = historyRecords.find(item => item.phase === "active" && (group
-      ? groupSessionMatches(item, event)
-      : sessionTypeOf(item) === "telegram" && String(channelOf(item)?.telegramUserId) === String(event.telegramUserId)));
-  }
-  if (!record || record.phase !== "active") {
-    const scope = group ? " for you in this group" : "";
-    await telegramRelay.resetCompleted(event.id, `There is no active Telegram session${scope} to reset. Your next message will begin one.`);
-    return;
-  }
-  let session = liveSessions.get(record.id);
-  if (!session) session = await buildConversation(record);
-  if (runtime) {
-    runtime.record = record;
-    runtime.session = session;
-    runtime.conversationId = record.id;
-  }
-  if (event.conversationId !== record.id || !event.processingStartedAt) {
-    await telegramRelay.bind(event.id, record.id, event.conversationId || null);
-  }
-  if (session.busy) throw new Error("The Telegram session is still completing its previous message.");
-  if (session.pendingTurn) await session.resumePendingTurn();
-  if (group && event.groupContext) {
-    session.refreshTelegramGroupContext(event.groupContext, event.messageId);
-    await session.persistSnapshot(session.snapshot());
-  }
-  const latest = historyRecords.find(item => item.id === record.id) || record;
-  await session.releaseRustLibs();
-  const closed = await conversationHistory.requestIngress(record.id, { expected_version: latest.version, state: session.snapshot() });
-  upsertHistory(closed);
-  liveSessions.delete(record.id);
-  if (selectedConversationId === record.id) update();
-  kickHistoryIngress();
-  const scope = group ? "Your session in this group" : "The Telegram session";
-  await telegramRelay.resetCompleted(event.id, `Conversation reset. ${scope} has been queued for memory ingress; your next message will begin a new session.`);
-}
-
-async function telegramVoiceInput(event) {
-  const blob = await telegramRelay.media(event.id);
-  let text = event.transcription;
-  let transcriptionModel = event.transcriptionModel;
-  let transcriptionDurationMs = null;
-  if (!text) {
-    if (inputModalities.includes("audio")) throw new Error("The selected model advertises native audio, but this Kennedy transport cannot yet forward it.");
-    const mimeType = blob.type || event.mimeType || "audio/ogg";
-    const transcriptionStarted = performance.now();
-    const result = await intelligence.transcribe({
-      provider, model, file: blob, fileName: `telegram-voice.${audioExtension(mimeType)}`,
-    });
-    transcriptionDurationMs = Math.max(0, Math.round(performance.now() - transcriptionStarted));
-    text = result.text;
-    transcriptionModel = result.transcription_model;
-    await telegramRelay.saveTranscription(event.id, text, transcriptionModel);
-  }
-  const mimeType = blob.type || event.mimeType || "audio/ogg";
-  return {
-    text,
-    metadata: {
-      externalEventId: event.id,
-      inputKind: "voice",
-      transcriptionModel,
-      transcriptionDurationMs,
-      media: {
-        id: `telegram:${event.id}`,
-        kind: "voice",
-        source: "telegram",
-        mimeType,
-        fileName: `telegram-voice.${audioExtension(mimeType)}`,
-        dataUrl: await blobToDataUrl(blob),
-        sizeBytes: blob.size,
-        durationSeconds: event.durationSeconds,
-      },
-    },
-  };
-}
-
-async function telegramDocumentInput(event) {
-  const blob = await telegramRelay.media(event.id);
-  const fileName = event.fileName || "telegram-document";
-  const extractionStarted = performance.now();
-  const result = await intelligence.extractDocument({ file: blob, fileName });
-  const extractionDurationMs = Math.max(0, Math.round(performance.now() - extractionStarted));
-  return {
-    text: event.text || "",
-    metadata: {
-      externalEventId: event.id,
-      inputKind: "document",
-      attachments: [{
-        id: `telegram:${event.id}`,
-        kind: "document",
-        source: "telegram",
-        fileName: result.file_name || fileName,
-        mimeType: blob.type || event.mimeType || result.content_type || "application/octet-stream",
-        sizeBytes: blob.size,
-        dataUrl: await blobToDataUrl(blob),
-        format: result.format,
-        text: result.text,
-        characters: result.characters,
-        truncated: Boolean(result.truncated),
-        extractionDurationMs,
-      }],
-    },
-  };
-}
-
-function preparedGroupMessageText(message) {
-  const base = typeof message.text === "string" ? message.text.trim() : "";
-  if (message.kind === "voice") {
-    const model = message.preparationModel ? ` · ${message.preparationModel}` : "";
-    return [`[Voice note transcription${model}]`, message.preparedText || "Voice note transcription unavailable."].join("\n");
-  }
-  if (message.kind === "document") {
-    const details = [
-      `[Document: ${message.fileName || "telegram-document"}${message.documentFormat ? ` · ${message.documentFormat}` : ""}${message.preparationTruncated ? " · truncated" : ""}]`,
-      message.preparedText || "Document text extraction unavailable.",
-    ].join("\n");
-    return [base, details].filter(Boolean).join("\n\n");
-  }
-  return base;
-}
-
-async function prepareTelegramGroupMessage(chatId, message) {
-  if (!message || message.sentByKennedy || !["voice", "document"].includes(message.kind)) {
-    return { ...message, text: preparedGroupMessageText(message || {}) };
-  }
-  const preparationKey = `${chatId}:${message.messageId}`;
-  let preparation = telegramGroupPreparations.get(preparationKey);
-  if (!preparation) {
-    preparation = (async () => {
-      const prepared = { ...message };
-      if (!prepared.preparedText && prepared.hasMedia) {
-        try {
-          const blob = await telegramRelay.groupMessageMedia(chatId, prepared.messageId);
-          if (prepared.kind === "voice") {
-            if (inputModalities.includes("audio")) throw new Error("Native Telegram group audio forwarding is not implemented for this model transport.");
-            const mimeType = blob.type || prepared.mimeType || "audio/ogg";
-            const result = await intelligence.transcribe({
-              provider, model, file: blob, fileName: prepared.fileName || `telegram-group-voice.${audioExtension(mimeType)}`,
-            });
-            prepared.preparedText = result.text;
-            prepared.preparationModel = result.transcription_model;
-          } else {
-            const result = await intelligence.extractDocument({ file: blob, fileName: prepared.fileName || "telegram-document" });
-            prepared.preparedText = result.text;
-            prepared.documentFormat = result.format;
-            prepared.preparationTruncated = Boolean(result.truncated);
-          }
-          await telegramRelay.saveGroupMessagePreparation(chatId, prepared.messageId, {
-            text: prepared.preparedText,
-            model: prepared.preparationModel || null,
-            format: prepared.documentFormat || null,
-            truncated: Boolean(prepared.preparationTruncated),
-          });
-        } catch (error) {
-          prepared.preparedText = `${prepared.kind === "voice" ? "Voice transcription" : "Document extraction"} failed: ${error.message}`;
-          prepared.preparationModel = "preparation-error";
-          await telegramRelay.saveGroupMessagePreparation(chatId, prepared.messageId, {
-            text: prepared.preparedText,
-            model: prepared.preparationModel,
-            truncated: false,
-          }).catch(() => {});
-        }
-      }
-      return prepared;
-    })();
-    telegramGroupPreparations.set(preparationKey, preparation);
-    if (telegramGroupPreparations.size > 512) {
-      telegramGroupPreparations.delete(telegramGroupPreparations.keys().next().value);
-    }
-  }
-  const prepared = { ...message, ...await preparation };
-  prepared.mediaRef = {
-    kind: prepared.kind,
-    source: "telegram-group",
-    chatId,
-    messageId: prepared.messageId,
-    fileName: prepared.fileName || null,
-    mimeType: prepared.mimeType || null,
-    durationSeconds: prepared.durationSeconds || null,
-  };
-  prepared.text = preparedGroupMessageText(prepared);
-  return prepared;
-}
-
-async function prepareTelegramGroupContext(groupContext, excludedMessageId = null, groupId = null) {
-  if (!groupContext || !Array.isArray(groupContext.messages)) return groupContext;
-  const messages = [];
-  for (const message of groupContext.messages) {
-    if (String(message.messageId) === String(excludedMessageId)) {
-      messages.push(message);
-    } else {
-      messages.push(await prepareTelegramGroupMessage(groupContext.chatId, message));
-    }
-  }
-  return decorateGroupContextWithDirectory(
-    { ...groupContext, messages },
-    groupId || groupContext.groupId,
-  );
-}
-
-async function closeTelegramGroupSessionSilently(updateRecord, session) {
-  await session.releaseRustLibs();
-  const latest = historyRecords.find(item => item.id === updateRecord.id) || updateRecord;
-  const closed = await conversationHistory.requestIngress(latest.id, {
-    expected_version: latest.version,
-    state: session.snapshot(),
-  });
-  upsertHistory(closed);
-  liveSessions.delete(latest.id);
-  if (selectedConversationId === latest.id) update();
-  await telegramRelay.completeSilentGroupReset(latest.id);
-  kickHistoryIngress();
-}
-
-async function syncGroupSessionUpdates() {
-  if (!telegramRelayReady || !conversationHistoryReady || !chatRuntimeReady()) return;
-  const updates = (await telegramRelay.groupSessionUpdates()).updates || [];
-  for (const pending of updates) {
-    let record = historyRecords.find(item => item.id === pending.conversationId)
-      || await conversationHistory.get(pending.conversationId).catch(() => null);
-    if (!record || record.phase !== "active") {
-      if (pending.resetRequired) await telegramRelay.completeSilentGroupReset(pending.conversationId);
-      continue;
-    }
-    let session = liveSessions.get(record.id);
-    if (!session) session = await buildConversation(record);
-    if (session.busy || session.pendingTurn) continue;
-    const groupContext = await prepareTelegramGroupContext({
-      ...pending.groupContext,
-      throughMessageId: pending.throughMessageId,
-    }, null, pending.groupId);
-    session.refreshTelegramGroupContext(groupContext);
-    await session.persistSnapshot(session.snapshot());
-    record = historyRecords.find(item => item.id === record.id) || record;
-    if (pending.resetRequired) {
-      await closeTelegramGroupSessionSilently(record, session);
-    } else {
-      await telegramRelay.acknowledgeGroupContext(record.id, pending.throughMessageId);
-    }
-  }
-}
-
-async function processTelegramEvent(event, runtime = null) {
-  const processingStarted = performance.now();
-  await directoryUserForEvent(event);
-  if (event.sessionKind === "group" && event.groupContext) {
-    event = {
-      ...event,
-      groupContext: await prepareTelegramGroupContext(event.groupContext, event.messageId, event.groupId),
-    };
-  }
-  if (event.kind === "reset") {
-    await processTelegramReset(event, runtime);
-  } else {
-    const { record, session } = await telegramConversationFor(event, runtime);
-    let response = session.answerForExternalEvent(event.id);
-    if (!response) {
-      if (session.pendingTurn && session.pendingExternalEventId === event.id) {
-        await session.resumePendingTurn();
-      } else if (session.pendingTurn) {
-        throw new Error("This Telegram session has an earlier saved query to finish.");
-      } else if (event.kind === "voice") {
-        const voice = await telegramVoiceInput(event);
-        await session.send(voice.text, voice.metadata);
-      } else if (event.kind === "document") {
-        let document;
-        try {
-          document = await telegramDocumentInput(event);
-        } catch (error) {
-          await telegramRelay.reply(
-            event.id,
-            record.id,
-            `I couldn't read ${event.fileName || "that document"}: ${error.message} Please try sending it again.`,
-          );
-          response = { content: "" };
-        }
-        if (document) await session.send(document.text, document.metadata);
-      } else {
-        await session.send(event.text || "", { externalEventId: event.id, inputKind: "text" });
-      }
-      if (!response) response = session.answerForExternalEvent(event.id);
-    }
-    if (!response) throw new Error("Kennedy completed the turn without a recoverable Telegram response.");
-    if (response.content) await telegramRelay.reply(event.id, record.id, response.content, response.contextWarning || null);
-  }
-  const processingDurationMs = Math.max(0, Math.round(performance.now() - processingStarted));
-  const receivedAt = Date.parse(event.createdAt);
-  const durationMs = Number.isFinite(receivedAt)
-    ? Math.max(processingDurationMs, Date.now() - receivedAt)
-    : processingDurationMs;
-  Promise.resolve(intelligence.recordTiming({
-    action: "delivery", status: "ok", sessionType: event.sessionKind === "group" ? "telegram-group" : "telegram", durationMs, processingDurationMs,
-  })).catch(() => {});
-}
-
-function groupMessageContent(message) {
-  const handle = message.username ? ` @${String(message.username).replace(/^@/, "")}` : "";
-  return `${message.displayName || "Telegram participant"}${handle}: ${message.text || ""}`;
-}
-
-function groupIngressState(batch) {
-  const groupContext = {
-    groupTitle: batch.groupTitle || "Telegram group",
-    chatId: batch.chatId,
-    groupId: batch.groupId,
-    invokingTelegramUserId: null,
-    groupRootNodeId: batch.groupRootNodeId,
-    groupRootReady: batch.groupRootReady,
-    participants: batch.participants || [],
-    messages: batch.messages || [],
-  };
-  if (typeof batch.groupRootNodeId !== "string" || !batch.groupRootNodeId) {
-    throw new Error(`Telegram group ${batch.chatId} does not have a provisioned root.`);
-  }
-  const directRoots = [batch.groupRootNodeId, kennedyRootNodeId];
-  const referenceRootNodeIds = referencesForGroup(groupContext, directRoots);
-  const transcript = groupContext.messages.map(message => ({
-    role: message.sentByKennedy ? "kennedy" : "user",
-    content: message.sentByKennedy ? message.text : groupMessageContent(message),
-  }));
-  const messages = transcript.map(message => ({
-    role: message.role === "kennedy" ? "assistant" : "user",
-    content: message.content,
-  }));
-  const channel = {
-    kind: "telegram-group",
-    chatId: batch.chatId,
-    groupId: batch.groupId,
-    groupRootNodeId: batch.groupRootNodeId,
-    groupIngressBatchId: batch.id,
-    backgroundIngress: true,
-    groupContext,
-  };
-  const archive = {
-    format: "kennedy-chatend",
-    version: 2,
-    sessionType: "telegram-group",
-    channel,
-    rootNodeIds: directRoots,
-    referenceRootNodeIds,
-    startedAt: batch.createdAt,
-    provider,
-    model,
-    systemPrompt: "",
-    retained: messages,
-    transcript,
-    messages,
-    fullHistory: { segments: [] },
-    context: {},
-    tools: { loadCalls: 0, loadLimit: 0, log: [] },
-    usage: null,
-    media: [],
-  };
-  return {
-    stateVersion: 2,
-    sessionType: "telegram-group",
-    channel,
-    rootNodeIds: directRoots,
-    referenceRootNodeIds,
-    startedAt: batch.createdAt,
-    transcript,
-    archive,
-  };
-}
-
-async function syncGroupIngressBatches() {
-  if (!telegramRelayReady || !conversationHistoryReady) return;
-  await provisionDirectoryRoots();
-  const batches = (await telegramRelay.groupIngress()).batches || [];
-  for (const batch of batches) {
-    const group = await provisionGroupRoot(batch.groupId);
-    const groupContext = await decorateGroupContextWithDirectory(
-      { participants: batch.participants || [], messages: batch.messages || [] },
-      batch.groupId,
-      group,
-    );
-    batch.groupRootNodeId = group.rootNodeId;
-    batch.groupRootReady = group.rootReady;
-    batch.participants = groupContext.participants;
-    let record = historyRecords.find(item =>
-      item.state?.channel?.groupIngressBatchId === batch.id
-      || item.state?.archive?.channel?.groupIngressBatchId === batch.id
-    );
-    if (!record) {
-      const state = groupIngressState(batch);
-      record = await conversationHistory.create({ started_at: state.startedAt, state });
-      upsertHistory(record);
-    }
-    if (record.phase === "active") {
-      record = await hydrateHistoryRecord(record);
-      record = await conversationHistory.requestIngress(record.id, { expected_version: record.version, state: record.state });
-      upsertHistory(record);
-      kickHistoryIngress();
-    } else if (record.phase === "complete") {
-      await telegramRelay.completeGroupIngress(batch.id);
-    }
-  }
-}
-
-const TELEGRAM_TIMEOUT_NOTICE = "Kennedy could not complete a response within 30 minutes, so this request was stopped. Please send it again if you want to retry it.";
-
-function waitAtMost(promise, milliseconds) {
-  let timer = null;
-  return Promise.race([
-    promise,
-    new Promise(resolve => { timer = setTimeout(() => resolve(null), milliseconds); }),
-  ]).finally(() => clearTimeout(timer));
-}
-
-async function closeTimedOutTelegramConversation(runtime) {
-  const id = runtime.record?.id;
-  if (!id) return;
-  let latest = await conversationHistory.get(id).catch(() => null);
-  if (!latest || latest.phase !== "active") return;
-  if (!runtime.session?.pendingTurn && !latest.state?.pendingTurn) return;
-  await runtime.session?.releaseRustLibs().catch(() => {});
-  for (let attempt = 0; attempt < 3 && latest?.phase === "active"; attempt += 1) {
-    try {
-      const closed = await conversationHistory.requestIngress(id, {
-        expected_version: latest.version,
-        state: latest.state,
-      });
-      upsertHistory(closed);
-      liveSessions.delete(id);
-      if (selectedConversationId === id) update();
-      kickHistoryIngress();
-      return;
-    } catch (error) {
-      if (error?.code !== "state_conflict") throw error;
-      latest = await conversationHistory.get(id).catch(() => null);
-    }
-  }
-}
-
-async function abortTimedOutTelegramEvent(event, runtime) {
-  if (runtime.session?.canStop) {
-    await waitAtMost(Promise.resolve(runtime.session.stopPendingTurn()).catch(() => null), 5_000);
-  }
-  await telegramRelay.abort(event.id, runtime.conversationId, TELEGRAM_TIMEOUT_NOTICE);
-  await closeTimedOutTelegramConversation(runtime);
-  await refreshHistory();
-  Promise.resolve(intelligence.recordTiming({
-    action: "delivery",
-    status: "error",
-    sessionType: event.sessionKind === "group" ? "telegram-group" : "telegram",
-    durationMs: TELEGRAM_RESPONSE_TIMEOUT_MS,
-    processingDurationMs: TELEGRAM_RESPONSE_TIMEOUT_MS,
-  })).catch(() => {});
-}
-
-async function runTelegramEvent(event) {
-  const runtime = { conversationId: event.conversationId || null, record: null, session: null };
-  let deadlineTimer = null;
-  const work = processTelegramEvent(event, runtime).then(
-    () => ({ ok: true }),
-    error => ({ ok: false, error }),
-  );
-  try {
-    const outcome = await Promise.race([
-      work,
-      new Promise(resolve => {
-        deadlineTimer = setTimeout(() => resolve({ timeout: true }), telegramEventTimeoutMs(event));
-      }),
-    ]);
-    if (outcome.timeout) {
-      if (runtime.session?.canStop) {
-        await waitAtMost(Promise.resolve(runtime.session.stopPendingTurn()).catch(() => null), 5_000);
-      }
-      const settled = await waitAtMost(work, 5_000);
-      if (settled?.ok) {
-        await refreshHistory();
-        return;
-      }
-      await abortTimedOutTelegramEvent(event, runtime);
-      ui.service_status.textContent = `Ready · ${model}`;
-      showError(ui.error_banner, "A Telegram request reached its 30-minute hard timeout and was aborted so later messages can continue.");
-      return;
-    }
-    if (!outcome.ok) throw outcome.error;
-    await refreshHistory();
-    if (ui.service_status.textContent === "Telegram queue needs attention") ui.service_status.textContent = `Ready · ${model}`;
-  } catch (error) {
-    console.error("Telegram event processing failed", event.id, error);
-    ui.service_status.textContent = "Telegram queue needs attention";
-    showError(ui.error_banner, `Telegram delivery will retry: ${error.message}`);
-  } finally {
-    clearTimeout(deadlineTimer);
-    telegramInFlight.delete(event.id);
-  }
-}
-
-function launchTelegramEvent(event) {
-  if (telegramInFlight.has(event.id)) return;
-  telegramInFlight.add(event.id);
-  void runTelegramEvent(event).catch(error => {
-    console.error("Telegram event task failed while reporting an error", event.id, error);
-  });
-}
-
-async function pollTelegramEvents() {
-  await provisionDirectoryRoots();
-  await syncGroupSessionUpdates();
-  await syncGroupIngressBatches();
-  const events = (await telegramRelay.events()).events || [];
-  if (ui.service_status.textContent === "Telegram relay unavailable") ui.service_status.textContent = `Ready · ${model}`;
-  for (const event of events) launchTelegramEvent(event);
-}
-
-async function telegramBridgeLoop() {
-  while (telegramBridgeRunning) {
-    await pollTelegramEvents().catch(error => {
-      console.error("Telegram relay poll failed", error);
-      ui.service_status.textContent = "Telegram relay unavailable";
-      showError(ui.error_banner, `Telegram relay polling will retry: ${error.message}`);
-    });
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-}
-
-function startTelegramBridge() {
-  if (telegramBridgeRunning) return;
-  telegramBridgeRunning = true;
-  const run = () => telegramBridgeLoop();
-  const work = navigator.locks?.request
-    ? navigator.locks.request("kennedy-telegram-bridge", { ifAvailable: true }, lock => {
-      if (lock) return run();
-      telegramBridgeRunning = false;
-      setTimeout(startTelegramBridge, 2000);
-      return undefined;
-    })
-    : run();
-  Promise.resolve(work).catch(error => console.error("Telegram bridge stopped", error));
 }
 
 function showView(view) {
@@ -2186,6 +1045,29 @@ function showView(view) {
     update();
   }
   if (memory && explorer && !explorer.currentNodeId) explorer.home();
+  if (!memory) void refreshObservedState();
+}
+
+async function refreshObservedState() {
+  if (backgroundRefreshRunning) return;
+  backgroundRefreshRunning = true;
+  try {
+    if (conversationHistoryReady) {
+      await refreshHistory();
+      const records = recordsForView();
+      if (!records.some(record => record.id === selectedConversationId)) {
+        selectedConversationId = records[0]?.id || null;
+        selectedByView[activeView] = selectedConversationId;
+      }
+    }
+    if (audioIngressReady && activeView === "audio") {
+      await refreshAudioHistory(true);
+    }
+  } catch (error) {
+    showError(ui.error_banner, `Backend view refresh will retry: ${error.message}`);
+  } finally {
+    backgroundRefreshRunning = false;
+  }
 }
 
 async function initialize() {
@@ -2193,57 +1075,32 @@ async function initialize() {
 
   try {
     const [health, roots] = await Promise.all([kweb.health(), kweb.roots()]);
-    legacyUserRootNodeId = roots.user_root_node_id;
-    kennedyRootNodeId = roots.kennedy_root_node_id;
-    rootNodeIds = [legacyUserRootNodeId, kennedyRootNodeId];
-    if (rootNodeIds.some(id => typeof id !== "string" || !id)) throw new Error("Kweb did not provide both required root nodes.");
+    rootNodeIds = [roots.user_root_node_id, roots.kennedy_root_node_id];
+    if (rootNodeIds.some(id => typeof id !== "string" || !id)) {
+      throw new Error("Kweb did not provide both required root nodes.");
+    }
     kwebReady = true;
     ui.service_status.textContent = `${health.status} · memory ready`;
+    explorer = new MemoryExplorer({
+      api: kweb,
+      rootNodeIds,
+      content: ui.memory_content,
+      backButton: ui.memory_back,
+      forwardButton: ui.memory_forward,
+    });
   } catch (error) {
     ui.service_status.textContent = "Kweb unavailable";
     showError(ui.error_banner, `Memory is unavailable: ${error.message}`);
   }
 
-  if (kwebReady) {
-    try {
-      await telegramRelay.health();
-      telegramRelayReady = true;
-      await provisionDirectoryRoots();
-    } catch (error) {
-      telegramRelayReady = false;
-      showError(ui.error_banner, `Telegram identity routing is unavailable; the web UI is using its legacy root until it recovers: ${error.message}`);
-    }
-    explorer = new MemoryExplorer({ api: kweb, rootNodeIds, content: ui.memory_content, backButton: ui.memory_back, forwardButton: ui.memory_forward });
-  }
-
-  if (kwebReady) {
-    const loaded = await loadPromptManuals(CONFIG.kwebBase);
-    manuals = loaded.manuals;
-    const promptImpact = {
-      identity: "Conversation and memory-ingress model sessions are unavailable",
-      kmapBasics: "Conversation and memory-ingress model sessions are unavailable",
-      readTools: "Conversation and memory-ingress model sessions are unavailable",
-      conversationSession: "New and restored conversations are unavailable",
-      freeTimeSession: "New and restored self-time sessions are unavailable",
-      historyIngressSession: "Conversation-history memory ingress is paused",
-      audioIngressSession: "Audio preparation and history remain available, but audio memory ingress is paused",
-      codexHarness: "Codex-backed conversation and memory-ingress model sessions are unavailable",
-      writeTools: "Conversation-history ingress, audio memory ingress, and self time are paused",
-    };
-    for (const [key, message] of Object.entries(loaded.errors)) {
-      showError(ui.error_banner, `${promptImpact[key] || "A model mode is unavailable"}: ${message}`);
-    }
-  }
-
   try {
     await conversationHistory.health();
-    try {
-      await conversationHistory.releaseIngressRepairs();
-    } catch (error) {
-      showError(ui.error_banner, `Historical conversation-ingress repairs remain safely paused: ${error.message}`);
-    }
-    await conversationHistory.discardUnstarted();
-    historyRecords = sortConversationHistory((await conversationHistory.list()).conversations || []);
+    const [history, commands] = await Promise.all([
+      conversationHistory.list(),
+      conversationHistory.commandHeads(),
+    ]);
+    historyRecords = sortConversationHistory(history.conversations || []);
+    conversationCommandHeads = new Map((commands.commands || []).map(command => [command.conversationId, command]));
     conversationHistoryReady = true;
   } catch (error) {
     showError(ui.error_banner, `Conversation history is unavailable: ${error.message}`);
@@ -2251,15 +1108,17 @@ async function initialize() {
 
   try {
     await audioIngress.health();
-    try {
-      await audioIngress.releaseIngressRepairs();
-    } catch (error) {
-      showError(ui.error_banner, `Historical audio-ingress repairs remain safely paused: ${error.message}`);
-    }
     audioRecords = (await audioIngress.list(50_000)).recordings || [];
     audioIngressReady = true;
   } catch (error) {
     showError(ui.error_banner, `Audio ingress is unavailable: ${error.message}`);
+  }
+
+  try {
+    await telegramRelay.health();
+    telegramRelayReady = true;
+  } catch (error) {
+    showError(ui.error_banner, `Telegram status is unavailable: ${error.message}`);
   }
 
   try {
@@ -2268,66 +1127,33 @@ async function initialize() {
     provider = providers.default_provider;
     const selected = providers.providers.find(item => item.name === provider);
     if (!selected) throw new Error("The intelligence service did not provide its configured default provider.");
-    providerKind = selected.kind;
     model = selected.default_model;
-    reasoningEffort = selected.reasoning_effort;
     const modelCapabilities = selected.model_capabilities?.[model] || {};
     inputModalities = modelCapabilities.input_modalities || selected.input_modalities || ["text"];
     transcriptionAvailable = Boolean(selected.transcription_available);
-    if (typeof providerKind !== "string" || !providerKind) throw new Error("The intelligence service did not identify the selected provider kind.");
-    if (typeof reasoningEffort !== "string" || !reasoningEffort) throw new Error("The intelligence service did not provide the model thinking mode.");
-    contextWindowTokens = Number(modelCapabilities.context_window_tokens ?? selected.context_window_tokens) || 0;
-    maxInputTokens = Number(modelCapabilities.max_input_tokens ?? selected.max_input_tokens) || 0;
-    if (contextWindowTokens <= 0 || maxInputTokens <= 0) throw new Error("The intelligence service did not provide the model's advertised effective context window.");
     intelligenceReady = true;
   } catch (error) {
     showError(ui.error_banner, `Kennedy's model service is unavailable: ${error.message}`);
   }
 
-  const activeRecords = historyRecords.filter(record => record.phase === "active");
-  if (chatRuntimeReady() || freeTimeRuntimeReady()) {
-    for (const record of activeRecords) {
-      if (record.state?.channel?.backgroundIngress || record.state?.archive?.channel?.backgroundIngress) continue;
-      const freeTimeRecord = sessionTypeOf(record) === "free-time";
-      if ((freeTimeRecord && !freeTimeRuntimeReady()) || (!freeTimeRecord && !chatRuntimeReady())) continue;
-      try {
-        await buildConversation(record);
-      } catch (error) {
-        showError(ui.error_banner, `Saved ${sessionTypeOf(record)} session ${record.id} could not be restored: ${error.message}`);
-      }
-    }
-  }
-  if (freeTimeRuntimeReady()) {
-    for (const record of activeRecords.filter(record => sessionTypeOf(record) === "free-time" && liveSessions.has(record.id))) {
-      freeTimeRun = freeTimeOf(record);
-      launchFreeTimeRecord(record.id);
-    }
-  }
-  if (chatRuntimeReady()) {
-    const activeConversations = activeRecords.filter(record =>
-      sessionTypeOf(record) === "conversation" && liveSessions.has(record.id)
-    );
+  if (conversationHistoryReady) {
+    const activeConversations = recordsForView("conversation").filter(record => record.phase === "active");
     if (activeConversations.length) {
       selectedConversationId = activeConversations[0].id;
       selectedByView.conversation = selectedConversationId;
+      await hydrateHistoryRecord(selectedConversationId).catch(() => null);
       restoreDraft();
     } else {
       try {
         await createNewConversation();
       } catch (error) {
-        showError(ui.error_banner, `A new conversation could not be started: ${error.message}`);
+        showError(ui.error_banner, `A new conversation could not be requested: ${error.message}`);
       }
     }
-  } else {
-    selectedConversationId = recordsForView("conversation")[0]?.id || null;
-    selectedByView.conversation = selectedConversationId;
   }
 
-  if (chatRuntimeReady() && telegramRelayReady) startTelegramBridge();
-
-  kickHistoryIngress();
   const readyFeatures = [
-    chatRuntimeReady() ? "chat" : null,
+    conversationHistoryReady ? "backend chat" : null,
     kwebReady ? "memory" : null,
     audioIngressReady ? "audio" : null,
     telegramRelayReady ? "Telegram" : null,
@@ -2336,17 +1162,13 @@ async function initialize() {
     ? `Ready · ${readyFeatures.join(", ")}${model ? ` · ${model}` : ""}`
     : "Kennedy services unavailable";
 
-  if (!chatRuntimeReady() && !historyRecords.length && audioIngressReady) {
-    showView("audio");
-  } else {
-    update();
-  }
+  if (!conversationHistoryReady && !historyRecords.length && audioIngressReady) showView("audio");
+  else update();
 }
-
 ui.message_form.addEventListener("submit", submitMessage);
 ui.start_self_time.addEventListener("click", () => startFreeTime().catch(error => showError(ui.error_banner, error.message)));
 ui.message_input.addEventListener("input", () => {
-  if (!selectedSession()) return;
+  if (activeView !== "conversation" || selectedRecord()?.phase !== "active") return;
   drafts.set(selectedConversationId, ui.message_input.value);
   if (!ui.message_input.value.trim()) voiceDrafts.delete(selectedConversationId);
 });
@@ -2398,7 +1220,9 @@ ui.message_resize_handle.addEventListener("keydown", event => {
 const messageInputResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(syncComposerResizeValue) : null;
 messageInputResizeObserver?.observe(ui.message_input);
 setInterval(renderSelfTimeControls, 1_000);
-ui.end_button.addEventListener("click", () => selectedSession()?.pendingTurn ? resumeSavedQuery() : endConversation());
+setInterval(() => { void refreshObservedState(); }, 1_000);
+ui.end_button.addEventListener("click", () => endConversation());
+ui.retry_button.addEventListener("click", () => resumeSavedQuery());
 ui.send_end_button.addEventListener("click", () => sendAndEndConversation());
 ui.stop_button.addEventListener("click", () => stopConversationTurn());
 ui.new_conversation.addEventListener("click", () => createNewConversation().catch(error => showError(ui.error_banner, error.message)));

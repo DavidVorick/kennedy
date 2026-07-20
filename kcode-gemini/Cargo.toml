@@ -1,0 +1,28 @@
+[package]
+name = "kcode-gemini"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Gemini inference, multimodal generation, and session spending limits"
+documentation = "https://docs.rs/kcode-gemini"
+readme = "README.md"
+license = "MIT"
+keywords = ["gemini", "llm", "multimodal", "image-generation"]
+categories = ["api-bindings", "multimedia"]
+include = ["src/**", "Cargo.toml", "DependencyAudit.md", "Documentation.md", "LICENSE", "README.md", "Specification.md", "Version.txt"]
+
+[dependencies]
+base64 = "0.22"
+chrono = "0.4"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+zeroize = "=1.9.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[workspace]
