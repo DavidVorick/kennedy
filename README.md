@@ -24,6 +24,8 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   orchestration worker consumes its durable stream heads.
 - `kennedy-audio-ingress` durably owns content-addressed vnotes, restartable
   Gemini/Sol transcript preparation, and timestamped Kennedy-ingress pieces.
+- `kennedy-memory-ingress` owns the single durable memory-update queue shared
+  by conversation archives and prepared audio transcript pieces.
 - `kennedy-server` runs the native Rust backend orchestrator. It owns web and
   Telegram Chatends, prompt/tool loops, self time, recovery, and one serialized
   Kmap-writer queue shared by conversation, Telegram, and audio ingress.
@@ -32,12 +34,13 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   explicit start/message/retry/end/stop or ingress-retry requests.
 
 One `kennedy-server` binary hosts the native Tokio orchestration runtime. Kmap,
-intelligence, conversation history, audio ingress, Telegram identity, and the
-frontend share its main HTTP listener on port 4321 while retaining separate
-databases. The published Telegram relay currently remains on port 4324 because
-its crate API owns its listener. Provider and content-processing implementations
-are separately publishable libraries. JavaScript runs only in the browser; the
-server does not launch or depend on Node.js.
+intelligence, conversation history, audio ingress, and Telegram identity expose
+browser adapters on the main HTTP listener, while the orchestrator calls their
+in-process service handles directly. The published Telegram relay currently
+remains the sole loopback HTTP exception on port 4324 because its crate API owns
+its listener. Provider and content-processing implementations are separately
+publishable libraries. JavaScript runs only in the browser; the server does not
+launch or depend on Node.js.
 
 ## First run
 
@@ -167,14 +170,15 @@ cargo run -p kennedy-server
 
 When the encrypted vault exists, startup prompts once for its passphrase and
 keeps the unlocked values only inside `kennedy-server`. Copy
-`kennedy-secrets.age` alongside the five SQLite databases and audio-ingress
+`kennedy-secrets.age` alongside the six SQLite databases and audio-ingress
 media directory to migrate the same credentials to another machine; the same
 vault passphrase unlocks them there.
 
 Open `http://127.0.0.1:4321`. The Kweb and conversation databases are created
 as `kweb-db-core.sqlite3`, `kennedy-conversations.sqlite3`,
 `kennedy-telegram.sqlite3`, `kennedy-users.sqlite3`, and
-`kennedy-audio.sqlite3` on first run. Large Kweb provenance payloads and media
+`kennedy-audio.sqlite3` plus `kennedy-memory-ingress.sqlite3` on first run.
+Large Kweb provenance payloads and media
 live in the sibling `kweb-provenance-artifacts/` tree. Original vnotes live
 under `kennedy-audio-ingress/`; temporary transcription shards exist there only
 until all Kennedy ingress pieces complete. All Kennedy-owned HTTP routes use
@@ -273,7 +277,7 @@ instance from modifying persistent state during a backup.
 
 The result is a private
 `backups/kennedy-backup-YYYY-MM-DDTHH-MM-SSZ.tar.gz` archive containing
-verified standalone snapshots of all five SQLite databases, the complete
+verified standalone snapshots of all six SQLite databases, the complete
 Kweb provenance-artifact tree, the complete audio-ingress media directory, the encrypted credential vault when present, a
 machine-readable checksum manifest, and a self-contained recovery README. The
 README begins with the creating source commit and includes the exact SQLite DDL

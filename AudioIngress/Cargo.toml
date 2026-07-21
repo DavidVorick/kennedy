@@ -11,6 +11,7 @@ chrono.workspace = true
 futures.workspace = true
 hound.workspace = true
 kennedy-chatend = { path = "../Chatend" }
+kennedy-memory-ingress = { path = "../MemoryIngress" }
 kcode-codex-runtime.workspace = true
 kcode-gemini-api.workspace = true
 rusqlite.workspace = true

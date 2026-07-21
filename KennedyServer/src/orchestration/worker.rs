@@ -110,13 +110,11 @@ impl Orchestrator {
 
     async fn initialize(&self) -> anyhow::Result<Runtime> {
         let (kweb, intelligence, history, telegram, audio) = tokio::join!(
-            self.api.health(&self.api.kweb, "/api/v1/kmap/health"),
-            self.api.health(&self.api.intelligence, "/health"),
-            self.api
-                .health(&self.api.history, "/api/v1/conversations/health"),
-            self.api.health(&self.api.telegram, "/health"),
-            self.api
-                .health(&self.api.audio, "/api/v1/audio-ingress/health"),
+            self.api.kmap_get("/api/v1/kmap/health"),
+            self.api.intelligence_get("/health"),
+            self.api.history_get("/api/v1/conversations/health"),
+            self.api.telegram_health(),
+            self.api.audio_get("/api/v1/audio-ingress/health"),
         );
         kweb?;
         intelligence?;
@@ -125,8 +123,8 @@ impl Orchestrator {
         audio?;
         let manuals = Manuals::load(&self.config.system_prompts_directory)?;
         let (roots, providers) = tokio::try_join!(
-            self.api.get(&self.api.kweb, "/api/v1/kmap/roots"),
-            self.api.get(&self.api.intelligence, "/api/v1/providers"),
+            self.api.kmap_get("/api/v1/kmap/roots"),
+            self.api.intelligence_get("/api/v1/providers"),
         )?;
         let runtime = Runtime {
             manuals,
@@ -135,21 +133,15 @@ impl Orchestrator {
             kennedy_root_node_id: required_string(&roots, "kennedy_root_node_id")?,
         };
         let (history_repairs, audio_repairs) = tokio::join!(
-            self.api.post(
-                &self.api.history,
-                "/api/v1/conversations/ingress/repairs/release",
-                json!({}),
-            ),
-            self.api.post(
-                &self.api.audio,
-                "/api/v1/audio-ingress/ingress/repairs/release",
-                json!({}),
-            ),
+            self.api
+                .history_post("/api/v1/conversations/ingress/repairs/release", json!({}),),
+            self.api
+                .audio_post("/api/v1/audio-ingress/ingress/repairs/release", json!({}),),
         );
         history_repairs?;
         audio_repairs?;
         self.api
-            .delete(&self.api.history, "/api/v1/conversations/unstarted", None)
+            .history_delete("/api/v1/conversations/unstarted", None)
             .await?;
         Ok(runtime)
     }
@@ -174,7 +166,7 @@ impl Orchestrator {
     async fn list_history(&self) -> anyhow::Result<Vec<Value>> {
         Ok(self
             .api
-            .get(&self.api.history, "/api/v1/conversations/summaries")
+            .history_get("/api/v1/conversations/summaries")
             .await?
             .get("conversations")
             .and_then(Value::as_array)
@@ -194,7 +186,7 @@ impl Orchestrator {
     async fn sync_conversation_commands(self: &Arc<Self>) -> anyhow::Result<()> {
         let commands = self
             .api
-            .get(&self.api.history, "/api/v1/conversation-commands")
+            .history_get("/api/v1/conversation-commands")
             .await?
             .get("commands")
             .and_then(Value::as_array)
@@ -218,8 +210,7 @@ impl Orchestrator {
                 {
                     let _ = self
                         .api
-                        .post(
-                            &self.api.intelligence,
+                        .intelligence_post(
                             &format!("/api/v1/operations/{operation}/cancel"),
                             json!({}),
                         )
@@ -250,8 +241,7 @@ impl Orchestrator {
         let _conversation_guard = lock.lock().await;
         let command = if command.get("status").and_then(Value::as_str) == Some("pending") {
             self.api
-                .post(
-                    &self.api.history,
+                .history_post(
                     &format!(
                         "/api/v1/conversation-commands/{}/claim",
                         encode_path(&command_id)
@@ -543,8 +533,7 @@ impl Orchestrator {
             state.unwrap_or_else(|| locked.get("state").cloned().unwrap_or_else(|| json!({})));
         let response = self
             .api
-            .post(
-                &self.api.history,
+            .history_post(
                 &format!("/api/v1/conversations/{}/request-ingress", encode_path(&id)),
                 json!({
                     "expected_version":version(&locked)?,
@@ -558,8 +547,7 @@ impl Orchestrator {
 
     async fn complete_command(&self, id: &str, outcome: Value) -> anyhow::Result<()> {
         self.api
-            .post(
-                &self.api.history,
+            .history_post(
                 &format!("/api/v1/conversation-commands/{}/complete", encode_path(id)),
                 json!({"outcome":outcome}),
             )
@@ -570,10 +558,7 @@ impl Orchestrator {
     async fn get_conversation(&self, id: &str) -> anyhow::Result<Value> {
         Ok(self
             .api
-            .get(
-                &self.api.history,
-                &format!("/api/v1/conversations/{}", encode_path(id)),
-            )
+            .history_get(&format!("/api/v1/conversations/{}", encode_path(id)))
             .await?)
     }
 
@@ -626,35 +611,30 @@ impl Orchestrator {
             .await;
             return Ok(());
         }
-        let (conversation, audio) = tokio::join!(
-            self.api
-                .get(&self.api.history, "/api/v1/conversations/ingress/next"),
-            self.api
-                .get(&self.api.audio, "/api/v1/audio-ingress/ingress/next"),
-        );
-        let conversation = conversation
-            .ok()
-            .and_then(|value| value.get("conversation").cloned())
-            .filter(|value| !value.is_null());
-        let audio = audio
-            .ok()
-            .and_then(|value| value.get("piece").cloned())
-            .filter(|value| !value.is_null());
-        let work = select_ingress(conversation, audio);
-        match work {
-            Some(("conversation", record)) => {
+        let Some(job) = self.api.next_memory_ingress()? else {
+            return Ok(());
+        };
+        match job.source_kind {
+            kennedy_memory_ingress::SourceKind::Conversation => {
+                let record = self.get_conversation(&job.source_id).await?;
                 self.launch_writer_job("conversation ingress", move |worker| async move {
                     worker.process_conversation_ingress(record).await
                 })
                 .await;
             }
-            Some(("audio", piece)) => {
+            kennedy_memory_ingress::SourceKind::Audio => {
+                let piece = self
+                    .api
+                    .audio_get(&format!(
+                        "/api/v1/audio-ingress/pieces/{}",
+                        encode_path(&job.source_id)
+                    ))
+                    .await?;
                 self.launch_writer_job("audio ingress", move |worker| async move {
                     worker.process_audio_ingress(piece).await
                 })
                 .await;
             }
-            _ => {}
         }
         Ok(())
     }
@@ -714,9 +694,7 @@ impl Orchestrator {
                     .await?;
                 stage = "claim";
                 record = self
-                    .api
-                    .post(
-                        &self.api.history,
+                    .api.history_post(
                         &format!(
                             "/api/v1/conversations/{}/ingress-started",
                             encode_path(&id)
@@ -783,9 +761,7 @@ impl Orchestrator {
             )
             .await?;
             let provenance = self
-                .api
-                .get(
-                    &self.api.kweb,
+                .api.kmap_get(
                     &format!("/api/v1/kmap/provenance/{}", encode_path(&provenance_id)),
                 )
                 .await?;
@@ -813,9 +789,7 @@ impl Orchestrator {
             stage = "completion";
             let mut locked = record.lock().await;
             let completed = self
-                .api
-                .post(
-                    &self.api.history,
+                .api.history_post(
                     &format!(
                         "/api/v1/conversations/{}/ingress-completed",
                         encode_path(&id)
@@ -830,9 +804,7 @@ impl Orchestrator {
                 .and_then(|channel| channel.get("groupIngressBatchId"))
                 .and_then(Value::as_str)
             {
-                self.api
-                    .post(
-                        &self.api.telegram,
+                self.api.telegram_post(
                         &format!("/api/v1/group-ingress/{}/complete", encode_path(batch)),
                         json!({}),
                     )
@@ -863,9 +835,7 @@ impl Orchestrator {
         ) {
             return Ok(());
         }
-        self.api
-            .post(
-                &self.api.history,
+        self.api.history_post(
                 &format!(
                     "/api/v1/conversations/{}/ingress-failure",
                     encode_path(id)
@@ -896,9 +866,7 @@ impl Orchestrator {
                     .await?;
                 stage = "claim";
                 piece = self
-                    .api
-                    .post(
-                        &self.api.audio,
+                    .api.audio_post(
                         &format!(
                             "/api/v1/audio-ingress/pieces/{}/ingress-started",
                             encode_path(&id)
@@ -921,30 +889,30 @@ impl Orchestrator {
             };
             let state=piece.get("state").cloned().unwrap_or_else(||json!({}));
             let mut session=Session::new(self.api.clone(),runtime.manuals,runtime.model,options,state.get("historyIngress")).await?;
-            let provenance=self.api.get(&self.api.kweb,&format!("/api/v1/kmap/provenance/{}",encode_path(&provenance_id))).await?;
+            let provenance=self.api.kmap_get(&format!("/api/v1/kmap/provenance/{}",encode_path(&provenance_id))).await?;
             session.set_ingress_provenance_message(&provenance)?;session.pending_turn=true;
             let piece=Arc::new(Mutex::new(piece));persist_audio_ingress(&self.api,&piece,session.archive()?).await?;
             let api=self.api.clone();let saved=piece.clone();
             session.run_pending_turn(Uuid::new_v4(),move|archive_state|{let api=api.clone();let piece=saved.clone();async move{let archive=archive_state.get("archive").cloned().unwrap_or(archive_state);persist_audio_ingress(&api,&piece,archive).await?;Ok(())}}).await?;
             persist_audio_ingress(&self.api,&piece,session.archive()?).await?;stage="completion";
             let locked=piece.lock().await;
-            self.api.post(&self.api.audio,&format!("/api/v1/audio-ingress/pieces/{}/ingress-completed",encode_path(&id)),json!({"expected_version":version(&locked)?})).await?;
+            self.api.audio_post(&format!("/api/v1/audio-ingress/pieces/{}/ingress-completed",encode_path(&id)),json!({"expected_version":version(&locked)?})).await?;
             Ok(())
         }.await;
         if let Err(error) = result {
             if let Ok(latest) = self
                 .api
-                .get(
-                    &self.api.audio,
-                    &format!("/api/v1/audio-ingress/pieces/{}", encode_path(&id)),
-                )
+                .audio_get(&format!(
+                    "/api/v1/audio-ingress/pieces/{}",
+                    encode_path(&id)
+                ))
                 .await
                 && matches!(
                     latest.get("phase").and_then(Value::as_str),
                     Some("ingress_pending" | "ingress_in_progress")
                 )
             {
-                let _=self.api.post(&self.api.audio,&format!("/api/v1/audio-ingress/pieces/{}/ingress-failure",encode_path(&id)),json!({"expected_version":version(&latest)?,"stage":stage,"code":"ingress_error","message":bounded_error(&error)})).await;
+                let _=self.api.audio_post(&format!("/api/v1/audio-ingress/pieces/{}/ingress-failure",encode_path(&id)),json!({"expected_version":version(&latest)?,"stage":stage,"code":"ingress_error","message":bounded_error(&error)})).await;
             }
             return Err(error);
         }
@@ -1043,11 +1011,7 @@ impl Orchestrator {
             Err(_) => {
                 let _ = self
                     .api
-                    .post(
-                        &self.api.intelligence,
-                        &format!("/api/v1/operations/{operation}/cancel"),
-                        json!({}),
-                    )
+                    .intelligence_post(&format!("/api/v1/operations/{operation}/cancel"), json!({}))
                     .await;
                 "hard-stop".into()
             }
@@ -1055,7 +1019,7 @@ impl Orchestrator {
         session.finalize_free_time(&reason)?;
         persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
         let mut locked = record_arc.lock().await;
-        let completed=self.api.post(&self.api.history,&format!("/api/v1/conversations/{}/complete",encode_path(&id)),json!({"expected_version":version(&locked)?,"state":locked.get("state").cloned().unwrap_or(Value::Null)})).await?;
+        let completed=self.api.history_post(&format!("/api/v1/conversations/{}/complete",encode_path(&id)),json!({"expected_version":version(&locked)?,"state":locked.get("state").cloned().unwrap_or(Value::Null)})).await?;
         *locked = completed;
         if deadline - Utc::now() >= ChronoDuration::minutes(5) {
             self.create_next_self_time_slice(
@@ -1116,8 +1080,7 @@ impl Orchestrator {
         .await?;
         session.stage_free_time_opening();
         self.api
-            .post(
-                &self.api.history,
+            .history_post(
                 "/api/v1/conversations",
                 json!({"started_at":session.started_at,"state":session.snapshot()?}),
             )
@@ -1144,14 +1107,10 @@ impl Orchestrator {
     async fn provision_directory(&self) -> anyhow::Result<()> {
         let runtime = self.runtime()?;
         let (users, groups) = tokio::try_join!(
-            self.api.get(
-                &self.api.kweb,
-                "/api/v1/telegram-directory/users/provisioning"
-            ),
-            self.api.get(
-                &self.api.kweb,
-                "/api/v1/telegram-directory/groups/provisioning"
-            )
+            self.api
+                .directory_get("/api/v1/telegram-directory/users/provisioning"),
+            self.api
+                .directory_get("/api/v1/telegram-directory/groups/provisioning")
         )?;
         for user in users
             .get("users")
@@ -1173,7 +1132,7 @@ impl Orchestrator {
                 self.api.bootstrap_node(&root, None).await?;
             }
             self.api
-                .kmap_post(
+                .directory_post(
                     &format!(
                         "/api/v1/telegram-directory/users/by-handle/{}/root-ready",
                         encode_path(&handle)
@@ -1193,7 +1152,7 @@ impl Orchestrator {
             let _guard = self.writer.lock().await;
             self.api.bootstrap_node(&root, Some("Group Root")).await?;
             self.api
-                .kmap_post(
+                .directory_post(
                     &format!(
                         "/api/v1/telegram-directory/groups/{}/root-ready",
                         encode_path(&group_id)
@@ -1212,10 +1171,10 @@ impl Orchestrator {
             .context("Telegram event omitted user ID")?;
         let mut user = self
             .api
-            .get(
-                &self.api.kweb,
-                &format!("/api/v1/telegram-directory/users/{}", encode_path(&id)),
-            )
+            .directory_get(&format!(
+                "/api/v1/telegram-directory/users/{}",
+                encode_path(&id)
+            ))
             .await?;
         if user.get("rootReady").and_then(Value::as_bool) != Some(true) {
             let root = required_string(&user, "rootNodeId")?;
@@ -1223,7 +1182,7 @@ impl Orchestrator {
             self.api.bootstrap_node(&root, None).await?;
             user = self
                 .api
-                .kmap_post(
+                .directory_post(
                     &format!(
                         "/api/v1/telegram-directory/users/{}/root-ready",
                         encode_path(&id)
@@ -1237,13 +1196,10 @@ impl Orchestrator {
     async fn directory_group(&self, group_id: &str) -> anyhow::Result<Value> {
         let mut group = self
             .api
-            .get(
-                &self.api.kweb,
-                &format!(
-                    "/api/v1/telegram-directory/groups/{}",
-                    encode_path(group_id)
-                ),
-            )
+            .directory_get(&format!(
+                "/api/v1/telegram-directory/groups/{}",
+                encode_path(group_id)
+            ))
             .await?;
         if group.get("rootReady").and_then(Value::as_bool) != Some(true) {
             let root = required_string(&group, "rootNodeId")?;
@@ -1251,7 +1207,7 @@ impl Orchestrator {
             self.api.bootstrap_node(&root, Some("Group Root")).await?;
             group = self
                 .api
-                .kmap_post(
+                .directory_post(
                     &format!(
                         "/api/v1/telegram-directory/groups/{}/root-ready",
                         encode_path(group_id)
@@ -1325,14 +1281,11 @@ impl Orchestrator {
                 let prepared = async {
                     let (bytes, mime) = self
                         .api
-                        .bytes(
-                            &self.api.telegram,
-                            &format!(
-                                "/api/v1/group-messages/{}/{}/media",
-                                encode_path(&chat_id),
-                                encode_path(&message_id)
-                            ),
-                        )
+                        .telegram_bytes(&format!(
+                            "/api/v1/group-messages/{}/{}/media",
+                            encode_path(&chat_id),
+                            encode_path(&message_id)
+                        ))
                         .await?;
                     if kind == "voice" {
                         let result = self
@@ -1405,8 +1358,7 @@ impl Orchestrator {
                 message["preparationTruncated"] = json!(truncated);
                 let _ = self
                     .api
-                    .post(
-                        &self.api.telegram,
+                    .telegram_post(
                         &format!(
                             "/api/v1/group-messages/{}/{}/preparation",
                             encode_path(&chat_id),
@@ -1448,7 +1400,7 @@ impl Orchestrator {
     async fn sync_telegram_events(self: &Arc<Self>) -> anyhow::Result<()> {
         let events = self
             .api
-            .get(&self.api.telegram, "/api/v1/events")
+            .telegram_get("/api/v1/events")
             .await?
             .get("events")
             .and_then(Value::as_array)
@@ -1504,11 +1456,7 @@ impl Orchestrator {
             Err(_) => {
                 let _ = self
                     .api
-                    .post(
-                        &self.api.intelligence,
-                        &format!("/api/v1/operations/{operation}/cancel"),
-                        json!({}),
-                    )
+                    .intelligence_post(&format!("/api/v1/operations/{operation}/cancel"), json!({}))
                     .await;
                 let conversation = conversation_id.lock().await.clone();
                 if let Some(conversation_id) = &conversation
@@ -1520,8 +1468,7 @@ impl Orchestrator {
                 }
                 let _ = self
                     .api
-                    .post(
-                        &self.api.telegram,
+                    .telegram_post(
                         &format!("/api/v1/events/{}/abort", encode_path(&id)),
                         json!({"conversationId":conversation,"message":TELEGRAM_TIMEOUT_NOTICE}),
                     )
@@ -1567,7 +1514,7 @@ impl Orchestrator {
                             .get("fileName")
                             .and_then(Value::as_str)
                             .unwrap_or("that document");
-                        self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reply",encode_path(&id)),json!({"conversationId":conversation_id,"text":format!("I couldn't read {filename}: {error} Please try sending it again."),"contextWarning":Value::Null})).await?;
+                        self.api.telegram_post(&format!("/api/v1/events/{}/reply",encode_path(&id)),json!({"conversationId":conversation_id,"text":format!("I couldn't read {filename}: {error} Please try sending it again."),"contextWarning":Value::Null})).await?;
                         return Ok(());
                     }
                     Err(error) => return Err(error),
@@ -1597,7 +1544,7 @@ impl Orchestrator {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reply",encode_path(&id)),json!({"conversationId":conversation_id,"text":text,"contextWarning":response.get("contextWarning").cloned().unwrap_or(Value::Null)})).await?;
+            self.api.telegram_post(&format!("/api/v1/events/{}/reply",encode_path(&id)),json!({"conversationId":conversation_id,"text":text,"contextWarning":response.get("contextWarning").cloned().unwrap_or(Value::Null)})).await?;
         }
         Ok(())
     }
@@ -1624,8 +1571,7 @@ impl Orchestrator {
         state["orchestration"] =
             json!({"owner":"backend","status":"stopped","reason":"telegram-timeout"});
         self.api
-            .post(
-                &self.api.history,
+            .history_post(
                 &format!(
                     "/api/v1/conversations/{}/request-ingress",
                     encode_path(conversation_id)
@@ -1690,7 +1636,7 @@ impl Orchestrator {
         if event.get("conversationId").and_then(Value::as_str) != Some(&id)
             || event.get("processingStartedAt").is_none()
         {
-            self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/bind",encode_path(required_string(event,"id")?)),json!({"conversationId":id,"expectedConversationId":event.get("conversationId").cloned().unwrap_or(Value::Null)})).await?;
+            self.api.telegram_post(&format!("/api/v1/events/{}/bind",encode_path(required_string(event,"id")?)),json!({"conversationId":id,"expectedConversationId":event.get("conversationId").cloned().unwrap_or(Value::Null)})).await?;
         }
         if group && !created {
             let group_id = required_string(event, "groupId")?;
@@ -1755,8 +1701,7 @@ impl Orchestrator {
         .await?;
         let record = self
             .api
-            .post(
-                &self.api.history,
+            .history_post(
                 "/api/v1/conversations",
                 json!({"started_at":session.started_at,"state":session.snapshot()?}),
             )
@@ -1770,10 +1715,7 @@ impl Orchestrator {
             "voice" => {
                 let (bytes, mime) = self
                     .api
-                    .bytes(
-                        &self.api.telegram,
-                        &format!("/api/v1/events/{}/media", encode_path(&id)),
-                    )
+                    .telegram_bytes(&format!("/api/v1/events/{}/media", encode_path(&id)))
                     .await?;
                 let existing = event.get("transcription").and_then(Value::as_str);
                 let (text, model) = if let Some(text) = existing {
@@ -1799,8 +1741,7 @@ impl Orchestrator {
                     let text = required_string(&result, "text")?;
                     let model = required_string(&result, "transcription_model")?;
                     self.api
-                        .post(
-                            &self.api.telegram,
+                        .telegram_post(
                             &format!("/api/v1/events/{}/transcription", encode_path(&id)),
                             json!({"text":text,"transcriptionModel":model}),
                         )
@@ -1815,10 +1756,7 @@ impl Orchestrator {
             "document" => {
                 let (bytes, mime) = self
                     .api
-                    .bytes(
-                        &self.api.telegram,
-                        &format!("/api/v1/events/{}/media", encode_path(&id)),
-                    )
+                    .telegram_bytes(&format!("/api/v1/events/{}/media", encode_path(&id)))
                     .await?;
                 let filename = event
                     .get("fileName")
@@ -1852,7 +1790,7 @@ impl Orchestrator {
     async fn process_telegram_reset(&self, event: &Value) -> anyhow::Result<()> {
         let id = required_string(event, "id")?;
         let Some(conversation_id) = event.get("conversationId").and_then(Value::as_str) else {
-            self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
+            self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
             return Ok(());
         };
         let record = match self.get_conversation(conversation_id).await {
@@ -1862,24 +1800,24 @@ impl Orchestrator {
                     .downcast_ref::<super::ApiError>()
                     .is_some_and(|error| error.code == "not_found") =>
             {
-                self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
+                self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
         if record.get("phase").and_then(Value::as_str) != Some("active") {
-            self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
+            self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
             return Ok(());
         }
-        self.api.post(&self.api.history,&format!("/api/v1/conversations/{}/request-ingress",encode_path(conversation_id)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
-        self.api.post(&self.api.telegram,&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session."})).await?;
+        self.api.history_post(&format!("/api/v1/conversations/{}/request-ingress",encode_path(conversation_id)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
+        self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session."})).await?;
         Ok(())
     }
 
     async fn sync_group_updates(self: &Arc<Self>) -> anyhow::Result<()> {
         let updates = self
             .api
-            .get(&self.api.telegram, "/api/v1/group-sessions/updates")
+            .telegram_get("/api/v1/group-sessions/updates")
             .await?
             .get("updates")
             .and_then(Value::as_array)
@@ -1911,8 +1849,7 @@ impl Orchestrator {
         if record.get("phase").and_then(Value::as_str) != Some("active") {
             if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
                 self.api
-                    .post(
-                        &self.api.telegram,
+                    .telegram_post(
                         &format!(
                             "/api/v1/group-sessions/{}/silent-reset-completed",
                             encode_path(&id)
@@ -1941,8 +1878,7 @@ impl Orchestrator {
         if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
             self.close_conversation(&record).await?;
             self.api
-                .post(
-                    &self.api.telegram,
+                .telegram_post(
                     &format!(
                         "/api/v1/group-sessions/{}/silent-reset-completed",
                         encode_path(&id)
@@ -1951,7 +1887,7 @@ impl Orchestrator {
                 )
                 .await?;
         } else {
-            self.api.post(&self.api.telegram,&format!("/api/v1/group-sessions/{}/context-ack",encode_path(&id)),json!({"throughMessageId":update.get("throughMessageId").cloned().unwrap_or(json!(0))})).await?;
+            self.api.telegram_post(&format!("/api/v1/group-sessions/{}/context-ack",encode_path(&id)),json!({"throughMessageId":update.get("throughMessageId").cloned().unwrap_or(json!(0))})).await?;
         }
         Ok(())
     }
@@ -1959,7 +1895,7 @@ impl Orchestrator {
     async fn sync_group_ingress(self: &Arc<Self>) -> anyhow::Result<()> {
         let batches = self
             .api
-            .get(&self.api.telegram, "/api/v1/group-ingress")
+            .telegram_get("/api/v1/group-ingress")
             .await?
             .get("batches")
             .and_then(Value::as_array)
@@ -2003,8 +1939,7 @@ impl Orchestrator {
             match existing.get("phase").and_then(Value::as_str) {
                 Some("complete") => {
                     self.api
-                        .post(
-                            &self.api.telegram,
+                        .telegram_post(
                             &format!("/api/v1/group-ingress/{}/complete", encode_path(&id)),
                             json!({}),
                         )
@@ -2014,7 +1949,7 @@ impl Orchestrator {
                     let existing = self
                         .get_conversation(&required_string(&existing, "id")?)
                         .await?;
-                    self.api.post(&self.api.history,&format!("/api/v1/conversations/{}/request-ingress",encode_path(required_string(&existing,"id")?)),json!({"expected_version":version(&existing)?,"state":existing.get("state").cloned().unwrap_or(Value::Null)})).await?;
+                    self.api.history_post(&format!("/api/v1/conversations/{}/request-ingress",encode_path(required_string(&existing,"id")?)),json!({"expected_version":version(&existing)?,"state":existing.get("state").cloned().unwrap_or(Value::Null)})).await?;
                 }
                 _ => {}
             }
@@ -2035,8 +1970,8 @@ impl Orchestrator {
         let channel = json!({"kind":"telegram-group","chatId":batch.get("chatId").cloned().unwrap_or(Value::Null),"groupId":group_id,"groupRootNodeId":group.get("rootNodeId").cloned().unwrap_or(Value::Null),"groupIngressBatchId":id,"backgroundIngress":true,"groupContext":context});
         let archive = json!({"format":"kennedy-chatend","version":2,"sessionType":"telegram-group","channel":channel,"rootNodeIds":roots,"referenceRootNodeIds":participant_references(&context,&roots),"startedAt":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"provider":runtime.model.provider,"model":runtime.model.model,"systemPrompt":"","retained":messages,"transcript":transcript,"messages":messages,"fullHistory":{"segments":[]},"context":{},"tools":{"loadCalls":0,"loadLimit":0,"log":[]},"usage":Value::Null,"media":[]});
         let state = json!({"stateVersion":2,"sessionType":"telegram-group","channel":channel,"rootNodeIds":roots,"referenceRootNodeIds":participant_references(&context,&roots),"startedAt":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"transcript":transcript,"archive":archive});
-        let record=self.api.post(&self.api.history,"/api/v1/conversations",json!({"started_at":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"state":state})).await?;
-        self.api.post(&self.api.history,&format!("/api/v1/conversations/{}/request-ingress",encode_path(required_string(&record,"id")?)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
+        let record=self.api.history_post("/api/v1/conversations",json!({"started_at":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"state":state})).await?;
+        self.api.history_post(&format!("/api/v1/conversations/{}/request-ingress",encode_path(required_string(&record,"id")?)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
         Ok(())
     }
 }
@@ -2050,8 +1985,7 @@ async fn persist_record(
     let mut record = record.lock().await;
     let id = required_string(&record, "id")?;
     let result = match api
-        .put(
-            &api.history,
+        .history_put(
             &format!(
                 "/api/v1/conversations/{}/checkpoint",
                 encode_path(&id)
@@ -2063,8 +1997,7 @@ async fn persist_record(
         Ok(result) => result,
         Err(error) if error.code == "state_conflict" => {
             let latest = api
-                .get(
-                    &api.history,
+                .history_get(
                     &format!("/api/v1/conversations/{}", encode_path(&id)),
                 )
                 .await?;
@@ -2089,8 +2022,7 @@ async fn persist_ingress_record(
     let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
     state["historyIngress"] = archive;
     let result = match api
-        .put(
-            &api.history,
+        .history_put(
             &format!(
                 "/api/v1/conversations/{}/ingress-checkpoint",
                 encode_path(&id)
@@ -2102,10 +2034,7 @@ async fn persist_ingress_record(
         Ok(result) => result,
         Err(error) if error.code == "state_conflict" => {
             let latest = api
-                .get(
-                    &api.history,
-                    &format!("/api/v1/conversations/{}", encode_path(&id)),
-                )
+                .history_get(&format!("/api/v1/conversations/{}", encode_path(&id)))
                 .await?;
             if latest.get("state") == Some(&state) {
                 latest
@@ -2128,8 +2057,7 @@ async fn persist_audio_ingress(
     let mut state = piece.get("state").cloned().unwrap_or_else(|| json!({}));
     state["historyIngress"] = archive;
     let result = match api
-        .put(
-            &api.audio,
+        .audio_put(
             &format!(
                 "/api/v1/audio-ingress/pieces/{}/ingress-checkpoint",
                 encode_path(&id)
@@ -2141,10 +2069,10 @@ async fn persist_audio_ingress(
         Ok(result) => result,
         Err(error) if error.code == "state_conflict" => {
             let latest = api
-                .get(
-                    &api.audio,
-                    &format!("/api/v1/audio-ingress/pieces/{}", encode_path(&id)),
-                )
+                .audio_get(&format!(
+                    "/api/v1/audio-ingress/pieces/{}",
+                    encode_path(&id)
+                ))
                 .await?;
             if latest.get("state") == Some(&state) {
                 latest
@@ -2213,28 +2141,6 @@ fn recoverable_self_time_slice(histories: &[Value]) -> Option<Value> {
     })
 }
 
-fn select_ingress(
-    conversation: Option<Value>,
-    audio: Option<Value>,
-) -> Option<(&'static str, Value)> {
-    match (conversation, audio) {
-        (None, None) => None,
-        (Some(value), None) => Some(("conversation", value)),
-        (None, Some(value)) => Some(("audio", value)),
-        (Some(conversation), Some(audio)) => {
-            if conversation.get("phase").and_then(Value::as_str) == Some("ingress_in_progress") {
-                Some(("conversation", conversation))
-            } else if audio.get("phase").and_then(Value::as_str) == Some("ingress_in_progress")
-                || audio.get("source_created_at").and_then(Value::as_str)
-                    < conversation.get("started_at").and_then(Value::as_str)
-            {
-                Some(("audio", audio))
-            } else {
-                Some(("conversation", conversation))
-            }
-        }
-    }
-}
 fn session_type(record: &Value) -> String {
     record
         .get("state")
@@ -2346,23 +2252,6 @@ fn telegram_timeout(event: &Value) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ingress_selection_prioritizes_recovery_then_source_time() {
-        let conversation = json!({"phase":"ingress_pending","started_at":"2026-01-02T00:00:00Z"});
-        let audio = json!({"phase":"ingress_pending","source_created_at":"2026-01-01T00:00:00Z"});
-        assert_eq!(
-            select_ingress(Some(conversation.clone()), Some(audio))
-                .unwrap()
-                .0,
-            "audio"
-        );
-        let active = json!({"phase":"ingress_in_progress","started_at":"2026-01-03T00:00:00Z"});
-        assert_eq!(
-            select_ingress(Some(active), Some(conversation)).unwrap().0,
-            "conversation"
-        );
-    }
 
     #[test]
     fn completed_self_time_continues_after_a_restart_only_for_the_latest_slice() {

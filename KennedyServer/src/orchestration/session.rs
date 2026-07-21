@@ -673,7 +673,7 @@ impl Session {
             }
             let response = self
                 .api
-                .post(&self.api.intelligence, "/api/v1/generate", request)
+                .intelligence_post("/api/v1/generate", request)
                 .await?;
             record_usage(&mut self.usage, response.get("usage"));
             anyhow::ensure!(
@@ -976,7 +976,7 @@ impl Session {
                     matches!(mode.as_str(), "quality" | "balanced" | "fast"),
                     "mode must be quality, balanced, or fast"
                 );
-                self.api.post(&self.api.intelligence, "/api/v1/web/search", json!({
+                self.api.intelligence_post( "/api/v1/web/search", json!({
                     "provider":self.runtime.provider,"model":self.runtime.model,"question":question,"mode":mode,"operation_id":operation_id,
                 })).await?
             }
@@ -984,8 +984,7 @@ impl Session {
                 validate_arguments(&call.arguments, &["url"], &[])?;
                 let url = nonempty_string(&call.arguments, "url", 4_096)?;
                 self.api
-                    .post(
-                        &self.api.intelligence,
+                    .intelligence_post(
                         "/api/v1/web/fetch",
                         json!({"url":url,"operation_id":operation_id}),
                     )
@@ -1069,10 +1068,7 @@ impl Session {
         {
             let record = self
                 .api
-                .get(
-                    &self.api.history,
-                    &format!("/api/v1/conversations/{}", encode_path(id)),
-                )
+                .history_get(&format!("/api/v1/conversations/{}", encode_path(id)))
                 .await?;
             anyhow::ensure!(
                 record.get("phase").and_then(Value::as_str) == Some("ingress_in_progress"),

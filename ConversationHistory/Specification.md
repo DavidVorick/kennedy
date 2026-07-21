@@ -4,12 +4,13 @@
 
 The conversation history backend is a logically independent Rust API that owns
 durable backend-owned web and Telegram conversation checkpoints, idempotent
-web/self-time start intents, per-conversation command queues, and the queue of
-conversations that must undergo history ingress. Autonomous self-time records are retained here
+web/self-time start intents, and per-conversation command queues. It submits
+closed conversations to `kennedy-memory-ingress`, which owns the memory queue.
+Autonomous self-time records are retained here
 but complete without entering that queue because their live sessions already
 write to the Kmap. The backend shares `kennedy-server`'s main listener but has
 its own router, state, SQLite database, and crate. It imports no other Kennedy
-backend and calls no other backend.
+backend. Its in-process service handle and HTTP adapter call the same methods.
 
 ## 2. Data Model
 
@@ -35,8 +36,9 @@ cancellation flag, optional outcome, and timestamps. Different conversations
 may expose and process their heads concurrently; only the earliest unfinished
 command within one conversation is claimable.
 
-SQLite permits any number of ordinary `active` and `ingress_pending` records
-but at most one `ingress_in_progress` record. The create path also atomically
+SQLite permits any number of ordinary `active` and mirrored ingress records.
+The shared memory-ingress database enforces the sole in-progress job across
+conversation and audio sources. The create path also atomically
 rejects a second active `free-time` record with
 `free_time_already_active`; this durable server-side guard covers every
 frontend client without a browser lock. Completed and failed records
@@ -90,9 +92,9 @@ active -> ingress_pending -> ingress_in_progress -> complete
   requires a successful `EndTurn` receipt in the archived tool log. Both the
   direct-completion transition and queue selection verify its stored session
   type. Existing queued or failed self-time records are migrated to `complete`.
-- The oldest eligible queued conversation is selected by last user activity,
-  falling back to its start time. An actively claimed `ingress_in_progress`
-  record wins; deferred records are skipped until their next-attempt time.
+- Shared queue ordering uses last user activity, falling back to conversation
+  start time, and compares that timestamp directly with audio source times. An
+  active global claim wins; deferred jobs are skipped until their next attempt.
 - The backend orchestrator creates or retrieves idempotent Kweb provenance, records its ID,
   supplies the `end-turn-v1` completion-protocol identifier, and
   changes the selected record to `ingress_in_progress`. The backend rejects a
@@ -114,7 +116,7 @@ active -> ingress_pending -> ingress_in_progress -> complete
   records remain quarantined from stale workers. A repair that exhausts its
   new attempts remains terminal for later explicit retry instead of being
   automatically released again on every frontend load.
-- The backend worker records a failed ingress attempt atomically. Attempts one
+- The shared queue records a failed ingress attempt atomically. Attempts one
   through four return the record to `ingress_pending`, release the
   single-worker claim, and defer that record for 15 seconds so other eligible
   conversations or audio pieces can proceed. Attempt five changes it to
@@ -122,7 +124,7 @@ active -> ingress_pending -> ingress_in_progress -> complete
   A provider input-size rejection is terminal on its first attempt because the
   unchanged checkpoint cannot make it smaller. Failed records remain queryable
   with their diagnostic logs.
-- New and existing active conversations are independent of this queue.
+- New and existing active conversations are independent of the shared queue.
 - A terminal failed record can be explicitly retried. A frontend request may
   schedule it, while the backend supplies a
   fresh opaque state with the failed history-ingress checkpoint removed, the

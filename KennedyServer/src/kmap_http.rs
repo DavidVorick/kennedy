@@ -33,17 +33,156 @@ pub(crate) struct SystemRoots {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct Service {
     kmap: Arc<Mutex<Kmap>>,
     roots: SystemRoots,
     prompts_dir: PathBuf,
 }
 
+impl Service {
+    pub(crate) fn new(kmap: Kmap, roots: SystemRoots, prompts_dir: PathBuf) -> Self {
+        Self {
+            kmap: Arc::new(Mutex::new(kmap)),
+            roots,
+            prompts_dir,
+        }
+    }
+}
+
 #[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+pub(crate) struct ApiError {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+}
+
+pub(crate) struct ArtifactInput {
+    pub original_filename: String,
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+impl Service {
+    pub(crate) async fn get_json(&self, path: &str) -> Result<Value, ApiError> {
+        let state = State(self.clone());
+        match path {
+            "/api/v1/kmap/health" => {
+                let Json(value) = health(state).await?;
+                Ok(value)
+            }
+            "/api/v1/kmap/roots" => {
+                let Json(value) = get_roots(state).await;
+                Ok(value)
+            }
+            _ if path.starts_with("/api/v1/kmap/nodes/") && !path.ends_with("/history") => {
+                let id = path.trim_start_matches("/api/v1/kmap/nodes/");
+                let Json(value) = get_node(state, Path(id.into())).await?;
+                Ok(value)
+            }
+            _ if path.starts_with("/api/v1/kmap/provenance/") => {
+                let id = path.trim_start_matches("/api/v1/kmap/provenance/");
+                let Json(value) = get_provenance(state, Path(id.into())).await?;
+                serde_json::to_value(value).map_err(ApiError::internal)
+            }
+            _ => Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "not_found",
+                message: "Kmap resource not found.".into(),
+            }),
+        }
+    }
+
+    pub(crate) async fn post_json(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        let state = State(self.clone());
+        match path {
+            "/api/v1/kmap/provenance" => {
+                let (_, Json(value)) = create_provenance(
+                    state,
+                    Json(
+                        serde_json::from_value(body)
+                            .map_err(|error| ApiError::invalid(error.to_string()))?,
+                    ),
+                )
+                .await?;
+                Ok(value)
+            }
+            "/api/v1/kmap/nodes" => {
+                let (_, Json(value)) = create_node(
+                    state,
+                    Json(
+                        serde_json::from_value(body)
+                            .map_err(|error| ApiError::invalid(error.to_string()))?,
+                    ),
+                )
+                .await?;
+                Ok(value)
+            }
+            _ => Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "not_found",
+                message: "Kmap resource not found.".into(),
+            }),
+        }
+    }
+
+    pub(crate) async fn put_json(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        let id = path
+            .strip_prefix("/api/v1/kmap/nodes/")
+            .filter(|id| !id.contains('/'))
+            .ok_or_else(|| ApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "not_found",
+                message: "Kmap node not found.".into(),
+            })?;
+        let Json(value) = update_node(
+            State(self.clone()),
+            Path(id.into()),
+            Json(
+                serde_json::from_value(body)
+                    .map_err(|error| ApiError::invalid(error.to_string()))?,
+            ),
+        )
+        .await?;
+        Ok(value)
+    }
+
+    pub(crate) fn create_provenance_archive(
+        &self,
+        idempotency_id: &str,
+        data: String,
+        source: &str,
+        source_created_at: &str,
+        data_filename: String,
+        artifacts: Vec<ArtifactInput>,
+    ) -> Result<Value, ApiError> {
+        let idempotency_id = IdempotencyId::from_hex(idempotency_id).map_err(ApiError::from)?;
+        let id = self
+            .kmap
+            .lock()
+            .map_err(ApiError::internal)?
+            .create_provenance_with_storage(
+                idempotency_id,
+                NewProvenance {
+                    data,
+                    source: source.into(),
+                    source_created_at: source_created_at.into(),
+                },
+                ProvenanceStorage {
+                    data_filename,
+                    artifacts: artifacts
+                        .into_iter()
+                        .map(|artifact| NewProvenanceArtifact {
+                            original_filename: artifact.original_filename,
+                            media_type: artifact.media_type,
+                            role: "media".into(),
+                            data: artifact.data,
+                        })
+                        .collect(),
+                },
+            )
+            .map_err(ApiError::from)?;
+        Ok(json!({"id":id}))
+    }
 }
 
 impl ApiError {
@@ -254,19 +393,17 @@ impl MergedRouters {
 }
 
 pub(crate) async fn serve_with_listener(
-    kmap: Kmap,
-    roots: SystemRoots,
+    state: Service,
     frontend_dir: PathBuf,
-    system_prompts_dir: PathBuf,
     merged_routers: MergedRouters,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
-    let artifact_directory = kmap.artifact_path().to_owned();
-    let state = AppState {
-        kmap: Arc::new(Mutex::new(kmap)),
-        roots,
-        prompts_dir: system_prompts_dir,
-    };
+    let artifact_directory = state
+        .kmap
+        .lock()
+        .map_err(|_| anyhow::anyhow!("locking Kmap for HTTP startup"))?
+        .artifact_path()
+        .to_owned();
     let app = Router::new()
         .route("/api/v1/kmap/health", get(health))
         .route("/api/v1/kmap/roots", get(get_roots))
@@ -313,7 +450,7 @@ async fn prevent_stale_frontend_assets(mut response: Response) -> Response {
     response
 }
 
-async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn health(State(state): State<Service>) -> Result<Json<Value>, ApiError> {
     state
         .kmap
         .lock()
@@ -323,14 +460,14 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
     Ok(Json(json!({"service":"kmap","status":"ok"})))
 }
 
-async fn get_roots(State(state): State<AppState>) -> Json<Value> {
+async fn get_roots(State(state): State<Service>) -> Json<Value> {
     Json(json!({
         "user_root_node_id":state.roots.user,
         "kennedy_root_node_id":state.roots.kennedy,
     }))
 }
 
-async fn get_stats(State(state): State<AppState>) -> Result<Json<kweb_db_core::Stats>, ApiError> {
+async fn get_stats(State(state): State<Service>) -> Result<Json<kweb_db_core::Stats>, ApiError> {
     let stats = state
         .kmap
         .lock()
@@ -341,7 +478,7 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<kweb_db_core::S
 }
 
 async fn create_provenance(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Json(input): Json<CreateProvenanceRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = state
@@ -361,7 +498,7 @@ async fn create_provenance(
 }
 
 async fn create_provenance_with_artifacts(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let mut idempotency_id = None;
@@ -485,7 +622,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<(), ApiErro
 }
 
 async fn get_provenance(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Path(id): Path<String>,
 ) -> Result<Json<kweb_db_core::Provenance>, ApiError> {
     let id = NodeId::from_hex(&id).map_err(ApiError::from)?;
@@ -499,7 +636,7 @@ async fn get_provenance(
 }
 
 async fn create_node(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Json(input): Json<CreateNodeRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = input
@@ -571,7 +708,7 @@ fn node_response(kmap: &mut Kmap, node: &kweb_db_core::Node) -> Result<Value, Ap
 }
 
 async fn get_node(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = NodeId::from_hex(&id).map_err(ApiError::from)?;
@@ -581,7 +718,7 @@ async fn get_node(
 }
 
 async fn update_node(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Path(id): Path<String>,
     Json(input): Json<UpdateNodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -609,7 +746,7 @@ async fn update_node(
 }
 
 async fn get_history(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = NodeId::from_hex(&id).map_err(ApiError::from)?;
@@ -623,7 +760,7 @@ async fn get_history(
 }
 
 async fn get_prompt(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Path(filename): Path<String>,
 ) -> Result<Response, ApiError> {
     let safe_name = filename.ends_with(".txt")
@@ -721,11 +858,10 @@ mod tests {
             "/api/v1/test-intelligence",
             get(|| async { Json(json!({"service":"intelligence"})) }),
         );
+        let service = Service::new(kmap, roots, directory.join("prompts"));
         let server = tokio::spawn(serve_with_listener(
-            kmap,
-            roots,
+            service,
             directory.join("frontend"),
-            directory.join("prompts"),
             MergedRouters::new(Router::new(), intelligence, Router::new(), Router::new()),
             listener,
         ));

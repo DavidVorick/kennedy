@@ -47,10 +47,10 @@ struct CompleteRoot {
 }
 
 #[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+pub(crate) struct ApiError {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl ApiError {
@@ -185,6 +185,100 @@ impl IdentitySink for Directory {
             params![group_id, root_node_id, now],
         )?;
         Ok(())
+    }
+}
+
+impl Directory {
+    pub(crate) async fn get_json(
+        self: &std::sync::Arc<Self>,
+        path: &str,
+    ) -> Result<Value, ApiError> {
+        let state = State(self.clone());
+        match path {
+            "/api/v1/telegram-directory/users/provisioning" => {
+                let Json(value) = list_provisioning_users(state).await?;
+                Ok(value)
+            }
+            "/api/v1/telegram-directory/groups/provisioning" => {
+                let Json(value) = list_provisioning_groups(state).await?;
+                Ok(value)
+            }
+            _ if path.starts_with("/api/v1/telegram-directory/users/by-handle/") => {
+                let handle = path.trim_start_matches("/api/v1/telegram-directory/users/by-handle/");
+                let Json(value) = user_by_handle(state, AxumPath(handle.into())).await?;
+                serde_json::to_value(value).map_err(ApiError::internal)
+            }
+            _ if path.starts_with("/api/v1/telegram-directory/users/") => {
+                let id = path
+                    .trim_start_matches("/api/v1/telegram-directory/users/")
+                    .parse::<i64>()
+                    .map_err(|_| ApiError::bad("Invalid Telegram user ID."))?;
+                let Json(value) = user_by_id(state, AxumPath(id)).await?;
+                serde_json::to_value(value).map_err(ApiError::internal)
+            }
+            _ if path.starts_with("/api/v1/telegram-directory/groups/") => {
+                let id = path.trim_start_matches("/api/v1/telegram-directory/groups/");
+                let Json(value) = group_by_id(state, AxumPath(id.into())).await?;
+                serde_json::to_value(value).map_err(ApiError::internal)
+            }
+            _ => Err(ApiError::not_found()),
+        }
+    }
+
+    pub(crate) async fn post_json(
+        self: &std::sync::Arc<Self>,
+        path: &str,
+        body: Value,
+    ) -> Result<Value, ApiError> {
+        if let Some(handle) = path
+            .strip_prefix("/api/v1/telegram-directory/users/by-handle/")
+            .and_then(|tail| tail.strip_suffix("/root-ready"))
+        {
+            let Json(value) = complete_handle_root(
+                State(self.clone()),
+                AxumPath(handle.into()),
+                Json(
+                    serde_json::from_value(body)
+                        .map_err(|error| ApiError::bad(error.to_string()))?,
+                ),
+            )
+            .await?;
+            return serde_json::to_value(value).map_err(ApiError::internal);
+        }
+        if let Some(id) = path
+            .strip_prefix("/api/v1/telegram-directory/users/")
+            .and_then(|tail| tail.strip_suffix("/root-ready"))
+        {
+            let id = id
+                .parse::<i64>()
+                .map_err(|_| ApiError::bad("Invalid Telegram user ID."))?;
+            let Json(value) = complete_user_root(
+                State(self.clone()),
+                AxumPath(id),
+                Json(
+                    serde_json::from_value(body)
+                        .map_err(|error| ApiError::bad(error.to_string()))?,
+                ),
+            )
+            .await?;
+            return serde_json::to_value(value).map_err(ApiError::internal);
+        }
+        if let Some(id) = path
+            .strip_prefix("/api/v1/telegram-directory/groups/")
+            .and_then(|tail| tail.strip_suffix("/root-ready"))
+        {
+            let Json(value) = complete_group_root(
+                State(self.clone()),
+                AxumPath(id.into()),
+                Json(
+                    serde_json::from_value(body)
+                        .map_err(|error| ApiError::bad(error.to_string()))?,
+                ),
+            )
+            .await?;
+            return serde_json::to_value(value).map_err(ApiError::internal);
+        }
+        Err(ApiError::not_found())
     }
 }
 

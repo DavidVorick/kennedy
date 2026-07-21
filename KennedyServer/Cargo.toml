@@ -16,6 +16,7 @@ hex.workspace = true
 kennedy-audio-ingress = { path = "../AudioIngress" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
 kennedy-chatend = { path = "../Chatend" }
+kennedy-memory-ingress = { path = "../MemoryIngress" }
 kcode-codex-runtime.workspace = true
 kcode-doc-extraction.workspace = true
 kcode-gemini-api.workspace = true

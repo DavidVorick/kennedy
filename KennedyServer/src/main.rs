@@ -45,6 +45,12 @@ struct Args {
     user_database: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-audio.sqlite3")]
     audio_ingress_database: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        default_value = "./kennedy-memory-ingress.sqlite3"
+    )]
+    memory_ingress_database: PathBuf,
     #[arg(long, global = true, default_value = "./kennedy-audio-ingress")]
     audio_ingress_media: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
@@ -131,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
                 telegram_database: args.telegram_database,
                 user_database: args.user_database,
                 audio_database: args.audio_ingress_database,
+                memory_ingress_database: args.memory_ingress_database,
                 audio_media_directory: args.audio_ingress_media,
                 vault: vault_path,
             })
@@ -154,11 +161,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let kweb_listener = tokio::net::TcpListener::bind(&args.kweb_bind)
         .await
         .with_context(|| format!("binding Kweb listener {}", args.kweb_bind))?;
-    let orchestration_kweb_base = internal_http_base(&args.kweb_bind);
-    let orchestration_intelligence_base = orchestration_kweb_base.clone();
-    let orchestration_history_base = orchestration_kweb_base.clone();
-    let orchestration_telegram_base = internal_http_base(&args.telegram_bind);
-    let orchestration_audio_base = orchestration_kweb_base.clone();
+    let orchestration_telegram_base = telegram_relay_http_base(&args.telegram_bind);
     let vault = if vault_path.exists() {
         let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
         CredentialVault::unlock(&vault_path, passphrase)?
@@ -184,31 +187,38 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.kweb_provenance_artifacts,
         &args.user_database,
     )?;
+    let kmap_service = kmap_http::Service::new(kmap, system_roots, args.system_prompts_dir.clone());
+    let memory_ingress = kennedy_memory_ingress::Queue::open(&args.memory_ingress_database)
+        .context("opening shared memory-ingress queue")?;
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
     )?);
     let telegram_directory_router = telegram_identity::router(telegram_identity.clone());
-    let history_router =
-        kennedy_conversation_history::router(kennedy_conversation_history::Config {
+    let history_service = kennedy_conversation_history::open(
+        kennedy_conversation_history::Config {
             database: args.conversation_history_database,
             max_request_bytes: 128 * 1024 * 1024,
-        })?;
-    let intelligence_router = intelligence::router(
+        },
+        memory_ingress.clone(),
+    )?;
+    let history_router = kennedy_conversation_history::router(history_service.clone());
+    let intelligence_service = intelligence::open(
         transcription_api_key,
         gemini_api_key.clone(),
         codex_catalog_cache.clone(),
     )
     .await?;
+    let intelligence_router = intelligence::router(intelligence_service.clone());
     let telegram = kcode_tg_kennedy_bot::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
         allowed_origins: vec![args.frontend_origin.clone()],
         bot_token: telegram_bot_token,
-        identity_sink: telegram_identity,
+        identity_sink: telegram_identity.clone(),
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
-    let audio_ingress_router = kennedy_audio_ingress::router(
+    let audio_service = kennedy_audio_ingress::open(
         kennedy_audio_ingress::Config {
             database: args.audio_ingress_database,
             media_directory: args.audio_ingress_media,
@@ -216,23 +226,38 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             gemini_api_key: gemini_api_key.clone(),
         },
         codex_catalog_cache,
+        memory_ingress.clone(),
     )
     .await?;
+    let audio_ingress_router = kennedy_audio_ingress::router(audio_service.clone());
     let orchestration = orchestration::Config {
         system_prompts_directory: args.system_prompts_dir.clone(),
-        kweb_base: orchestration_kweb_base,
-        intelligence_base: orchestration_intelligence_base,
-        conversation_history_base: orchestration_history_base,
         telegram_relay_base: orchestration_telegram_base,
-        audio_ingress_base: orchestration_audio_base,
+        #[cfg(test)]
+        kweb_base: String::new(),
+        #[cfg(test)]
+        intelligence_base: String::new(),
+        #[cfg(test)]
+        conversation_history_base: String::new(),
+        #[cfg(test)]
+        audio_ingress_base: String::new(),
         telegram_web_user_handle: args.telegram_bootstrap_username,
     };
+    let orchestration_api = orchestration::Api::local(
+        &orchestration.telegram_relay_base,
+        orchestration::LocalServices {
+            kmap: kmap_service.clone(),
+            intelligence: intelligence_service,
+            history: history_service,
+            audio: audio_service,
+            directory: telegram_identity.clone(),
+            memory_ingress,
+        },
+    )?;
     tokio::try_join!(
         kmap_http::serve_with_listener(
-            kmap,
-            system_roots,
+            kmap_service,
             args.frontend_dir,
-            args.system_prompts_dir,
             kmap_http::MergedRouters::new(
                 telegram_directory_router,
                 intelligence_router,
@@ -242,12 +267,12 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             kweb_listener,
         ),
         kcode_tg_kennedy_bot::serve(telegram),
-        orchestration::run(orchestration),
+        orchestration::run(orchestration, orchestration_api),
     )?;
     Ok(())
 }
 
-fn internal_http_base(bind: &str) -> String {
+fn telegram_relay_http_base(bind: &str) -> String {
     let bind = bind.trim();
     let Ok(address) = bind.parse::<SocketAddr>() else {
         return format!("http://{bind}");
@@ -405,10 +430,16 @@ mod tests {
     }
 
     #[test]
-    fn internal_service_urls_are_valid_for_wildcard_and_ipv6_binds() {
-        assert_eq!(internal_http_base("0.0.0.0:4321"), "http://127.0.0.1:4321");
-        assert_eq!(internal_http_base("[::]:4322"), "http://127.0.0.1:4322");
-        assert_eq!(internal_http_base("[::1]:9876"), "http://[::1]:9876");
+    fn telegram_relay_urls_are_valid_for_wildcard_and_ipv6_binds() {
+        assert_eq!(
+            telegram_relay_http_base("0.0.0.0:4321"),
+            "http://127.0.0.1:4321"
+        );
+        assert_eq!(
+            telegram_relay_http_base("[::]:4322"),
+            "http://127.0.0.1:4322"
+        );
+        assert_eq!(telegram_relay_http_base("[::1]:9876"), "http://[::1]:9876");
     }
 
     #[tokio::test]
@@ -424,6 +455,7 @@ mod tests {
         let telegram = directory.join("telegram.sqlite3");
         let users = directory.join("users.sqlite3");
         let audio = directory.join("audio.sqlite3");
+        let memory_ingress = directory.join("memory-ingress.sqlite3");
         let audio_media = directory.join("audio-media");
         let args = Args {
             vault_path: vault.clone(),
@@ -437,6 +469,7 @@ mod tests {
             telegram_database: telegram.clone(),
             user_database: users.clone(),
             audio_ingress_database: audio.clone(),
+            memory_ingress_database: memory_ingress.clone(),
             audio_ingress_media: audio_media.clone(),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
@@ -453,6 +486,7 @@ mod tests {
         assert!(!telegram.exists());
         assert!(!users.exists());
         assert!(!audio.exists());
+        assert!(!memory_ingress.exists());
         assert!(!audio_media.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }

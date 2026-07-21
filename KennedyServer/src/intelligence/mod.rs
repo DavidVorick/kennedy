@@ -64,7 +64,7 @@ struct ProviderRuntime {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct Service {
     default_provider: &'static str,
     providers: Arc<HashMap<&'static str, ProviderRuntime>>,
     codex: Codex,
@@ -188,15 +188,15 @@ impl CleanCodexThreads {
 }
 
 #[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+pub(crate) struct ApiError {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
     request_id: Option<Uuid>,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
             code,
@@ -440,11 +440,11 @@ struct ActionTiming {
     step_count: Option<u64>,
 }
 
-pub(crate) async fn router(
+pub(crate) async fn open(
     openai_api_key: Option<String>,
     gemini_api_key: Option<String>,
     codex_catalog_cache: CatalogCache,
-) -> anyhow::Result<Router> {
+) -> anyhow::Result<Service> {
     let mut codex_config = CodexConfig::new(DEFAULT_MODEL);
     codex_config.base_instruction = KENNEDY_CODEX_BASE_INSTRUCTION.into();
     codex_config.validation_reasoning_effort = GENERATION_REASONING_EFFORT;
@@ -477,7 +477,7 @@ pub(crate) async fn router(
         .map(Gemini::open)
         .transpose()
         .context("opening Gemini client")?;
-    let state = AppState {
+    Ok(Service {
         default_provider: DEFAULT_PROVIDER_NAME,
         providers: Arc::new(providers),
         codex,
@@ -487,8 +487,11 @@ pub(crate) async fn router(
         document_extractor: DocumentExtractor::default(),
         active_operations: ActiveOperations::default(),
         clean_codex_threads: CleanCodexThreads::default(),
-    };
-    Ok(Router::new()
+    })
+}
+
+pub(crate) fn router(state: Service) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/api/v1/providers", get(list_providers))
         .route("/api/v1/generate", post(generate))
@@ -502,10 +505,221 @@ pub(crate) async fn router(
         )
         .route("/api/v1/timings", post(record_timing))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .with_state(state))
+        .with_state(state)
 }
 
-async fn health(State(state): State<AppState>) -> Json<Value> {
+impl Service {
+    pub(crate) async fn get_json(&self, path: &str) -> Result<Value, ApiError> {
+        match path {
+            "/health" => {
+                let Json(value) = health(State(self.clone())).await;
+                Ok(value)
+            }
+            "/api/v1/providers" => {
+                let Json(value) = list_providers(State(self.clone())).await;
+                Ok(value)
+            }
+            _ => Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Intelligence resource not found.",
+            )),
+        }
+    }
+
+    pub(crate) async fn post_json(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        match path {
+            "/api/v1/generate" => {
+                let Json(value) = generate(
+                    State(self.clone()),
+                    Json(
+                        serde_json::from_value(body)
+                            .map_err(|error| ApiError::invalid(error.to_string()))?,
+                    ),
+                )
+                .await?;
+                serde_json::to_value(value)
+                    .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
+            }
+            "/api/v1/web/search" => {
+                let Json(value) = web_search(
+                    State(self.clone()),
+                    Json(
+                        serde_json::from_value(body)
+                            .map_err(|error| ApiError::invalid(error.to_string()))?,
+                    ),
+                )
+                .await?;
+                serde_json::to_value(value)
+                    .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
+            }
+            "/api/v1/web/fetch" => {
+                let Json(value) = web_fetch(
+                    State(self.clone()),
+                    Json(
+                        serde_json::from_value(body)
+                            .map_err(|error| ApiError::invalid(error.to_string()))?,
+                    ),
+                )
+                .await?;
+                serde_json::to_value(value)
+                    .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
+            }
+            _ if path.starts_with("/api/v1/operations/") && path.ends_with("/cancel") => {
+                let id = path
+                    .trim_start_matches("/api/v1/operations/")
+                    .trim_end_matches("/cancel")
+                    .trim_end_matches('/');
+                let operation_id =
+                    Uuid::parse_str(id).map_err(|_| ApiError::invalid("Invalid operation ID."))?;
+                let Json(value) = cancel_operation(State(self.clone()), Path(operation_id)).await?;
+                serde_json::to_value(value)
+                    .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
+            }
+            "/api/v1/timings" => {
+                record_timing(Json(
+                    serde_json::from_value(body)
+                        .map_err(|error| ApiError::invalid(error.to_string()))?,
+                ))
+                .await?;
+                Ok(Value::Null)
+            }
+            _ => Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Intelligence resource not found.",
+            )),
+        }
+    }
+
+    pub(crate) async fn extract_document_bytes(
+        &self,
+        bytes: Vec<u8>,
+        filename: String,
+        mime: &str,
+    ) -> Result<Value, ApiError> {
+        let request_id = Uuid::new_v4();
+        let response = self
+            .extract_document_input(
+                DocumentInput {
+                    file_name: filename,
+                    content_type: mime.to_ascii_lowercase(),
+                    data: bytes,
+                },
+                request_id,
+            )
+            .await?;
+        serde_json::to_value(response)
+            .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
+    }
+
+    pub(crate) async fn transcribe_bytes(
+        &self,
+        provider: &str,
+        model: &str,
+        bytes: Vec<u8>,
+        filename: String,
+        mime: &str,
+    ) -> Result<Value, ApiError> {
+        let request_id = Uuid::new_v4();
+        let response = self
+            .transcribe_input(
+                Some(provider),
+                Some(model),
+                bytes,
+                safe_audio_filename(Some(&filename), mime),
+                mime.to_ascii_lowercase(),
+                request_id,
+            )
+            .await?;
+        serde_json::to_value(response)
+            .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
+    }
+
+    async fn extract_document_input(
+        &self,
+        input: DocumentInput,
+        request_id: Uuid,
+    ) -> Result<DocumentExtractionResponse, ApiError> {
+        let input_bytes = input.data.len();
+        let started = Instant::now();
+        let extractor = self.document_extractor.clone();
+        let extracted = tokio::task::spawn_blocking(move || extractor.extract(input))
+            .await
+            .map_err(|_| {
+                ApiError::internal(
+                    "document_extraction_failed",
+                    "The document extraction worker stopped unexpectedly.",
+                )
+                .with_request_id(request_id)
+            })?
+            .map_err(|error| document_error(error, request_id))?;
+        tracing::info!(
+            format = extracted.format.as_str(),
+            input_bytes,
+            characters = extracted.characters,
+            truncated = extracted.truncated,
+            duration_ms = started.elapsed().as_millis(),
+            "Document extracted"
+        );
+        Ok(DocumentExtractionResponse {
+            status: "complete".into(),
+            file_name: extracted.file_name,
+            content_type: extracted.content_type,
+            format: extracted.format.as_str().into(),
+            text: extracted.text,
+            characters: extracted.characters,
+            truncated: extracted.truncated,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transcribe_input(
+        &self,
+        requested_provider: Option<&str>,
+        requested_model: Option<&str>,
+        bytes: Vec<u8>,
+        file_name: String,
+        content_type: String,
+        request_id: Uuid,
+    ) -> Result<TranscriptionResponse, ApiError> {
+        let (provider_name, provider, model) =
+            selected_provider(self, requested_provider, requested_model)?;
+        if provider.config.native_audio_input_models.contains(&model) {
+            return Err(ApiError::conflict(
+                "native_audio_supported",
+                "The selected model supports native audio and must receive the recording directly.",
+            )
+            .with_request_id(request_id));
+        }
+        let openai = self.openai.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transcription_unavailable",
+                "Audio transcription is not configured.",
+            )
+            .with_request_id(request_id)
+        })?;
+        let input = AudioInput::new(file_name, content_type, bytes)
+            .map_err(|error| openai_error(error, request_id))?;
+        let started = Instant::now();
+        let transcription = openai
+            .transcribe(TranscriptionRequest::new(input))
+            .await
+            .map_err(|error| openai_error(error, request_id))?;
+        tracing::info!(%request_id,action="transcribe",provider=%provider_name,model=TRANSCRIPTION_MODEL,duration_ms=started.elapsed().as_millis(),"LLM call");
+        Ok(TranscriptionResponse {
+            status: "complete".into(),
+            provider: provider_name.into(),
+            input_model: model.into(),
+            transcription_model: TRANSCRIPTION_MODEL.into(),
+            text: transcription.text,
+            usage: transcription.usage.map(transcription_usage_json),
+        })
+    }
+}
+
+async fn health(State(state): State<Service>) -> Json<Value> {
     Json(json!({
         "service":"kennedy",
         "status":"ok",
@@ -514,7 +728,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn list_providers(State(state): State<AppState>) -> Json<Value> {
+async fn list_providers(State(state): State<Service>) -> Json<Value> {
     let providers = state
         .providers
         .iter()
@@ -575,7 +789,7 @@ fn model_input_modalities(provider: &ProviderConfig, model: &str) -> Vec<&'stati
 }
 
 fn selected_provider<'a>(
-    state: &'a AppState,
+    state: &'a Service,
     requested_provider: Option<&'a str>,
     requested_model: Option<&'a str>,
 ) -> Result<(&'a str, &'a ProviderRuntime, &'a str), ApiError> {
@@ -627,7 +841,7 @@ fn validate_generate_request(request: &GenerateRequest) -> Result<(), ApiError> 
 }
 
 async fn generate(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Json(request): Json<GenerateRequest>,
 ) -> Result<Json<NormalizedResponse>, ApiError> {
     validate_generate_request(&request)?;
@@ -675,7 +889,7 @@ async fn generate(
 }
 
 async fn web_search(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Json(request): Json<WebSearchRequest>,
 ) -> Result<Json<WebSearchResponse>, ApiError> {
     let question = request.question.trim();
@@ -802,7 +1016,7 @@ async fn web_search(
 }
 
 async fn web_fetch(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Json(request): Json<WebFetchRequest>,
 ) -> Result<Json<WebFetchResponse>, ApiError> {
     let request_id = request.operation_id.unwrap_or_else(Uuid::new_v4);
@@ -822,11 +1036,10 @@ async fn web_fetch(
 }
 
 async fn extract_document(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     mut multipart: Multipart,
 ) -> Result<Json<DocumentExtractionResponse>, ApiError> {
     let request_id = Uuid::new_v4();
-    let started = Instant::now();
     let mut upload = None;
     while let Some(field) = multipart.next_field().await.map_err(|_| {
         ApiError::invalid("The multipart document request could not be read.")
@@ -859,39 +1072,11 @@ async fn extract_document(
         ApiError::invalid("One document file field named 'file' is required.")
             .with_request_id(request_id)
     })?;
-    let input_bytes = input.data.len();
-    let extractor = state.document_extractor.clone();
-    let extracted = tokio::task::spawn_blocking(move || extractor.extract(input))
-        .await
-        .map_err(|_| {
-            ApiError::internal(
-                "document_extraction_failed",
-                "The document extraction worker stopped unexpectedly.",
-            )
-            .with_request_id(request_id)
-        })?
-        .map_err(|error| document_error(error, request_id))?;
-    tracing::info!(
-        format = extracted.format.as_str(),
-        input_bytes,
-        characters = extracted.characters,
-        truncated = extracted.truncated,
-        duration_ms = started.elapsed().as_millis(),
-        "Document extracted"
-    );
-    Ok(Json(DocumentExtractionResponse {
-        status: "complete".into(),
-        file_name: extracted.file_name,
-        content_type: extracted.content_type,
-        format: extracted.format.as_str().into(),
-        text: extracted.text,
-        characters: extracted.characters,
-        truncated: extracted.truncated,
-    }))
+    Ok(Json(state.extract_document_input(input, request_id).await?))
 }
 
 async fn transcribe_audio(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     mut multipart: Multipart,
 ) -> Result<Json<TranscriptionResponse>, ApiError> {
     let request_id = Uuid::new_v4();
@@ -934,46 +1119,22 @@ async fn transcribe_audio(
             .to_vec();
         audio = Some((bytes, file_name, content_type));
     }
-    let (provider_name, provider, model) = selected_provider(
-        &state,
-        requested_provider.as_deref(),
-        requested_model.as_deref(),
-    )?;
-    if provider.config.native_audio_input_models.contains(&model) {
-        return Err(ApiError::conflict(
-            "native_audio_supported",
-            "The selected model supports native audio and must receive the recording directly.",
-        )
-        .with_request_id(request_id));
-    }
-    let openai = state.openai.as_ref().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "transcription_unavailable",
-            "Audio transcription is not configured.",
-        )
-        .with_request_id(request_id)
-    })?;
     let (bytes, file_name, content_type) = audio.ok_or_else(|| {
         ApiError::invalid("One audio file field named 'file' is required.")
             .with_request_id(request_id)
     })?;
-    let input = AudioInput::new(file_name, content_type, bytes)
-        .map_err(|error| openai_error(error, request_id))?;
-    let started = Instant::now();
-    let transcription = openai
-        .transcribe(TranscriptionRequest::new(input))
-        .await
-        .map_err(|error| openai_error(error, request_id))?;
-    tracing::info!(%request_id,action="transcribe",provider=%provider_name,model=TRANSCRIPTION_MODEL,duration_ms=started.elapsed().as_millis(),"LLM call");
-    Ok(Json(TranscriptionResponse {
-        status: "complete".into(),
-        provider: provider_name.into(),
-        input_model: model.into(),
-        transcription_model: TRANSCRIPTION_MODEL.into(),
-        text: transcription.text,
-        usage: transcription.usage.map(transcription_usage_json),
-    }))
+    Ok(Json(
+        state
+            .transcribe_input(
+                requested_provider.as_deref(),
+                requested_model.as_deref(),
+                bytes,
+                file_name,
+                content_type,
+                request_id,
+            )
+            .await?,
+    ))
 }
 
 fn safe_audio_filename(value: Option<&str>, content_type: &str) -> String {
@@ -1021,7 +1182,7 @@ fn transcription_usage_json(usage: TranscriptionUsage) -> Value {
 }
 
 async fn cancel_operation(
-    State(state): State<AppState>,
+    State(state): State<Service>,
     Path(operation_id): Path<Uuid>,
 ) -> Result<Json<OperationCancellationResponse>, ApiError> {
     Ok(Json(OperationCancellationResponse {

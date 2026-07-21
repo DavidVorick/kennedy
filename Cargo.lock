@@ -2040,6 +2040,7 @@ dependencies = [
  "kcode-codex-runtime",
  "kcode-gemini-api",
  "kennedy-chatend",
+ "kennedy-memory-ingress",
  "ruopus",
  "rusqlite",
  "serde",
@@ -2065,12 +2066,25 @@ dependencies = [
  "axum",
  "chrono",
  "kennedy-chatend",
+ "kennedy-memory-ingress",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kennedy-memory-ingress"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2094,6 +2108,7 @@ dependencies = [
  "kennedy-audio-ingress",
  "kennedy-chatend",
  "kennedy-conversation-history",
+ "kennedy-memory-ingress",
  "kweb-db-core",
  "rand 0.9.5",
  "reqwest 0.13.4",

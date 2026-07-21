@@ -1,9 +1,10 @@
 # Audio Ingress Specification
 
-The audio-ingress router is Kennedy's durable loopback pipeline for vnote WAV
-recordings. It does not access the Kmap, conversation database, or intelligence
-backend. Its persistent state is `kennedy-audio.sqlite3` plus the private
-`kennedy-audio-ingress/` media tree.
+The audio-ingress router is Kennedy's durable pipeline for vnote WAV recordings.
+It does not access the Kmap, conversation database, or intelligence backend.
+Its persistent state is `kennedy-audio.sqlite3` plus the private
+`kennedy-audio-ingress/` media tree. The native orchestrator calls its cloned
+service handle directly; the HTTP routes remain for browser and upload clients.
 
 ## Upload and identity
 
@@ -83,27 +84,26 @@ copy-only boundary pass if the initial result exceeds that contract.
 
 ## Kennedy ingress queue
 
-Every piece stores its text, index, total-piece relationship, estimated tokens,
-optimistic version, provenance ID, complete history-ingress archive, and its
-concise failure history. The queue returns an in-progress piece first, then the
-oldest recording and lowest piece index. At most one audio piece can be in
-progress in this database. A failed Kennedy turn is eligible for retry after a
-durable 15-second delay. Every nonterminal failure returns the piece to pending
-before scheduling its retry, releasing the single-piece claim so eligible work
-from other recordings can continue during that delay. The fifth consecutive
+Every prepared piece submits its source ID, recording timestamp, and piece
+index to `kennedy-memory-ingress`. That shared queue owns the optimistic
+version, provenance ID, complete history-ingress checkpoint, concise failure
+history, retry schedule, and the single global claim across audio and
+conversation sources. It resumes an in-progress job first, otherwise choosing
+the oldest source and lowest piece index. A failed Kennedy turn is eligible for
+retry after a durable 15-second delay. Every nonterminal failure releases the
+global claim so other conversation or recording work can proceed. The fifth consecutive
 failure remains terminal, but the UI can explicitly requeue the preserved
 piece; doing so keeps the old diagnostics while resetting the
 consecutive-failure counter. A provider input-size rejection is known to be
 non-retryable for an unchanged checkpoint, so it becomes terminal immediately
 instead of repeating the same oversized request five times.
 
-The frontend creates provenance with source `audio-vnote`, the piece-specific
-idempotency key `audio:{sha256}:piece:{index}`, and `source_created_at` equal to
-recording start. It supplies the `end-turn-v1` completion-protocol
+The backend creates provenance with source `audio-vnote`, a stable
+piece-specific idempotency key, and `source_created_at` equal to recording
+start. It supplies the `end-turn-v1` completion-protocol
 identifier when claiming work, and the backend rejects claims from older
 clients. It runs the normal mutation tool loop with the additional
-audio-ingress prompt policy. The frontend uses one Web Lock for conversation
-and audio ingress, providing global browser-side Kmap mutation serialization.
+audio-ingress prompt policy under the backend's serialized Kmap-writer gate.
 Completing the final piece atomically marks the recording complete and then
 removes its generated local WAV shards.
 The completion endpoint independently requires a successful

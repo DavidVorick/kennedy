@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const BACKUP_FORMAT_VERSION: u32 = 7;
+const BACKUP_FORMAT_VERSION: u32 = 8;
 const ARCHIVE_PREFIX: &str = "kennedy-backup";
 const BACKUP_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -44,6 +44,7 @@ pub(crate) struct BackupOptions {
     pub telegram_database: PathBuf,
     pub user_database: PathBuf,
     pub audio_database: PathBuf,
+    pub memory_ingress_database: PathBuf,
     pub audio_media_directory: PathBuf,
     pub vault: PathBuf,
 }
@@ -151,6 +152,7 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
     validate_database_source(&options.telegram_database, "Telegram relay")?;
     validate_database_source(&options.user_database, "user directory")?;
     validate_database_source(&options.audio_database, "audio ingress")?;
+    validate_database_source(&options.memory_ingress_database, "memory ingress")?;
     ensure!(
         options.audio_media_directory.is_dir(),
         "audio-ingress media directory {} does not exist or is not a directory; refusing to create an incomplete backup",
@@ -203,6 +205,12 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
         // address is held before this worker starts and a normal server binds
         // that address before opening any persistent state.
         let mut files = vec![
+            snapshot_database(
+                &options.memory_ingress_database,
+                &data_directory.join("memory-ingress.sqlite3"),
+                "data/memory-ingress.sqlite3",
+                "shared memory-ingress queue database",
+            )?,
             snapshot_database(
                 &options.audio_database,
                 &data_directory.join("audio-ingress.sqlite3"),
@@ -656,7 +664,7 @@ fn render_readme(manifest: &Manifest) -> String {
     readme.push_str(
         r#"
 
-All files are stored beneath one top-level archive directory. The five `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases, Kweb artifacts, and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
+All files are stored beneath one top-level archive directory. The six `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. Gzip provides compression only. The SQLite databases, Kweb artifacts, and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
 
 ## Kmap data format
 
@@ -679,6 +687,8 @@ All files are stored beneath one top-level archive directory. The five `.sqlite3
 ## Audio-ingress data format
 
 `data/audio-ingress.sqlite3` tracks uploaded recordings by SHA-256, making renamed or recopied audio idempotent. `audio_recordings` owns the recording timestamp, original filename, provider-model attribution, durable processing stage, retry state, and final Sol transcript. `audio_chunks` preserves ordered four-minute-or-shorter WAV windows, their recording-relative offsets, and Gemini's structured transcript JSON. Neighboring chunks overlap by fifteen seconds. `audio_ingress_pieces` stores Sol-selected transcript pieces of no more than an estimated 50,000 tokens and their independent Kennedy ingress checkpoints, provenance identifiers, versions, and failure logs.
+
+`data/memory-ingress.sqlite3` is the single durable queue used by both conversation-history archives and prepared audio transcript pieces. `memory_ingress_jobs` owns global ordering, the sole in-progress claim, provenance binding, model-loop checkpoints, retry scheduling, and bounded failure history. Source databases retain mirrored fields only so existing browser records remain compatible.
 
 Paths in the audio database are relative to `data/audio-ingress-media/` after restoration. `originals/` contains content-addressed uploaded WAV files. `chunks/{recording UUID}/` contains derived WAV windows needed by unfinished transcription jobs. Keep the complete directory during recovery.
 
@@ -719,7 +729,7 @@ The following DDL was read from each verified snapshot's `sqlite_schema`. It is 
 2. Recompute SHA-256 for every `data/` entry and compare it with `manifest.json`.
 3. Open each database with SQLite and run `PRAGMA integrity_check` and `PRAGMA foreign_key_check` before attempting a migration.
 4. Use the commit at the first line of this README as the primary behavioral reference. If that build was marked dirty or unavailable, use the exact schemas and JSON descriptions above to construct an explicit migration from copies of the files.
-5. Stop Kennedy. Place the five standalone databases, the complete audio-ingress media directory, and optional encrypted vault at the paths supplied to the target binary. Do not restore old `-wal` or `-shm` files.
+5. Stop Kennedy. Place the six standalone databases, the complete audio-ingress media directory, and optional encrypted vault at the paths supplied to the target binary. Do not restore old `-wal` or `-shm` files.
 6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify the external user/Kennedy role mappings, several Kmap histories and fixed/recent arrays, active and completed conversations, pending conversation/audio/group ingress, Telegram TOFU bindings/group decisions/events, audio SHA lookups, and vault unlock.
 
 Tracked frontend assets, system prompts, source migrations, and external Codex/ChatGPT state are not duplicated here; the source commit identifies tracked assets, and the latter is not Kennedy-owned runtime persistence.
@@ -876,6 +886,7 @@ mod tests {
             telegram_database: directory.path().join("telegram.sqlite3"),
             user_database: directory.path().join("users.sqlite3"),
             audio_database: directory.path().join("audio.sqlite3"),
+            memory_ingress_database: directory.path().join("memory-ingress.sqlite3"),
             audio_media_directory,
             vault: directory.path().join("secrets.age"),
         }
@@ -890,6 +901,7 @@ mod tests {
         let telegram = database(&options.telegram_database, "telegram in wal");
         let users = database(&options.user_database, "user directory in wal");
         let audio = database(&options.audio_database, "audio queue in wal");
+        let memory_ingress = database(&options.memory_ingress_database, "memory queue in wal");
         fs::create_dir(options.audio_media_directory.join("originals")).unwrap();
         fs::write(
             options.audio_media_directory.join("originals/vnote.wav"),
@@ -918,9 +930,9 @@ mod tests {
 
         let manifest: Value =
             serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["backup_format_version"], 7);
+        assert_eq!(manifest["backup_format_version"], 8);
         assert_eq!(manifest["snapshot_mode"], "offline-port-guard");
-        assert_eq!(manifest["files"].as_array().unwrap().len(), 7);
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 8);
         for file in manifest["files"].as_array().unwrap() {
             let path = root.join(file["path"].as_str().unwrap());
             assert_eq!(sha256(&path).unwrap(), file["sha256"]);
@@ -933,6 +945,7 @@ mod tests {
             ("telegram.sqlite3", "telegram in wal"),
             ("users.sqlite3", "user directory in wal"),
             ("audio-ingress.sqlite3", "audio queue in wal"),
+            ("memory-ingress.sqlite3", "memory queue in wal"),
         ] {
             let path = root.join("data").join(name);
             let snapshot = Connection::open(&path).unwrap();
@@ -952,7 +965,7 @@ mod tests {
             b"private audio"
         );
 
-        drop((kmap, conversations, telegram, users, audio));
+        drop((kmap, conversations, telegram, users, audio, memory_ingress));
     }
 
     #[test]
@@ -981,6 +994,7 @@ mod tests {
             (&options.telegram_database, "telegram"),
             (&options.user_database, "users"),
             (&options.audio_database, "audio"),
+            (&options.memory_ingress_database, "memory ingress"),
         ] {
             drop(database(path, value));
         }
@@ -1055,6 +1069,7 @@ mod tests {
         drop(database(&options.telegram_database, "telegram"));
         drop(database(&options.user_database, "users"));
         drop(database(&options.audio_database, "audio"));
+        drop(database(&options.memory_ingress_database, "memory ingress"));
         let created_at = Utc.with_ymd_and_hms(2026, 7, 16, 12, 34, 56).unwrap();
         fs::create_dir(&options.backup_dir).unwrap();
         let existing = options

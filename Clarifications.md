@@ -58,6 +58,18 @@ canonical documents; this file is not an append-only log.
   requirements and the workspace lockfile rather than an unnecessary exact
   requirement.
 - Leave the externally published Telegram relay unchanged for now.
+- Collapse same-process loopback HTTP boundaries: Kennedy-owned orchestration
+  calls Kmap, intelligence, conversation history, audio ingress, and Telegram
+  identity through in-process service handles. HTTP remains a browser adapter;
+  the published Telegram relay remains the sole temporary loopback exception
+  until its crate exposes an in-process service API.
+- Use one durable memory-ingress queue for conversation Chatend archives and
+  prepared audio transcript pieces. The source libraries submit ordered jobs;
+  the shared queue alone owns claiming, provenance binding, checkpoints,
+  retries, failures, and completion. Keep source-record fields as compatibility
+  mirrors while existing browser APIs still expose them.
+- Defer a typed Kennedy session protocol and the remaining advanced cleanup;
+  do not introduce a `kennedy-session-protocol` package as part of this pass.
 
 ## Kmap DB Core
 
@@ -98,7 +110,7 @@ canonical documents; this file is not an append-only log.
 ## Offline Backups
 
 - `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
-  all five SQLite databases, the complete Kweb provenance-artifact and
+  all six SQLite databases, including the shared memory-ingress queue, the complete Kweb provenance-artifact and
   audio-ingress media trees, and the
   encrypted credential vault when present.
   Each archive is self-describing: its README starts with the creating commit

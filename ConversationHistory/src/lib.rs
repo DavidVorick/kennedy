@@ -13,6 +13,9 @@ use axum::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use kennedy_chatend::hydrate_state_chatend_text;
+use kennedy_memory_ingress::{
+    Failure as QueueFailure, Job as QueueJob, LegacySubmission, Queue, SourceKind, Submission,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,9 +32,10 @@ const SELF_TIME_COMPLETION_MIGRATION: &str =
 const CONVERSATION_SUMMARIES_MIGRATION: &str =
     include_str!("../migrations/006_conversation_summaries.sql");
 const BACKEND_COMMANDS_MIGRATION: &str = include_str!("../migrations/007_backend_commands.sql");
+#[cfg(test)]
 const INGRESS_FAILURE_LIMIT: i64 = 5;
+#[cfg(test)]
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
-const HISTORY_INGRESS_COMPLETION_PROTOCOL: &str = "end-turn-v1";
 const SUMMARY_TEXT_LIMIT: usize = 512;
 
 #[derive(Clone, Debug)]
@@ -43,6 +47,38 @@ pub struct Config {
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
+    queue: Queue,
+}
+
+#[derive(Clone)]
+pub struct Service {
+    state: AppState,
+    max_request_bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct ServiceError {
+    pub status: u16,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+impl From<ApiError> for ServiceError {
+    fn from(error: ApiError) -> Self {
+        Self {
+            status: error.status.as_u16(),
+            code: error.code,
+            message: error.message,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -87,6 +123,16 @@ impl ApiError {
             "internal_error",
             "An unexpected conversation database error occurred.",
         )
+    }
+
+    fn queue(error: kennedy_memory_ingress::Error) -> Self {
+        use kennedy_memory_ingress::ErrorKind;
+        match error.kind {
+            ErrorKind::Invalid => Self::bad(error.message),
+            ErrorKind::NotFound => Self::not_found(),
+            ErrorKind::Conflict => Self::conflict(error.message),
+            ErrorKind::Internal => Self::internal(error),
+        }
     }
 }
 
@@ -214,17 +260,27 @@ struct RecordIngressFailure {
     context_window_tokens: Option<u64>,
 }
 
-pub fn router(config: Config) -> anyhow::Result<Router> {
+pub fn open(config: Config, queue: Queue) -> anyhow::Result<Service> {
     let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
     )?;
     apply_migrations(&connection).context("applying conversation history migrations")?;
+    import_legacy_ingress(&connection, &queue)
+        .context("moving conversation history ingress into the shared queue")?;
     let state = AppState {
         db: Arc::new(Mutex::new(connection)),
+        queue,
     };
-    let app = Router::new()
+    Ok(Service {
+        state,
+        max_request_bytes: config.max_request_bytes,
+    })
+}
+
+pub fn router(service: Service) -> Router {
+    Router::new()
         .route("/api/v1/conversations/health", get(health))
         .route(
             "/api/v1/conversations",
@@ -304,9 +360,177 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
             "/api/v1/conversations/{conversation_id}/retry-ingress",
             post(retry_ingress),
         )
-        .layer(DefaultBodyLimit::max(config.max_request_bytes))
-        .with_state(state);
-    Ok(app)
+        .layer(DefaultBodyLimit::max(service.max_request_bytes))
+        .with_state(service.state)
+}
+
+impl Service {
+    pub fn health(&self) -> Result<Value, ServiceError> {
+        let db = self.state.db.lock().map_err(ApiError::internal)?;
+        db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .map_err(ApiError::internal)?;
+        Ok(json!({"service":"conversation-history","status":"ok"}))
+    }
+
+    pub async fn get_json(&self, path: &str) -> Result<Value, ServiceError> {
+        let state = State(self.state.clone());
+        match path {
+            "/api/v1/conversations/health" => self.health(),
+            "/api/v1/conversations/summaries" => {
+                let Json(value) = list_conversation_summaries(state).await?;
+                Ok(value)
+            }
+            "/api/v1/conversation-commands" => {
+                let Json(value) = list_conversation_command_heads(state).await?;
+                Ok(value)
+            }
+            "/api/v1/conversations/current" => {
+                let Json(value) = current_conversation(state).await?;
+                Ok(value)
+            }
+            _ => {
+                let id = path
+                    .strip_prefix("/api/v1/conversations/")
+                    .filter(|id| !id.contains('/'))
+                    .ok_or_else(ApiError::not_found)?;
+                let Json(record) = get_conversation(state, Path(id.to_owned())).await?;
+                serde_json::to_value(record)
+                    .map_err(ApiError::internal)
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    pub async fn post_json(&self, path: &str, body: Value) -> Result<Value, ServiceError> {
+        let state = State(self.state.clone());
+        if path == "/api/v1/conversations" {
+            let (_, Json(record)) = create_conversation(state, Json(parse_body(body)?)).await?;
+            return json_value(record);
+        }
+        if path == "/api/v1/conversations/start" {
+            let (_, Json(record)) =
+                start_managed_conversation(state, Json(parse_body(body)?)).await?;
+            return json_value(record);
+        }
+        if path == "/api/v1/conversations/ingress/repairs/release" {
+            let Json(value) = release_ingress_repairs(state).await?;
+            return Ok(value);
+        }
+        if let Some(command_id) = path
+            .strip_prefix("/api/v1/conversation-commands/")
+            .and_then(|tail| tail.strip_suffix("/claim"))
+        {
+            let Json(command) = claim_conversation_command(state, Path(command_id.into())).await?;
+            return json_value(command);
+        }
+        if let Some(command_id) = path
+            .strip_prefix("/api/v1/conversation-commands/")
+            .and_then(|tail| tail.strip_suffix("/complete"))
+        {
+            let Json(command) = complete_conversation_command(
+                state,
+                Path(command_id.into()),
+                Json(parse_body(body)?),
+            )
+            .await?;
+            return json_value(command);
+        }
+        let tail = path
+            .strip_prefix("/api/v1/conversations/")
+            .ok_or_else(ApiError::not_found)?;
+        let (id, action) = tail.split_once('/').ok_or_else(ApiError::not_found)?;
+        match action {
+            "commands" => {
+                let (_, Json(command)) =
+                    queue_conversation_command(state, Path(id.into()), Json(parse_body(body)?))
+                        .await?;
+                json_value(command)
+            }
+            "stop" => {
+                let Json(value) = request_conversation_stop(state, Path(id.into())).await?;
+                Ok(value)
+            }
+            "request-ingress" => {
+                let Json(record) =
+                    request_ingress(state, Path(id.into()), Json(parse_body(body)?)).await?;
+                json_value(record)
+            }
+            "complete" => {
+                let Json(record) =
+                    complete_conversation(state, Path(id.into()), Json(parse_body(body)?)).await?;
+                json_value(record)
+            }
+            "ingress-started" => {
+                let Json(record) =
+                    ingress_started(state, Path(id.into()), Json(parse_body(body)?)).await?;
+                json_value(record)
+            }
+            "ingress-completed" => {
+                let Json(record) =
+                    ingress_completed(state, Path(id.into()), Json(parse_body(body)?)).await?;
+                json_value(record)
+            }
+            "ingress-failure" => {
+                let Json(record) =
+                    ingress_failure(state, Path(id.into()), Json(parse_body(body)?)).await?;
+                json_value(record)
+            }
+            _ => Err(ApiError::not_found().into()),
+        }
+    }
+
+    pub async fn put_json(&self, path: &str, body: Value) -> Result<Value, ServiceError> {
+        let tail = path
+            .strip_prefix("/api/v1/conversations/")
+            .ok_or_else(ApiError::not_found)?;
+        let (id, action) = tail.split_once('/').ok_or_else(ApiError::not_found)?;
+        let state = State(self.state.clone());
+        let Json(record) = match action {
+            "checkpoint" => {
+                checkpoint_conversation(state, Path(id.into()), Json(parse_body(body)?)).await?
+            }
+            "ingress-checkpoint" => {
+                checkpoint_ingress(state, Path(id.into()), Json(parse_body(body)?)).await?
+            }
+            _ => return Err(ApiError::not_found().into()),
+        };
+        json_value(record)
+    }
+
+    pub async fn delete_json(
+        &self,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, ServiceError> {
+        let state = State(self.state.clone());
+        if path == "/api/v1/conversations/unstarted" {
+            let Json(value) = discard_unstarted_conversations(state).await?;
+            return Ok(value);
+        }
+        let id = path
+            .strip_prefix("/api/v1/conversations/")
+            .filter(|id| !id.contains('/'))
+            .ok_or_else(ApiError::not_found)?;
+        let Json(value) = purge_conversation(
+            state,
+            Path(id.into()),
+            Json(parse_body(body.unwrap_or(Value::Null))?),
+        )
+        .await?;
+        Ok(value)
+    }
+}
+
+fn parse_body<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T, ServiceError> {
+    serde_json::from_value(body)
+        .map_err(|error| ApiError::bad(format!("Invalid internal request: {error}")))
+        .map_err(Into::into)
+}
+
+fn json_value(value: impl Serialize) -> Result<Value, ServiceError> {
+    serde_json::to_value(value)
+        .map_err(ApiError::internal)
+        .map_err(Into::into)
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -353,6 +577,55 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch("DROP INDEX IF EXISTS one_unfinished_conversation;")?;
     backfill_missing_summaries(connection)?;
     Ok(())
+}
+
+fn import_legacy_ingress(connection: &Connection, queue: &Queue) -> anyhow::Result<()> {
+    let mut statement = connection.prepare(&format!(
+        "{} WHERE phase IN ('ingress_pending','ingress_in_progress','ingress_failed') ORDER BY datetime(COALESCE(last_user_message_at,started_at)),id",
+        conversation_select()
+    ))?;
+    let records = statement
+        .query_map([], row_record)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for record in records {
+        if is_free_time_session(&record.state) && !requires_history_ingress_repair(&record.state) {
+            continue;
+        }
+        let job = queue.import_legacy(LegacySubmission {
+            source_kind: SourceKind::Conversation,
+            source_id: record.id.clone(),
+            source_created_at: record
+                .last_user_message_at
+                .clone()
+                .unwrap_or_else(|| record.started_at.clone()),
+            source_position: 0,
+            phase: record.phase.clone(),
+            provenance_id: record.provenance_id.clone(),
+            state: record.state.clone(),
+            version: record.version,
+            failure_count: record.ingress_failure_count,
+            failures: record.ingress_failures.clone(),
+            next_attempt_at: record.ingress_next_attempt_at.clone(),
+        })?;
+        mirror_queue_job(connection, &job).map_err(|error| anyhow::anyhow!(error.message))?;
+    }
+    Ok(())
+}
+
+fn mirror_queue_job(db: &Connection, job: &QueueJob) -> Result<ConversationRecord, ApiError> {
+    let (state_json, summary_state_json) = serialize_state(&job.state)?;
+    let failures_json = serde_json::to_string(&job.failures).map_err(ApiError::internal)?;
+    let changed = db
+        .execute(
+            "UPDATE conversations SET phase=?1,provenance_id=?2,state_json=?3,summary_state_json=?4,version=?5,ingress_failure_count=?6,ingress_failures_json=?7,ingress_next_attempt_at=?8,updated_at=?9 WHERE id=?10",
+            params![job.phase,job.provenance_id,state_json,summary_state_json,job.version,job.failure_count,failures_json,job.next_attempt_at,job.updated_at,job.source_id],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::not_found());
+    }
+    fetch_record(db, &job.source_id)
 }
 
 fn validate_started_at(value: &str) -> Result<(), ApiError> {
@@ -1137,6 +1410,7 @@ fn tool_log_has_success(state: &Value, pointer: &str, name: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
     tool_log_has_success(state, "/historyIngress/tools/log", "EndTurn")
 }
@@ -1235,20 +1509,46 @@ async fn current_conversation(State(state): State<AppState>) -> Result<Json<Valu
 
 async fn next_ingress(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
-    Ok(Json(json!({"conversation":fetch_next_ingress(&db)?})))
+    let record = state
+        .queue
+        .next_for(SourceKind::Conversation)
+        .map_err(ApiError::queue)?
+        .map(|job| mirror_queue_job(&db, &job))
+        .transpose()?;
+    Ok(Json(json!({"conversation":record})))
 }
 
 async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let released = state
+        .queue
+        .release_repairs_for(SourceKind::Conversation)
+        .map_err(ApiError::queue)?;
     let db = state.db.lock().map_err(ApiError::internal)?;
-    let released = db
-        .execute(
-            "UPDATE conversations SET phase='ingress_pending',state_json=json_remove(state_json,'$.historyIngress','$.historyIngressRepairReleasePending'),ingress_next_attempt_at=NULL,ingress_failure_count=0,updated_at=?1,version=version+1 WHERE phase='ingress_failed' AND json_extract(state_json,'$.historyIngressRepairRequired')=1 AND json_extract(state_json,'$.historyIngressRepairReleasePending')=1",
-            [Utc::now().to_rfc3339()],
-        )
-        .map_err(ApiError::internal)?;
+    let ids = {
+        let mut statement = db
+            .prepare(
+                "SELECT id FROM conversations WHERE phase IN ('ingress_pending','ingress_failed')",
+            )
+            .map_err(ApiError::internal)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(ApiError::internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::internal)?
+    };
+    for id in ids {
+        if let Some(job) = state
+            .queue
+            .get(SourceKind::Conversation, &id)
+            .map_err(ApiError::queue)?
+        {
+            mirror_queue_job(&db, &job)?;
+        }
+    }
     Ok(Json(json!({"released":released})))
 }
 
+#[cfg(test)]
 fn fetch_next_ingress(db: &Connection) -> Result<Option<ConversationRecord>, ApiError> {
     let mut statement = db
         .prepare(&format!("{} WHERE phase IN ('ingress_in_progress','ingress_pending') AND (ingress_next_attempt_at IS NULL OR datetime(ingress_next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END, datetime(COALESCE(last_user_message_at,started_at)), datetime(started_at), id", conversation_select()))
@@ -1307,6 +1607,10 @@ async fn purge_conversation(
 ) -> Result<Json<Value>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
     purge_record(&db, &id, input.expected_version)?;
+    state
+        .queue
+        .remove(SourceKind::Conversation, &id)
+        .map_err(ApiError::queue)?;
     tracing::info!(conversation_id = %id, "Conversation permanently purged");
     Ok(Json(json!({"purged":true,"conversation_id":id})))
 }
@@ -1340,6 +1644,7 @@ async fn checkpoint_conversation(
     if input.user_activity {
         Ok(Json(checkpoint_user_activity(
             &mut db,
+            &state.queue,
             &id,
             input.expected_version,
             &input.state,
@@ -1357,6 +1662,7 @@ async fn checkpoint_conversation(
 
 fn checkpoint_user_activity(
     db: &mut Connection,
+    queue: &Queue,
     id: &str,
     expected_version: i64,
     state: &Value,
@@ -1389,6 +1695,7 @@ fn checkpoint_user_activity(
         .collect::<Result<Vec<_>, _>>()
         .map_err(ApiError::internal)?;
     drop(statement);
+    let mut queued = Vec::new();
     for (stale_id, stale_summary) in candidates {
         let state = serde_json::from_str::<Value>(&stale_summary).unwrap_or(Value::Null);
         let pending_turn = state
@@ -1396,13 +1703,33 @@ fn checkpoint_user_activity(
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !pending_turn && !is_idle_protected_session(&state) {
-            tx.execute(
+            let changed = tx.execute(
                 "UPDATE conversations SET phase='ingress_pending',updated_at=?1,ended_at=?1,version=version+1 WHERE id=?2 AND phase='active'",
                 params![now_text,stale_id],
             ).map_err(ApiError::internal)?;
+            if changed == 1 {
+                queued.push(stale_id);
+            }
         }
     }
     tx.commit().map_err(ApiError::internal)?;
+    for stale_id in queued {
+        let record = fetch_record(db, &stale_id)?;
+        let job = queue
+            .submit(Submission {
+                source_kind: SourceKind::Conversation,
+                source_id: record.id.clone(),
+                source_created_at: record
+                    .last_user_message_at
+                    .clone()
+                    .unwrap_or_else(|| record.started_at.clone()),
+                source_position: 0,
+                state: record.state.clone(),
+                version: record.version,
+            })
+            .map_err(ApiError::queue)?;
+        mirror_queue_job(db, &job)?;
+    }
     fetch_record(db, id)
 }
 
@@ -1420,13 +1747,28 @@ async fn request_ingress(
             &input.state,
         )?));
     }
-    Ok(Json(update_active(
+    let record = update_active(
         &db,
         &id,
         input.expected_version,
         &input.state,
         "ingress_pending",
-    )?))
+    )?;
+    let job = state
+        .queue
+        .submit(Submission {
+            source_kind: SourceKind::Conversation,
+            source_id: record.id.clone(),
+            source_created_at: record
+                .last_user_message_at
+                .clone()
+                .unwrap_or_else(|| record.started_at.clone()),
+            source_position: 0,
+            state: record.state.clone(),
+            version: record.version,
+        })
+        .map_err(ApiError::queue)?;
+    Ok(Json(mirror_queue_job(&db, &job)?))
 }
 
 fn complete_self_time(
@@ -1477,15 +1819,6 @@ async fn ingress_started(
     Path(id): Path<String>,
     Json(input): Json<StartIngress>,
 ) -> Result<Json<ConversationRecord>, ApiError> {
-    validate_version(input.expected_version)?;
-    if input.provenance_id.trim().is_empty() {
-        return Err(ApiError::bad("provenance_id must not be empty."));
-    }
-    if input.completion_protocol.as_deref() != Some(HISTORY_INGRESS_COMPLETION_PROTOCOL) {
-        return Err(ApiError::conflict(
-            "This client does not support the required explicit history-ingress completion protocol.",
-        ));
-    }
     let db = state.db.lock().map_err(ApiError::internal)?;
     let existing = fetch_record(&db, &id)?;
     if is_free_time_session(&existing.state) && !requires_history_ingress_repair(&existing.state) {
@@ -1493,31 +1826,17 @@ async fn ingress_started(
             "Self-time records complete directly and do not undergo history ingress.",
         ));
     }
-    if existing.phase == "ingress_in_progress"
-        && existing.provenance_id.as_deref() == Some(input.provenance_id.as_str())
-    {
-        return Ok(Json(existing));
-    }
-    let claimed_by: Option<String> = db
-        .query_row(
-            "SELECT id FROM conversations WHERE phase='ingress_in_progress' LIMIT 1",
-            [],
-            |row| row.get(0),
+    let job = state
+        .queue
+        .start(
+            SourceKind::Conversation,
+            &id,
+            input.expected_version,
+            &input.provenance_id,
+            input.completion_protocol.as_deref(),
         )
-        .optional()
-        .map_err(ApiError::internal)?;
-    if claimed_by.as_deref().is_some_and(|claimed| claimed != id) {
-        return Err(ApiError::conflict(
-            "Another conversation is already undergoing history ingress.",
-        ));
-    }
-    let changed = db.execute("UPDATE conversations SET phase='ingress_in_progress',provenance_id=?1,ingress_next_attempt_at=NULL,updated_at=?2,version=version+1 WHERE id=?3 AND phase='ingress_pending' AND version=?4", params![input.provenance_id,Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
-    if changed == 0 {
-        return Err(ApiError::conflict(
-            "Conversation is not ready to start history ingress.",
-        ));
-    }
-    Ok(Json(fetch_record(&db, &id)?))
+        .map_err(ApiError::queue)?;
+    Ok(Json(mirror_queue_job(&db, &job)?))
 }
 
 async fn checkpoint_ingress(
@@ -1526,14 +1845,19 @@ async fn checkpoint_ingress(
     Json(input): Json<CheckpointConversation>,
 ) -> Result<Json<ConversationRecord>, ApiError> {
     let db = state.db.lock().map_err(ApiError::internal)?;
-    Ok(Json(update_ingress(
-        &db,
-        &id,
-        input.expected_version,
-        &input.state,
-    )?))
+    let job = state
+        .queue
+        .checkpoint(
+            SourceKind::Conversation,
+            &id,
+            input.expected_version,
+            &input.state,
+        )
+        .map_err(ApiError::queue)?;
+    Ok(Json(mirror_queue_job(&db, &job)?))
 }
 
+#[cfg(test)]
 fn update_ingress(
     db: &Connection,
     id: &str,
@@ -1554,6 +1878,7 @@ fn update_ingress(
     fetch_record(db, id)
 }
 
+#[cfg(test)]
 fn concise_failure_text(value: &str, limit: usize, fallback: &str) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let bounded = normalized.chars().take(limit).collect::<String>();
@@ -1564,6 +1889,7 @@ fn concise_failure_text(value: &str, limit: usize, fallback: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn record_ingress_failure(
     db: &mut Connection,
     id: &str,
@@ -1656,10 +1982,27 @@ async fn ingress_failure(
     Path(id): Path<String>,
     Json(input): Json<RecordIngressFailure>,
 ) -> Result<Json<ConversationRecord>, ApiError> {
-    let mut db = state.db.lock().map_err(ApiError::internal)?;
-    Ok(Json(record_ingress_failure(&mut db, &id, &input)?))
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let job = state
+        .queue
+        .fail(
+            SourceKind::Conversation,
+            &id,
+            input.expected_version,
+            &QueueFailure {
+                stage: input.stage,
+                code: input.code,
+                message: input.message,
+                rounds_used: input.rounds_used,
+                context_tokens: input.context_tokens,
+                context_window_tokens: input.context_window_tokens,
+            },
+        )
+        .map_err(ApiError::queue)?;
+    Ok(Json(mirror_queue_job(&db, &job)?))
 }
 
+#[cfg(test)]
 fn retry_failed_ingress(
     db: &mut Connection,
     id: &str,
@@ -1694,8 +2037,17 @@ async fn retry_ingress(
     Path(id): Path<String>,
     Json(input): Json<RetryIngress>,
 ) -> Result<Json<ConversationRecord>, ApiError> {
-    let mut db = state.db.lock().map_err(ApiError::internal)?;
-    Ok(Json(retry_failed_ingress(&mut db, &id, &input)?))
+    let db = state.db.lock().map_err(ApiError::internal)?;
+    let job = state
+        .queue
+        .retry(
+            SourceKind::Conversation,
+            &id,
+            input.expected_version,
+            &input.state,
+        )
+        .map_err(ApiError::queue)?;
+    Ok(Json(mirror_queue_job(&db, &job)?))
 }
 
 async fn ingress_completed(
@@ -1703,24 +2055,12 @@ async fn ingress_completed(
     Path(id): Path<String>,
     Json(input): Json<VersionedTransition>,
 ) -> Result<Json<ConversationRecord>, ApiError> {
-    validate_version(input.expected_version)?;
     let db = state.db.lock().map_err(ApiError::internal)?;
-    let existing = fetch_record(&db, &id)?;
-    if existing.phase == "complete" {
-        return Ok(Json(existing));
-    }
-    if !history_ingress_was_explicitly_ended(&existing.state) {
-        return Err(ApiError::conflict(
-            "History ingress cannot complete without a successful EndTurn tool call.",
-        ));
-    }
-    let changed = db.execute("UPDATE conversations SET phase='complete',state_json=json_remove(state_json,'$.historyIngressRepairRequired'),ingress_next_attempt_at=NULL,updated_at=?1,version=version+1 WHERE id=?2 AND phase='ingress_in_progress' AND version=?3", params![Utc::now().to_rfc3339(),id,input.expected_version]).map_err(ApiError::internal)?;
-    if changed == 0 {
-        return Err(ApiError::conflict(
-            "Conversation is not in the expected ingress state.",
-        ));
-    }
-    Ok(Json(fetch_record(&db, &id)?))
+    let job = state
+        .queue
+        .complete(SourceKind::Conversation, &id, input.expected_version)
+        .map_err(ApiError::queue)?;
+    Ok(Json(mirror_queue_job(&db, &job)?))
 }
 
 #[cfg(test)]
@@ -1737,6 +2077,7 @@ mod tests {
     fn app_state() -> AppState {
         AppState {
             db: Arc::new(Mutex::new(database())),
+            queue: Queue::in_memory().unwrap(),
         }
     }
 
@@ -1792,6 +2133,50 @@ mod tests {
         let mut db = state.db.lock().unwrap();
         assert!(discard_unstarted(&mut db).unwrap().is_empty());
         assert_eq!(fetch_record(&db, &first.id).unwrap().phase, "active");
+    }
+
+    #[tokio::test]
+    async fn ending_a_conversation_submits_its_exact_archive_to_the_shared_queue() {
+        let state = app_state();
+        let record = {
+            let db = state.db.lock().unwrap();
+            insert_conversation(
+                &db,
+                CreateConversation {
+                    started_at: "2026-07-20T12:00:00Z".into(),
+                    state: json!({"transcript":[]}),
+                },
+            )
+            .unwrap()
+        };
+        let final_state = json!({
+            "archive": {
+                "format":"kennedy-chatend",
+                "messages":[{"role":"user","content":"Remember this exactly."}],
+                "chatendText":"Remember this exactly."
+            }
+        });
+        let Json(closed) = request_ingress(
+            State(state.clone()),
+            Path(record.id.clone()),
+            Json(CheckpointConversation {
+                expected_version: record.version,
+                state: final_state.clone(),
+                user_activity: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let job = state.queue.next().unwrap().unwrap();
+        assert_eq!(job.source_kind, SourceKind::Conversation);
+        assert_eq!(job.source_id, record.id);
+        assert_eq!(job.state, final_state);
+        assert_eq!(closed.version, job.version);
+        assert_eq!(
+            closed.state["archive"]["chatendText"],
+            "Remember this exactly."
+        );
     }
 
     #[tokio::test]
@@ -2328,7 +2713,14 @@ mod tests {
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('telegram','active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','{\"sessionType\":\"telegram\",\"pendingTurn\":false}',1,'2020-01-01T00:00:00Z')", []).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('telegram-group','active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','{\"sessionType\":\"telegram-group\",\"pendingTurn\":false}',1,'2020-01-01T00:00:00Z')", []).unwrap();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('free-time','active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','{\"sessionType\":\"free-time\",\"pendingTurn\":false}',1,'2020-01-01T00:00:00Z')", []).unwrap();
-        checkpoint_user_activity(&mut db, "current", 1, &json!({"pendingTurn":true})).unwrap();
+        checkpoint_user_activity(
+            &mut db,
+            &Queue::in_memory().unwrap(),
+            "current",
+            1,
+            &json!({"pendingTurn":true}),
+        )
+        .unwrap();
         assert_eq!(fetch_record(&db, "stale").unwrap().phase, "ingress_pending");
         assert_eq!(fetch_record(&db, "pending").unwrap().phase, "active");
         assert_eq!(fetch_record(&db, "telegram").unwrap().phase, "active");

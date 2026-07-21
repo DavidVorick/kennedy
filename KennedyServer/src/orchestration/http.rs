@@ -2,12 +2,25 @@ use std::{path::Path, time::Duration};
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use reqwest::{Client, Method, StatusCode, multipart};
+#[cfg(test)]
+use reqwest::multipart;
+use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[cfg(test)]
 use super::Config;
+
+#[derive(Clone)]
+pub(crate) struct LocalServices {
+    pub kmap: crate::kmap_http::Service,
+    pub intelligence: crate::intelligence::Service,
+    pub history: kennedy_conversation_history::Service,
+    pub audio: kennedy_audio_ingress::Service,
+    pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
+    pub memory_ingress: kennedy_memory_ingress::Queue,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ApiError {
@@ -27,14 +40,28 @@ impl std::error::Error for ApiError {}
 #[derive(Clone)]
 pub(crate) struct Api {
     client: Client,
-    pub kweb: String,
-    pub intelligence: String,
-    pub history: String,
-    pub telegram: String,
-    pub audio: String,
+    services: ServiceBackend,
+    telegram: String,
+}
+
+#[derive(Clone)]
+enum ServiceBackend {
+    Local(std::sync::Arc<LocalServices>),
+    #[cfg(test)]
+    Http(TestBases),
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestBases {
+    kweb: String,
+    intelligence: String,
+    history: String,
+    audio: String,
 }
 
 impl Api {
+    #[cfg(test)]
     pub fn new(config: &Config) -> anyhow::Result<Self> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -42,68 +69,109 @@ impl Api {
             .context("building reqwest client")?;
         Ok(Self {
             client,
-            kweb: trim_base(&config.kweb_base),
-            intelligence: trim_base(&config.intelligence_base),
-            history: trim_base(&config.conversation_history_base),
+            services: ServiceBackend::Http(TestBases {
+                kweb: trim_base(&config.kweb_base),
+                intelligence: trim_base(&config.intelligence_base),
+                history: trim_base(&config.conversation_history_base),
+                audio: trim_base(&config.audio_ingress_base),
+            }),
             telegram: trim_base(&config.telegram_relay_base),
-            audio: trim_base(&config.audio_ingress_base),
         })
     }
 
-    pub async fn health(&self, base: &str, path: &str) -> Result<(), ApiError> {
-        self.get(base, path).await.map(|_| ())
-    }
-
-    pub async fn get(&self, base: &str, path: &str) -> Result<Value, ApiError> {
-        self.request(Method::GET, base, path, None).await
-    }
-
-    pub async fn post(&self, base: &str, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.request(Method::POST, base, path, Some(body)).await
-    }
-
-    pub async fn put(&self, base: &str, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.request(Method::PUT, base, path, Some(body)).await
+    pub fn local(telegram_base: &str, services: LocalServices) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .context("building Telegram relay HTTP client")?;
+        Ok(Self {
+            client,
+            services: ServiceBackend::Local(std::sync::Arc::new(services)),
+            telegram: trim_base(telegram_base),
+        })
     }
 
     pub async fn kmap_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.kmap_request(Method::POST, path, body).await
+        self.service_request(ServiceKind::Kmap, Method::POST, path, Some(body))
+            .await
     }
 
     pub async fn kmap_put(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.kmap_request(Method::PUT, path, body).await
+        self.service_request(ServiceKind::Kmap, Method::PUT, path, Some(body))
+            .await
     }
 
-    async fn kmap_request(
-        &self,
-        method: Method,
-        path: &str,
-        body: Value,
-    ) -> Result<Value, ApiError> {
-        let mut last_error = None;
-        for attempt in 0..3 {
-            match self
-                .request(method.clone(), &self.kweb, path, Some(body.clone()))
-                .await
-            {
-                Ok(value) => return Ok(value),
-                Err(error) if error.code == "network_error" && attempt < 2 => {
-                    last_error = Some(error);
-                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last_error.expect("a Kmap request retry must retain its network error"))
+    pub async fn kmap_get(&self, path: &str) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Kmap, Method::GET, path, None)
+            .await
     }
 
-    pub async fn delete(
-        &self,
-        base: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, ApiError> {
-        self.request(Method::DELETE, base, path, body).await
+    pub async fn intelligence_get(&self, path: &str) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Intelligence, Method::GET, path, None)
+            .await
+    }
+
+    pub async fn intelligence_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Intelligence, Method::POST, path, Some(body))
+            .await
+    }
+
+    pub async fn history_get(&self, path: &str) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::History, Method::GET, path, None)
+            .await
+    }
+
+    pub async fn history_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::History, Method::POST, path, Some(body))
+            .await
+    }
+
+    pub async fn history_put(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::History, Method::PUT, path, Some(body))
+            .await
+    }
+
+    pub async fn history_delete(&self, path: &str, body: Option<Value>) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::History, Method::DELETE, path, body)
+            .await
+    }
+
+    pub async fn audio_get(&self, path: &str) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Audio, Method::GET, path, None)
+            .await
+    }
+
+    pub async fn audio_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Audio, Method::POST, path, Some(body))
+            .await
+    }
+
+    pub async fn audio_put(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Audio, Method::PUT, path, Some(body))
+            .await
+    }
+
+    pub async fn directory_get(&self, path: &str) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Directory, Method::GET, path, None)
+            .await
+    }
+
+    pub async fn directory_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.service_request(ServiceKind::Directory, Method::POST, path, Some(body))
+            .await
+    }
+
+    pub async fn telegram_get(&self, path: &str) -> Result<Value, ApiError> {
+        self.request(Method::GET, &self.telegram, path, None).await
+    }
+
+    pub async fn telegram_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.request(Method::POST, &self.telegram, path, Some(body))
+            .await
+    }
+
+    pub async fn telegram_health(&self) -> Result<(), ApiError> {
+        self.telegram_get("/health").await.map(|_| ())
     }
 
     async fn request(
@@ -125,7 +193,8 @@ impl Api {
         decode_response(response).await
     }
 
-    pub async fn bytes(&self, base: &str, path: &str) -> Result<(Vec<u8>, String), ApiError> {
+    pub async fn telegram_bytes(&self, path: &str) -> Result<(Vec<u8>, String), ApiError> {
+        let base = &self.telegram;
         let response = self
             .client
             .get(format!("{base}{path}"))
@@ -154,7 +223,8 @@ impl Api {
         Ok((bytes.to_vec(), content_type))
     }
 
-    pub async fn multipart(
+    #[cfg(test)]
+    async fn multipart(
         &self,
         base: &str,
         path: &str,
@@ -176,7 +246,7 @@ impl Api {
 
     pub async fn kmap_context(&self, node_id: &str) -> Result<Value, ApiError> {
         let requested = self
-            .get(&self.kweb, &format!("/api/v1/kmap/nodes/{node_id}"))
+            .kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
             .await?;
         let active_ids = recent_connection_ids(&requested)
             .into_iter()
@@ -184,10 +254,7 @@ impl Api {
             .collect::<Vec<_>>();
         let mut active = Vec::with_capacity(active_ids.len());
         for id in active_ids {
-            active.push(
-                self.get(&self.kweb, &format!("/api/v1/kmap/nodes/{id}"))
-                    .await?,
-            );
+            active.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
         }
         Ok(json!({
             "requested_node": normalize_node(requested),
@@ -201,7 +268,7 @@ impl Api {
         short_name: Option<&str>,
     ) -> Result<Value, ApiError> {
         match self
-            .get(&self.kweb, &format!("/api/v1/kmap/nodes/{node_id}"))
+            .kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
             .await
         {
             Ok(node) => return Ok(node),
@@ -275,32 +342,57 @@ impl Api {
                 }
             })
             .collect::<String>();
-        let mut form = multipart::Form::new()
-            .text("idempotency_id", idempotency.to_owned())
-            .text("source", source.to_owned())
-            .text("source_created_at", source_created_at.to_owned())
-            .text("data_filename", format!("{safe_source}-archive.json"));
-        for (filename, mime, bytes) in artifacts {
-            let part = multipart::Part::bytes(bytes)
-                .file_name(filename)
-                .mime_str(&mime)
-                .map_err(|error| ApiError {
-                    status: None,
-                    code: "invalid_media".into(),
-                    message: error.to_string(),
-                })?;
-            form = form.part("artifact", part);
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .kmap
+                .create_provenance_archive(
+                    idempotency,
+                    serde_json::to_string_pretty(&stored).map_err(local_api_error)?,
+                    source,
+                    source_created_at,
+                    format!("{safe_source}-archive.json"),
+                    artifacts
+                        .into_iter()
+                        .map(|(original_filename, media_type, data)| {
+                            crate::kmap_http::ArtifactInput {
+                                original_filename,
+                                media_type,
+                                data,
+                            }
+                        })
+                        .collect(),
+                )
+                .map_err(kmap_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let mut form = multipart::Form::new()
+                    .text("idempotency_id", idempotency.to_owned())
+                    .text("source", source.to_owned())
+                    .text("source_created_at", source_created_at.to_owned())
+                    .text("data_filename", format!("{safe_source}-archive.json"));
+                for (filename, mime, bytes) in artifacts {
+                    let part = multipart::Part::bytes(bytes)
+                        .file_name(filename)
+                        .mime_str(&mime)
+                        .map_err(|error| ApiError {
+                            status: None,
+                            code: "invalid_media".into(),
+                            message: error.to_string(),
+                        })?;
+                    form = form.part("artifact", part);
+                }
+                form = form.text(
+                    "data",
+                    serde_json::to_string_pretty(&stored).map_err(|error| ApiError {
+                        status: None,
+                        code: "invalid_archive".into(),
+                        message: error.to_string(),
+                    })?,
+                );
+                self.multipart(&bases.kweb, "/api/v1/kmap/provenance-with-artifacts", form)
+                    .await
+            }
         }
-        form = form.text(
-            "data",
-            serde_json::to_string_pretty(&stored).map_err(|error| ApiError {
-                status: None,
-                code: "invalid_archive".into(),
-                message: error.to_string(),
-            })?,
-        );
-        self.multipart(&self.kweb, "/api/v1/kmap/provenance-with-artifacts", form)
-            .await
     }
 
     pub async fn transcribe(
@@ -311,19 +403,29 @@ impl Api {
         filename: String,
         mime: &str,
     ) -> Result<Value, ApiError> {
-        let part = multipart::Part::bytes(bytes)
-            .file_name(filename)
-            .mime_str(mime)
-            .map_err(local_api_error)?;
-        self.multipart(
-            &self.intelligence,
-            "/api/v1/audio/transcriptions",
-            multipart::Form::new()
-                .text("provider", provider.to_owned())
-                .text("model", model.to_owned())
-                .part("file", part),
-        )
-        .await
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .intelligence
+                .transcribe_bytes(provider, model, bytes, filename, mime)
+                .await
+                .map_err(intelligence_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let part = multipart::Part::bytes(bytes)
+                    .file_name(filename)
+                    .mime_str(mime)
+                    .map_err(local_api_error)?;
+                self.multipart(
+                    &bases.intelligence,
+                    "/api/v1/audio/transcriptions",
+                    multipart::Form::new()
+                        .text("provider", provider.to_owned())
+                        .text("model", model.to_owned())
+                        .part("file", part),
+                )
+                .await
+            }
+        }
     }
 
     pub async fn extract_document(
@@ -332,16 +434,178 @@ impl Api {
         filename: String,
         mime: &str,
     ) -> Result<Value, ApiError> {
-        let part = multipart::Part::bytes(bytes)
-            .file_name(filename)
-            .mime_str(mime)
-            .map_err(local_api_error)?;
-        self.multipart(
-            &self.intelligence,
-            "/api/v1/documents/extract",
-            multipart::Form::new().part("file", part),
-        )
-        .await
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .intelligence
+                .extract_document_bytes(bytes, filename, mime)
+                .await
+                .map_err(intelligence_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let part = multipart::Part::bytes(bytes)
+                    .file_name(filename)
+                    .mime_str(mime)
+                    .map_err(local_api_error)?;
+                self.multipart(
+                    &bases.intelligence,
+                    "/api/v1/documents/extract",
+                    multipart::Form::new().part("file", part),
+                )
+                .await
+            }
+        }
+    }
+
+    pub fn next_memory_ingress(&self) -> Result<Option<kennedy_memory_ingress::Job>, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local.memory_ingress.next().map_err(queue_error),
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "The shared memory-ingress queue is unavailable in HTTP test mode.".into(),
+            }),
+        }
+    }
+
+    async fn service_request(
+        &self,
+        service: ServiceKind,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(services) => {
+                let body = body.unwrap_or(Value::Null);
+                match service {
+                    ServiceKind::Kmap => match method {
+                        Method::GET => services.kmap.get_json(path).await,
+                        Method::POST => services.kmap.post_json(path, body).await,
+                        Method::PUT => services.kmap.put_json(path, body).await,
+                        _ => Err(crate::kmap_http::ApiError {
+                            status: StatusCode::METHOD_NOT_ALLOWED,
+                            code: "method_not_allowed",
+                            message: "Unsupported direct Kmap operation.".into(),
+                        }),
+                    }
+                    .map_err(kmap_error),
+                    ServiceKind::Intelligence => match method {
+                        Method::GET => services.intelligence.get_json(path).await,
+                        Method::POST => services.intelligence.post_json(path, body).await,
+                        _ => Err(crate::intelligence::ApiError::new(
+                            StatusCode::METHOD_NOT_ALLOWED,
+                            "method_not_allowed",
+                            "Unsupported direct intelligence operation.",
+                        )),
+                    }
+                    .map_err(intelligence_error),
+                    ServiceKind::History => match method {
+                        Method::GET => services.history.get_json(path).await,
+                        Method::POST => services.history.post_json(path, body).await,
+                        Method::PUT => services.history.put_json(path, body).await,
+                        Method::DELETE => services.history.delete_json(path, Some(body)).await,
+                        _ => unreachable!(),
+                    }
+                    .map_err(history_error),
+                    ServiceKind::Audio => match method {
+                        Method::GET => services.audio.get_json(path).await,
+                        Method::POST => services.audio.post_json(path, body).await,
+                        Method::PUT => services.audio.put_json(path, body).await,
+                        _ => Err(kennedy_audio_ingress::ServiceError {
+                            status: StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+                            code: "method_not_allowed",
+                            message: "Unsupported direct audio operation.".into(),
+                        }),
+                    }
+                    .map_err(audio_error),
+                    ServiceKind::Directory => match method {
+                        Method::GET => services.directory.get_json(path).await,
+                        Method::POST => services.directory.post_json(path, body).await,
+                        _ => Err(crate::telegram_identity::ApiError {
+                            status: StatusCode::METHOD_NOT_ALLOWED,
+                            code: "method_not_allowed",
+                            message: "Unsupported direct directory operation.".into(),
+                        }),
+                    }
+                    .map_err(directory_error),
+                }
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let base = match service {
+                    ServiceKind::Kmap | ServiceKind::Directory => &bases.kweb,
+                    ServiceKind::Intelligence => &bases.intelligence,
+                    ServiceKind::History => &bases.history,
+                    ServiceKind::Audio => &bases.audio,
+                };
+                self.request(method, base, path, body).await
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ServiceKind {
+    Kmap,
+    Intelligence,
+    History,
+    Audio,
+    Directory,
+}
+
+fn kmap_error(error: crate::kmap_http::ApiError) -> ApiError {
+    ApiError {
+        status: Some(error.status),
+        code: error.code.into(),
+        message: error.message,
+    }
+}
+
+fn intelligence_error(error: crate::intelligence::ApiError) -> ApiError {
+    ApiError {
+        status: Some(error.status),
+        code: error.code.into(),
+        message: error.message,
+    }
+}
+
+fn directory_error(error: crate::telegram_identity::ApiError) -> ApiError {
+    ApiError {
+        status: Some(error.status),
+        code: error.code.into(),
+        message: error.message,
+    }
+}
+
+fn history_error(error: kennedy_conversation_history::ServiceError) -> ApiError {
+    ApiError {
+        status: StatusCode::from_u16(error.status).ok(),
+        code: error.code.into(),
+        message: error.message,
+    }
+}
+
+fn audio_error(error: kennedy_audio_ingress::ServiceError) -> ApiError {
+    ApiError {
+        status: StatusCode::from_u16(error.status).ok(),
+        code: error.code.into(),
+        message: error.message,
+    }
+}
+
+fn queue_error(error: kennedy_memory_ingress::Error) -> ApiError {
+    use kennedy_memory_ingress::ErrorKind;
+    let status = match error.kind {
+        ErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::Conflict => StatusCode::CONFLICT,
+        ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    ApiError {
+        status: Some(status),
+        code: "memory_ingress_error".into(),
+        message: error.message,
     }
 }
 
