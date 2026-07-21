@@ -95,11 +95,13 @@ impl Api {
     pub async fn kmap_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
         self.service_request(ServiceKind::Kmap, Method::POST, path, Some(body))
             .await
+            .map(normalize_kmap_mutation_response)
     }
 
     pub async fn kmap_put(&self, path: &str, body: Value) -> Result<Value, ApiError> {
         self.service_request(ServiceKind::Kmap, Method::PUT, path, Some(body))
             .await
+            .map(normalize_kmap_mutation_response)
     }
 
     pub async fn kmap_get(&self, path: &str) -> Result<Value, ApiError> {
@@ -841,6 +843,13 @@ fn normalize_node(mut node: Value) -> Value {
     node
 }
 
+fn normalize_kmap_mutation_response(mut response: Value) -> Value {
+    if let Some(node) = response.get_mut("node") {
+        *node = normalize_node(std::mem::take(node));
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,5 +864,42 @@ mod tests {
         );
         assert_eq!(first.len(), 32);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn mutation_nodes_are_normalized_for_immediate_agent_rendering() {
+        let recent = (0..9).map(|index| format!("recent-{index}"));
+        let summaries = std::iter::once(json!({
+            "id":"fixed",
+            "short_name":"Fixed node",
+            "short_description":"Fixed summary",
+        }))
+        .chain((0..9).map(|index| {
+            json!({
+                "id":format!("recent-{index}"),
+                "short_name":format!("Recent {index}"),
+                "short_description":format!("Recent summary {index}"),
+            })
+        }))
+        .collect::<Vec<_>>();
+        let response = normalize_kmap_mutation_response(json!({
+            "node": {
+                "id":"updated",
+                "owner_node_id":"root",
+                "short_name":"Updated node",
+                "short_description":"Updated summary",
+                "long_description":"Updated details",
+                "fixed_connections":["fixed"],
+                "recent_connections":recent.collect::<Vec<_>>(),
+                "connection_summaries":summaries,
+            }
+        }));
+        let node = &response["node"];
+        assert_eq!(node["owner_root_node_id"], "root");
+        assert_eq!(node["fixed_connections"][0]["id"], "fixed");
+        assert_eq!(node["fixed_connections"][0]["slot"], 1);
+        assert_eq!(node["active_connections"].as_array().unwrap().len(), 8);
+        assert_eq!(node["fanout_connections"].as_array().unwrap().len(), 1);
+        assert_eq!(node["fanout_connections"][0]["short_name"], "Recent 8");
     }
 }

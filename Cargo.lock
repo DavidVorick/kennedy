@@ -1968,9 +1968,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-gemini-api"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9401237124daaba769ebc84f96b1ddca77b2e182604cc3c12fd886dab021c3e"
+checksum = "d31bd4726dbabc53486e5e1af0a4790d88bf9f48efdf84faa08ccc3b00b014aa"
 dependencies = [
  "base64",
  "chrono",
