@@ -600,4 +600,58 @@ mod tests {
         service.release("conversation:test".into()).await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn reopening_returns_every_nested_file_with_exact_contents() {
+        let root = temporary_root();
+        let service = service(&root);
+        service
+            .execute(
+                "conversation:writer".into(),
+                "CreateRustLib".into(),
+                json!({"name":"complete-lib"}),
+            )
+            .await
+            .unwrap();
+        let nested = "pub fn nested() -> &'static str { \"nested\" }\n";
+        let integration =
+            "#[test]\nfn it_works() { assert_eq!(complete_lib::nested(), \"nested\"); }\n";
+        service
+            .execute(
+                "conversation:writer".into(),
+                "WriteRustLib".into(),
+                json!({
+                    "name":"complete-lib",
+                    "files":[
+                        {"path":"src/internal/mod.rs","contents":nested},
+                        {"path":"tests/integration.rs","contents":integration}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        service.release("conversation:writer".into()).await.unwrap();
+
+        let opened = service
+            .execute(
+                "conversation:reader".into(),
+                "OpenRustLib".into(),
+                json!({"name":"complete-lib"}),
+            )
+            .await
+            .unwrap();
+        let files = opened["files"].as_array().unwrap();
+        assert_eq!(files.len(), 5);
+        assert!(
+            files.iter().any(|file| {
+                file["path"] == "src/internal/mod.rs" && file["contents"] == nested
+            })
+        );
+        assert!(files.iter().any(|file| {
+            file["path"] == "tests/integration.rs" && file["contents"] == integration
+        }));
+
+        service.release("conversation:reader".into()).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

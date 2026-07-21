@@ -1938,6 +1938,23 @@ fn format_tool_result(name: &str, content: &Value) -> String {
             if result.get("truncated").and_then(Value::as_bool) == Some(true) { "yes" } else { "no" },
             indent_result(result_text(result.get("content"), "(none)").as_str()),
         ),
+        "CreateRustLib" | "OpenRustLib" => format!(
+            "Managed Rust library {}.\n\nComplete library snapshot (every UTF-8 file; file bodies are exact JSON strings):\n{}",
+            if name == "CreateRustLib" { "created" } else { "opened" },
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
+        ),
+        "WriteRustLib" => format!(
+            "Managed Rust library files written.\n\n{}",
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
+        ),
+        "CheckRustLib" => format!(
+            "Managed Rust library check completed.\n\n{}",
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
+        ),
+        "PublishRustLib" => format!(
+            "Managed Rust library publication completed.\n\n{}",
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
+        ),
         _ => format!("{name} completed successfully."),
     }
 }
@@ -2482,6 +2499,31 @@ mod tests {
         );
         assert!(mutation.contains("Node 7: Created"));
         assert!(!mutation.contains('{') && !mutation.contains("shortDescription"));
+    }
+
+    #[test]
+    fn open_rust_lib_exposes_the_complete_snapshot_to_the_model() {
+        let result = json!({
+            "name": "complete-lib",
+            "version": "0.3.0",
+            "documentation": "Complete docs\n",
+            "files": [
+                {"path":"Cargo.toml","contents":"[package]\nname = \"complete-lib\"\nversion = \"0.3.0\"\n"},
+                {"path":"Documentation.md","contents":"Complete docs\n"},
+                {"path":"src/internal/mod.rs","contents":"pub fn nested() -> &'static str { \"nested\" }\n"},
+                {"path":"src/lib.rs","contents":"mod internal;\npub use internal::nested;\n"},
+                {"path":"tests/integration.rs","contents":"#[test]\nfn it_works() { assert_eq!(complete_lib::nested(), \"nested\"); }\n"},
+            ],
+        });
+        let payload = json!({"ok":true,"result":result});
+        let exact_snapshot = serde_json::to_string_pretty(&payload["result"]).unwrap();
+        let readable = format_tool_result("OpenRustLib", &payload);
+        assert!(readable.ends_with(&exact_snapshot));
+        assert_eq!(readable.matches("\"contents\":").count(), 5);
+
+        let message = tool_result_message("OpenRustLib", payload, 1);
+        let chatend = format_chatend(std::slice::from_ref(&message), None);
+        assert!(chatend.contains(&exact_snapshot));
     }
 
     #[test]
