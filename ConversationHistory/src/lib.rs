@@ -9,7 +9,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use kennedy_chatend::hydrate_state_chatend_text;
@@ -32,10 +32,6 @@ const SELF_TIME_COMPLETION_MIGRATION: &str =
 const CONVERSATION_SUMMARIES_MIGRATION: &str =
     include_str!("../migrations/006_conversation_summaries.sql");
 const BACKEND_COMMANDS_MIGRATION: &str = include_str!("../migrations/007_backend_commands.sql");
-#[cfg(test)]
-const INGRESS_FAILURE_LIMIT: i64 = 5;
-#[cfg(test)]
-const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
 const SUMMARY_TEXT_LIMIT: usize = 512;
 
 #[derive(Clone, Debug)]
@@ -283,10 +279,6 @@ pub fn router(service: Service) -> Router {
     Router::new()
         .route("/api/v1/conversations/health", get(health))
         .route(
-            "/api/v1/conversations",
-            get(list_conversations).post(create_conversation),
-        )
-        .route(
             "/api/v1/conversations/start",
             post(start_managed_conversation),
         )
@@ -295,34 +287,12 @@ pub fn router(service: Service) -> Router {
             get(list_conversation_command_heads),
         )
         .route(
-            "/api/v1/conversation-commands/{command_id}/claim",
-            post(claim_conversation_command),
-        )
-        .route(
-            "/api/v1/conversation-commands/{command_id}/complete",
-            post(complete_conversation_command),
-        )
-        .route(
             "/api/v1/conversations/summaries",
             get(list_conversation_summaries),
-        )
-        .route("/api/v1/conversations/current", get(current_conversation))
-        .route("/api/v1/conversations/ingress/next", get(next_ingress))
-        .route(
-            "/api/v1/conversations/ingress/repairs/release",
-            post(release_ingress_repairs),
-        )
-        .route(
-            "/api/v1/conversations/unstarted",
-            delete(discard_unstarted_conversations),
         )
         .route(
             "/api/v1/conversations/{conversation_id}",
             get(get_conversation).delete(purge_conversation),
-        )
-        .route(
-            "/api/v1/conversations/{conversation_id}/checkpoint",
-            put(checkpoint_conversation),
         )
         .route(
             "/api/v1/conversations/{conversation_id}/commands",
@@ -331,30 +301,6 @@ pub fn router(service: Service) -> Router {
         .route(
             "/api/v1/conversations/{conversation_id}/stop",
             post(request_conversation_stop),
-        )
-        .route(
-            "/api/v1/conversations/{conversation_id}/request-ingress",
-            post(request_ingress),
-        )
-        .route(
-            "/api/v1/conversations/{conversation_id}/complete",
-            post(complete_conversation),
-        )
-        .route(
-            "/api/v1/conversations/{conversation_id}/ingress-started",
-            post(ingress_started),
-        )
-        .route(
-            "/api/v1/conversations/{conversation_id}/ingress-checkpoint",
-            put(checkpoint_ingress),
-        )
-        .route(
-            "/api/v1/conversations/{conversation_id}/ingress-completed",
-            post(ingress_completed),
-        )
-        .route(
-            "/api/v1/conversations/{conversation_id}/ingress-failure",
-            post(ingress_failure),
         )
         .route(
             "/api/v1/conversations/{conversation_id}/retry-ingress",
@@ -382,10 +328,6 @@ impl Service {
             }
             "/api/v1/conversation-commands" => {
                 let Json(value) = list_conversation_command_heads(state).await?;
-                Ok(value)
-            }
-            "/api/v1/conversations/current" => {
-                let Json(value) = current_conversation(state).await?;
                 Ok(value)
             }
             _ => {
@@ -1311,22 +1253,6 @@ async fn request_conversation_stop(
     Ok(Json(json!({"stop_requested":changed > 0})))
 }
 
-async fn list_conversations(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let db = state.db.lock().map_err(ApiError::internal)?;
-    let mut statement = db
-        .prepare(&format!(
-            "{} ORDER BY updated_at DESC",
-            conversation_select()
-        ))
-        .map_err(ApiError::internal)?;
-    let records = statement
-        .query_map([], row_record)
-        .map_err(ApiError::internal)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(ApiError::internal)?;
-    Ok(Json(json!({"conversations":records})))
-}
-
 async fn list_conversation_summaries(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1410,11 +1336,6 @@ fn tool_log_has_success(state: &Value, pointer: &str, name: &str) -> bool {
         })
 }
 
-#[cfg(test)]
-fn history_ingress_was_explicitly_ended(state: &Value) -> bool {
-    tool_log_has_success(state, "/historyIngress/tools/log", "EndTurn")
-}
-
 fn is_idle_protected_session(state: &Value) -> bool {
     is_telegram_session(state) || is_free_time_session(state)
 }
@@ -1491,33 +1412,6 @@ async fn discard_unstarted_conversations(
     })))
 }
 
-async fn current_conversation(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let db = state.db.lock().map_err(ApiError::internal)?;
-    let record = db
-        .query_row(
-            &format!(
-                "{} WHERE phase='active' ORDER BY updated_at DESC LIMIT 1",
-                conversation_select()
-            ),
-            [],
-            row_record,
-        )
-        .optional()
-        .map_err(ApiError::internal)?;
-    Ok(Json(json!({"conversation":record})))
-}
-
-async fn next_ingress(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let db = state.db.lock().map_err(ApiError::internal)?;
-    let record = state
-        .queue
-        .next_for(SourceKind::Conversation)
-        .map_err(ApiError::queue)?
-        .map(|job| mirror_queue_job(&db, &job))
-        .transpose()?;
-    Ok(Json(json!({"conversation":record})))
-}
-
 async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let released = state
         .queue
@@ -1546,23 +1440,6 @@ async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<V
         }
     }
     Ok(Json(json!({"released":released})))
-}
-
-#[cfg(test)]
-fn fetch_next_ingress(db: &Connection) -> Result<Option<ConversationRecord>, ApiError> {
-    let mut statement = db
-        .prepare(&format!("{} WHERE phase IN ('ingress_in_progress','ingress_pending') AND (ingress_next_attempt_at IS NULL OR datetime(ingress_next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END, datetime(COALESCE(last_user_message_at,started_at)), datetime(started_at), id", conversation_select()))
-        .map_err(ApiError::internal)?;
-    let records = statement
-        .query_map([], row_record)
-        .map_err(ApiError::internal)?;
-    for record in records {
-        let record = record.map_err(ApiError::internal)?;
-        if !is_free_time_session(&record.state) || requires_history_ingress_repair(&record.state) {
-            return Ok(Some(record));
-        }
-    }
-    Ok(None)
 }
 
 async fn get_conversation(
@@ -1857,126 +1734,6 @@ async fn checkpoint_ingress(
     Ok(Json(mirror_queue_job(&db, &job)?))
 }
 
-#[cfg(test)]
-fn update_ingress(
-    db: &Connection,
-    id: &str,
-    expected_version: i64,
-    state: &Value,
-) -> Result<ConversationRecord, ApiError> {
-    validate_version(expected_version)?;
-    let (state_json, summary_state_json) = serialize_state(state)?;
-    let changed = db.execute(
-        "UPDATE conversations SET state_json=?1,summary_state_json=?2,updated_at=?3,version=version+1 WHERE id=?4 AND phase='ingress_in_progress' AND version=?5",
-        params![state_json,summary_state_json,Utc::now().to_rfc3339(),id,expected_version],
-    ).map_err(ApiError::internal)?;
-    if changed == 0 {
-        return Err(ApiError::conflict(
-            "Conversation ingress changed in another session or is no longer in progress.",
-        ));
-    }
-    fetch_record(db, id)
-}
-
-#[cfg(test)]
-fn concise_failure_text(value: &str, limit: usize, fallback: &str) -> String {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let bounded = normalized.chars().take(limit).collect::<String>();
-    if bounded.is_empty() {
-        fallback.to_owned()
-    } else {
-        bounded
-    }
-}
-
-#[cfg(test)]
-fn record_ingress_failure(
-    db: &mut Connection,
-    id: &str,
-    input: &RecordIngressFailure,
-) -> Result<ConversationRecord, ApiError> {
-    validate_version(input.expected_version)?;
-    let tx = db.transaction().map_err(ApiError::internal)?;
-    let existing = fetch_record(&tx, id)?;
-    if !matches!(
-        existing.phase.as_str(),
-        "ingress_pending" | "ingress_in_progress"
-    ) || existing.version != input.expected_version
-    {
-        return Err(ApiError::conflict(
-            "Conversation is no longer in the expected history-ingress attempt.",
-        ));
-    }
-
-    let attempt = existing.ingress_failure_count + 1;
-    let terminal =
-        input.code.as_deref() == Some("input_too_large") || attempt >= INGRESS_FAILURE_LIMIT;
-    let stage = concise_failure_text(&input.stage, 80, "unknown");
-    let code = input
-        .code
-        .as_deref()
-        .map(|value| concise_failure_text(value, 80, "unknown_error"));
-    let message = concise_failure_text(
-        &input.message,
-        2_000,
-        "History ingress failed without an error message.",
-    );
-    let mut failures = existing
-        .ingress_failures
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    failures.push(json!({
-        "attempt": attempt,
-        "occurred_at": Utc::now().to_rfc3339(),
-        "stage": stage,
-        "code": code,
-        "message": message,
-        "rounds_used": input.rounds_used,
-        "context_tokens": input.context_tokens,
-        "context_window_tokens": input.context_window_tokens,
-    }));
-    if failures.len() > INGRESS_FAILURE_LIMIT as usize {
-        failures.drain(..failures.len() - INGRESS_FAILURE_LIMIT as usize);
-    }
-    let failures_json = serde_json::to_string(&failures).map_err(ApiError::internal)?;
-    let next_phase = if terminal {
-        "ingress_failed"
-    } else {
-        "ingress_pending"
-    };
-    let now_time = Utc::now();
-    let now = now_time.to_rfc3339();
-    let next_attempt_at = (!terminal)
-        .then(|| (now_time + ChronoDuration::seconds(INGRESS_RETRY_DELAY_SECONDS)).to_rfc3339());
-    let changed = tx
-        .execute(
-            "UPDATE conversations SET phase=?1,ingress_next_attempt_at=?2,updated_at=?3,ingress_failure_count=?4,ingress_failures_json=?5,version=version+1 WHERE id=?6 AND phase IN ('ingress_pending','ingress_in_progress') AND version=?7",
-            params![next_phase, next_attempt_at, now, attempt, failures_json, id, input.expected_version],
-        )
-        .map_err(ApiError::internal)?;
-    if changed == 0 {
-        return Err(ApiError::conflict(
-            "Conversation history ingress changed while recording a failure.",
-        ));
-    }
-    tx.commit().map_err(ApiError::internal)?;
-    tracing::warn!(
-        conversation_id = id,
-        attempt,
-        limit = INGRESS_FAILURE_LIMIT,
-        terminal,
-        stage,
-        code = code.as_deref().unwrap_or("unknown_error"),
-        message,
-        rounds_used = input.rounds_used,
-        context_tokens = input.context_tokens,
-        context_window_tokens = input.context_window_tokens,
-        "History ingress attempt failed"
-    );
-    fetch_record(db, id)
-}
-
 async fn ingress_failure(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2000,36 +1757,6 @@ async fn ingress_failure(
         )
         .map_err(ApiError::queue)?;
     Ok(Json(mirror_queue_job(&db, &job)?))
-}
-
-#[cfg(test)]
-fn retry_failed_ingress(
-    db: &mut Connection,
-    id: &str,
-    input: &RetryIngress,
-) -> Result<ConversationRecord, ApiError> {
-    validate_version(input.expected_version)?;
-    let existing = fetch_record(db, id)?;
-    if existing.phase != "ingress_failed" || existing.version != input.expected_version {
-        return Err(ApiError::conflict(
-            "Conversation is not in the expected failed history-ingress state.",
-        ));
-    }
-    let (state_json, summary_state_json) = serialize_state(&input.state)?;
-    let tx = db.transaction().map_err(ApiError::internal)?;
-    let changed = tx
-        .execute(
-            "UPDATE conversations SET phase='ingress_pending',state_json=?1,summary_state_json=?2,ingress_next_attempt_at=NULL,updated_at=?3,ingress_failure_count=0,version=version+1 WHERE id=?4 AND phase='ingress_failed' AND version=?5",
-            params![state_json, summary_state_json, Utc::now().to_rfc3339(), id, input.expected_version],
-        )
-        .map_err(ApiError::internal)?;
-    if changed == 0 {
-        return Err(ApiError::conflict(
-            "Conversation history ingress changed before it could be retried.",
-        ));
-    }
-    tx.commit().map_err(ApiError::internal)?;
-    fetch_record(db, id)
 }
 
 async fn retry_ingress(
@@ -2077,7 +1804,7 @@ mod tests {
     fn app_state() -> AppState {
         AppState {
             db: Arc::new(Mutex::new(database())),
-            queue: Queue::in_memory().unwrap(),
+            queue: Queue::open(std::path::Path::new(":memory:")).unwrap(),
         }
     }
 
@@ -2541,7 +2268,10 @@ mod tests {
             fetch_record(&db, "self-time-failed").unwrap().phase,
             "complete"
         );
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "conversation");
+        assert_eq!(
+            fetch_record(&db, "conversation").unwrap().phase,
+            "ingress_pending"
+        );
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -2594,8 +2324,6 @@ mod tests {
         assert_eq!(completed.phase, "complete");
         assert_eq!(completed.version, 2);
         assert!(completed.ended_at.is_some());
-        assert!(fetch_next_ingress(&db).unwrap().is_none());
-
         let error = complete_self_time(
             &db,
             "conversation",
@@ -2605,21 +2333,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, "invalid_request");
         assert_eq!(fetch_record(&db, "conversation").unwrap().phase, "active");
-    }
-
-    #[test]
-    fn ingress_queue_defensively_skips_self_time_records() {
-        let db = database();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time','ingress_pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{\"sessionType\":\"free-time\"}',1)", []).unwrap();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('conversation','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
-
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "conversation");
-
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('self-time-repair','ingress_pending','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z','{\"sessionType\":\"free-time\",\"historyIngressRepairRequired\":true}',1)", []).unwrap();
-        assert_eq!(
-            fetch_next_ingress(&db).unwrap().unwrap().id,
-            "self-time-repair"
-        );
     }
 
     #[test]
@@ -2651,7 +2364,7 @@ mod tests {
 
         assert_eq!(fetch_record(&db, "stuck").unwrap_err().code, "not_found");
         assert_eq!(fetch_record(&db, "claimed").unwrap_err().code, "not_found");
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
+        assert_eq!(fetch_record(&db, "next").unwrap().phase, "ingress_pending");
     }
 
     #[test]
@@ -2715,7 +2428,7 @@ mod tests {
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('free-time','active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','{\"sessionType\":\"free-time\",\"pendingTurn\":false}',1,'2020-01-01T00:00:00Z')", []).unwrap();
         checkpoint_user_activity(
             &mut db,
-            &Queue::in_memory().unwrap(),
+            &Queue::open(std::path::Path::new(":memory:")).unwrap(),
             "current",
             1,
             &json!({"pendingTurn":true}),
@@ -2849,179 +2562,5 @@ mod tests {
                 .and_then(Value::as_str),
             Some("David\n\nLegacy ingress")
         );
-    }
-
-    #[test]
-    fn ingress_queue_is_oldest_activity_first_and_resumes_claimed_work() {
-        let db = database();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('newer','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1,'2026-01-02T00:00:00Z')", []).unwrap();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('older','ingress_pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1,'2026-01-01T00:00:00Z')", []).unwrap();
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "older");
-        db.execute(
-            "UPDATE conversations SET phase='ingress_in_progress' WHERE id='newer'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "newer");
-    }
-
-    #[test]
-    fn ingress_checkpoints_preserve_the_complete_ingress_chatend() {
-        let db = database();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('c','ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',4)", []).unwrap();
-        let state = json!({"archive":{"format":"kennedy-chatend"},"historyIngress":{
-            "format":"kennedy-chatend",
-            "sessionType":"history-ingress",
-            "messages":[{"role":"assistant","content":"Memory updated."}]
-        }});
-        let record = update_ingress(&db, "c", 4, &state).unwrap();
-        assert_eq!(record.phase, "ingress_in_progress");
-        assert_eq!(record.version, 5);
-        assert_eq!(
-            record
-                .state
-                .pointer("/historyIngress/chatendText")
-                .and_then(Value::as_str),
-            Some("Kennedy\n\nMemory updated.")
-        );
-        let stored: String = db
-            .query_row(
-                "SELECT state_json FROM conversations WHERE id='c'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), state);
-        assert_eq!(
-            update_ingress(&db, "c", 4, &json!({})).unwrap_err().code,
-            "state_conflict"
-        );
-    }
-
-    #[test]
-    fn ingress_completion_requires_a_successful_end_tool_receipt() {
-        assert!(!history_ingress_was_explicitly_ended(&json!({})));
-        assert!(!history_ingress_was_explicitly_ended(&json!({
-            "historyIngress":{"tools":{"log":[{
-                "name":"EndHistoryIngress",
-                "ok":true
-            }]}}
-        })));
-        assert!(!history_ingress_was_explicitly_ended(&json!({
-            "historyIngress":{"tools":{"log":[{
-                "name":"EndTurn",
-                "ok":false
-            }]}}
-        })));
-        assert!(history_ingress_was_explicitly_ended(&json!({
-            "historyIngress":{"tools":{"log":[{
-                "name":"EndTurn",
-                "ok":true
-            }]}}
-        })));
-    }
-
-    #[test]
-    fn fifth_ingress_failure_is_durable_and_terminal() {
-        let mut db = database();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('poisoned','ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).unwrap();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
-
-        let mut record = fetch_record(&db, "poisoned").unwrap();
-        for attempt in 1..=INGRESS_FAILURE_LIMIT {
-            record = record_ingress_failure(
-                &mut db,
-                "poisoned",
-                &RecordIngressFailure {
-                    expected_version: record.version,
-                    stage: "generation".into(),
-                    code: Some("provider_error".into()),
-                    message: format!("Attempt {attempt} failed\nwith details"),
-                    rounds_used: Some(attempt as u64),
-                    context_tokens: Some(250_000),
-                    context_window_tokens: Some(258_400),
-                },
-            )
-            .unwrap();
-            assert_eq!(record.ingress_failure_count, attempt);
-            assert_eq!(
-                record.ingress_failures.as_array().unwrap().len(),
-                attempt as usize
-            );
-            if attempt < INGRESS_FAILURE_LIMIT {
-                assert_eq!(record.phase, "ingress_pending");
-                assert!(record.ingress_next_attempt_at.is_some());
-                assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
-                db.execute(
-                    "UPDATE conversations SET phase='ingress_in_progress',ingress_next_attempt_at=NULL WHERE id='poisoned'",
-                    [],
-                )
-                .unwrap();
-            }
-        }
-
-        assert_eq!(record.phase, "ingress_failed");
-        assert_eq!(record.ingress_failures[4]["stage"], "generation");
-        assert_eq!(record.ingress_failures[4]["rounds_used"], 5);
-        assert_eq!(
-            record.ingress_failures[4]["message"],
-            "Attempt 5 failed with details"
-        );
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
-    }
-
-    #[test]
-    fn oversized_conversation_ingress_is_terminal_without_repeating_the_same_request() {
-        let mut db = database();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('oversized','ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}',1)", []).unwrap();
-        db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('next','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1)", []).unwrap();
-
-        let failed = record_ingress_failure(
-            &mut db,
-            "oversized",
-            &RecordIngressFailure {
-                expected_version: 1,
-                stage: "generation".into(),
-                code: Some("input_too_large".into()),
-                message: "input exceeds the provider limit".into(),
-                rounds_used: Some(1),
-                context_tokens: None,
-                context_window_tokens: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(failed.phase, "ingress_failed");
-        assert_eq!(failed.ingress_failure_count, 1);
-        assert_eq!(fetch_next_ingress(&db).unwrap().unwrap().id, "next");
-    }
-
-    #[test]
-    fn terminal_ingress_can_be_requeued_with_a_fresh_frontend_checkpoint() {
-        let mut db = database();
-        db.execute(
-            "INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,ingress_failure_count,ingress_failures_json) VALUES('failed','ingress_failed','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1,3,5,?2)",
-            params![
-                r#"{"archive":{"format":"kennedy-chatend"},"historyIngress":{"completed":false}}"#,
-                r#"[{"attempt":5,"message":"context exhausted"}]"#,
-            ],
-        )
-        .unwrap();
-
-        let retried = retry_failed_ingress(
-            &mut db,
-            "failed",
-            &RetryIngress {
-                expected_version: 3,
-                state: json!({"archive":{"format":"kennedy-chatend"}}),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(retried.phase, "ingress_pending");
-        assert_eq!(retried.ingress_failure_count, 0);
-        assert!(retried.ingress_next_attempt_at.is_none());
-        assert_eq!(retried.state.get("historyIngress"), None);
-        assert_eq!(retried.ingress_failures[0]["message"], "context exhausted");
     }
 }

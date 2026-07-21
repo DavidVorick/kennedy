@@ -160,6 +160,7 @@ impl Queue {
         Self::configure(connection).context("initializing memory-ingress queue")
     }
 
+    #[cfg(test)]
     pub fn in_memory() -> anyhow::Result<Self> {
         Self::configure(Connection::open_in_memory()?)
     }
@@ -175,13 +176,6 @@ impl Queue {
         Ok(Self {
             db: Arc::new(Mutex::new(connection)),
         })
-    }
-
-    pub fn health(&self) -> Result<(), Error> {
-        let db = self.lock()?;
-        db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-            .map(|_| ())
-            .map_err(Error::internal)
     }
 
     pub fn submit(&self, submission: Submission) -> Result<Job, Error> {
@@ -252,19 +246,6 @@ impl Queue {
         db.query_row(
             &format!("{} WHERE phase IN ('ingress_in_progress','ingress_pending') AND (next_attempt_at IS NULL OR datetime(next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END,datetime(source_created_at),source_position,id LIMIT 1", job_select()),
             [],
-            row_job,
-        )
-        .optional()
-        .map_err(Error::internal)
-    }
-
-    /// Returns the first eligible job for a source adapter. The orchestrator
-    /// uses `next`; this filtered view exists only for the legacy browser APIs.
-    pub fn next_for(&self, source_kind: SourceKind) -> Result<Option<Job>, Error> {
-        let db = self.lock()?;
-        db.query_row(
-            &format!("{} WHERE source_kind=?1 AND phase IN ('ingress_in_progress','ingress_pending') AND (next_attempt_at IS NULL OR datetime(next_attempt_at)<=datetime('now')) ORDER BY CASE phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END,datetime(source_created_at),source_position,id LIMIT 1", job_select()),
-            [source_kind.as_str()],
             row_job,
         )
         .optional()
@@ -450,15 +431,6 @@ impl Queue {
             ));
         }
         fetch_by_source(&db, source_kind, source_id)
-    }
-
-    pub fn release_repairs(&self) -> Result<usize, Error> {
-        let db = self.lock()?;
-        db.execute(
-            "UPDATE memory_ingress_jobs SET phase='ingress_pending',state_json=json_remove(state_json,'$.historyIngress','$.historyIngressRepairReleasePending'),next_attempt_at=NULL,failure_count=0,updated_at=?1,version=version+1
-             WHERE phase='ingress_failed' AND json_extract(state_json,'$.historyIngressRepairRequired')=1 AND json_extract(state_json,'$.historyIngressRepairReleasePending')=1",
-            [Utc::now().to_rfc3339()],
-        ).map_err(Error::internal)
     }
 
     pub fn release_repairs_for(&self, source_kind: SourceKind) -> Result<usize, Error> {

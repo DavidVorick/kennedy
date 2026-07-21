@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -778,14 +778,6 @@ fn normalize_node(mut node: Value) -> Value {
         );
     }
     node
-}
-
-#[allow(dead_code)]
-pub(crate) fn file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("file")
-        .to_owned()
 }
 
 #[cfg(test)]

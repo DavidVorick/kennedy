@@ -2,11 +2,9 @@ use std::{collections::HashSet, path::Path, sync::Mutex};
 
 use anyhow::Context;
 use axum::{
-    Json, Router,
+    Json,
     extract::{Path as AxumPath, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use chrono::Utc;
 use kcode_tg_kennedy_bot::{AddUserOutcome, IdentityObservation, IdentitySink, WhitelistSnapshot};
@@ -85,16 +83,6 @@ impl ApiError {
             code: "internal_error",
             message: "An unexpected Telegram identity-directory error occurred.".into(),
         }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({"error":{"code":self.code,"message":self.message}})),
-        )
-            .into_response()
     }
 }
 
@@ -203,11 +191,6 @@ impl Directory {
                 let Json(value) = list_provisioning_groups(state).await?;
                 Ok(value)
             }
-            _ if path.starts_with("/api/v1/telegram-directory/users/by-handle/") => {
-                let handle = path.trim_start_matches("/api/v1/telegram-directory/users/by-handle/");
-                let Json(value) = user_by_handle(state, AxumPath(handle.into())).await?;
-                serde_json::to_value(value).map_err(ApiError::internal)
-            }
             _ if path.starts_with("/api/v1/telegram-directory/users/") => {
                 let id = path
                     .trim_start_matches("/api/v1/telegram-directory/users/")
@@ -280,43 +263,6 @@ impl Directory {
         }
         Err(ApiError::not_found())
     }
-}
-
-pub(crate) fn router(directory: std::sync::Arc<Directory>) -> Router {
-    Router::new()
-        .route(
-            "/api/v1/telegram-directory/users/provisioning",
-            get(list_provisioning_users),
-        )
-        .route(
-            "/api/v1/telegram-directory/users/by-handle/{handle}",
-            get(user_by_handle),
-        )
-        .route(
-            "/api/v1/telegram-directory/users/by-handle/{handle}/root-ready",
-            post(complete_handle_root),
-        )
-        .route(
-            "/api/v1/telegram-directory/users/{telegram_user_id}",
-            get(user_by_id),
-        )
-        .route(
-            "/api/v1/telegram-directory/users/{telegram_user_id}/root-ready",
-            post(complete_user_root),
-        )
-        .route(
-            "/api/v1/telegram-directory/groups/provisioning",
-            get(list_provisioning_groups),
-        )
-        .route(
-            "/api/v1/telegram-directory/groups/{group_id}",
-            get(group_by_id),
-        )
-        .route(
-            "/api/v1/telegram-directory/groups/{group_id}/root-ready",
-            post(complete_group_root),
-        )
-        .with_state(directory)
 }
 
 fn normalize_username(value: &str) -> String {
@@ -518,17 +464,6 @@ async fn list_provisioning_users(
         .collect::<Result<Vec<_>, _>>()
         .map_err(ApiError::internal)?;
     Ok(Json(json!({"users":users})))
-}
-
-async fn user_by_handle(
-    State(directory): State<std::sync::Arc<Directory>>,
-    AxumPath(handle): AxumPath<String>,
-) -> Result<Json<DirectoryUser>, ApiError> {
-    let database = directory.lock().map_err(ApiError::internal)?;
-    directory_user_by_handle(&database, &normalize_username(&handle))
-        .map_err(ApiError::internal)?
-        .map(Json)
-        .ok_or_else(ApiError::not_found)
 }
 
 async fn user_by_id(

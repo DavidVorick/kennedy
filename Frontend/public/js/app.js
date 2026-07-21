@@ -41,7 +41,6 @@ let retryingAudioPieces = new Set();
 let retryingAudioRecordings = new Set();
 let retryingConversationIds = new Set();
 let purgingConversationIds = new Set();
-let purgedConversationIds = new Set();
 let activeView = "conversation";
 let drafts = new Map();
 let conversationErrors = new Map();
@@ -59,7 +58,6 @@ let freeTimeStartPromise = null;
 let backgroundRefreshRunning = false;
 let kwebReady = false;
 let conversationHistoryReady = false;
-let intelligenceReady = false;
 let audioIngressReady = false;
 let telegramRelayReady = false;
 
@@ -812,7 +810,6 @@ async function forcePurgeConversation(record) {
     }
     if (!deleted) throw lastError || new Error("The conversation kept changing while it was being purged.");
     await cancelConversationWork(id);
-    purgedConversationIds.add(id);
     removePurgedConversation(id);
   } catch (error) {
     showError(ui.error_banner, `Conversation could not be purged: ${error.message}`);
@@ -1132,7 +1129,6 @@ async function initialize() {
     const modelCapabilities = selected.model_capabilities?.[model] || {};
     inputModalities = modelCapabilities.input_modalities || selected.input_modalities || ["text"];
     transcriptionAvailable = Boolean(selected.transcription_available);
-    intelligenceReady = true;
   } catch (error) {
     showError(ui.error_banner, `Kennedy's model service is unavailable: ${error.message}`);
   }

@@ -109,28 +109,26 @@ removes its generated local WAV shards.
 The completion endpoint independently requires a successful
 `EndTurn` entry in the persisted history-ingress tool log. Historical
 pieces identified as prematurely completed remain terminal with
-`historyIngressRepairRequired: true` until the corrected frontend calls the
-repair-release endpoint; release removes the old ingress checkpoint, resets the
+`historyIngressRepairRequired: true` until the corrected backend worker invokes
+repair release through the in-process adapter; release removes the old ingress
+checkpoint, resets the
 consecutive-attempt count, consumes a separate one-time release marker, and
 returns their parent recordings to `ready_for_ingress`. If the repaired ingress
 exhausts its new attempts, later frontend loads leave it terminal for explicit
 retry.
 
-## API summary
+## Browser-facing HTTP API
 
 - `GET /api/v1/audio-ingress/health`
 - `POST /api/v1/audio-ingress`
 - `GET /api/v1/audio-ingress?limit=N`
-- `GET /api/v1/audio-ingress/{recording_id}`
 - `GET /api/v1/audio-ingress/by-sha256/{sha256}`
-- `GET /api/v1/audio-ingress/ingress/next`
-- `POST /api/v1/audio-ingress/ingress/repairs/release`
-- `GET /api/v1/audio-ingress/pieces/{piece_id}`
-- `POST /api/v1/audio-ingress/pieces/{piece_id}/ingress-started`
-- `PUT /api/v1/audio-ingress/pieces/{piece_id}/ingress-checkpoint`
-- `POST /api/v1/audio-ingress/pieces/{piece_id}/ingress-completed`
-- `POST /api/v1/audio-ingress/pieces/{piece_id}/ingress-failure`
+- `GET /api/v1/audio-ingress/{recording_id}/history`
 - `POST /api/v1/audio-ingress/pieces/{piece_id}/retry-ingress`
+
+Piece reads, ingress transitions, and repair release use the same path-shaped
+contract through the backend's in-process service adapter; they are not public
+HTTP routes.
 
 Terminal retry preserves the transcript, provenance, and diagnostic log. The
 caller may replace the opaque frontend state so an exhausted model checkpoint

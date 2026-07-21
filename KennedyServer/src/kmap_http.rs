@@ -7,11 +7,11 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
 use chrono::Utc;
 use kweb_db_core::{
@@ -36,15 +36,13 @@ pub(crate) struct SystemRoots {
 pub(crate) struct Service {
     kmap: Arc<Mutex<Kmap>>,
     roots: SystemRoots,
-    prompts_dir: PathBuf,
 }
 
 impl Service {
-    pub(crate) fn new(kmap: Kmap, roots: SystemRoots, prompts_dir: PathBuf) -> Self {
+    pub(crate) fn new(kmap: Kmap, roots: SystemRoots) -> Self {
         Self {
             kmap: Arc::new(Mutex::new(kmap)),
             roots,
-            prompts_dir,
         }
     }
 }
@@ -370,7 +368,6 @@ pub(crate) fn initialize(
 }
 
 pub(crate) struct MergedRouters {
-    telegram_directory: Router,
     intelligence: Router,
     conversation_history: Router,
     audio_ingress: Router,
@@ -378,13 +375,11 @@ pub(crate) struct MergedRouters {
 
 impl MergedRouters {
     pub(crate) fn new(
-        telegram_directory: Router,
         intelligence: Router,
         conversation_history: Router,
         audio_ingress: Router,
     ) -> Self {
         Self {
-            telegram_directory,
             intelligence,
             conversation_history,
             audio_ingress,
@@ -398,38 +393,16 @@ pub(crate) async fn serve_with_listener(
     merged_routers: MergedRouters,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
-    let artifact_directory = state
-        .kmap
-        .lock()
-        .map_err(|_| anyhow::anyhow!("locking Kmap for HTTP startup"))?
-        .artifact_path()
-        .to_owned();
     let app = Router::new()
         .route("/api/v1/kmap/health", get(health))
         .route("/api/v1/kmap/roots", get(get_roots))
-        .route("/api/v1/kmap/stats", get(get_stats))
-        .route(
-            "/api/v1/kmap/nodes/{node_id}",
-            get(get_node).put(update_node),
-        )
+        .route("/api/v1/kmap/nodes/{node_id}", get(get_node))
         .route("/api/v1/kmap/nodes/{node_id}/history", get(get_history))
-        .route("/api/v1/kmap/nodes", post(create_node))
-        .route("/api/v1/kmap/provenance", post(create_provenance))
-        .route(
-            "/api/v1/kmap/provenance-with-artifacts",
-            post(create_provenance_with_artifacts),
-        )
         .route(
             "/api/v1/kmap/provenance/{provenance_id}",
             get(get_provenance),
         )
-        .nest_service(
-            "/api/v1/kmap/provenance-artifacts",
-            ServeDir::new(artifact_directory),
-        )
-        .route("/system-prompts/{filename}", get(get_prompt))
         .with_state(state)
-        .merge(merged_routers.telegram_directory)
         .merge(merged_routers.intelligence)
         .merge(merged_routers.conversation_history)
         .merge(merged_routers.audio_ingress)
@@ -467,16 +440,6 @@ async fn get_roots(State(state): State<Service>) -> Json<Value> {
     }))
 }
 
-async fn get_stats(State(state): State<Service>) -> Result<Json<kweb_db_core::Stats>, ApiError> {
-    let stats = state
-        .kmap
-        .lock()
-        .map_err(ApiError::internal)?
-        .stats()
-        .map_err(ApiError::from)?;
-    Ok(Json(stats))
-}
-
 async fn create_provenance(
     State(state): State<Service>,
     Json(input): Json<CreateProvenanceRequest>,
@@ -495,130 +458,6 @@ async fn create_provenance(
         )
         .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(json!({"id":id}))))
-}
-
-async fn create_provenance_with_artifacts(
-    State(state): State<Service>,
-    mut multipart: Multipart,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let mut idempotency_id = None;
-    let mut data = None;
-    let mut source = None;
-    let mut source_created_at = None;
-    let mut data_filename = None;
-    let mut artifacts = Vec::new();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::invalid(error.to_string()))?
-    {
-        let name = field
-            .name()
-            .ok_or_else(|| ApiError::invalid("Multipart fields must have names."))?
-            .to_owned();
-        match name.as_str() {
-            "artifact" => {
-                let original_filename = field
-                    .file_name()
-                    .ok_or_else(|| ApiError::invalid("Artifact parts must have filenames."))?
-                    .to_owned();
-                let media_type = field
-                    .content_type()
-                    .unwrap_or("application/octet-stream")
-                    .to_owned();
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|error| ApiError::invalid(error.to_string()))?
-                    .to_vec();
-                artifacts.push(NewProvenanceArtifact {
-                    original_filename,
-                    media_type,
-                    role: "media".into(),
-                    data,
-                });
-            }
-            "idempotency_id" => {
-                set_once(
-                    &mut idempotency_id,
-                    IdempotencyId::from_hex(
-                        &field
-                            .text()
-                            .await
-                            .map_err(|error| ApiError::invalid(error.to_string()))?,
-                    )
-                    .map_err(ApiError::from)?,
-                    "idempotency_id",
-                )?;
-            }
-            "data" => set_once(
-                &mut data,
-                field
-                    .text()
-                    .await
-                    .map_err(|error| ApiError::invalid(error.to_string()))?,
-                "data",
-            )?,
-            "source" => set_once(
-                &mut source,
-                field
-                    .text()
-                    .await
-                    .map_err(|error| ApiError::invalid(error.to_string()))?,
-                "source",
-            )?,
-            "source_created_at" => set_once(
-                &mut source_created_at,
-                field
-                    .text()
-                    .await
-                    .map_err(|error| ApiError::invalid(error.to_string()))?,
-                "source_created_at",
-            )?,
-            "data_filename" => set_once(
-                &mut data_filename,
-                field
-                    .text()
-                    .await
-                    .map_err(|error| ApiError::invalid(error.to_string()))?,
-                "data_filename",
-            )?,
-            _ => {
-                return Err(ApiError::invalid(format!(
-                    "Unknown provenance multipart field {name}."
-                )));
-            }
-        }
-    }
-    let id = state
-        .kmap
-        .lock()
-        .map_err(ApiError::internal)?
-        .create_provenance_with_storage(
-            idempotency_id.ok_or_else(|| ApiError::invalid("Missing idempotency_id."))?,
-            NewProvenance {
-                data: data.ok_or_else(|| ApiError::invalid("Missing data."))?,
-                source: source.ok_or_else(|| ApiError::invalid("Missing source."))?,
-                source_created_at: source_created_at
-                    .ok_or_else(|| ApiError::invalid("Missing source_created_at."))?,
-            },
-            ProvenanceStorage {
-                data_filename: data_filename
-                    .ok_or_else(|| ApiError::invalid("Missing data_filename."))?,
-                artifacts,
-            },
-        )
-        .map_err(ApiError::from)?;
-    Ok((StatusCode::CREATED, Json(json!({"id":id}))))
-}
-
-fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<(), ApiError> {
-    if slot.replace(value).is_some() {
-        return Err(ApiError::invalid(format!(
-            "Multipart field {name} must appear once."
-        )));
-    }
-    Ok(())
 }
 
 async fn get_provenance(
@@ -759,38 +598,6 @@ async fn get_history(
     Ok(Json(json!({"node_id":id,"provenance_ids":provenance_ids})))
 }
 
-async fn get_prompt(
-    State(state): State<Service>,
-    Path(filename): Path<String>,
-) -> Result<Response, ApiError> {
-    let safe_name = filename.ends_with(".txt")
-        && !filename.starts_with('.')
-        && filename
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
-    if !safe_name {
-        return Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            code: "not_found",
-            message: "Prompt manual not found.".into(),
-        });
-    }
-    let body = tokio::fs::read_to_string(state.prompts_dir.join(&filename))
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ApiError {
-                    status: StatusCode::NOT_FOUND,
-                    code: "not_found",
-                    message: "Prompt manual not found.".into(),
-                }
-            } else {
-                ApiError::internal(error)
-            }
-        })?;
-    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
-}
-
 fn parse_owner(value: &str) -> Result<Owner, ApiError> {
     match value {
         "self" => Ok(Owner::SelfNode),
@@ -812,19 +619,9 @@ mod tests {
         path: &str,
         body: &str,
     ) -> String {
-        http_request_with_content_type(address, method, path, "application/json", body).await
-    }
-
-    async fn http_request_with_content_type(
-        address: std::net::SocketAddr,
-        method: &str,
-        path: &str,
-        content_type: &str,
-        body: &str,
-    ) -> String {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -838,7 +635,6 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("kennedy-kmap-http-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(directory.join("frontend")).unwrap();
-        std::fs::create_dir_all(directory.join("prompts")).unwrap();
         let kmap_path = directory.join("kmap.sqlite3");
         let identity_path = directory.join("users.sqlite3");
         let (kmap, roots) =
@@ -858,11 +654,11 @@ mod tests {
             "/api/v1/test-intelligence",
             get(|| async { Json(json!({"service":"intelligence"})) }),
         );
-        let service = Service::new(kmap, roots, directory.join("prompts"));
+        let service = Service::new(kmap, roots);
         let server = tokio::spawn(serve_with_listener(
             service,
             directory.join("frontend"),
-            MergedRouters::new(Router::new(), intelligence, Router::new(), Router::new()),
+            MergedRouters::new(intelligence, Router::new(), Router::new()),
             listener,
         ));
         let response = http_request(address, "GET", "/api/v1/kmap/roots", "").await;
@@ -873,158 +669,6 @@ mod tests {
             http_request(address, "GET", "/api/v1/test-intelligence", "").await;
         assert!(intelligence_response.starts_with("HTTP/1.1 200 OK"));
         assert!(intelligence_response.contains("\"service\":\"intelligence\""));
-        let idempotency_id = IdempotencyId::random();
-        let body = json!({
-            "idempotency_id":idempotency_id,
-            "data":"HTTP replay source",
-            "source":"test",
-            "source_created_at":"2026-07-18T00:00:00Z",
-        })
-        .to_string();
-        let first = http_request(address, "POST", "/api/v1/kmap/provenance", &body).await;
-        let replay = http_request(address, "POST", "/api/v1/kmap/provenance", &body).await;
-        assert!(first.starts_with("HTTP/1.1 201 Created"));
-        assert!(replay.starts_with("HTTP/1.1 201 Created"));
-        let response_id = |response: &str| {
-            serde_json::from_str::<Value>(response.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        };
-        assert_eq!(response_id(&first), response_id(&replay));
-
-        let provenance_id = response_id(&first);
-        let node_body = json!({
-            "idempotency_id":IdempotencyId::random(),
-            "provenance_id":provenance_id,
-            "owner_node_id":"self",
-            "model_attribution":"http-test",
-            "short_name":"HTTP Replay Node",
-            "short_description":"",
-            "long_description":"",
-            "fixed_connections":[],
-            "recent_connections":[],
-        })
-        .to_string();
-        let first_node = http_request(address, "POST", "/api/v1/kmap/nodes", &node_body).await;
-        let replayed_node = http_request(address, "POST", "/api/v1/kmap/nodes", &node_body).await;
-        assert!(first_node.starts_with("HTTP/1.1 201 Created"));
-        assert!(replayed_node.starts_with("HTTP/1.1 201 Created"));
-        let node_id = |response: &str| {
-            serde_json::from_str::<Value>(response.split("\r\n\r\n").nth(1).unwrap()).unwrap()
-                ["node"]["id"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        };
-        assert_eq!(node_id(&first_node), node_id(&replayed_node));
-        let history = http_request(
-            address,
-            "GET",
-            &format!("/api/v1/kmap/nodes/{}/history", node_id(&first_node)),
-            "",
-        )
-        .await;
-        let history: Value =
-            serde_json::from_str(history.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(history["provenance_ids"].as_array().unwrap().len(), 1);
-
-        let connected_node_body = json!({
-            "idempotency_id":IdempotencyId::random(),
-            "provenance_id":provenance_id,
-            "owner_node_id":"self",
-            "model_attribution":"http-test",
-            "short_name":"HTTP Connected Node",
-            "short_description":"Connection metadata test",
-            "long_description":"",
-            "fixed_connections":[],
-            "recent_connections":[node_id(&first_node)],
-        })
-        .to_string();
-        let connected_node =
-            http_request(address, "POST", "/api/v1/kmap/nodes", &connected_node_body).await;
-        assert!(connected_node.starts_with("HTTP/1.1 201 Created"));
-        let connected_node_json: Value =
-            serde_json::from_str(connected_node.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(
-            connected_node_json["node"]["connection_summaries"][0]["short_name"],
-            "HTTP Replay Node"
-        );
-        let connected_node_get = http_request(
-            address,
-            "GET",
-            &format!(
-                "/api/v1/kmap/nodes/{}",
-                connected_node_json["node"]["id"].as_str().unwrap()
-            ),
-            "",
-        )
-        .await;
-        let connected_node_get: Value =
-            serde_json::from_str(connected_node_get.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(
-            connected_node_get["connection_summaries"][0]["short_description"],
-            ""
-        );
-
-        let multipart_id = IdempotencyId::random();
-        let boundary = "kweb-artifact-boundary";
-        let multipart = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"idempotency_id\"\r\n\r\n{multipart_id}\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\nconversation-history\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"source_created_at\"\r\n\r\n2026-07-18T00:00:00Z\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"data_filename\"\r\n\r\nconversation-archive.json\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"artifact\"; filename=\"telegram-vnote.wav\"\r\nContent-Type: audio/wav\r\n\r\nvoice-note\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n{{\"media\":[{{\"provenanceArtifactIndex\":0}}]}}\r\n\
-             --{boundary}--\r\n"
-        );
-        let content_type = format!("multipart/form-data; boundary={boundary}");
-        let first_artifact = http_request_with_content_type(
-            address,
-            "POST",
-            "/api/v1/kmap/provenance-with-artifacts",
-            &content_type,
-            &multipart,
-        )
-        .await;
-        let replayed_artifact = http_request_with_content_type(
-            address,
-            "POST",
-            "/api/v1/kmap/provenance-with-artifacts",
-            &content_type,
-            &multipart,
-        )
-        .await;
-        assert!(first_artifact.starts_with("HTTP/1.1 201 Created"));
-        assert!(replayed_artifact.starts_with("HTTP/1.1 201 Created"));
-        assert_eq!(
-            response_id(&first_artifact),
-            response_id(&replayed_artifact)
-        );
-        let artifact_provenance = http_request(
-            address,
-            "GET",
-            &format!("/api/v1/kmap/provenance/{}", response_id(&first_artifact)),
-            "",
-        )
-        .await;
-        let artifact_provenance: Value =
-            serde_json::from_str(artifact_provenance.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        let relative_path = artifact_provenance["artifacts"][0]["relative_path"]
-            .as_str()
-            .unwrap();
-        assert!(relative_path.contains("/telegram-vnote."));
-        assert!(relative_path.ends_with(".wav"));
-        let served = http_request(
-            address,
-            "GET",
-            &format!("/api/v1/kmap/provenance-artifacts/{relative_path}"),
-            "",
-        )
-        .await;
-        assert!(served.starts_with("HTTP/1.1 200 OK"));
-        assert!(served.ends_with("voice-note"));
-
         server.abort();
         let _ = server.await;
         std::fs::remove_dir_all(directory).unwrap();

@@ -4,23 +4,17 @@
 `kweb-db-core` library. The library itself contains no Axum or filesystem asset
 serving code.
 
-The adapter serializes access to one `Kmap`, serves the frontend and prompt
-assets on the same listener, and exposes:
+The adapter serializes access to one `Kmap`, serves the frontend on the same
+listener, and exposes these browser-facing reads:
 
 - `GET /api/v1/kmap/health`
 - `GET /api/v1/kmap/roots`
-- `GET /api/v1/kmap/stats`
-- `POST /api/v1/kmap/provenance`
-- `POST /api/v1/kmap/provenance-with-artifacts`
 - `GET /api/v1/kmap/provenance/{id}`
-- `GET /api/v1/kmap/provenance-artifacts/{shard}/{filename}`
-- `POST /api/v1/kmap/nodes`
 - `GET /api/v1/kmap/nodes/{id}`
-- `PUT /api/v1/kmap/nodes/{id}`
 - `GET /api/v1/kmap/nodes/{id}/history`
 
 The same listener also merges intelligence, conversation-history,
-audio-ingress, and Telegram-identity routes before serving frontend assets.
+and audio-ingress routes before serving frontend assets.
 Those routes remain separate application domains and are not Kmap storage
 methods.
 
@@ -29,17 +23,8 @@ root mappings live in `kmap_system_roots` in the separate identity database.
 The Kmap database must already satisfy the strict core schema; neither the core
 nor the adapter performs compatibility migration during startup.
 
-An HTTP create may omit `node_id`, in which case the adapter deterministically
-derives one from the request's random idempotency identifier so an exact replay
-uses the same effective node request. Externally reserved identity roots
-provide their exact ID. `owner_node_id` is either a node identifier, `self`, or
-`unowned`.
-
-The frontend implements recent-connection activation, graph operations, and
-multi-node workflows through ordinary node reads and sequential updates. Those
-sequences are intentionally non-atomic and are not one composite idempotent
-transaction. Every individual mutation is idempotent under its own required
-identifier.
+Kmap mutations and provenance artifact persistence are backend-only operations
+through the in-process service adapter. They are not exposed as HTTP routes.
 
 ## Representations
 
@@ -71,7 +56,7 @@ arrays. `connection_summaries` is an additive read projection containing each
 unique referenced node once, in first-reference order, so clients can render
 fixed, active, and fanout links without fetching every full connected node.
 
-Create and update requests contain every stored field above except the two
+Backend create and update requests contain every stored field above except the two
 generated modification fields, and omit the read-only `connection_summaries`
 projection. They use `provenance_id`, `model_attribution`, and `owner_node_id`;
 the owner input is a durable ID, `self`, or `unowned`.
@@ -80,30 +65,21 @@ hexadecimal characters (16 random bytes). Creation may additionally supply
 `node_id`. Create/update responses wrap the same enriched node representation as
 `{ "node": ... }`; a direct get returns that representation itself.
 
-Provenance creation accepts required `idempotency_id` plus `data`, `source`,
+Backend provenance creation accepts required `idempotency_id` plus `data`, `source`,
 and `source_created_at`, and returns `{ "id": ... }`. A provenance read
 returns those fields plus `id` and ordered `artifacts` metadata.
-`provenance-with-artifacts` accepts the same logical fields as multipart form
-parts, required `data_filename`, and repeated file parts named `artifact`.
-The adapter preserves each multipart filename and content type, assigns the
-role `media`, and passes all bytes to the library under the same idempotency
-receipt. Artifact metadata exposes a two-component relative path; the
-namespaced artifact GET streams that immutable file. Conversation archives
-replace each embedded media `dataUrl` with `provenanceArtifactIndex`, an index
-into the returned ordered artifact metadata.
+The in-process archive operation preserves each artifact filename and content
+type and passes all bytes to the library under the same idempotency receipt.
 History returns `{ "node_id": ..., "provenance_ids": [...] }`, newest first.
 
-The caller generates a new idempotency identifier once per logical mutation
-and reuses that exact request for retries. The adapter's frontend client retries
-one ambiguous network failure automatically without changing the identifier.
+The backend generates a new idempotency identifier once per logical mutation
+and reuses that exact request for retries.
 An exact replay succeeds without another provenance or history row. Reusing an
 identifier with a different operation or normalized request returns 409. Node
 replays return current node state; provenance replays return the originally
 created identifier.
 
-Roots returns `user_root_node_id` and `kennedy_root_node_id`. Stats returns the
-library's typed stats as JSON. Stats fields are additive: clients must ignore
-unknown fields so future statistics do not break existing consumers.
+Roots returns `user_root_node_id` and `kennedy_root_node_id`.
 
 Validated-library input errors return 400, missing objects return 404,
 constraint conflicts return 409, and unexpected storage errors return 500,

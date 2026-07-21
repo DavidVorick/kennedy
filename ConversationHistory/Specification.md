@@ -152,33 +152,21 @@ one Kmap-writer gate across this queue, audio ingress, self time, and Telegram
 root provisioning; this service cannot enforce that cross-database invariant
 by itself.
 
-## 4. API
+## 4. Browser-facing HTTP API
 
 - `GET /api/v1/conversations/health`
-- `GET|POST /api/v1/conversations`
 - `POST /api/v1/conversations/start`
 - `GET /api/v1/conversation-commands`
-- `POST /api/v1/conversation-commands/{command_id}/claim`
-- `POST /api/v1/conversation-commands/{command_id}/complete`
 - `GET /api/v1/conversations/summaries`
-- `GET /api/v1/conversations/current` (most recently updated active record,
-  retained as a compatibility convenience)
-- `GET /api/v1/conversations/ingress/next`
-- `POST /api/v1/conversations/ingress/repairs/release`
-- `DELETE /api/v1/conversations/unstarted`
 - `GET /api/v1/conversations/{id}`
 - `DELETE /api/v1/conversations/{id}`
-- `PUT /api/v1/conversations/{id}/checkpoint`
 - `POST /api/v1/conversations/{id}/commands`
 - `POST /api/v1/conversations/{id}/stop`
-- `POST /api/v1/conversations/{id}/request-ingress`
-- `POST /api/v1/conversations/{id}/complete` (self time only; requires an
-  explicit end-tool or deadline reason and does not start ingress)
-- `POST /api/v1/conversations/{id}/ingress-started`
-- `PUT /api/v1/conversations/{id}/ingress-checkpoint`
-- `POST /api/v1/conversations/{id}/ingress-completed`
-- `POST /api/v1/conversations/{id}/ingress-failure`
 - `POST /api/v1/conversations/{id}/retry-ingress`
+
+Conversation creation, checkpoints, command claims, ingress transitions,
+repair release, and startup cleanup use the same path-shaped contract through
+the backend's in-process service adapter; they are not public HTTP routes.
 
 Managed start accepts a 32-hex `idempotency_id`, `started_at`, and
 `session_type` (`conversation` or `free-time`); self time additionally requires

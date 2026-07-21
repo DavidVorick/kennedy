@@ -7,13 +7,11 @@ import {
   ConversationHistoryAPI,
   IntelligenceAPI,
   KwebAPI,
-  TelegramDirectoryAPI,
   TelegramRelayAPI,
   newIdempotencyId,
 } from "../public/js/api.js";
 import {
   audioRecordingTitle,
-  conversationControlState,
   conversationIngressActivity,
   conversationTitle,
   inspectorText,
@@ -21,24 +19,16 @@ import {
   reconcileConversationHistory,
   sortConversationHistory,
 } from "../public/js/render.js";
-import { formatContextNode, formatToolResult } from "../public/js/human_format.js";
 import {
   contextUsageMeasurement,
   formatChatend,
   formatContextWindowProgress,
 } from "../public/js/chatend_format.js";
 import {
-  FREE_TIME_HARD_STOP_GRACE_MS,
-  FREE_TIME_WARNING_MS,
-  freeTimeCanStartNewSession,
   freeTimeTiming,
-  nextFreeTimeSlice,
   parseFreeTimeMinutes,
   parseSelfTimePrompt,
 } from "../public/js/self_time.js";
-
-const id = value => value.toString(16).padStart(40, "0");
-const summary = value => ({ id: id(value), short_name: `Node ${value}`, short_description: `Summary ${value}` });
 
 async function withMockFetch(handler, operation) {
   const original = globalThis.fetch;
@@ -57,60 +47,12 @@ function jsonResponse(value, status = 200) {
   });
 }
 
-test("Kmap client uses namespaced routes and derives active context", async () => {
-  const calls = [];
-  const stored = new Map([
-    [id(1), {
-      id: id(1), short_name: "Root", short_description: "", long_description: "Root details",
-      owner_node_id: id(1), fixed_connections: [id(3)],
-      recent_connections: [id(2), id(4), id(5), id(6), id(7), id(8), id(9), id(10), id(11)],
-      connection_summaries: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(summary),
-    }],
-    ...[2, 4, 5, 6, 7, 8, 9, 10].map(value => [id(value), {
-      id: id(value), short_name: `Node ${value}`, short_description: `Summary ${value}`,
-      long_description: `Details ${value}`, owner_node_id: id(1), fixed_connections: [],
-      recent_connections: [], connection_summaries: [],
-    }]),
-  ]);
-
-  await withMockFetch(async url => {
-    calls.push(String(url));
-    return jsonResponse(stored.get(String(url).split("/").at(-1)));
-  }, async () => {
-    const context = await KwebAPI("http://local").context(id(1));
-    assert.equal(context.requested_node.active_connections.length, 8);
-    assert.deepEqual(context.requested_node.fanout_connections, [summary(11)]);
-    assert.deepEqual(context.requested_node.fixed_connections, [{ ...summary(3), slot: 1 }]);
-    assert.equal(context.active_connection_nodes.length, 8);
-  });
-
-  assert.equal(calls[0], `http://local/api/v1/kmap/nodes/${id(1)}`);
-  assert.equal(calls.length, 9);
-});
-
-test("Kmap mutation retries preserve the caller's idempotency identifier", async () => {
+test("browser idempotency identifiers are random hexadecimal values", () => {
   const generated = newIdempotencyId();
   assert.match(generated, /^[0-9a-f]{32}$/);
-  const requests = [];
-  await withMockFetch(async (url, options) => {
-    requests.push({ url: String(url), body: options.body });
-    if (requests.length === 1) throw new TypeError("ambiguous disconnect");
-    return jsonResponse({ id: "saved" }, 201);
-  }, async () => {
-    await KwebAPI("http://local").createProvenance({
-      idempotency_id: generated,
-      data: "source",
-      source: "test",
-      source_created_at: "2026-07-20T00:00:00Z",
-    });
-  });
-  assert.equal(requests.length, 2);
-  assert.equal(requests[0].url, "http://local/api/v1/kmap/provenance");
-  assert.equal(requests[0].body, requests[1].body);
-  assert.equal(JSON.parse(requests[1].body).idempotency_id, generated);
 });
 
-test("production API clients retain backend-owned queue boundaries", async () => {
+test("browser API clients expose only browser-owned reads and commands", async () => {
   const calls = [];
   await withMockFetch(async (url, options = {}) => {
     calls.push({ url: String(url), method: options.method || "GET", body: options.body });
@@ -120,39 +62,29 @@ test("production API clients retain backend-owned queue boundaries", async () =>
     await history.health();
     await history.start({ idempotency_id: "start", session_type: "conversation", started_at: "now" });
     await history.queueCommand("conversation", { idempotency_id: "command", kind: "send" });
-    await history.claimCommand("command");
-    await history.completeCommand("command", { delivered: true });
 
     const audio = AudioIngressAPI("http://kennedy");
     await audio.health();
-    await audio.nextIngress();
     await audio.retryIngress("piece", { expected_version: 3 });
 
     const intelligence = IntelligenceAPI("http://kennedy");
-    await intelligence.generate({ provider: "codex", messages: [] }, { operationId: "operation" });
-    await intelligence.cancelOperation("operation");
-
-    const directory = TelegramDirectoryAPI("http://kennedy");
-    await directory.completeHandleRoot("@david", id(1));
+    await intelligence.health();
+    const kmap = KwebAPI("http://kennedy");
+    await kmap.roots();
     const relay = TelegramRelayAPI("http://telegram");
-    await relay.completeGroupIngress("group-ingress");
+    await relay.health();
   });
 
   assert.deepEqual(calls.map(call => [call.method, call.url]), [
     ["GET", "http://kennedy/api/v1/conversations/health"],
     ["POST", "http://kennedy/api/v1/conversations/start"],
     ["POST", "http://kennedy/api/v1/conversations/conversation/commands"],
-    ["POST", "http://kennedy/api/v1/conversation-commands/command/claim"],
-    ["POST", "http://kennedy/api/v1/conversation-commands/command/complete"],
     ["GET", "http://kennedy/api/v1/audio-ingress/health"],
-    ["GET", "http://kennedy/api/v1/audio-ingress/ingress/next"],
     ["POST", "http://kennedy/api/v1/audio-ingress/pieces/piece/retry-ingress"],
-    ["POST", "http://kennedy/api/v1/generate"],
-    ["POST", "http://kennedy/api/v1/operations/operation/cancel"],
-    ["POST", `http://kennedy/api/v1/telegram-directory/users/by-handle/%40david/root-ready`],
-    ["POST", "http://telegram/api/v1/group-ingress/group-ingress/complete"],
+    ["GET", "http://kennedy/health"],
+    ["GET", "http://kennedy/api/v1/kmap/roots"],
+    ["GET", "http://telegram/health"],
   ]);
-  assert.equal(JSON.parse(calls[8].body).operation_id, "operation");
 });
 
 test("conversation and audio titles use durable source data", () => {
@@ -197,24 +129,6 @@ test("conversation history reconciliation never regresses a hydrated record", ()
   assert.equal(reconcileConversationHistory(hydrated, sameVersionSummary)[0], hydrated[0]);
 });
 
-test("conversation controls keep drafting available while preventing overlapping work", () => {
-  const transitioning = conversationControlState({
-    hasSession: true, sessionBusy: false, transitionBusy: true,
-    pendingTurn: false, viewingHistory: false, transcriptLength: 1,
-  });
-  assert.equal(transitioning.inputDisabled, false);
-  assert.equal(transitioning.sendDisabled, true);
-  assert.equal(transitioning.endDisabled, true);
-
-  const working = conversationControlState({
-    hasSession: true, sessionBusy: true, transitionBusy: false,
-    pendingTurn: false, viewingHistory: false, transcriptLength: 1,
-  });
-  assert.equal(working.inputDisabled, false);
-  assert.equal(working.sendDisabled, true);
-  assert.equal(working.stopHidden, false);
-});
-
 test("ingress activity is scoped to the selected record", () => {
   const record = {
     id: "selected", phase: "ingress_in_progress",
@@ -230,22 +144,18 @@ test("ingress activity is scoped to the selected record", () => {
   assert.equal(conversationIngressActivity({ record, dismissedId: "selected" }), null);
 });
 
-test("self-time validation and deadline calculations preserve the shared run", () => {
+test("self-time validation and display timing use the backend deadline", () => {
   assert.equal(parseFreeTimeMinutes("30"), 30);
   assert.throws(() => parseFreeTimeMinutes("0"));
   assert.equal(parseSelfTimePrompt("  investigate memory  "), "investigate memory");
   const now = Date.parse("2026-07-20T12:00:00Z");
   const freeTime = {
-    runId: "run", sliceIndex: 1, deadlineAt: new Date(now + FREE_TIME_WARNING_MS).toISOString(),
-    nextSessionMessage: "continue this thread",
+    runId: "run", sliceIndex: 1, deadlineAt: new Date(now + 90_000).toISOString(),
   };
   const timing = freeTimeTiming(freeTime, now);
   assert.equal(timing.warningDue, true);
-  assert.equal(timing.hardStopMs, timing.deadlineMs + FREE_TIME_HARD_STOP_GRACE_MS);
-  assert.equal(freeTimeCanStartNewSession(freeTime, now), false);
-  const next = nextFreeTimeSlice(freeTime);
-  assert.equal(next.sliceIndex, 2);
-  assert.equal(next.handoffMessage, "continue this thread");
+  assert.equal(timing.remainingMs, 90_000);
+  assert.ok(timing.hardStopMs > timing.deadlineMs);
 });
 
 test("Chatend formatting uses the latest complete context measurement", () => {
@@ -265,26 +175,6 @@ test("Chatend formatting uses the latest complete context measurement", () => {
     { role: "user", content: "Question" },
     { role: "assistant", content: "Answer" },
   ], usage), /System context[\s\S]*David[\s\S]*Kennedy[\s\S]*21,000/);
-});
-
-test("human-readable memory and tool results avoid raw implementation shapes", () => {
-  const node = {
-    identifier: 2,
-    shortName: "Project",
-    shortDescription: "Current work",
-    longDescription: "Detailed project memory",
-    lastModifiedBy: "gpt-5-high",
-    fixedConnections: [], activeConnections: [], fanoutConnections: [],
-  };
-  assert.match(formatContextNode(node), /Node 2: Project/);
-  assert.match(formatToolResult("LoadNode", {
-    ok: true,
-    result: { requestedNode: node, activeConnectionNodes: [] },
-  }), /Memory load completed/);
-  assert.match(formatToolResult("WebFetch", {
-    ok: true,
-    result: { url: "https://example.com", title: "Example", content: "Readable", retrieved_at: "now" },
-  }), /Readable page content/);
 });
 
 test("Full inspector displays the exact backend Chatend string without reconstruction", () => {

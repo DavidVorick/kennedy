@@ -518,18 +518,6 @@ export function renderAudioRecording(container, detail, {
   restoreViewState(container, viewKey, viewState);
 }
 
-export function conversationControlState({ hasSession, sessionBusy, transitionBusy, pendingTurn, viewingHistory, transcriptLength }) {
-  return {
-    composerHidden: viewingHistory,
-    inputDisabled: viewingHistory || !hasSession,
-    sendDisabled: sessionBusy || transitionBusy || pendingTurn || viewingHistory || !hasSession,
-    endDisabled: transitionBusy || viewingHistory || !hasSession,
-    retryHidden: !pendingTurn || sessionBusy || viewingHistory || !hasSession,
-    stopHidden: !sessionBusy || viewingHistory || !hasSession,
-    newDisabled: transitionBusy,
-  };
-}
-
 export function conversationIngressActivity({ record, liveRecordId = null, liveDiagnostic = null, dismissedId = null }) {
   if (!record || record.id === dismissedId) return null;
   const archive = record.state?.historyIngress;

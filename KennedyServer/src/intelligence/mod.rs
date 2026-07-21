@@ -426,20 +426,6 @@ impl From<GeminiUsage> for Usage {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ActionTiming {
-    action: String,
-    name: Option<String>,
-    status: String,
-    session_type: Option<String>,
-    duration_ms: u64,
-    llm_duration_ms: Option<u64>,
-    tool_duration_ms: Option<u64>,
-    processing_duration_ms: Option<u64>,
-    step_count: Option<u64>,
-}
-
 pub(crate) async fn open(
     openai_api_key: Option<String>,
     gemini_api_key: Option<String>,
@@ -494,16 +480,8 @@ pub(crate) fn router(state: Service) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/providers", get(list_providers))
-        .route("/api/v1/generate", post(generate))
         .route("/api/v1/audio/transcriptions", post(transcribe_audio))
         .route("/api/v1/documents/extract", post(extract_document))
-        .route("/api/v1/web/search", post(web_search))
-        .route("/api/v1/web/fetch", post(web_fetch))
-        .route(
-            "/api/v1/operations/{operation_id}/cancel",
-            post(cancel_operation),
-        )
-        .route("/api/v1/timings", post(record_timing))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
 }
@@ -575,14 +553,6 @@ impl Service {
                 let Json(value) = cancel_operation(State(self.clone()), Path(operation_id)).await?;
                 serde_json::to_value(value)
                     .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
-            }
-            "/api/v1/timings" => {
-                record_timing(Json(
-                    serde_json::from_value(body)
-                        .map_err(|error| ApiError::invalid(error.to_string()))?,
-                ))
-                .await?;
-                Ok(Value::Null)
             }
             _ => Err(ApiError::new(
                 StatusCode::NOT_FOUND,
@@ -1188,48 +1158,6 @@ async fn cancel_operation(
     Ok(Json(OperationCancellationResponse {
         cancelled: state.active_operations.cancel(operation_id)?,
     }))
-}
-
-async fn record_timing(Json(timing): Json<ActionTiming>) -> Result<StatusCode, ApiError> {
-    if !matches!(timing.status.as_str(), "ok" | "error") {
-        return Err(ApiError::invalid("status must be ok or error."));
-    }
-    if timing.duration_ms > 2_592_000_000 {
-        return Err(ApiError::invalid("durationMs must not exceed 30 days."));
-    }
-    let session = timing.session_type.as_deref().unwrap_or("unknown");
-    if session.is_empty() || session.chars().count() > 40 {
-        return Err(ApiError::invalid(
-            "sessionType must contain between 1 and 40 characters.",
-        ));
-    }
-    match timing.action.as_str() {
-        "tool" => {
-            let tool = timing
-                .name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty() && name.chars().count() <= 80)
-                .ok_or_else(|| ApiError::invalid("Tool timings require a valid name."))?;
-            tracing::info!(tool,session,status=%timing.status,duration_ms=timing.duration_ms,"Tool call");
-        }
-        "turn" => {
-            let llm_ms = timing.llm_duration_ms.unwrap_or(0).min(timing.duration_ms);
-            let tool_ms = timing
-                .tool_duration_ms
-                .unwrap_or(0)
-                .min(timing.duration_ms - llm_ms);
-            tracing::info!(session,status=%timing.status,duration_ms=timing.duration_ms,llm_ms,tool_ms,other_ms=timing.duration_ms-llm_ms-tool_ms,steps=timing.step_count.unwrap_or(0),"User turn");
-        }
-        "delivery" => {
-            let processing_ms = timing
-                .processing_duration_ms
-                .unwrap_or(timing.duration_ms)
-                .min(timing.duration_ms);
-            tracing::info!(session,status=%timing.status,duration_ms=timing.duration_ms,processing_ms,queue_ms=timing.duration_ms-processing_ms,"User delivery");
-        }
-        _ => return Err(ApiError::invalid("action must be tool, turn, or delivery.")),
-    }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 fn codex_error(error: kcode_codex_runtime::Error, request_id: Uuid) -> ApiError {

@@ -187,14 +187,13 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.kweb_provenance_artifacts,
         &args.user_database,
     )?;
-    let kmap_service = kmap_http::Service::new(kmap, system_roots, args.system_prompts_dir.clone());
+    let kmap_service = kmap_http::Service::new(kmap, system_roots);
     let memory_ingress = kennedy_memory_ingress::Queue::open(&args.memory_ingress_database)
         .context("opening shared memory-ingress queue")?;
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
     )?);
-    let telegram_directory_router = telegram_identity::router(telegram_identity.clone());
     let history_service = kennedy_conversation_history::open(
         kennedy_conversation_history::Config {
             database: args.conversation_history_database,
@@ -259,7 +258,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             kmap_service,
             args.frontend_dir,
             kmap_http::MergedRouters::new(
-                telegram_directory_router,
                 intelligence_router,
                 history_router,
                 audio_ingress_router,
