@@ -736,7 +736,8 @@ fn wav_interval_to_opus(audio: &[u8], start_ms: u64, end_ms: u64) -> anyhow::Res
     let start_frame = u32::try_from(start_ms * u64::from(spec.sample_rate) / 1_000)
         .context("audio interval starts beyond WAV limits")?;
     let end_frame = u32::try_from(end_ms * u64::from(spec.sample_rate) / 1_000)
-        .context("audio interval ends beyond WAV limits")?;
+        .context("audio interval ends beyond WAV limits")?
+        .min(reader.duration());
     let sample_values = usize::try_from(
         u64::from(end_frame.saturating_sub(start_frame)) * u64::from(spec.channels),
     )
@@ -1075,6 +1076,18 @@ mod tests {
         assert_eq!(head.channel_count, 2);
         assert_eq!(head.input_sample_rate, OPUS_SAMPLE_RATE);
         assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn interval_encoding_clamps_rounded_duration_to_available_frames() {
+        let wav = wav_bytes(2, 44_100, 4_411);
+        let info = validate_wav(&wav).unwrap();
+        assert_eq!(info.duration_ms, 101);
+        let rounded_end_frame = info.duration_ms * 44_100 / 1_000;
+        assert!(rounded_end_frame > 4_411);
+
+        let opus = wav_interval_to_opus(&wav, 0, info.duration_ms).unwrap();
+        assert_eq!(&opus[..4], b"OggS");
     }
 
     #[test]

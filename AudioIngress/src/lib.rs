@@ -35,6 +35,8 @@ const RELEASE_DEFERRED_INGRESS_MIGRATION: &str =
     include_str!("../migrations/002_release_deferred_ingress.sql");
 const TRANSCRIPTION_STATUS_MIGRATION: &str =
     include_str!("../migrations/003_transcription_status.sql");
+const RETRY_ROUNDED_WAV_INTERVALS_MIGRATION: &str =
+    include_str!("../migrations/004_retry_rounded_wav_intervals.sql");
 const MAX_INGRESS_TOKENS: u64 = 50_000;
 const ESTIMATED_CHARACTERS_PER_TOKEN: u64 = 4;
 
@@ -462,6 +464,9 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     }
     if version < 3 {
         connection.execute_batch(TRANSCRIPTION_STATUS_MIGRATION)?;
+    }
+    if version < 4 {
+        connection.execute_batch(RETRY_ROUNDED_WAV_INTERVALS_MIGRATION)?;
     }
     Ok(())
 }
@@ -1607,9 +1612,67 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES('next','r',1,'text',1,'ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
+    }
+
+    #[test]
+    fn migration_retries_recordings_failed_by_rounded_wav_intervals() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(INITIAL_MIGRATION).unwrap();
+        db.execute_batch(TRANSCRIPTION_STATUS_MIGRATION).unwrap();
+        let insert = |id: &str, sha_character: char, error: &str| {
+            db.execute(
+                "INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning,attempt_count,last_error,transcription_status_json) VALUES(?1,?2,'note.wav','audio/wav',10,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?3,'failed',?4,?5,?6,1,?7,'{\"state\":\"failed\"}')",
+                params![
+                    id,
+                    sha_character.to_string().repeat(64),
+                    format!("originals/{id}.wav"),
+                    TRANSCRIPTION_MODEL,
+                    RECONCILIATION_MODEL,
+                    RECONCILIATION_REASONING,
+                    error,
+                ],
+            )
+            .unwrap();
+        };
+        insert(
+            "rounded",
+            'a',
+            "transcribing: terminal audio transcription: chunk 7 could not be prepared: WAV audio ended before the planned interval",
+        );
+        insert(
+            "unrelated",
+            'b',
+            "transcribing: terminal audio transcription: unsupported WAV sample format",
+        );
+
+        apply_migrations(&db).unwrap();
+
+        let repaired: (String, i64, Option<String>, Option<String>) = db
+            .query_row(
+                "SELECT status,attempt_count,last_error,transcription_status_json FROM audio_recordings WHERE id='rounded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired, ("uploaded".into(), 0, None, None));
+        assert_eq!(
+            db.query_row(
+                "SELECT status FROM audio_recordings WHERE id='unrelated'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
     }
 
     #[test]
