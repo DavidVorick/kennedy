@@ -767,15 +767,17 @@ transcript and full Chatend inspector, but has no browser composer. The
 ordinary conversation composer includes a microphone control and an editable
 paid transcription.
 
-Audio Ingress lists the complete durable recording history. Selecting a vnote
-shows its recording time and hash, processing status, Gemini chunk transcripts,
-Sol's reconciled final transcript, Kennedy-sized pieces, retry failures, and
-the saved Kennedy ingress Chatend for every piece. The full transcript and
-other large artifacts begin collapsed. The large center display appends a
-conversation-style History Ingress section for every transcript piece, while
-the inspector's Full History orders those piece sessions and retains all
-pre-reset contexts. A terminal memory-ingress failure exposes an always-visible
-retry action above the collapsed transcript sections for the preserved piece.
+Audio Ingress lists the complete durable recording history by recording-start
+time, newest first, regardless of when each vnote was uploaded or ingressed.
+Selecting a vnote shows its recording time and hash, processing status, Gemini
+chunk transcripts, Sol's reconciled final transcript, Kennedy-sized pieces,
+retry failures, and the saved Kennedy ingress Chatend for every piece. The full
+transcript and other large artifacts begin collapsed. The large center display
+appends a conversation-style History Ingress section for every transcript
+piece, while the inspector's Full History orders those piece sessions and
+retains all pre-reset contexts. A terminal memory-ingress failure exposes an
+always-visible retry action above the collapsed transcript sections for the
+preserved piece.
 
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from

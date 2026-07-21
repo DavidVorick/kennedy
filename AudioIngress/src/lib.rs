@@ -922,18 +922,22 @@ async fn list_recordings(
 ) -> Result<Json<Value>, ApiError> {
     let limit = query.limit.clamp(1, 50_000) as i64;
     let db = state.db.lock().map_err(ApiError::internal)?;
+    let recordings = fetch_recordings(&db, limit)?;
+    Ok(Json(json!({"recordings":recordings})))
+}
+
+fn fetch_recordings(db: &Connection, limit: i64) -> Result<Vec<RecordingRecord>, ApiError> {
     let mut statement = db
         .prepare(&format!(
-            "{} ORDER BY datetime(r.received_at) DESC,r.id DESC LIMIT ?1",
+            "{} ORDER BY datetime(r.source_created_at) DESC,datetime(r.received_at) DESC,r.id DESC LIMIT ?1",
             recording_select()
         ))
         .map_err(ApiError::internal)?;
-    let recordings = statement
+    statement
         .query_map([limit], row_recording)
         .map_err(ApiError::internal)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(ApiError::internal)?;
-    Ok(Json(json!({"recordings":recordings})))
+        .map_err(ApiError::internal)
 }
 
 async fn worker_loop(state: AppState) {
@@ -1623,6 +1627,57 @@ mod tests {
         assert_eq!(next.source_kind, SourceKind::Audio);
         assert_eq!(next.source_id, "first");
         assert_eq!(next.source_position, 0);
+    }
+
+    #[test]
+    fn recording_list_uses_recording_time_instead_of_upload_time() {
+        let db = database();
+        let insert = |id: &str, sha_character: char, recorded_at: &str, received_at: &str| {
+            db.execute(
+                "INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES(?1,?2,?3,'audio/wav',10,?4,?5,?5,?6,'uploaded',?7,?8,?9)",
+                params![
+                    id,
+                    sha_character.to_string().repeat(64),
+                    format!("{id}.wav"),
+                    recorded_at,
+                    received_at,
+                    format!("originals/{id}.wav"),
+                    TRANSCRIPTION_MODEL,
+                    RECONCILIATION_MODEL,
+                    RECONCILIATION_REASONING,
+                ],
+            )
+            .unwrap();
+        };
+        insert(
+            "latest-recording",
+            'a',
+            "2026-07-20T10:00:00-04:00",
+            "2026-07-20T15:00:00Z",
+        );
+        insert(
+            "middle-recording",
+            'b',
+            "2026-07-20T13:00:00Z",
+            "2026-07-21T15:00:00Z",
+        );
+        insert(
+            "latest-upload",
+            'c',
+            "2026-07-18T13:00:00Z",
+            "2026-07-22T15:00:00Z",
+        );
+
+        let ids = fetch_recordings(&db, 50)
+            .unwrap()
+            .into_iter()
+            .map(|recording| recording.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            ["latest-recording", "middle-recording", "latest-upload"]
+        );
     }
 
     #[test]

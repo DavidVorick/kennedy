@@ -19,7 +19,8 @@ return `202`; an already-known hash returns its existing record with
 `GET /api/v1/audio-ingress/by-sha256/{sha256}` provides the historical-import
 membership test. The list and individual-record endpoints expose processing,
 piece, retry, and completion status without returning the large final transcript
-or audio bytes.
+or audio bytes. The list orders recordings by recording-start time from newest
+to oldest; upload time and identifier are deterministic tie-breakers only.
 
 ## Durable preparation
 

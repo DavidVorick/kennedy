@@ -933,3 +933,8 @@ canonical documents; this file is not an append-only log.
   or using the dependency, and repeat that audit before every version bump.
   Record the audited version or revision and the safety conclusion; automated
   scans do not replace the source audit.
+
+## Vnote History Ordering
+
+- Sort the Audio Ingress vnote history by recording-start time from most recent
+  to least recent, independently of upload or ingress time.
