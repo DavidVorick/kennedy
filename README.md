@@ -15,6 +15,10 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   `kcode-web-fetch` and `kcode-doc-extraction` own bounded local fetching and
   document parsing. `kennedy-server` adds only Kennedy's HTTP contract,
   cancellation registry, and fixed search-mode policy.
+- `kcode-rust-libs` is an exact-pinned library used in-process for Kennedy's
+  managed Rust crate create/open/write/check/publish tools. It keeps validation
+  work in disposable Podman environments and publishing authority outside the
+  managed-library tree.
 - `kennedy-conversation-history` checkpoints active conversations and durably
   stores complete conversation and history-ingress recovery archives. It also
   owns idempotent start intents and per-conversation command queues.
@@ -122,6 +126,17 @@ audio, and safety defaults are compiled into the codebase. Deployment-specific
 listener addresses, database paths, frontend paths, and the encrypted vault
 path remain ordinary `kennedy-server` CLI options; run with `--help` to inspect
 or override them.
+
+The managed Rust-library service requires a crates.io API key at startup. Store
+it in Kennedy's encrypted credential vault under the conventional name
+`cratesio-key`:
+
+```sh
+cargo run -p kennedy-server -- secrets set cratesio-key
+```
+
+Kennedy passes this key directly to the exact-pinned `kcode-rust-libs`
+dependency. The managed libraries directory contains no credential file.
 
 No OpenAI API key is required for ordinary Kennedy generation. Startup rejects
 API-key-only Codex authentication so a
@@ -350,7 +365,8 @@ connections replace the former priority/task terminology.
 
 Kennedy's local tools use a text protocol documented once in `KmapBasics.txt`,
 so tool requests and results are visible in the chatend. Every session can read
-Kmap memory and use WebSearch/WebFetch. Live conversations cannot mutate the
+Kmap memory, use WebSearch/WebFetch, and access the five managed Rust-library
+tools documented in `KennedyRustLibTools.md`. Live conversations cannot mutate the
 Kmap; the serialized, offline history-ingress worker owns memory mutation. Kennedy
 chooses `quality`, `balanced`, or `fast` for each WebSearch call; the concrete
 provider, model, reasoning, context, and fixed deadline for those modes stay in

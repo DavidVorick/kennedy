@@ -95,10 +95,32 @@ canonical documents; this file is not an append-only log.
   to future renderers cannot rewrite what the model saw. Structured fields may
   support richer current UI rendering, while every renderer retains a raw-text
   fallback for older or unrecognized object versions.
-- Prefer one canonical, compact, human-readable YAML representation rather than
-  separately storing structured objects and rendered Chatend text. Parse that
-  stored text for typed current rendering and fall back to displaying it raw.
-  Conversation content needs only user-and-model or model-only visibility.
+- Prefer one canonical, compact, human-readable, machine-parseable text
+  representation rather than separately storing structured objects and
+  rendered Chatend text; compare suitable standards before selecting the
+  representation. Parse stored text for typed current rendering and fall back
+  to displaying it raw. A single session format version determines every object
+  schema; do not repeat versions on individual objects. Conversation content
+  needs only user-and-model or model-only visibility, and visibility or other
+  properties implied by an object kind are not serialized.
+- Do not adopt YAML or KDL merely for uniformity when their self-describing
+  structure makes the model-facing conversation more verbose than the current
+  Chatend. Prefer the existing compact domain rendering unless measurement
+  demonstrates a better representation.
+- Persist the exact model-facing Chatend text produced when content is appended;
+  do not rely on retaining historical renderer implementations to reconstruct
+  it from structured storage. Structure is parsed from the stored text when
+  useful, with raw-text fallback, so obsolete parsers and renderers can be
+  removed without losing the historical model input.
+- Define and measure a leaner next Chatend format rather than assuming the
+  current framing is optimal: reduce or remove long visual delimiters and
+  redundant blank lines, replace the verbose JSON tool envelope if a smaller
+  protocol remains reliable, and remove fields or labels implied by position or
+  object kind. New text is stored exactly; existing history is never rewritten.
+- Do not optimize away familiar chat semantics. Because the model consumes one
+  flat Chatend string, every format must retain conspicuous, conventional role
+  and turn boundaries so the input still reads unmistakably as a sequence of
+  system, user, Kennedy/assistant, tool-call, and tool-result turns.
 - Store the conversation as an append-only sequence. A reset is a boundary
   object with no retained-object list; content retained into the rebuilt
   Chatend is appended again after the boundary. Appending an atomic object batch

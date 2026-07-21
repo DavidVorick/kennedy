@@ -654,11 +654,41 @@ Every corrected conversation or audio claim also supplies
 `completion_protocol: "end-turn-v1"`, allowing the backend to reject
 an older backend build before it can consume newly released repair work.
 
-### 8.12 Tool Failures
+### 8.12 Kmap-documented Rust library tools
+
+`CreateRustLib`, `OpenRustLib`, `WriteRustLib`, `CheckRustLib`, and
+`PublishRustLib` are always available in every Kennedy execution mode,
+including browser conversation, private/group Telegram, self time, history
+ingress, and audio ingress. Their Kennedy-facing contracts are absent from the
+static prompt assets and live entirely in the Kmap; `KmapBasics.txt` supplies
+only the generic discovery notice and text-call protocol.
+
+The native backend validates the model-visible name and complete-file write
+shapes, automatically attaches a durable tool-session identifier that never
+appears in Kennedy's arguments, and calls the synchronous exact-pinned
+`kcode-rust-libs` crate in-process on a blocking worker. Create/open results
+contain every sorted UTF-8 file; write results contain accepted paths and the
+canonical manifest version; check results distinguish code-quality failures
+from infrastructure errors; and publish results never expose the operator's
+token.
+
+The hidden tool-session identifier survives Chatend and ingress recovery. The
+server owns at most one open handle per library across all Kennedy sessions and
+releases it on conversation close/reset/timeout, self-time completion, or
+successful history/audio ingress completion. Idle abandoned ownership expires
+after 24 hours. There is no Kennedy-facing close, reload, delete, list, patch,
+arbitrary-command, credential, root-path, or Podman-configuration call.
+
+Rust-library mutations are external filesystem or registry effects and are not
+rolled back when a later checkpoint fails. Complete-file writes are safely
+repeatable. After an ambiguous create Kennedy opens the library; after an
+ambiguous publish she verifies the exact version on crates.io before retrying.
+
+### 8.13 Tool Failures
 
 Unknown tools are never executed. Invalid arguments, exhausted budgets, missing
 short IDs, unsafe URLs, and backend failures are returned to Kennedy as failed
-tool results with a readable explanation. Memory and web operations have
+tool results with a readable explanation. Memory, web, and coding operations have
 distinct readable result labels. Machine-readable error codes remain in the
 internal diagnostic tool log; readable requests and failures appear in the
 chatend visualization.

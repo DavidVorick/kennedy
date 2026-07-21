@@ -47,11 +47,14 @@ coordination happens in the backend orchestrator through the same public HTTP
 APIs used for durable boundaries. The published Telegram transport remains on
 port 4324 until its crate exposes a mergeable router instead of owning a
 listener.
+The exact-pinned `kcode-rust-libs` adapter is also imported into the main
+process and called directly from Kennedy's native tool executor on blocking
+workers; it has no browser-facing route.
 
 `kennedy-server` also owns a generic named credential vault stored as the
 passphrase-encrypted `data/kennedy-secrets.age` file. At startup the server unlocks
-the vault and passes the conventionally named OpenAI, Gemini, and Telegram
-values directly to their trusted connectors. The vault has terminal-only
+the vault and passes the conventionally named OpenAI, Gemini, Telegram, and
+crates.io values directly to their trusted connectors. The vault has terminal-only
 set/remove/list/passphrase commands and no HTTP, browser, Kennedy-tool, Codex,
 or reveal surface. Stable runtime policy is compiled into code; only
 deployment-specific listeners, paths, limits, and the vault location are CLI
@@ -125,11 +128,20 @@ the audited version or revision and its conclusion so the pin and audit are
 verifiable together. Automated vulnerability or license scans may supplement
 this review but do not replace it.
 
+Audit record: `kcode-rust-libs` `0.2.2` was fully source-audited on 2026-07-21
+before restoration. The published crate has no dependencies or build script.
+It keeps the supplied crates.io token in a private, redacted in-memory value,
+never discovers or writes credential files, excludes the token from validation
+containers and process arguments, passes it by environment only to the final
+`cargo publish --no-verify` container, and redacts it from publication errors.
+The version is approved for Kennedy's `cratesio-key` credential.
+
 ## 3. Runtime Topology
 
 ```text
 One kennedy-server process
   ├─ Encrypted credential vault -------- data/kennedy-secrets.age
+  ├─ Managed Rust libraries ------------ /home/user/dev/kennedy/kcode/kcode-rust-libs
   ├─ Main HTTP application :4321
   │    ├─ /api/v1/kmap/* via kweb-db-core
   │    ├─ intelligence routes via kcode libraries
@@ -305,6 +317,11 @@ search, `kcode-openai-api` owns paid transcription and image generation,
 `kcode-doc-extraction` owns local PDF, DOCX, spreadsheet, and text extraction.
 Each is standalone and can be moved to its own repository and crates.io without
 Kennedy code.
+
+`kcode-rust-libs` owns managed-library filesystem validation, complete-file
+writes, disposable Podman checks, and crates.io publication. The orchestration
+session layer owns tool schemas, hidden durable ownership IDs, exclusive open
+handles, lease expiry, lifecycle release, and readable result formatting.
 
 KennedyServer's thin intelligence adapter owns:
 
@@ -787,6 +804,7 @@ Frontend/
 KennedyServer/
   KmapHttp.md
   src/main.rs
+  src/rust_lib_tools.rs
   src/intelligence/
   src/orchestration.rs
   src/orchestration/
@@ -798,7 +816,7 @@ KennedyServer/
 ```
 
 Implementation code belongs under its owning component directory.
-The Kweb storage and five kcode libraries are external crates.io dependencies,
+The Kweb storage and six kcode libraries are external crates.io dependencies,
 not workspace members. Credential-bearing provider libraries use exact version
 requirements; the other kcode libraries use compatible version requirements
 resolved by the workspace lockfile.

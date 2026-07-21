@@ -1993,6 +1993,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-rust-libs"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5356536324a7e9758b3ae0c9ca48f04d3fcc161d4ed046ef460cefe9a216b9d4"
+
+[[package]]
 name = "kcode-tg-kennedy-bot"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2115,6 +2121,7 @@ dependencies = [
  "kcode-doc-extraction",
  "kcode-gemini-api",
  "kcode-openai-api",
+ "kcode-rust-libs",
  "kcode-tg-kennedy-bot",
  "kcode-web-fetch",
  "kennedy-audio-ingress",

@@ -4,6 +4,7 @@ mod intelligence;
 mod kmap_http;
 mod kmap_size;
 mod orchestration;
+mod rust_lib_tools;
 mod telegram_identity;
 
 use std::{
@@ -21,6 +22,8 @@ use zeroize::Zeroize;
 const OPENAI_API_KEY_SECRET: &str = "openai-api-key";
 const GEMINI_API_KEY_SECRET: &str = "gemini-api-key";
 const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
+const CRATES_IO_KEY_SECRET: &str = "cratesio-key";
+const RUST_LIBS_ROOT: &str = "/home/user/dev/kennedy/kcode/kcode-rust-libs";
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long, global = true, default_value = "./data/kennedy-secrets.age")]
@@ -194,6 +197,8 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?
             .map(kcode_tg_kennedy_bot::BotToken::new)
             .transpose()?;
+    let crates_io_key =
+        resolve_required_secret(&vault, CRATES_IO_KEY_SECRET, "Rust library publication")?;
     let codex_catalog_cache =
         kcode_codex_runtime::CatalogCache::new(kcode_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) = kmap_http::initialize(
@@ -202,6 +207,8 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.user_database,
     )?;
     let kmap_service = kmap_http::Service::new(kmap, system_roots);
+    let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT, crates_io_key)
+        .with_context(|| format!("opening managed Rust libraries root {RUST_LIBS_ROOT}"))?;
     let memory_ingress = kennedy_memory_ingress::Queue::open(&args.memory_ingress_database)
         .context("opening shared memory-ingress queue")?;
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
@@ -275,6 +282,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             audio: audio_service,
             directory: telegram_identity.clone(),
             memory_ingress,
+            rust_lib_tools,
         },
     )?;
     tokio::try_join!(
@@ -356,6 +364,25 @@ fn resolve_optional_secret(
         tracing::warn!(secret_name=name, %purpose, "configured Kennedy secret is not present in the vault");
     }
     Ok(secret.map(|value| value.expose_secret().to_owned()))
+}
+
+fn resolve_required_secret(
+    vault: &CredentialVault,
+    configured_name: &str,
+    purpose: &str,
+) -> anyhow::Result<String> {
+    let name = configured_name.trim();
+    if name.is_empty() {
+        anyhow::bail!("{purpose} requires a configured Kennedy secret name");
+    }
+    vault
+        .secret(name)?
+        .map(|value| value.expose_secret().to_owned())
+        .with_context(|| {
+            format!(
+                "{purpose} requires Kennedy secret '{name}'; store it with `kennedy-server secrets set {name}`"
+            )
+        })
 }
 
 fn manage_secrets(command: SecretsCommand, vault_path: &Path) -> anyhow::Result<()> {
@@ -466,6 +493,11 @@ mod tests {
         assert_eq!(OPENAI_API_KEY_SECRET, "openai-api-key");
         assert_eq!(GEMINI_API_KEY_SECRET, "gemini-api-key");
         assert_eq!(TELEGRAM_BOT_TOKEN_SECRET, "telegram-bot-token");
+        assert_eq!(CRATES_IO_KEY_SECRET, "cratesio-key");
+        assert_eq!(
+            RUST_LIBS_ROOT,
+            "/home/user/dev/kennedy/kcode/kcode-rust-libs"
+        );
     }
 
     #[test]
@@ -480,6 +512,22 @@ mod tests {
             resolve_optional_secret(&vault, "", "disabled")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn required_secret_must_be_present() {
+        let mut vault = CredentialVault::empty();
+        let error =
+            resolve_required_secret(&vault, CRATES_IO_KEY_SECRET, "publication").unwrap_err();
+        assert!(error.to_string().contains(CRATES_IO_KEY_SECRET));
+
+        vault
+            .set(CRATES_IO_KEY_SECRET, "test-crates-io-key".into())
+            .unwrap();
+        assert_eq!(
+            resolve_required_secret(&vault, CRATES_IO_KEY_SECRET, "publication").unwrap(),
+            "test-crates-io-key"
         );
     }
 

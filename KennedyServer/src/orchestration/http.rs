@@ -20,6 +20,7 @@ pub(crate) struct LocalServices {
     pub audio: kennedy_audio_ingress::Service,
     pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
     pub memory_ingress: kennedy_memory_ingress::Queue,
+    pub rust_lib_tools: crate::rust_lib_tools::RustLibToolService,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +160,58 @@ impl Api {
     pub async fn directory_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
         self.service_request(ServiceKind::Directory, Method::POST, path, Some(body))
             .await
+    }
+
+    pub async fn rust_lib_execute(
+        &self,
+        session_id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .rust_lib_tools
+                .execute(session_id.to_owned(), name.to_owned(), arguments)
+                .await
+                .map_err(rust_lib_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let payload = self
+                    .request(
+                        Method::POST,
+                        &bases.kweb,
+                        "/api/v1/rust-libs/execute",
+                        Some(json!({
+                            "session_id":session_id,
+                            "name":name,
+                            "arguments":arguments,
+                        })),
+                    )
+                    .await?;
+                Ok(payload.get("result").cloned().unwrap_or(Value::Null))
+            }
+        }
+    }
+
+    pub async fn release_rust_libs(&self, session_id: &str) {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                if let Err(error) = local.rust_lib_tools.release(session_id.to_owned()).await {
+                    tracing::warn!(error=%error.message, "Rust library session release failed");
+                }
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let _ = self
+                    .request(
+                        Method::POST,
+                        &bases.kweb,
+                        "/api/v1/rust-libs/release",
+                        Some(json!({"session_id":session_id})),
+                    )
+                    .await;
+            }
+        }
     }
 
     pub async fn telegram_get(&self, path: &str) -> Result<Value, ApiError> {
@@ -571,6 +624,14 @@ fn intelligence_error(error: crate::intelligence::ApiError) -> ApiError {
 }
 
 fn directory_error(error: crate::telegram_identity::ApiError) -> ApiError {
+    ApiError {
+        status: Some(error.status),
+        code: error.code.into(),
+        message: error.message,
+    }
+}
+
+fn rust_lib_error(error: crate::rust_lib_tools::ToolError) -> ApiError {
     ApiError {
         status: Some(error.status),
         code: error.code.into(),

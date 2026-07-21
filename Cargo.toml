@@ -21,6 +21,7 @@ kcode-doc-extraction = "0.1.0"
 kcode-gemini-api = "=0.1.0"
 kcode-audio-transcribe = { path = "kcode-audio-transcribe" }
 kcode-openai-api = "=0.1.0"
+kcode-rust-libs = "=0.2.2"
 kcode-web-fetch = "0.1.1"
 rand = "0.9"
 rpassword = "7.5.4"
