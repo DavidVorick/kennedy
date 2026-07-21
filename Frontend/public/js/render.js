@@ -376,6 +376,39 @@ function audioRetryButton(piece, retryingPieceIds, onRetryPiece, viewKey) {
   return retry;
 }
 
+function audioStepLabel(step) {
+  switch (step?.kind) {
+    case "validate_audio": return "Validate audio";
+    case "plan_chunks": return "Plan overlapping chunks";
+    case "transcribe_chunk": return `Transcribe chunk ${Number(step.index) + 1}/${Number(step.total)}`;
+    case "reconcile_transcript": return "Reconcile final transcript";
+    case "split_transcript": return "Check transcript boundaries";
+    default: return String(step?.kind || "Transcription step").replaceAll("_", " ");
+  }
+}
+
+function renderAudioTranscriptionProgress(status) {
+  if (!status || !Array.isArray(status.steps)) return null;
+  const section = element("section", "audio-progress");
+  section.append(element("h3", "", "Transcription progress"));
+  const steps = element("ol", "audio-progress-steps");
+  for (const entry of status.steps) {
+    const state = String(entry?.state || "pending");
+    const item = element("li", `audio-progress-step audio-progress-step-${state}`);
+    const label = element("span", "audio-progress-label", audioStepLabel(entry?.step));
+    const detail = state === "retrying"
+      ? `Retrying · attempt ${Number(entry?.attempts || 0)}`
+      : state === "running" && Number(entry?.attempts || 0) > 1
+        ? `Running · attempt ${Number(entry.attempts)}`
+        : state.replaceAll("_", " ");
+    item.append(label, element("span", "audio-progress-state", detail));
+    if (entry?.error?.message) item.append(element("span", "audio-progress-error", entry.error.message));
+    steps.append(item);
+  }
+  section.append(steps);
+  return section;
+}
+
 export function renderAudioRecording(container, detail, {
   loading = false,
   error = null,
@@ -420,6 +453,8 @@ export function renderAudioRecording(container, detail, {
     audioDetail("Kennedy pieces", `${record.completed_piece_count}/${record.transcript_piece_count} complete`),
   );
   container.append(header, metadata);
+  const transcriptionProgress = renderAudioTranscriptionProgress(record.transcription_status);
+  if (transcriptionProgress) container.append(transcriptionProgress);
   if (record.last_error) container.append(element("pre", "audio-error", record.last_error));
 
   const failedPieces = (detail.pieces || []).filter(piece => piece.phase === "ingress_failed");

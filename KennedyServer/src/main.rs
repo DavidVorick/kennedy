@@ -23,7 +23,7 @@ const GEMINI_API_KEY_SECRET: &str = "gemini-api-key";
 const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, global = true, default_value = "./kennedy-secrets.age")]
+    #[arg(long, global = true, default_value = "./data/kennedy-secrets.age")]
     vault_path: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
@@ -33,25 +33,33 @@ struct Args {
     telegram_bind: String,
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     frontend_origin: String,
-    #[arg(long, global = true, default_value = "./kweb-db-core.sqlite3")]
+    #[arg(long, global = true, default_value = "./data/kweb-db-core.sqlite3")]
     kweb_database: PathBuf,
-    #[arg(long, global = true, default_value = "./kweb-provenance-artifacts")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "./data/kweb-provenance-artifacts"
+    )]
     kweb_provenance_artifacts: PathBuf,
-    #[arg(long, global = true, default_value = "./kennedy-conversations.sqlite3")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "./data/kennedy-conversations.sqlite3"
+    )]
     conversation_history_database: PathBuf,
-    #[arg(long, global = true, default_value = "./kennedy-telegram.sqlite3")]
+    #[arg(long, global = true, default_value = "./data/kennedy-telegram.sqlite3")]
     telegram_database: PathBuf,
-    #[arg(long, global = true, default_value = "./kennedy-users.sqlite3")]
+    #[arg(long, global = true, default_value = "./data/kennedy-users.sqlite3")]
     user_database: PathBuf,
-    #[arg(long, global = true, default_value = "./kennedy-audio.sqlite3")]
+    #[arg(long, global = true, default_value = "./data/kennedy-audio.sqlite3")]
     audio_ingress_database: PathBuf,
     #[arg(
         long,
         global = true,
-        default_value = "./kennedy-memory-ingress.sqlite3"
+        default_value = "./data/kennedy-memory-ingress.sqlite3"
     )]
     memory_ingress_database: PathBuf,
-    #[arg(long, global = true, default_value = "./kennedy-audio-ingress")]
+    #[arg(long, global = true, default_value = "./data/audio-ingress-media")]
     audio_ingress_media: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
     frontend_dir: PathBuf,
@@ -75,7 +83,7 @@ enum Command {
     /// Create a verified offline archive of all Kennedy-owned persistent data.
     Backup {
         /// Directory in which to create the timestamped .tar.gz archive.
-        #[arg(long, default_value = "./backups")]
+        #[arg(long, default_value = "./data/backups")]
         backup_dir: PathBuf,
         /// Omit large Kweb provenance artifacts while retaining the Kweb database and artifact metadata.
         #[arg(long)]
@@ -161,6 +169,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let kweb_listener = tokio::net::TcpListener::bind(&args.kweb_bind)
         .await
         .with_context(|| format!("binding Kweb listener {}", args.kweb_bind))?;
+    ensure_runtime_parent_directories(&args, &vault_path)?;
     let orchestration_telegram_base = telegram_relay_http_base(&args.telegram_bind);
     let vault = if vault_path.exists() {
         let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
@@ -176,6 +185,11 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         GEMINI_API_KEY_SECRET,
         "Gemini search and audio transcription",
     )?;
+    let gemini = gemini_api_key
+        .filter(|value| !value.trim().is_empty())
+        .map(kcode_gemini_api::Gemini::open)
+        .transpose()
+        .context("opening shared Gemini client")?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?
             .map(kcode_tg_kennedy_bot::BotToken::new)
@@ -204,7 +218,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let history_router = kennedy_conversation_history::router(history_service.clone());
     let intelligence_service = intelligence::open(
         transcription_api_key,
-        gemini_api_key.clone(),
+        gemini.clone(),
         codex_catalog_cache.clone(),
     )
     .await?;
@@ -217,14 +231,24 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         identity_sink: telegram_identity.clone(),
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
+    let audio_transcriber = if let Some(gemini) = gemini {
+        let mut config =
+            kcode_codex_runtime::CodexConfig::new(kcode_audio_transcribe::RECONCILIATION_MODEL);
+        config.validation_reasoning_effort = kcode_codex_runtime::ReasoningEffort::XHigh;
+        let codex = kcode_codex_runtime::Codex::open(config, codex_catalog_cache)
+            .await
+            .context("opening Codex audio-reconciliation runtime")?;
+        Some(kcode_audio_transcribe::AudioTranscriber::new(gemini, codex))
+    } else {
+        None
+    };
     let audio_service = kennedy_audio_ingress::open(
         kennedy_audio_ingress::Config {
             database: args.audio_ingress_database,
             media_directory: args.audio_ingress_media,
             max_upload_bytes: args.audio_ingress_max_upload_bytes,
-            gemini_api_key: gemini_api_key.clone(),
         },
-        codex_catalog_cache,
+        audio_transcriber,
         memory_ingress.clone(),
     )
     .await?;
@@ -267,6 +291,38 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kcode_tg_kennedy_bot::serve(telegram),
         orchestration::run(orchestration, orchestration_api),
     )?;
+    Ok(())
+}
+
+fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::Result<()> {
+    for path in [
+        vault_path,
+        &args.kweb_database,
+        &args.kweb_provenance_artifacts,
+        &args.conversation_history_database,
+        &args.telegram_database,
+        &args.user_database,
+        &args.audio_ingress_database,
+        &args.memory_ingress_database,
+        &args.audio_ingress_media,
+    ] {
+        let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) else {
+            continue;
+        };
+        if parent.exists() {
+            continue;
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(parent)
+            .with_context(|| format!("creating runtime data directory {}", parent.display()))?;
+    }
     Ok(())
 }
 

@@ -49,7 +49,7 @@ port 4324 until its crate exposes a mergeable router instead of owning a
 listener.
 
 `kennedy-server` also owns a generic named credential vault stored as the
-passphrase-encrypted `kennedy-secrets.age` file. At startup the server unlocks
+passphrase-encrypted `data/kennedy-secrets.age` file. At startup the server unlocks
 the vault and passes the conventionally named OpenAI, Gemini, and Telegram
 values directly to their trusted connectors. The vault has terminal-only
 set/remove/list/passphrase commands and no HTTP, browser, Kennedy-tool, Codex,
@@ -129,15 +129,15 @@ this review but do not replace it.
 
 ```text
 One kennedy-server process
-  ├─ Encrypted credential vault -------- kennedy-secrets.age
+  ├─ Encrypted credential vault -------- data/kennedy-secrets.age
   ├─ Main HTTP application :4321
   │    ├─ /api/v1/kmap/* via kweb-db-core
   │    ├─ intelligence routes via kcode libraries
-  │    ├─ conversation history routes --- kennedy-conversations.sqlite3
-  │    ├─ audio ingress routes ----------- kennedy-audio.sqlite3 + kennedy-audio-ingress/
-  │    ├─ Telegram identity routes ------- kennedy-users.sqlite3
+  │    ├─ conversation history routes --- data/kennedy-conversations.sqlite3
+  │    ├─ audio ingress routes ----------- data/kennedy-audio.sqlite3 + data/audio-ingress-media/
+  │    ├─ Telegram identity routes ------- data/kennedy-users.sqlite3
   │    └─ frontend and manuals
-  └─ Telegram Relay API :4324 ---------- kennedy-telegram.sqlite3 + Telegram long polling
+  └─ Telegram Relay API :4324 ---------- data/kennedy-telegram.sqlite3 + Telegram long polling
 
 Browser frontend calls the main application and Telegram relay directly. The
 main application calls its storage libraries in-process.
@@ -698,8 +698,8 @@ SQLite stores exactly the three durable node types from the user specification:
 - **Data history node**: an append-only link from one knowledge node to one
   provenance node and the previous history node.
 
-The default physical store is `kweb-db-core.sqlite3` plus its sibling
-`kweb-provenance-artifacts/`. Provenance text at or below 256 KiB remains
+The default physical store is `data/kweb-db-core.sqlite3` plus its sibling
+`data/kweb-provenance-artifacts/`. Provenance text at or below 256 KiB remains
 inline. Larger text and explicit media are written as private immutable files;
 SQLite stores relative path, preserved original basename, media type, byte
 length, SHA-256, creation time, semantic role, and order. The main provenance

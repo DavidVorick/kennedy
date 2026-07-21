@@ -1,5 +1,5 @@
 [workspace]
-members = ["AudioIngress", "Chatend", "ConversationHistory", "KennedyServer", "MemoryIngress"]
+members = ["AudioIngress", "Chatend", "ConversationHistory", "KennedyServer", "MemoryIngress", "kcode-audio-transcribe"]
 resolver = "2"
 
 [workspace.package]
@@ -19,6 +19,7 @@ http = "1"
 kcode-codex-runtime = "0.1.0"
 kcode-doc-extraction = "0.1.0"
 kcode-gemini-api = "=0.1.0"
+kcode-audio-transcribe = { path = "kcode-audio-transcribe" }
 kcode-openai-api = "=0.1.0"
 kcode-web-fetch = "0.1.1"
 rand = "0.9"

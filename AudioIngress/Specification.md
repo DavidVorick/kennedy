@@ -2,8 +2,8 @@
 
 The audio-ingress router is Kennedy's durable pipeline for vnote WAV recordings.
 It does not access the Kmap, conversation database, or intelligence backend.
-Its persistent state is `kennedy-audio.sqlite3` plus the private
-`kennedy-audio-ingress/` media tree. The native orchestrator calls its cloned
+Its default persistent state is `data/kennedy-audio.sqlite3` plus the private
+`data/audio-ingress-media/` tree. The native orchestrator calls its cloned
 service handle directly; the HTTP routes remain for browser and upload clients.
 
 ## Upload and identity

@@ -428,7 +428,7 @@ impl From<GeminiUsage> for Usage {
 
 pub(crate) async fn open(
     openai_api_key: Option<String>,
-    gemini_api_key: Option<String>,
+    gemini: Option<Gemini>,
     codex_catalog_cache: CatalogCache,
 ) -> anyhow::Result<Service> {
     let mut codex_config = CodexConfig::new(DEFAULT_MODEL);
@@ -458,11 +458,6 @@ pub(crate) async fn open(
         .map(OpenAi::open)
         .transpose()
         .context("opening OpenAI client")?;
-    let gemini = gemini_api_key
-        .filter(|value| !value.trim().is_empty())
-        .map(Gemini::open)
-        .transpose()
-        .context("opening Gemini client")?;
     Ok(Service {
         default_provider: DEFAULT_PROVIDER_NAME,
         providers: Arc::new(providers),

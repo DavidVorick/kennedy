@@ -22,6 +22,89 @@ canonical documents; this file is not an append-only log.
 - Treat the literal package version in `Cargo.toml` as canonical; do not require
   or include a redundant `Version.txt` in this managed library.
 
+## Standalone Audio Transcription Library
+
+- Extract the working audio-to-transcript pipeline as the independently
+  published `kcode-audio-transcribe` Rust library. Preserve the current WAV
+  validation, equalized overlapping chunks, in-memory Opus conversion, Gemini
+  transcription, concurrent chunk processing, Codex/Sol reconciliation,
+  speaker/timestamp/translation handling, and final transcript behavior.
+- Parallelize every independent per-chunk stage under the current bounded
+  concurrency of four: interval decoding, resampling, in-memory Opus encoding,
+  Gemini submission, and response validation may overlap across chunks. Commit
+  in-process results as they finish while retaining chunk indexes for final
+  chronological ordering. Only dependency-bound work remains serial, including
+  initial validation/planning, final reconciliation after every chunk succeeds,
+  and any necessary final transcript-splitting pass.
+- The host constructs and passes configured `kcode-gemini-api` and
+  `kcode-codex-runtime` client objects (and any future provider clients); the
+  transcription library never receives or unlocks raw API keys.
+- Keep the ordinary caller API job-oriented and asynchronous:
+  `transcribe(audio_bytes)` takes ownership of raw audio bytes and returns a job
+  handle, and `job.status()` returns ordered completed, active, pending,
+  retrying, or failed steps. The completed status also contains the final
+  transcript. The caller does not orchestrate chunking, provider calls,
+  retries, or reconciliation.
+- The public snapshot is `TranscriptionStatus { state: JobState, steps:
+  Vec<StepStatus>, transcript: Option<String> }`. Each `StepStatus` contains
+  `step`, `state`, `attempts`, `retry_after: Option<Duration>`, and an optional
+  sanitized `StepError { code, message, retryable }`. Ordered steps are
+  `ValidateAudio`, `PlanChunks`, one `TranscribeChunk { index, total }` per
+  planned window, `ReconcileTranscript`, and `SplitTranscript`; step states are
+  `Pending`, `Running`, `Retrying`, `Completed`, `Skipped`, or `Failed`.
+  `status()` clones this in-memory snapshot and never performs a provider call.
+- The library owns no media directory, database, durable job state, or restart
+  recovery and performs no filesystem reads or writes. Its only audio input is
+  an owned byte buffer retained in memory for as long as the job needs it; do
+  not support paths, readers, caller-supplied storage, or library-managed
+  storage. Filenames, recording timestamps, hashes, and durable originals remain
+  caller metadata. In-process status remains pollable for frontend progress
+  through Kennedy's browser adapter. If transcription is interrupted by process
+  shutdown, Kennedy starts a new transcription from the retained original;
+  repeating previously completed provider work is accepted.
+- `kcode-audio-transcribe` owns transcription only. It has no Kennedy HTTP,
+  Chatend, Kmap, provenance, or MemoryIngress behavior. Its completed result may
+  include structured chunks and bounded transcript segments, but Kennedy alone
+  maps completed transcript material into MemoryIngress jobs and later builds
+  and checkpoints the audio-ingress Chatend.
+
+## Repository-Local Runtime Data
+
+- Keep Kennedy's persistent runtime data inside the repository sandbox, but
+  consolidate it under the single ignored `data/` directory so the repository
+  root remains source-focused and the data remains inspectable by Codex.
+- Do not add a `--data-dir` abstraction. Change the existing individual path
+  defaults to locations under `./data/` while retaining those existing flags as
+  overrides. Store live databases and their WAL/SHM companions directly in
+  `data/`, audio originals in `data/audio-ingress-media/`, Kweb artifacts in
+  `data/kweb-provenance-artifacts/`, the encrypted vault in `data/`, and backup
+  and manual recovery material in `data/backups/` and `data/recovery/`.
+
+## Standalone Conversation History Library
+
+- Extract Conversation History into the independently maintained kcode Rust
+  library `kcode-conversation-history` (Rust crate path
+  `kcode_conversation_history`) in its own repository, following the managed
+  library and publication conventions established by `kcode-rust-libs`.
+- Conversation contents are a versioned, typed sequence of a finite set of
+  conversation objects rather than an opaque application snapshot. The model
+  covers system/user/Kennedy messages, Kennedy-private continuity messages,
+  generic tool calls and results, Kmap context, and reset boundaries, and it is
+  extended when conversation building blocks change.
+- Preserve the exact historical Chatend text produced by each object so changes
+  to future renderers cannot rewrite what the model saw. Structured fields may
+  support richer current UI rendering, while every renderer retains a raw-text
+  fallback for older or unrecognized object versions.
+- Prefer one canonical, compact, human-readable YAML representation rather than
+  separately storing structured objects and rendered Chatend text. Parse that
+  stored text for typed current rendering and fall back to displaying it raw.
+  Conversation content needs only user-and-model or model-only visibility.
+- Store the conversation as an append-only sequence. A reset is a boundary
+  object with no retained-object list; content retained into the rebuilt
+  Chatend is appended again after the boundary. Appending an atomic object batch
+  is itself the durable checkpoint, so do not retain a separate full-snapshot
+  checkpoint API.
+
 ## Frontend Conversation-History Recovery
 
 - Restore visible, selectable conversation history first so the user can talk
@@ -40,10 +123,12 @@ canonical documents; this file is not an append-only log.
   identity, and the frontend from the main `127.0.0.1:4321` listener. The
   published Telegram relay currently remains on `4324` only because version
   `0.1.0` exposes a self-binding server rather than a mergeable Axum router.
-- Preserve each raw audio original. Generated transcription shards are working
-  data: delete their files after every ingress piece for the recording is
-  complete, while retaining transcript metadata in SQLite. Also remove stale
-  shard directories for already-completed recordings during startup.
+- Preserve each raw audio original in Kennedy-owned storage. The external audio
+  transcription library owns no media directory or durable generated shards;
+  it receives only owned bytes and keeps all internal working data ephemeral and
+  memory-only. Kennedy retains completed transcript metadata in SQLite and may
+  restart an interrupted transcription from the raw original rather than
+  resuming completed chunks.
 - The intended AudioIngress provider path is inline Opus through
   `kcode-gemini-api`; the Opus buffer is never persisted. Preserve the uploaded
   raw original byte-for-byte. Resample only inside the ephemeral Opus
@@ -99,8 +184,9 @@ canonical documents; this file is not an append-only log.
   multi-call workflow uses its own stable ID, which makes individual retries
   safe without making the workflow atomic.
 - This storage is a Kweb (knowledge web), not a Kennedy-specific database. The
-  database path is caller-supplied; Kennedy defaults it to `kweb-db-core.sqlite3` and
-  supplies the sibling `kweb-provenance-artifacts/` directory.
+  database path is caller-supplied; Kennedy defaults it to
+  `data/kweb-db-core.sqlite3` and supplies the sibling
+  `data/kweb-provenance-artifacts/` directory.
 - Provenance media and large provenance payloads live outside SQLite. Artifact
   filenames preserve the original safe basename with exactly 12 random
   URL-safe Base64 characters inserted before the final extension; the first
@@ -144,9 +230,11 @@ canonical documents; this file is not an append-only log.
   hotkey ends `arecord`, then checks the five newest vnotes by SHA-256 and
   uploads any Kennedy has not accepted. Once Kennedy has durably accepted the
   bytes, the script never waits for later processing.
-- Audio jobs and originals survive shutdown and resume gracefully. SHA-256 is
-  the durable identity and lookup key so a large historical recording archive
-  can skip files Kennedy has already accepted or ingressed even when renamed.
+- Audio job identity and originals survive shutdown. SHA-256 is the durable
+  identity and lookup key so a large historical recording archive can skip
+  files Kennedy has already accepted or ingressed even when renamed. An
+  in-progress external-library transcription does not preserve step progress;
+  Kennedy restarts it from the retained original after shutdown.
 - Split each recording into equalized, ordered windows no longer than four
   minutes, with fifteen-second overlap. The four-minute limit is a deliberate
   Gemini fidelity choice despite longer advertised support. Gemini 3.1 Pro

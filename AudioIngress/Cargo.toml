@@ -8,14 +8,10 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
-futures.workspace = true
-hound.workspace = true
 kennedy-chatend = { path = "../Chatend" }
 kennedy-memory-ingress = { path = "../MemoryIngress" }
-kcode-codex-runtime.workspace = true
-kcode-gemini-api.workspace = true
+kcode-audio-transcribe.workspace = true
 rusqlite.workspace = true
-ruopus = { version = "0.1.2", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

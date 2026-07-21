@@ -647,7 +647,7 @@ fn render_readme(manifest: &Manifest) -> String {
             file.path, file.role, file.source_path, file.size_bytes, file.sha256
         ));
     }
-    readme.push_str("- `data/audio-ingress-media/` contains private original vnote audio and any durable in-progress WAV chunks. Empty directories have no checksum entry in the manifest.\n");
+    readme.push_str("- `data/audio-ingress-media/` contains private content-addressed original vnote audio. Older installations may also contain obsolete generated WAV chunks. Empty directories have no checksum entry in the manifest.\n");
     if manifest.kweb_provenance_artifacts_included {
         readme.push_str("- `data/kweb-provenance-artifacts/` contains every immutable Kweb provenance file referenced by `data/kweb-db-core.sqlite3`; each copied size and SHA-256 was checked against SQLite. The directory may be absent when the database has no artifacts.\n");
     } else {
@@ -686,11 +686,11 @@ All files are stored beneath one top-level archive directory. The six `.sqlite3`
 
 ## Audio-ingress data format
 
-`data/audio-ingress.sqlite3` tracks uploaded recordings by SHA-256, making renamed or recopied audio idempotent. `audio_recordings` owns the recording timestamp, original filename, provider-model attribution, durable processing stage, retry state, and final Sol transcript. `audio_chunks` preserves ordered four-minute-or-shorter WAV windows, their recording-relative offsets, and Gemini's structured transcript JSON. Neighboring chunks overlap by fifteen seconds. `audio_ingress_pieces` stores Sol-selected transcript pieces of no more than an estimated 50,000 tokens and their independent Kennedy ingress checkpoints, provenance identifiers, versions, and failure logs.
+`data/audio-ingress.sqlite3` tracks uploaded recordings by SHA-256, making renamed or recopied audio idempotent. `audio_recordings` owns the recording timestamp, original filename, provider-model attribution, latest serialized `kcode-audio-transcribe` status snapshot, durable host processing stage, retry state, and final Sol transcript. `audio_chunks` is retained for compatibility with historical records produced before byte-only library jobs; new jobs create no rows or chunk files. `audio_ingress_pieces` stores transcript pieces of no more than an estimated 50,000 tokens and their independent Kennedy ingress checkpoints, provenance identifiers, versions, and failure logs.
 
 `data/memory-ingress.sqlite3` is the single durable queue used by both conversation-history archives and prepared audio transcript pieces. `memory_ingress_jobs` owns global ordering, the sole in-progress claim, provenance binding, model-loop checkpoints, retry scheduling, and bounded failure history. Source databases retain mirrored fields only so existing browser records remain compatible.
 
-Paths in the audio database are relative to `data/audio-ingress-media/` after restoration. `originals/` contains content-addressed uploaded WAV files. `chunks/{recording UUID}/` contains derived WAV windows needed by unfinished transcription jobs. Keep the complete directory during recovery.
+Paths in the audio database are relative to `data/audio-ingress-media/` after restoration. `originals/` contains content-addressed uploaded WAV files. In-progress transcription state is intentionally not recoverable: after restoration Kennedy starts a new in-memory job from the original bytes. Preserve the complete directory so originals and any historical artifacts remain available.
 
 ## Credential-vault data format
 

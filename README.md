@@ -22,8 +22,10 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   group identity, membership, and group-security state. Kennedy's separate user
   directory owns TOFU whitelists and Kmap-root mappings; Kennedy's backend
   orchestration worker consumes its durable stream heads.
-- `kennedy-audio-ingress` durably owns content-addressed vnotes, restartable
-  Gemini/Sol transcript preparation, and timestamped Kennedy-ingress pieces.
+- `kcode-audio-transcribe` owns the byte-only, in-memory Gemini/Sol
+  transcription pipeline and its pollable job status.
+- `kennedy-audio-ingress` durably owns content-addressed vnotes, persisted
+  progress snapshots, and timestamped Kennedy-ingress pieces.
 - `kennedy-memory-ingress` owns the single durable memory-update queue shared
   by conversation archives and prepared audio transcript pieces.
 - `kennedy-server` runs the native Rust backend orchestrator. It owns web and
@@ -142,7 +144,7 @@ under the compiled secret name:
 cargo run -p kennedy-server -- secrets set gemini-api-key
 ```
 
-The first `secrets set` command creates `kennedy-secrets.age`, asks for a vault
+The first `secrets set` command creates `data/kennedy-secrets.age`, asks for a vault
 passphrase twice, and then asks for the secret value twice without echoing
 either input. To enable the optional Telegram relay, create a bot with
 BotFather and store its token under Kennedy's conventional secret name:
@@ -170,20 +172,25 @@ cargo run -p kennedy-server
 
 When the encrypted vault exists, startup prompts once for its passphrase and
 keeps the unlocked values only inside `kennedy-server`. Copy
-`kennedy-secrets.age` alongside the six SQLite databases and audio-ingress
+`data/kennedy-secrets.age` alongside the six SQLite databases and audio-ingress
 media directory to migrate the same credentials to another machine; the same
 vault passphrase unlocks them there.
 
 Open `http://127.0.0.1:4321`. The Kweb and conversation databases are created
-as `kweb-db-core.sqlite3`, `kennedy-conversations.sqlite3`,
-`kennedy-telegram.sqlite3`, `kennedy-users.sqlite3`, and
-`kennedy-audio.sqlite3` plus `kennedy-memory-ingress.sqlite3` on first run.
+under the ignored `data/` directory as `kweb-db-core.sqlite3`,
+`kennedy-conversations.sqlite3`, `kennedy-telegram.sqlite3`,
+`kennedy-users.sqlite3`, and `kennedy-audio.sqlite3` plus
+`kennedy-memory-ingress.sqlite3` on first run.
 Large Kweb provenance payloads and media
-live in the sibling `kweb-provenance-artifacts/` tree. Original vnotes live
-under `kennedy-audio-ingress/`; temporary transcription shards exist there only
-until all Kennedy ingress pieces complete. All Kennedy-owned HTTP routes use
+live in `data/kweb-provenance-artifacts/`. Original vnotes live under
+`data/audio-ingress-media/`; transcription working data exists only in the
+library job's memory. All Kennedy-owned HTTP routes use
 port 4321. The published Telegram relay remains on loopback port 4324; without
 a Telegram token it reports disabled and the rest of Kennedy remains usable.
+Manual recovery snapshots live in `data/recovery/`, and the default backup
+destination is `data/backups/`. The entire `data/` tree is repository-local so
+sandboxed maintenance can inspect it, but Git ignores it as mutable private
+runtime state.
 
 ## Durable vnote ingress
 
@@ -230,36 +237,39 @@ only while the file's device, inode, size, modification time, and change time
 still match, so later backlog scans do not reread unchanged large recordings.
 Deleting the cache is safe; the next scan simply rebuilds it.
 
-After acceptance, the server hashes and stores the original WAV byte-for-byte, creates equal
-four-minute-or-shorter windows with fifteen seconds of neighboring overlap,
-and transcribes up to four windows concurrently with
+After acceptance, the server hashes and stores the original WAV byte-for-byte,
+then passes a fresh owned byte buffer to `kcode-audio-transcribe`. The library
+plans equal four-minute-or-shorter windows with fifteen seconds of neighboring
+overlap and runs up to four complete chunk pipelines concurrently with
 `gemini-3.1-pro-preview`. Each WAV window is resampled to 48 kHz only inside the
 in-memory Ogg Opus encoder, retaining the source's mono or stereo channel count
 at 192 kbps per channel (384 kbps for stereo), and sent inline through
 `kcode-gemini-api` with a structured-output schema; the Opus bytes are discarded
 after the response.
-Successful chunk results are stored immediately and retries send only
-unfinished chunks. `gpt-5.6-sol` with `xhigh` reasoning
-receives the stored transcripts in chronological order, reconciles speakers,
+Successful chunk results remain inside the job and its progress is exposed as
+an ordered status snapshot. `gpt-5.6-sol` with `xhigh` reasoning receives the
+in-memory transcripts in chronological order, reconciles speakers,
 removes repeated overlap, preserves annotations and translations, and produces
 the canonical final transcript. If needed, Sol inserts sensible boundaries so
 each Kennedy ingress piece remains at or below an estimated 50,000 tokens.
 Every piece repeats the recording timestamp and shares the recording SHA-256
-identity. Processing stages, transcripts, retries, and Kennedy ingress
-checkpoints are SQLite-backed and resume after server restarts. Kmap mutation
-runs in the supervised backend worker and remains serialized with ordinary and
-Telegram conversation-history ingress plus self time.
+identity. Kennedy persists the latest public status snapshot, final transcript,
+retry schedule, and Kennedy ingress checkpoints. A restart during transcription
+starts a new library job from the retained original; completed MemoryIngress
+work remains restartable. Kmap mutation runs in the supervised backend worker
+and remains serialized with ordinary and Telegram conversation-history ingress
+plus self time.
 
-Once every Kennedy ingress piece is complete, the generated local WAV shards
-are deleted. The raw content-addressed original and all transcript/history
-metadata remain archived.
+The library creates no local WAV shards. The raw content-addressed original and
+all transcript/history metadata remain archived.
 
 Recordings are idempotent by content hash. Check one with
 `GET /api/v1/audio-ingress/by-sha256/{sha256}` or inspect the entire durable
 processing history in the UI's **Audio Ingress** tab. Selecting a recording
-shows its metadata, Gemini chunk transcripts, reconciled final transcript,
-Kennedy-sized pieces, retry records, and the saved Kennedy Chatend for each
-piece.
+shows its live validation/chunk/reconciliation steps, reconciled final
+transcript, Kennedy-sized pieces, retry records, and the saved Kennedy Chatend
+for each piece. Historical rows created before the library extraction may also
+show their retained Gemini chunk transcripts.
 
 ## Backups
 
@@ -276,7 +286,7 @@ the Kweb address before opening the vault or any database, preventing a second
 instance from modifying persistent state during a backup.
 
 The result is a private
-`backups/kennedy-backup-YYYY-MM-DDTHH-MM-SSZ.tar.gz` archive containing
+`data/backups/kennedy-backup-YYYY-MM-DDTHH-MM-SSZ.tar.gz` archive containing
 verified standalone snapshots of all six SQLite databases, the complete
 Kweb provenance-artifact tree, the complete audio-ingress media directory, the encrypted credential vault when present, a
 machine-readable checksum manifest, and a self-contained recovery README. The

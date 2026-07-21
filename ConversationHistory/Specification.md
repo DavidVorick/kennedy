@@ -216,7 +216,7 @@ restoring, displaying, retrying, or otherwise mutating a summarized record.
 ## 5. Deployment and Isolation
 
 The router is merged into `kennedy-server`'s default `127.0.0.1:4321` listener
-and the default database is `kennedy-conversations.sqlite3`. SQLite uses WAL mode and a busy timeout, so
+and the default database is `data/kennedy-conversations.sqlite3`. SQLite uses WAL mode and a busy timeout, so
 Kmap reads can continue while the separate Kweb database is being updated.
 The server accepts request bodies up to 128 MiB for structured Chatend archives
 and future inline media.

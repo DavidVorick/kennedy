@@ -1,4 +1,4 @@
-import { element } from "./render.js?v=20260719.2";
+import { element } from "./render.js?v=20260721.1";
 import { hydrateStoredNodeConnections } from "./api.js?v=20260720.2";
 
 export class MemoryExplorer {

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -14,18 +15,14 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures::{StreamExt, stream};
-use hound::{SampleFormat, WavReader, WavWriter};
-use kcode_codex_runtime::{CatalogCache, Codex, CodexConfig, GenerationRequest, ReasoningEffort};
-use kcode_gemini_api::{
-    CompletionStatus, GEMINI_31_PRO, Gemini, GenerationOptions, MediaInput, MultimodalRequest,
-    ServiceTier, StructuredOutput, ThinkingLevel,
+use kcode_audio_transcribe::{
+    AudioTranscriber, JobState, RECONCILIATION_MODEL, RECONCILIATION_REASONING, Step, StepState,
+    TRANSCRIPTION_MODEL, TranscriptionJob, TranscriptionStatus,
 };
 use kennedy_chatend::hydrate_state_chatend_text;
 use kennedy_memory_ingress::{
     Failure as QueueFailure, Job as QueueJob, LegacySubmission, Queue, SourceKind, Submission,
 };
-use ruopus::encode_ogg_opus;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,33 +33,24 @@ use uuid::Uuid;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const RELEASE_DEFERRED_INGRESS_MIGRATION: &str =
     include_str!("../migrations/002_release_deferred_ingress.sql");
-const GEMINI_MODEL: &str = GEMINI_31_PRO;
-const RECONCILIATION_MODEL: &str = "gpt-5.6-sol";
-const RECONCILIATION_REASONING: &str = "xhigh";
-const MAX_CHUNK_MILLISECONDS: u64 = 4 * 60 * 1_000;
-const CHUNK_OVERLAP_MILLISECONDS: u64 = 15 * 1_000;
+const TRANSCRIPTION_STATUS_MIGRATION: &str =
+    include_str!("../migrations/003_transcription_status.sql");
 const MAX_INGRESS_TOKENS: u64 = 50_000;
 const ESTIMATED_CHARACTERS_PER_TOKEN: u64 = 4;
-const MAX_CONCURRENT_GEMINI_CHUNKS: usize = 4;
-const OPUS_SAMPLE_RATE: u32 = 48_000;
-const OPUS_MAX_CHANNELS: usize = 2;
-const OPUS_BITRATE_PER_CHANNEL_BPS: u32 = 192_000;
-const INGRESS_BREAK: &str = "<!-- KENNEDY_INGRESS_BREAK -->";
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub database: PathBuf,
     pub media_directory: PathBuf,
     pub max_upload_bytes: usize,
-    pub gemini_api_key: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
     db: Arc<Mutex<Connection>>,
-    gemini: Option<Gemini>,
-    codex: Codex,
+    transcriber: Option<AudioTranscriber>,
+    jobs: Arc<Mutex<HashMap<String, TranscriptionJob>>>,
     queue: Queue,
 }
 
@@ -181,6 +169,7 @@ struct RecordingRecord {
     gemini_model: String,
     reconciliation_model: String,
     reconciliation_reasoning: String,
+    transcription_status: Option<Value>,
     attempt_count: i64,
     next_attempt_at: Option<String>,
     last_error: Option<String>,
@@ -235,16 +224,7 @@ struct WorkRecording {
     status: String,
 }
 
-#[derive(Debug)]
-struct ChunkRecord {
-    index: i64,
-    audio_start_ms: i64,
-    audio_end_ms: i64,
-    relative_path: String,
-    transcript_json: Option<String>,
-}
-
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ListQuery {
     #[serde(default = "default_list_limit")]
     limit: usize,
@@ -295,23 +275,14 @@ struct RecordIngressFailure {
 }
 
 pub async fn open(
-    mut config: Config,
-    codex_catalog_cache: CatalogCache,
+    config: Config,
+    transcriber: Option<AudioTranscriber>,
     queue: Queue,
 ) -> anyhow::Result<Service> {
-    ensure!(
-        MAX_CHUNK_MILLISECONDS > CHUNK_OVERLAP_MILLISECONDS,
-        "audio chunk overlap must be smaller than the chunk limit"
-    );
     ensure!(
         config.max_upload_bytes > 0,
         "audio upload limit must be positive"
     );
-    let mut codex_config = CodexConfig::new(RECONCILIATION_MODEL);
-    codex_config.validation_reasoning_effort = ReasoningEffort::XHigh;
-    let codex = Codex::open(codex_config, codex_catalog_cache)
-        .await
-        .context("opening Codex audio-reconciliation runtime")?;
     ensure_private_directory(&config.media_directory)?;
     let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
@@ -337,17 +308,11 @@ pub async fn open(
         }
     }
 
-    let gemini = config
-        .gemini_api_key
-        .take()
-        .map(Gemini::open)
-        .transpose()
-        .context("opening Gemini audio-transcription client")?;
     let state = AppState {
         config: Arc::new(config),
         db: Arc::new(Mutex::new(connection)),
-        gemini,
-        codex,
+        transcriber,
+        jobs: Arc::new(Mutex::new(HashMap::new())),
         queue,
     };
     let max_upload_bytes = state.config.max_upload_bytes;
@@ -478,11 +443,10 @@ async fn health(State(state): State<AppState>) -> Response {
         Json(json!({
             "service":"audio-ingress",
             "status":status,
-            "gemini":if state.gemini.is_some() { "ready" } else { "unconfigured" },
-            "gemini_model":GEMINI_MODEL,
+            "transcriber":if state.transcriber.is_some() { "ready" } else { "unconfigured" },
+            "gemini_model":TRANSCRIPTION_MODEL,
             "reconciliation_model":RECONCILIATION_MODEL,
-            "chunk_seconds":MAX_CHUNK_MILLISECONDS / 1000,
-            "overlap_seconds":CHUNK_OVERLAP_MILLISECONDS / 1000,
+            "input":"bytes",
         })),
     )
         .into_response()
@@ -495,6 +459,9 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     }
     if version < 2 {
         connection.execute_batch(RELEASE_DEFERRED_INGRESS_MIGRATION)?;
+    }
+    if version < 3 {
+        connection.execute_batch(TRANSCRIPTION_STATUS_MIGRATION)?;
     }
     Ok(())
 }
@@ -757,7 +724,7 @@ async fn upload_recording(
         let db = state.db.lock().map_err(ApiError::internal)?;
         db.execute(
             "INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,?8,'uploaded',?9,?10,?11)",
-            params![id,sha256,original_filename,content_type,size_bytes as i64,recorded_at,now,relative_path,GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING],
+            params![id,sha256,original_filename,content_type,size_bytes as i64,recorded_at,now,relative_path,TRANSCRIPTION_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING],
         )
     };
     if let Err(error) = insert {
@@ -813,7 +780,7 @@ fn safe_filename(value: Option<&str>) -> String {
 }
 
 fn recording_select() -> &'static str {
-    "SELECT r.id,r.sha256,r.original_filename,r.content_type,r.size_bytes,r.source_created_at,r.received_at,r.updated_at,r.status,r.gemini_model,r.reconciliation_model,r.reconciliation_reasoning,r.attempt_count,r.next_attempt_at,r.last_error,(SELECT COUNT(*) FROM audio_ingress_pieces p WHERE p.recording_id=r.id),(SELECT COUNT(*) FROM audio_ingress_pieces p WHERE p.recording_id=r.id AND p.phase='complete') FROM audio_recordings r"
+    "SELECT r.id,r.sha256,r.original_filename,r.content_type,r.size_bytes,r.source_created_at,r.received_at,r.updated_at,r.status,r.gemini_model,r.reconciliation_model,r.reconciliation_reasoning,r.transcription_status_json,r.attempt_count,r.next_attempt_at,r.last_error,(SELECT COUNT(*) FROM audio_ingress_pieces p WHERE p.recording_id=r.id),(SELECT COUNT(*) FROM audio_ingress_pieces p WHERE p.recording_id=r.id AND p.phase='complete') FROM audio_recordings r"
 }
 
 fn row_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRecord> {
@@ -830,11 +797,14 @@ fn row_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRecord> {
         gemini_model: row.get(9)?,
         reconciliation_model: row.get(10)?,
         reconciliation_reasoning: row.get(11)?,
-        attempt_count: row.get(12)?,
-        next_attempt_at: row.get(13)?,
-        last_error: row.get(14)?,
-        transcript_piece_count: row.get(15)?,
-        completed_piece_count: row.get(16)?,
+        transcription_status: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|value| serde_json::from_str(&value).ok()),
+        attempt_count: row.get(13)?,
+        next_attempt_at: row.get(14)?,
+        last_error: row.get(15)?,
+        transcript_piece_count: row.get(16)?,
+        completed_piece_count: row.get(17)?,
     })
 }
 
@@ -998,9 +968,9 @@ async fn process_next_recording(state: &AppState) -> anyhow::Result<bool> {
     let recording_id = recording.id.clone();
     let stage = recording.status.clone();
     let result = match recording.status.as_str() {
-        "uploaded" | "chunking" => prepare_recording_chunks(state, &recording).await,
-        "transcribing" => transcribe_pending_chunks(state, &recording).await,
-        "reconciling" => reconcile_recording(state, &recording).await,
+        "uploaded" | "chunking" | "transcribing" | "reconciling" => {
+            poll_transcription(state, &recording).await
+        }
         _ => Ok(()),
     };
     match result {
@@ -1024,10 +994,14 @@ async fn process_next_recording(state: &AppState) -> anyhow::Result<bool> {
 }
 
 fn terminal_processing_failure(stage: &str, error: &anyhow::Error) -> bool {
-    matches!(stage, "uploaded" | "chunking")
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .starts_with("terminal audio transcription:")
+    }) || (matches!(stage, "uploaded" | "chunking")
         && error
             .chain()
-            .any(|cause| cause.to_string().starts_with("invalid WAV recording"))
+            .any(|cause| cause.to_string().starts_with("invalid WAV recording")))
 }
 
 fn record_terminal_processing_failure(
@@ -1096,539 +1070,153 @@ fn record_processing_failure(
     Ok(())
 }
 
-async fn prepare_recording_chunks(
-    state: &AppState,
-    recording: &WorkRecording,
-) -> anyhow::Result<()> {
-    {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
-        db.execute(
-            "UPDATE audio_recordings SET status='chunking',updated_at=?1,next_attempt_at=NULL,last_error=NULL WHERE id=?2",
-            params![Utc::now().to_rfc3339(),recording.id],
-        )?;
-    }
-    let source = state
-        .config
-        .media_directory
-        .join(&recording.original_relative_path);
-    let chunk_directory = state
-        .config
-        .media_directory
-        .join("chunks")
-        .join(&recording.id);
-    let relative_prefix = format!("chunks/{}", recording.id);
-    let generated =
-        tokio::task::spawn_blocking(move || split_wav(&source, &chunk_directory, &relative_prefix))
-            .await
-            .context("audio chunk worker stopped")??;
-
-    let mut db = state
-        .db
+async fn poll_transcription(state: &AppState, recording: &WorkRecording) -> anyhow::Result<()> {
+    let existing = state
+        .jobs
         .lock()
-        .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
-    let tx = db.transaction()?;
-    tx.execute(
-        "DELETE FROM audio_chunks WHERE recording_id=?1",
-        [&recording.id],
-    )?;
-    for chunk in generated {
-        tx.execute(
-            "INSERT INTO audio_chunks(recording_id,chunk_index,audio_start_ms,audio_end_ms,relative_path) VALUES(?1,?2,?3,?4,?5)",
-            params![recording.id,chunk.index,chunk.audio_start_ms,chunk.audio_end_ms,chunk.relative_path],
+        .map_err(|_| anyhow::anyhow!("audio transcription job lock was poisoned"))?
+        .get(&recording.id)
+        .cloned();
+    let job = if let Some(job) = existing {
+        job
+    } else {
+        let transcriber = state.transcriber.as_ref().context(
+            "Audio transcription is not configured; store gemini-api-key in Kennedy's vault",
         )?;
-    }
-    tx.execute(
-        "UPDATE audio_recordings SET status='transcribing',attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
-        params![Utc::now().to_rfc3339(),recording.id],
-    )?;
-    tx.commit()?;
-    tracing::info!(recording_id=%recording.id, "Audio recording split into durable transcription chunks");
-    Ok(())
-}
-
-#[derive(Debug)]
-struct GeneratedChunk {
-    index: i64,
-    audio_start_ms: i64,
-    audio_end_ms: i64,
-    relative_path: String,
-}
-
-fn chunk_boundaries(duration_ms: u64) -> Vec<(u64, u64)> {
-    if duration_ms == 0 {
-        return Vec::new();
-    }
-    if duration_ms <= MAX_CHUNK_MILLISECONDS {
-        return vec![(0, duration_ms)];
-    }
-    let advance = MAX_CHUNK_MILLISECONDS - CHUNK_OVERLAP_MILLISECONDS;
-    let chunks = (duration_ms - CHUNK_OVERLAP_MILLISECONDS).div_ceil(advance);
-    let window = (duration_ms + (chunks - 1) * CHUNK_OVERLAP_MILLISECONDS).div_ceil(chunks);
-    let step = window - CHUNK_OVERLAP_MILLISECONDS;
-    (0..chunks)
-        .map(|index| {
-            let start = index * step;
-            (start, (start + window).min(duration_ms))
-        })
-        .filter(|(start, end)| end > start)
-        .collect()
-}
-
-fn split_wav(
-    source: &Path,
-    chunk_directory: &Path,
-    relative_prefix: &str,
-) -> anyhow::Result<Vec<GeneratedChunk>> {
-    let reader = WavReader::open(source)
-        .with_context(|| format!("invalid WAV recording: opening {}", source.display()))?;
-    let spec = reader.spec();
-    ensure!(
-        spec.sample_rate > 0 && spec.channels > 0,
-        "invalid WAV recording: audio metadata is invalid"
-    );
-    let complete_file_bytes = fs::metadata(source)?.len();
-    let declared_audio_bytes = u64::from(reader.duration())
-        .saturating_mul(u64::from(spec.channels))
-        .saturating_mul(u64::from(spec.bits_per_sample).div_ceil(8));
-    ensure!(
-        declared_audio_bytes <= complete_file_bytes,
-        "invalid WAV recording: header declares {declared_audio_bytes} audio bytes but the complete file has only {complete_file_bytes} bytes"
-    );
-    let duration_ms = (u64::from(reader.duration()) * 1_000).div_ceil(u64::from(spec.sample_rate));
-    drop(reader);
-    let boundaries = chunk_boundaries(duration_ms);
-    ensure!(
-        !boundaries.is_empty(),
-        "invalid WAV recording: file contains no audio samples"
-    );
-    if chunk_directory.exists() {
-        fs::remove_dir_all(chunk_directory)
-            .with_context(|| format!("clearing {}", chunk_directory.display()))?;
-    }
-    ensure_private_directory(chunk_directory)?;
-    let mut generated = Vec::with_capacity(boundaries.len());
-    for (index, (start_ms, end_ms)) in boundaries.into_iter().enumerate() {
-        let name = format!("chunk-{index:05}.wav");
-        let path = chunk_directory.join(&name);
-        copy_wav_interval(source, &path, start_ms, end_ms)
-            .context("invalid WAV recording while reading declared samples")?;
-        set_private_file(&path)?;
-        sync_file(&path)?;
-        generated.push(GeneratedChunk {
-            index: index as i64,
-            audio_start_ms: start_ms as i64,
-            audio_end_ms: end_ms as i64,
-            relative_path: format!("{relative_prefix}/{name}"),
-        });
-    }
-    sync_directory(chunk_directory)?;
-    if let Some(parent) = chunk_directory.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(generated)
-}
-
-fn copy_wav_interval(
-    source: &Path,
-    destination: &Path,
-    start_ms: u64,
-    end_ms: u64,
-) -> anyhow::Result<()> {
-    let mut reader = WavReader::open(source)?;
-    let spec = reader.spec();
-    let start_frame = (start_ms * u64::from(spec.sample_rate) / 1_000) as u32;
-    let end_frame = (end_ms * u64::from(spec.sample_rate) / 1_000) as u32;
-    let sample_values = u64::from(end_frame.saturating_sub(start_frame)) * u64::from(spec.channels);
-    reader.seek(start_frame)?;
-    let mut writer = WavWriter::create(destination, spec)?;
-    match (spec.sample_format, spec.bits_per_sample) {
-        (SampleFormat::Float, _) => {
-            for sample in reader.samples::<f32>().take(sample_values as usize) {
-                writer.write_sample(sample?)?;
-            }
-        }
-        (SampleFormat::Int, 1..=8) => {
-            for sample in reader.samples::<i8>().take(sample_values as usize) {
-                writer.write_sample(sample?)?;
-            }
-        }
-        (SampleFormat::Int, 9..=16) => {
-            for sample in reader.samples::<i16>().take(sample_values as usize) {
-                writer.write_sample(sample?)?;
-            }
-        }
-        (SampleFormat::Int, _) => {
-            for sample in reader.samples::<i32>().take(sample_values as usize) {
-                writer.write_sample(sample?)?;
-            }
-        }
-    }
-    writer.finalize()?;
-    Ok(())
-}
-
-async fn transcribe_pending_chunks(
-    state: &AppState,
-    recording: &WorkRecording,
-) -> anyhow::Result<()> {
-    let chunks = {
-        let db = state
-            .db
+        let source = state
+            .config
+            .media_directory
+            .join(&recording.original_relative_path);
+        let audio = tokio::fs::read(&source)
+            .await
+            .with_context(|| format!("reading retained audio original {}", source.display()))?;
+        let job = transcriber.transcribe(audio);
+        state
+            .jobs
             .lock()
-            .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
-        let mut statement = db.prepare(
-            "SELECT chunk_index,audio_start_ms,audio_end_ms,relative_path,transcript_json \
-             FROM audio_chunks WHERE recording_id=?1 AND transcript_json IS NULL ORDER BY chunk_index",
-        )?;
-        statement
-            .query_map([&recording.id], |row| {
-                Ok(ChunkRecord {
-                    index: row.get(0)?,
-                    audio_start_ms: row.get(1)?,
-                    audio_end_ms: row.get(2)?,
-                    relative_path: row.get(3)?,
-                    transcript_json: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+            .map_err(|_| anyhow::anyhow!("audio transcription job lock was poisoned"))?
+            .insert(recording.id.clone(), job.clone());
+        tracing::info!(
+            recording_id = %recording.id,
+            model = TRANSCRIPTION_MODEL,
+            reconciliation_model = RECONCILIATION_MODEL,
+            "Started byte-only audio transcription job"
+        );
+        job
     };
-    if chunks.is_empty() {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
-        db.execute(
-            "UPDATE audio_recordings SET status='reconciling',attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
-            params![Utc::now().to_rfc3339(),recording.id],
-        )?;
-        return Ok(());
-    }
-    let gemini = state
-        .gemini
-        .as_ref()
-        .context(
-            "Gemini audio transcription is not configured; store gemini-api-key in Kennedy's vault",
-        )?
-        .clone();
-    tracing::info!(
-        recording_id = %recording.id,
-        chunks = chunks.len(),
-        concurrency = MAX_CONCURRENT_GEMINI_CHUNKS.min(chunks.len()),
-        model = GEMINI_MODEL,
-        "Transcribing audio chunks concurrently"
-    );
-    let mut transcriptions = stream::iter(chunks.into_iter().map(|chunk| {
-        let path = state.config.media_directory.join(&chunk.relative_path);
-        let gemini = gemini.clone();
-        async move {
-            let index = chunk.index;
-            let result = transcribe_chunk(&gemini, &path, recording, &chunk).await;
-            (index, result)
+
+    let snapshot = job.status();
+    persist_transcription_status(state, &recording.id, &snapshot)?;
+    match snapshot.state {
+        JobState::Queued | JobState::Running => Ok(()),
+        JobState::Completed => {
+            remove_transcription_job(state, &recording.id)?;
+            let transcript = snapshot
+                .transcript
+                .as_deref()
+                .context("completed audio transcription omitted its transcript")?;
+            prepare_transcript_ingress(state, recording, transcript, &snapshot)
         }
-    }))
-    .buffer_unordered(MAX_CONCURRENT_GEMINI_CHUNKS);
-    let mut failures = Vec::new();
-    while let Some((chunk_index, result)) = transcriptions.next().await {
-        match result {
-            Ok(transcript) => {
-                let db = state
-                    .db
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
-                let changed = db.execute(
-                    "UPDATE audio_chunks SET transcript_json=?1 WHERE recording_id=?2 AND chunk_index=?3 AND transcript_json IS NULL",
-                    params![transcript,recording.id,chunk_index],
-                )?;
-                ensure!(
-                    changed == 1,
-                    "audio chunk {chunk_index} changed before its transcript could be saved"
-                );
-                db.execute(
-                    "UPDATE audio_recordings SET attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
-                    params![Utc::now().to_rfc3339(),recording.id],
-                )?;
-                tracing::info!(recording_id=%recording.id, chunk=chunk_index, model=GEMINI_MODEL, "Transcribed audio chunk");
+        JobState::Failed => {
+            remove_transcription_job(state, &recording.id)?;
+            let error = snapshot
+                .steps
+                .iter()
+                .find(|step| step.state == StepState::Failed)
+                .and_then(|step| step.error.as_ref());
+            let message = error
+                .map(|error| error.message.as_str())
+                .unwrap_or("audio transcription failed without detail");
+            if error.is_some_and(|error| !error.retryable) {
+                anyhow::bail!("terminal audio transcription: {message}");
             }
-            Err(error) => failures.push((
-                chunk_index,
-                concise_text(
-                    &error.to_string(),
-                    800,
-                    "Gemini transcription failed without detail",
-                ),
-            )),
+            anyhow::bail!("audio transcription job failed: {message}");
         }
     }
-    if !failures.is_empty() {
-        failures.sort_by_key(|(chunk_index, _)| *chunk_index);
-        let detail = failures
-            .into_iter()
-            .map(|(chunk_index, error)| format!("chunk {chunk_index}: {error}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::bail!("one or more concurrent Gemini transcriptions failed: {detail}");
-    }
+}
+
+fn remove_transcription_job(state: &AppState, recording_id: &str) -> anyhow::Result<()> {
+    state
+        .jobs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("audio transcription job lock was poisoned"))?
+        .remove(recording_id);
+    Ok(())
+}
+
+fn persist_transcription_status(
+    state: &AppState,
+    recording_id: &str,
+    snapshot: &TranscriptionStatus,
+) -> anyhow::Result<()> {
+    let stage = transcription_stage(snapshot);
+    let serialized = serde_json::to_string(snapshot)?;
     let db = state
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
     db.execute(
-        "UPDATE audio_recordings SET status='reconciling',attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?1 WHERE id=?2",
-        params![Utc::now().to_rfc3339(),recording.id],
+        "UPDATE audio_recordings SET status=?1,transcription_status_json=?2,updated_at=?3,next_attempt_at=NULL,last_error=NULL WHERE id=?4 AND (status<>?1 OR COALESCE(transcription_status_json,'')<>?2 OR next_attempt_at IS NOT NULL OR last_error IS NOT NULL)",
+        params![stage,serialized,Utc::now().to_rfc3339(),recording_id],
     )?;
     Ok(())
 }
 
-async fn transcribe_chunk(
-    gemini: &Gemini,
-    path: &Path,
-    recording: &WorkRecording,
-    chunk: &ChunkRecord,
-) -> anyhow::Result<String> {
-    let source = path.to_owned();
-    let opus = tokio::task::spawn_blocking(move || wav_to_opus(&source))
-        .await
-        .context("joining in-memory Opus encoder")??;
-    let media = MediaInput::audio("audio/ogg", opus)
-        .context("preparing inline Ogg Opus audio for Gemini")?;
-    let mut request = MultimodalRequest::new(transcription_prompt(recording, chunk), vec![media]);
-    request.options = GenerationOptions {
-        max_output_tokens: Some(32_768),
-        temperature: None,
-        thinking_level: Some(ThinkingLevel::High),
-        service_tier: ServiceTier::Standard,
-    };
-    request.structured_output = Some(
-        StructuredOutput::new(transcription_schema())
-            .context("validating audio-transcription output schema")?,
-    );
-    let response = gemini
-        .infer_pro_multimodal(request)
-        .await
-        .context("requesting Gemini audio transcription")?;
-    ensure!(
-        response.status == CompletionStatus::Completed,
-        "Gemini transcription did not complete"
-    );
-    let text = response
-        .text
-        .context("Gemini transcription returned no structured text")?;
-    let transcript: Value = serde_json::from_str(&text)
-        .context("Gemini transcription returned invalid structured JSON")?;
-    ensure!(
-        transcript
-            .get("utterances")
-            .and_then(Value::as_array)
-            .is_some(),
-        "Gemini transcript omitted utterances"
-    );
-    serde_json::to_string_pretty(&transcript).context("serializing Gemini transcript")
-}
-
-fn wav_to_opus(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut reader =
-        WavReader::open(path).with_context(|| format!("opening WAV audio {}", path.display()))?;
-    let spec = reader.spec();
-    ensure!(
-        spec.sample_rate > 0 && spec.channels > 0,
-        "WAV audio metadata is invalid"
-    );
-    let samples = match (spec.sample_format, spec.bits_per_sample) {
-        (SampleFormat::Float, 32) => reader
-            .samples::<f32>()
-            .map(|sample| sample.context("reading 32-bit float WAV sample"))
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        (SampleFormat::Int, 1..=8) => {
-            let scale = 2.0_f32.powi(i32::from(spec.bits_per_sample) - 1);
-            reader
-                .samples::<i8>()
-                .map(|sample| {
-                    sample
-                        .map(|value| f32::from(value) / scale)
-                        .context("reading 8-bit WAV sample")
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
-        }
-        (SampleFormat::Int, 9..=16) => {
-            let scale = 2.0_f32.powi(i32::from(spec.bits_per_sample) - 1);
-            reader
-                .samples::<i16>()
-                .map(|sample| {
-                    sample
-                        .map(|value| f32::from(value) / scale)
-                        .context("reading 16-bit WAV sample")
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
-        }
-        (SampleFormat::Int, 17..=32) => {
-            let scale = 2.0_f64.powi(i32::from(spec.bits_per_sample) - 1) as f32;
-            reader
-                .samples::<i32>()
-                .map(|sample| {
-                    sample
-                        .map(|value| value as f32 / scale)
-                        .context("reading high-resolution integer WAV sample")
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
-        }
-        _ => anyhow::bail!(
-            "unsupported WAV sample format: {:?} with {} bits",
-            spec.sample_format,
-            spec.bits_per_sample
-        ),
-    };
-    let channels = usize::from(spec.channels);
-    ensure!(
-        (1..=OPUS_MAX_CHANNELS).contains(&channels),
-        "Ogg Opus encoding supports mono or stereo WAV audio; source has {channels} channels"
-    );
-    ensure!(
-        samples.len().is_multiple_of(channels),
-        "WAV audio ended with an incomplete sample frame"
-    );
-    ensure!(!samples.is_empty(), "WAV audio contains no samples");
-    ensure!(
-        samples.iter().all(|sample| sample.is_finite()),
-        "WAV audio contains a non-finite sample"
-    );
-
-    let pcm = samples
-        .into_iter()
-        .map(|sample| sample.clamp(-1.0, 1.0))
-        .collect::<Vec<_>>();
-    let pcm = resample_interleaved(&pcm, spec.sample_rate, channels)?;
-    let bitrate = OPUS_BITRATE_PER_CHANNEL_BPS * u32::from(spec.channels);
-    Ok(encode_ogg_opus(&pcm, channels, bitrate))
-}
-
-fn resample_interleaved(
-    source: &[f32],
-    source_rate: u32,
-    channels: usize,
-) -> anyhow::Result<Vec<f32>> {
-    ensure!(source_rate > 0, "WAV sample rate must be positive");
-    ensure!(
-        (1..=OPUS_MAX_CHANNELS).contains(&channels),
-        "Ogg Opus encoding supports mono or stereo PCM"
-    );
-    ensure!(
-        source.len().is_multiple_of(channels),
-        "PCM ended with an incomplete frame"
-    );
-    ensure!(!source.is_empty(), "PCM contains no samples");
-    if source_rate == OPUS_SAMPLE_RATE {
-        return Ok(source.to_vec());
-    }
-    let source_frames = source.len() / channels;
-    let output_frames = usize::try_from(
-        (source_frames as u128 * u128::from(OPUS_SAMPLE_RATE)).div_ceil(u128::from(source_rate)),
-    )
-    .context("resampled audio is too large for this platform")?;
-    let output_samples = output_frames
-        .checked_mul(channels)
-        .context("resampled audio is too large for this platform")?;
-    let mut output = Vec::with_capacity(output_samples);
-    for output_frame in 0..output_frames {
-        let source_position = output_frame as u128 * u128::from(source_rate);
-        let lower = usize::try_from(source_position / u128::from(OPUS_SAMPLE_RATE))
-            .context("resampling position is too large for this platform")?
-            .min(source_frames - 1);
-        let upper = (lower + 1).min(source_frames - 1);
-        let fraction =
-            (source_position % u128::from(OPUS_SAMPLE_RATE)) as f32 / OPUS_SAMPLE_RATE as f32;
-        for channel in 0..channels {
-            let lower_sample = source[lower * channels + channel];
-            let upper_sample = source[upper * channels + channel];
-            output.push(lower_sample + (upper_sample - lower_sample) * fraction);
-        }
-    }
-    Ok(output)
-}
-
-fn transcription_prompt(recording: &WorkRecording, chunk: &ChunkRecord) -> String {
-    format!(
-        "Transcribe this vnote audio faithfully and completely. Distinguish every discernible speaker with chunk-local labels such as speaker_1. Do not guess a real identity. Preserve the original language. When an utterance is not English, also provide an accurate English translation; for English, use an empty translation string. Add concise annotations when speech is unclear, overlapping, interrupted, emotional in a materially relevant way, or accompanied by relevant non-speech audio. Timestamps are seconds relative to this audio chunk. Do not omit quiet or difficult portions.\n\nRecording began: {}\nRecording SHA-256: {}\nOriginal filename: {}\nChunk index: {}\nThis chunk covers recording offsets {:.3} through {:.3} seconds. Adjacent chunks overlap by up to 15 seconds; transcribe the entire supplied chunk even when boundary material will be repeated elsewhere.",
-        recording.source_created_at,
-        recording.sha256,
-        recording.original_filename,
-        chunk.index,
-        chunk.audio_start_ms as f64 / 1_000.0,
-        chunk.audio_end_ms as f64 / 1_000.0,
-    )
-}
-
-fn transcription_schema() -> Value {
-    json!({
-        "type":"object",
-        "properties":{
-            "utterances":{
-                "type":"array",
-                "items":{
-                    "type":"object",
-                    "properties":{
-                        "start_seconds":{"type":"number"},
-                        "end_seconds":{"type":"number"},
-                        "speaker":{"type":"string"},
-                        "language":{"type":"string"},
-                        "original_text":{"type":"string"},
-                        "english_translation":{"type":"string"},
-                        "annotations":{"type":"array","items":{"type":"string"}},
-                        "confidence":{"type":"string","enum":["high","medium","low"]}
-                    },
-                    "required":["start_seconds","end_seconds","speaker","language","original_text","english_translation","annotations","confidence"]
-                }
-            },
-            "chunk_notes":{"type":"array","items":{"type":"string"}}
-        },
-        "required":["utterances","chunk_notes"]
-    })
-}
-
-async fn reconcile_recording(state: &AppState, recording: &WorkRecording) -> anyhow::Result<()> {
-    let chunks = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("audio database lock was poisoned"))?;
-        let mut statement = db.prepare("SELECT chunk_index,audio_start_ms,audio_end_ms,relative_path,transcript_json FROM audio_chunks WHERE recording_id=?1 ORDER BY chunk_index")?;
-        statement
-            .query_map([&recording.id], |row| {
-                Ok(ChunkRecord {
-                    index: row.get(0)?,
-                    audio_start_ms: row.get(1)?,
-                    audio_end_ms: row.get(2)?,
-                    relative_path: row.get(3)?,
-                    transcript_json: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    ensure!(!chunks.is_empty(), "recording has no transcription chunks");
-    ensure!(
-        chunks.iter().all(|chunk| chunk.transcript_json.is_some()),
-        "recording has incomplete transcription chunks"
-    );
-    let prompt = reconciliation_prompt(recording, &chunks);
-    let mut transcript = run_sol(&state.codex, &prompt).await?;
-    let mut pieces = parse_ingress_pieces(&transcript);
-    if pieces
+fn transcription_stage(snapshot: &TranscriptionStatus) -> &'static str {
+    let plan_complete = snapshot
+        .steps
         .iter()
-        .any(|piece| estimate_tokens(piece) > MAX_INGRESS_TOKENS)
-    {
-        transcript = run_sol(&state.codex, &split_prompt(&transcript)).await?;
-        pieces = parse_ingress_pieces(&transcript);
+        .any(|entry| entry.step == Step::PlanChunks && entry.state == StepState::Completed);
+    if !plan_complete {
+        return "chunking";
     }
-    ensure!(!pieces.is_empty(), "Sol returned an empty final transcript");
+    let chunks_complete = snapshot
+        .steps
+        .iter()
+        .filter(|entry| matches!(entry.step, Step::TranscribeChunk { .. }))
+        .all(|entry| entry.state == StepState::Completed);
+    if !chunks_complete {
+        "transcribing"
+    } else {
+        "reconciling"
+    }
+}
+
+fn prepare_transcript_ingress(
+    state: &AppState,
+    recording: &WorkRecording,
+    transcript: &str,
+    snapshot: &TranscriptionStatus,
+) -> anyhow::Result<()> {
+    ensure!(
+        !transcript.trim().is_empty(),
+        "completed transcription is empty"
+    );
+    let body_pieces = split_transcript_body(recording, transcript)?;
+    let piece_count = body_pieces.len();
+    let pieces = body_pieces
+        .into_iter()
+        .enumerate()
+        .map(|(index, body)| {
+            format!(
+                "{}\n\n{}",
+                transcript_header(recording, Some((index, piece_count))),
+                body
+            )
+        })
+        .collect::<Vec<_>>();
     ensure!(
         pieces
             .iter()
             .all(|piece| estimate_tokens(piece) <= MAX_INGRESS_TOKENS),
-        "Sol did not place transcript boundaries below the 50,000-token estimate"
+        "prepared transcript piece exceeds Kennedy's ingress limit"
     );
-    let final_transcript = pieces.join("\n\n");
+    let final_transcript = format!(
+        "{}\n\n{}",
+        transcript_header(recording, None),
+        transcript.trim()
+    );
+    let status_json = serde_json::to_string(snapshot)?;
     let now = Utc::now().to_rfc3339();
     let mut db = state
         .db
@@ -1637,6 +1225,10 @@ async fn reconcile_recording(state: &AppState, recording: &WorkRecording) -> any
     let tx = db.transaction()?;
     tx.execute(
         "DELETE FROM audio_ingress_pieces WHERE recording_id=?1",
+        [&recording.id],
+    )?;
+    tx.execute(
+        "DELETE FROM audio_chunks WHERE recording_id=?1",
         [&recording.id],
     )?;
     let mut submissions = Vec::with_capacity(pieces.len());
@@ -1656,71 +1248,99 @@ async fn reconcile_recording(state: &AppState, recording: &WorkRecording) -> any
         });
     }
     tx.execute(
-        "UPDATE audio_recordings SET status='ready_for_ingress',final_transcript=?1,attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?2 WHERE id=?3",
-        params![final_transcript,now,recording.id],
+        "UPDATE audio_recordings SET status='ready_for_ingress',final_transcript=?1,transcription_status_json=?2,attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?3 WHERE id=?4",
+        params![final_transcript,status_json,now,recording.id],
     )?;
     tx.commit()?;
     for submission in submissions {
         let job = state.queue.submit(submission)?;
         mirror_queue_job(&db, &job).map_err(|error| anyhow::anyhow!(error.message))?;
     }
-    tracing::info!(recording_id=%recording.id, pieces=pieces.len(), model=RECONCILIATION_MODEL, reasoning=RECONCILIATION_REASONING, "Prepared final vnote transcript for Kennedy ingress");
+    tracing::info!(
+        recording_id = %recording.id,
+        pieces = pieces.len(),
+        model = RECONCILIATION_MODEL,
+        reasoning = RECONCILIATION_REASONING,
+        "Prepared library transcript for Kennedy ingress"
+    );
     Ok(())
 }
 
-fn reconciliation_prompt(recording: &WorkRecording, chunks: &[ChunkRecord]) -> String {
-    let mut prompt = format!(
-        "You are producing the canonical final transcript of one vnote. The chunk transcripts below are already in exact chronological order. They were independently transcribed from audio windows that overlap their neighbors by 15 seconds. Faithfully copy all spoken content into one coherent transcript, remove only duplicated boundary material, and reconcile chunk-local speaker labels across the complete conversation. Use real speaker names only when supported by the conversation; otherwise assign stable labels such as Speaker A. Preserve useful uncertainty and annotations. For every non-English utterance, show its English translation alongside it. Preserve chronological timestamps, converting chunk-relative timestamps using each chunk's supplied recording offset. Do not summarize or omit content.\n\nThe vnote began at {created}. This source timestamp is important historical context and must appear prominently at the top of the final transcript. The recording may describe plans, beliefs, or facts that were current then but are stale now.\n\nOutput only the final readable Markdown transcript. When the transcript would exceed an estimated 50,000 tokens using one token per four Unicode characters, insert the exact line `{boundary}` at sensible conversational or topical boundaries so every resulting piece stays at or below that estimate. Do not make pieces equal-sized merely for symmetry. Each piece must repeat a short metadata header containing the recording timestamp, SHA-256, and its piece context so Kennedy never receives a piece without the source date.\n\nRecording metadata\n- Began: {created}\n- SHA-256: {sha}\n- Original filename: {filename}\n- Transcription model: {gemini}\n- Reconciliation model: {sol} ({reasoning})\n\nORDERED CHUNK TRANSCRIPTS\n",
-        created = recording.source_created_at,
-        sha = recording.sha256,
-        filename = recording.original_filename,
-        gemini = GEMINI_MODEL,
-        sol = RECONCILIATION_MODEL,
-        reasoning = RECONCILIATION_REASONING,
-        boundary = INGRESS_BREAK,
+fn transcript_header(recording: &WorkRecording, piece: Option<(usize, usize)>) -> String {
+    let mut header = format!(
+        "# Audio transcript\n\n- Began: {}\n- SHA-256: {}\n- Original filename: {}\n- Transcription model: {}\n- Reconciliation model: {} ({})",
+        recording.source_created_at,
+        recording.sha256,
+        recording.original_filename,
+        TRANSCRIPTION_MODEL,
+        RECONCILIATION_MODEL,
+        RECONCILIATION_REASONING,
     );
-    for chunk in chunks {
-        prompt.push_str(&format!(
-            "\n\nCHUNK {:05} | recording offsets {:.3}–{:.3} seconds\n{}",
-            chunk.index,
-            chunk.audio_start_ms as f64 / 1_000.0,
-            chunk.audio_end_ms as f64 / 1_000.0,
-            chunk.transcript_json.as_deref().unwrap_or("{}"),
+    if let Some((index, total)) = piece {
+        header.push_str(&format!(
+            "\n- Transcript piece: {} of {}",
+            index.saturating_add(1),
+            total
         ));
     }
-    prompt
+    header
 }
 
-fn split_prompt(transcript: &str) -> String {
-    format!(
-        "Copy the following final transcript completely and exactly, adding only the exact boundary line `{INGRESS_BREAK}` at sensible conversational or topical boundaries. Using the conservative estimate of one token per four Unicode characters, every resulting piece must be no more than 50,000 estimated tokens. Do not summarize, rewrite, reorder, or omit anything. Each piece must start with a brief copied metadata header that includes the original recording timestamp and SHA-256. Output only the complete marked transcript.\n\nFINAL TRANSCRIPT\n\n{transcript}"
-    )
-}
-
-fn parse_ingress_pieces(transcript: &str) -> Vec<String> {
-    transcript
-        .split(INGRESS_BREAK)
-        .map(str::trim)
-        .filter(|piece| !piece.is_empty())
-        .map(str::to_owned)
-        .collect()
+fn split_transcript_body(
+    recording: &WorkRecording,
+    transcript: &str,
+) -> anyhow::Result<Vec<String>> {
+    let maximum_characters = usize::try_from(MAX_INGRESS_TOKENS * ESTIMATED_CHARACTERS_PER_TOKEN)?;
+    let largest_header = transcript_header(recording, Some((usize::MAX, usize::MAX)));
+    let body_limit = maximum_characters
+        .checked_sub(largest_header.chars().count() + 2)
+        .context("audio transcript metadata exceeds the ingress limit")?;
+    ensure!(
+        body_limit > 0,
+        "audio transcript has no room after metadata"
+    );
+    let mut remaining = transcript.trim();
+    let mut pieces = Vec::new();
+    while remaining.chars().count() > body_limit {
+        let cutoff = remaining
+            .char_indices()
+            .nth(body_limit)
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        let prefix = &remaining[..cutoff];
+        let minimum_boundary = prefix
+            .char_indices()
+            .nth(body_limit / 2)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let boundary = prefix
+            .rfind("\n\n")
+            .filter(|index| *index >= minimum_boundary)
+            .or_else(|| {
+                prefix
+                    .rfind('\n')
+                    .filter(|index| *index >= minimum_boundary)
+            })
+            .unwrap_or(cutoff);
+        let piece = remaining[..boundary].trim();
+        ensure!(
+            !piece.is_empty(),
+            "could not split oversized audio transcript"
+        );
+        pieces.push(piece.to_owned());
+        remaining = remaining[boundary..].trim();
+    }
+    if !remaining.is_empty() {
+        pieces.push(remaining.to_owned());
+    }
+    ensure!(!pieces.is_empty(), "audio transcript is empty");
+    Ok(pieces)
 }
 
 fn estimate_tokens(value: &str) -> u64 {
     (value.chars().count() as u64).div_ceil(ESTIMATED_CHARACTERS_PER_TOKEN)
 }
 
-async fn run_sol(codex: &Codex, prompt: &str) -> anyhow::Result<String> {
-    let mut request = GenerationRequest::new(prompt, RECONCILIATION_MODEL);
-    request.reasoning_effort = ReasoningEffort::XHigh;
-    request.ephemeral = true;
-    request.timeout = Duration::from_secs(30 * 60);
-    codex
-        .generate(request)
-        .await
-        .map(|response| response.answer)
-        .context("Sol transcript processing failed")
-}
 fn concise_text(value: &str, limit: usize, fallback: &str) -> String {
     let clean = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let bounded = clean.chars().take(limit).collect::<String>();
@@ -1957,7 +1577,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db.execute_batch(INITIAL_MIGRATION).unwrap();
-        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning,next_attempt_at) VALUES('r',?1,'note.wav','audio/wav',10,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','originals/x.wav','ingressing',?2,?3,?4,'2099-01-01T00:00:00Z')",params!["a".repeat(64),GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
+        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning,next_attempt_at) VALUES('r',?1,'note.wav','audio/wav',10,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','originals/x.wav','ingressing',?2,?3,?4,'2099-01-01T00:00:00Z')",params!["a".repeat(64),TRANSCRIPTION_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
         db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,version,created_at,updated_at) VALUES('stranded','r',0,'text',1,'ingress_in_progress',7,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
 
         apply_migrations(&db).unwrap();
@@ -1983,7 +1603,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES('next','r',1,'text',1,'ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
     }
@@ -1991,7 +1611,7 @@ mod tests {
     #[test]
     fn prepared_audio_pieces_are_adopted_by_the_shared_queue_in_piece_order() {
         let db = database();
-        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES('r',?1,'note.wav','audio/wav',10,'2026-01-01T00:00:00Z','2026-07-01T00:00:00Z','2026-07-01T00:00:00Z','originals/x.wav','ready_for_ingress',?2,?3,?4)",params!["a".repeat(64),GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
+        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES('r',?1,'note.wav','audio/wav',10,'2026-01-01T00:00:00Z','2026-07-01T00:00:00Z','2026-07-01T00:00:00Z','originals/x.wav','ready_for_ingress',?2,?3,?4)",params!["a".repeat(64),TRANSCRIPTION_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
         for (id, index) in [("later", 1), ("first", 0)] {
             db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES(?1,'r',?2,?3,1,'ingress_pending','2026-07-01T00:00:00Z','2026-07-01T00:00:00Z')",params![id,index,format!("piece {index}")]).unwrap();
         }
@@ -2006,90 +1626,29 @@ mod tests {
     }
 
     #[test]
-    fn chunk_boundaries_are_equal_overlapping_and_never_exceed_four_minutes() {
-        let boundaries = chunk_boundaries(7 * 60 * 1000);
-        assert_eq!(boundaries.len(), 2);
-        assert_eq!(
-            boundaries[0].1 - boundaries[0].0,
-            boundaries[1].1 - boundaries[1].0
-        );
-        assert_eq!(boundaries[0].1 - boundaries[1].0, 15_000);
-        assert!(boundaries.iter().all(|(start, end)| end - start <= 240_000));
-        assert_eq!(boundaries.last().unwrap().1, 420_000);
-    }
-
-    #[test]
-    fn wav_chunks_preserve_the_planned_duration_and_overlap() {
-        let root = std::env::temp_dir().join(format!("kennedy-audio-test-{}", Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        let source = root.join("source.wav");
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 10,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
+    fn oversized_transcripts_are_split_with_repeated_metadata() {
+        let recording = WorkRecording {
+            id: "recording".into(),
+            sha256: "a".repeat(64),
+            original_filename: "note.wav".into(),
+            source_created_at: "2026-07-16T10:00:00Z".into(),
+            original_relative_path: "originals/note.wav".into(),
+            status: "reconciling".into(),
         };
-        let mut writer = WavWriter::create(&source, spec).unwrap();
-        for sample in 0_i16..4_200_i16 {
-            writer.write_sample(sample).unwrap();
+        let transcript = format!("A complete paragraph.\n\n{}", "x".repeat(210_000));
+        let pieces = split_transcript_body(&recording, &transcript).unwrap();
+        assert_eq!(pieces.len(), 2);
+        let total = pieces.len();
+        for (index, piece) in pieces.into_iter().enumerate() {
+            let prepared = format!(
+                "{}\n\n{}",
+                transcript_header(&recording, Some((index, total))),
+                piece
+            );
+            assert!(estimate_tokens(&prepared) <= MAX_INGRESS_TOKENS);
+            assert!(prepared.contains("2026-07-16T10:00:00Z"));
+            assert!(prepared.contains(&format!("Transcript piece: {} of {total}", index + 1)));
         }
-        writer.finalize().unwrap();
-
-        let chunks = split_wav(&source, &root.join("chunks"), "chunks").unwrap();
-        assert_eq!(chunks.len(), 2);
-        let first = WavReader::open(root.join(&chunks[0].relative_path)).unwrap();
-        let second = WavReader::open(root.join(&chunks[1].relative_path)).unwrap();
-        assert_eq!(first.duration(), 2_175);
-        assert_eq!(second.duration(), 2_175);
-        assert_eq!(chunks[0].audio_end_ms - chunks[1].audio_start_ms, 15_000);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn wav_audio_preserves_source_channels_in_ogg_opus() {
-        for channels in [1_u16, 2_u16] {
-            let root = std::env::temp_dir()
-                .join(format!("kennedy-opus-test-{channels}-{}", Uuid::new_v4()));
-            fs::create_dir(&root).unwrap();
-            let source = root.join("source.wav");
-            let mut writer = WavWriter::create(
-                &source,
-                hound::WavSpec {
-                    channels,
-                    sample_rate: 44_100,
-                    bits_per_sample: 16,
-                    sample_format: SampleFormat::Int,
-                },
-            )
-            .unwrap();
-            for frame in 0..4_410 {
-                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 44_100.0;
-                for channel in 0..channels {
-                    let amplitude = 8_192.0 - f32::from(channel) * 1_024.0;
-                    writer
-                        .write_sample((phase.sin() * amplitude) as i16)
-                        .unwrap();
-                }
-            }
-            writer.finalize().unwrap();
-
-            let opus = wav_to_opus(&source).unwrap();
-            assert_eq!(&opus[..4], b"OggS");
-            let (decoded, head) = ruopus::decode_ogg_opus(&opus).unwrap();
-            assert_eq!(u16::from(head.channel_count), channels);
-            assert_eq!(head.input_sample_rate, OPUS_SAMPLE_RATE);
-            assert!(decoded.len() >= 4_600 * usize::from(channels));
-            assert!(decoded.len() <= 4_800 * usize::from(channels));
-
-            fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
-    fn transcript_breaks_are_trimmed_and_enforced_with_the_shared_estimate() {
-        let transcript = format!("first\n{INGRESS_BREAK}\nsecond");
-        assert_eq!(parse_ingress_pieces(&transcript), vec!["first", "second"]);
         assert_eq!(estimate_tokens("12345"), 2);
     }
 
@@ -2097,7 +1656,7 @@ mod tests {
     fn sha_identity_and_ingress_completion_are_durable() {
         let mut db = database();
         let now = "2026-07-16T10:00:00Z";
-        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES('r',?1,'note.wav','audio/wav',10,?2,?2,?2,'originals/x.wav','ready_for_ingress',?3,?4,?5)",params!["a".repeat(64),now,GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
+        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES('r',?1,'note.wav','audio/wav',10,?2,?2,?2,'originals/x.wav','ready_for_ingress',?3,?4,?5)",params!["a".repeat(64),now,TRANSCRIPTION_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
         db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES('p','r',0,'text',1,'ingress_pending',?1,?1)",[now]).unwrap();
         assert_eq!(
             fetch_recording_by_sha(&db, &"a".repeat(64))
@@ -2125,7 +1684,7 @@ mod tests {
     fn recording_history_contains_preparation_and_kennedy_ingress_artifacts() {
         let db = database();
         let now = "2026-07-16T10:00:00Z";
-        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning,final_transcript) VALUES('r',?1,'note.wav','audio/wav',10,?2,?2,?2,'originals/x.wav','complete',?3,?4,?5,'Final transcript')",params!["a".repeat(64),now,GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
+        db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning,final_transcript) VALUES('r',?1,'note.wav','audio/wav',10,?2,?2,?2,'originals/x.wav','complete',?3,?4,?5,'Final transcript')",params!["a".repeat(64),now,TRANSCRIPTION_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
         db.execute("INSERT INTO audio_chunks(recording_id,chunk_index,audio_start_ms,audio_end_ms,relative_path,transcript_json) VALUES('r',0,0,1000,'chunks/0.wav',?1)",[r#"{"lines":[{"speaker":"Speaker 1","text":"Hello"}]}"#]).unwrap();
         db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,state_json,created_at,updated_at) VALUES('p','r',0,'Final transcript',4,'complete',?1,?2,?2)",params![r#"{"historyIngress":{"format":"kennedy-chatend","completed":true,"messages":[{"role":"user","content":"Legacy audio ingress"}]}}"#,now]).unwrap();
 
@@ -2154,38 +1713,5 @@ mod tests {
             "voice_note.wav"
         );
         assert_eq!(safe_filename(None), "vnote.wav");
-    }
-
-    #[test]
-    fn truncated_wav_is_rejected_as_a_terminal_input_error() {
-        let root = std::env::temp_dir().join(format!("kennedy-audio-test-{}", Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        let source = root.join("truncated.wav");
-        let mut writer = WavWriter::create(
-            &source,
-            hound::WavSpec {
-                channels: 1,
-                sample_rate: 8_000,
-                bits_per_sample: 16,
-                sample_format: SampleFormat::Int,
-            },
-        )
-        .unwrap();
-        for _ in 0..8_000 {
-            writer.write_sample(0_i16).unwrap();
-        }
-        writer.finalize().unwrap();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&source)
-            .unwrap()
-            .set_len(100)
-            .unwrap();
-
-        let error = split_wav(&source, &root.join("chunks"), "chunks").unwrap_err();
-        assert!(error.to_string().starts_with("invalid WAV recording"));
-        assert!(terminal_processing_failure("chunking", &error));
-        assert!(!terminal_processing_failure("transcribing", &error));
-        fs::remove_dir_all(root).unwrap();
     }
 }

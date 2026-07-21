@@ -126,8 +126,8 @@ A data provenance node needs several things:
 + A date indicating when the data was created
 + Ordered metadata for any attached immutable artifacts
 
-The physical Kweb is `kweb-db-core.sqlite3` beside
-`kweb-provenance-artifacts/`. Large provenance data and attached media live as
+The physical Kweb defaults to `data/kweb-db-core.sqlite3` beside
+`data/kweb-provenance-artifacts/`. Large provenance data and attached media live as
 files so node text, history, and lightweight provenance metadata remain easy
 to back up. SQLite records artifact relative paths, original filenames, media
 types, sizes, SHA-256 hashes, roles, and order. A stored file keeps its safe
