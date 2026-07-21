@@ -209,7 +209,12 @@ view is every byte of application-controlled plaintext sent to Codex for
 Kennedy, not a representation of a JSON recovery archive. Forced Codex or
 upstream-provider system/tool scaffolding may be added outside the
 application's observable boundary; the application minimizes exposed
-scaffolding and does not pretend invisible layers are inspectable. It provides full-context,
+scaffolding and does not pretend invisible layers are inspectable. The formatter
+lives in shared Rust backend code. Conversation History and Audio Ingress apply
+it while reading legacy archives that contain messages but lack `chatendText`,
+including pre-reset segments, and return the computed field to the browser.
+Existing persisted canonical strings are never replaced, and the frontend has
+no legacy formatter or alternate Full-view representation. It provides full-context,
 system-prompt-only, and expandable Kmap-memory views. The memory view derives
 node provenance from the Kweb context snapshot so direct loads, task edges,
 active-edge expansions, and summary-only fanout references remain visually distinct.
@@ -472,9 +477,9 @@ extra calls. The rebuild places a complete, duplicate-grouped reset history
 before the latest note, using node names for readability. Existing identifiers
 remain resolvable after the reset, while newly seen nodes receive monotonically
 increasing identifiers. The latest note precedes the new Kweb context; root nodes precede
-explicitly requested nodes. The Full inspector and next fresh-thread request
-are formatted from this rebuilt list, so wiped Kmap material is absent from
-both.
+explicitly requested nodes. The backend formats the next fresh-thread request
+from this rebuilt list and checkpoints that exact plaintext for verbatim Full
+inspector display, so wiped Kmap material is absent from both.
 
 Explicitly ending a conversation transitions its durable record to
 `ingress_pending`; starting a new conversation does not end existing live ones.

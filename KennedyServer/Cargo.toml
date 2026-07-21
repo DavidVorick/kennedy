@@ -15,6 +15,7 @@ flate2.workspace = true
 hex.workspace = true
 kennedy-audio-ingress = { path = "../AudioIngress" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
+kennedy-chatend = { path = "../Chatend" }
 kcode-codex-runtime.workspace = true
 kcode-doc-extraction.workspace = true
 kcode-gemini-api.workspace = true

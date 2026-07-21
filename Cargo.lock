@@ -2039,6 +2039,7 @@ dependencies = [
  "hound",
  "kcode-codex-runtime",
  "kcode-gemini-api",
+ "kennedy-chatend",
  "ruopus",
  "rusqlite",
  "serde",
@@ -2050,12 +2051,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kennedy-chatend"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "kennedy-conversation-history"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "kennedy-chatend",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2083,6 +2092,7 @@ dependencies = [
  "kcode-tg-kennedy-bot",
  "kcode-web-fetch",
  "kennedy-audio-ingress",
+ "kennedy-chatend",
  "kennedy-conversation-history",
  "kweb-db-core",
  "rand 0.9.5",

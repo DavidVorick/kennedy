@@ -175,11 +175,30 @@ canonical documents; this file is not an append-only log.
 - Organize system instructions as prose sections and loaded Kmap nodes and tool
   results as clear YAML-like text rather than serialized JSON.
 - Keep model-readable Kmap text compact and role-based. Direct nodes retain
-  their descriptions but refer to connections by identifier. Emit each full
-  active-connection node once with its long description and no short
-  description. Emit direct-node fanouts once with name and short description,
-  and fanouts found only beneath active nodes once by name alone. Richer
-  structured summaries may remain in recovery state and the memory UI.
+  their descriptions but refer to connections by identifier. Classify the
+  complete projection before rendering it, then emit all directly loaded nodes,
+  all remaining full active-connection nodes, all remaining direct-node fanouts
+  with name and short description, and finally all remaining fanouts of full
+  active-connection nodes by name alone. A node appears in only its highest
+  applicable section within one projection. For an envelope containing several
+  `LoadNode` calls, execute the calls in order but project their combined delta
+  once in this same section-wide order, including any status upgrades.
+  Deduplicate that delta against earlier Chatend memory output. Richer structured
+  summaries may remain in recovery state and the memory UI, but never serialize
+  those structures into model-facing Chatend text.
+- The backend is the sole owner of canonical Chatend composition. Every
+  generation receives that backend-produced plaintext, and every checkpoint
+  exposes the same current plaintext to the browser. Full view displays the
+  supplied string verbatim without parsing or reconstructing it; only Main and
+  other convenience views may interpret structured archive fields. Optimize
+  model-facing memory text primarily for token cost while retaining enough
+  labels and whitespace for human inspection.
+- A checkpoint that predates the persisted `chatendText` field is not an
+  exception to that rule. When archived messages can be supplied to the model,
+  the backend applies the same canonical formatter on read and includes that
+  exact result as `chatendText`; the frontend still performs only a verbatim
+  passthrough. Missing historical persistence is not a reason to hide an
+  otherwise computable Full view or to introduce a frontend reconstruction.
 - Provide Full, System Prompts, Tool Calls, and expandable Memory Tree views.
   The Tool Calls view contains each transparent tool request and its readable
   response in chronological order. Distinguish directly loaded nodes, full

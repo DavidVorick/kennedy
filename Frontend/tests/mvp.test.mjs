@@ -17,6 +17,7 @@ import {
   conversationIngressActivity,
   conversationTitle,
   inspectorText,
+  mainViewEntries,
   reconcileConversationHistory,
   sortConversationHistory,
 } from "../public/js/render.js";
@@ -286,18 +287,46 @@ test("human-readable memory and tool results avoid raw implementation shapes", (
   }), /Readable page content/);
 });
 
-test("inspector retains tool protocol details without leaking private diagnostics", () => {
+test("Full inspector displays the exact backend Chatend string without reconstruction", () => {
   const chatend = [
-    { role: "system", content: "Readable instructions." },
-    { role: "user", content: "Hello." },
-    { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}}]}' },
-    { role: "user", display_role: "Memory tool result", content: "Memory load completed." },
-    { role: "assistant", content: "Done." },
+    { role: "system", content: "FRONTEND RECONSTRUCTION MUST NOT APPEAR" },
   ];
-  const rendered = inspectorText({ chatend, context: { privateDiagnostic: true } });
-  assert.match(rendered, /KENNEDY_TOOL_CALLS/);
-  assert.match(rendered, /Memory tool result/);
-  assert.doesNotMatch(rendered, /privateDiagnostic/);
+  const exact = "Backend-owned Chatend\n\n  spacing is preserved  \n\n{ordinary tool request JSON remains text}";
+  const rendered = inspectorText({ chatend, chatendText: exact, usage: { contextKnown: true, contextTokens: 999 }, context: { privateDiagnostic: true } });
+  assert.equal(rendered, exact);
+  assert.doesNotMatch(rendered, /FRONTEND RECONSTRUCTION|privateDiagnostic|999/);
+  assert.equal(inspectorText({ chatend }, "full"), "");
+});
+
+test("Main inspector consumes one combined result for a LoadNode batch", () => {
+  const direct = identifier => ({
+    identifier,
+    shortName: `Node ${identifier}`,
+    shortDescription: `Summary ${identifier}`,
+    longDescription: `Details ${identifier}`,
+    fixedConnections: [], activeConnections: [], fanoutConnections: [],
+  });
+  const entries = mainViewEntries({
+    chatend: [
+      { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}},{"name":"LoadNode","arguments":{"identifier":3}}]}' },
+      {
+        role: "user",
+        display_role: "Memory tool result",
+        tool_name: "LoadNode",
+        tool_call_count: 2,
+        tool_result: { ok: true, result: { directNodes: [direct(2)], directNodePromotions: [3], activeConnectionNodes: [] } },
+        content: "Kennedy tool result · LoadNode · 8 ms\n\nMemory load completed.",
+      },
+      { role: "assistant", content: "Done." },
+    ],
+    memory: { directlyLoadedIdentifiers: [2, 3], nodes: [direct(2), direct(3)] },
+  });
+  assert.deepEqual(
+    entries.filter(entry => entry.kind === "loaded-node").map(entry => entry.node.identifier),
+    [2, 3],
+  );
+  assert.equal(entries.filter(entry => entry.kind === "tool-result").length, 0);
+  assert.equal(entries.at(-1).content, "Done.");
 });
 
 test("production frontend is server-driven and uses the consolidated origin", async () => {

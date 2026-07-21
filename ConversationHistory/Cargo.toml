@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+kennedy-chatend = { path = "../Chatend" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

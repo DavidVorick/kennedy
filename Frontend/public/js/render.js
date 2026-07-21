@@ -639,6 +639,16 @@ function readableMessageContent(content) {
 function loadedNodesForResult(message, call, memory) {
   if ((message?.tool_name || call?.name) !== "LoadNode" || message?.tool_result?.ok === false) return [];
   const result = message?.tool_result?.result;
+  if (Array.isArray(result?.directNodes)) {
+    const loaded = result.directNodes.map(node => ({ node, relation: "direct" }));
+    for (const identifier of result.directNodePromotions || []) {
+      const node = (memory?.nodes || []).find(candidate => candidate.identifier === identifier);
+      if (node && !loaded.some(entry => entry.node.identifier === identifier)) {
+        loaded.push({ node, relation: "direct" });
+      }
+    }
+    return loaded;
+  }
   if (result?.requestedNode) return [{ node: result.requestedNode, relation: "direct" }];
   const requested = (memory?.nodes || []).find(node => node.identifier === call?.arguments?.identifier);
   if (!requested) return [];
@@ -722,7 +732,9 @@ export function mainViewEntries(diagnostic) {
       continue;
     }
     if (isToolResult(message)) {
-      const call = pendingCalls.shift() || (message.tool_name ? { name: message.tool_name, arguments: {} } : null);
+      const call = pendingCalls[0] || (message.tool_name ? { name: message.tool_name, arguments: {} } : null);
+      const consumedCalls = Math.max(1, Number(message?.tool_call_count) || 1);
+      pendingCalls.splice(0, consumedCalls);
       const loadedNodes = loadedNodesForResult(message, call, memory);
       const presentation = toolResultPresentation(message);
       if (loadedNodes.length) {
@@ -798,6 +810,11 @@ export function mainViewEntries(diagnostic) {
 export function inspectorText(diagnostic, view = "full") {
   if (view === "history") return fullHistoryText(diagnostic);
   if (view === "memory") return formatKmapContext(diagnostic.memory || { directlyLoadedIdentifiers: [], nodes: [] });
+  if (view === "full") {
+    return typeof diagnostic?.chatendText === "string"
+      ? diagnostic.chatendText
+      : "";
+  }
   let messages = diagnostic.chatend || [];
   if (view === "system") {
     const explicit = messages.filter(message => message.context_kind === "instructions");
@@ -817,7 +834,7 @@ export function inspectorText(diagnostic, view = "full") {
     });
     if (!messages.length) return "No tool calls are currently in the Chatend.";
   }
-  return formatChatend(messages, view === "full" || view === "main" ? diagnostic.usage : null);
+  return formatChatend(messages, view === "main" ? diagnostic.usage : null);
 }
 
 function tokenCount(value) {
@@ -1077,7 +1094,7 @@ function fullHistoryPhases(diagnostic) {
     label: diagnostic?.mode === "history ingress" ? "History ingress" : "Conversation",
     status: diagnostic?.ingressStatus || "current",
     segments: diagnostic?.historySegments || [],
-    current: { messages: diagnostic?.chatend || [], memory: diagnostic?.memory || null, usage: diagnostic?.usage || null },
+    current: { messages: diagnostic?.chatend || [], chatendText: diagnostic?.chatendText || null, memory: diagnostic?.memory || null, usage: diagnostic?.usage || null },
   }];
 }
 
@@ -1153,7 +1170,12 @@ function fullHistoryText(diagnostic) {
       continue;
     }
     for (const [contextIndex, context] of contexts.entries()) {
-      output.push(`Context ${contextIndex + 1}`, formatChatend(context.messages || [], context.usage || null));
+      output.push(
+        `Context ${contextIndex + 1}`,
+        typeof context.chatendText === "string"
+          ? context.chatendText
+          : "",
+      );
       if (contextIndex < contexts.length - 1) output.push(`════════ ${context.reason || "ResetContext"} · context reset ════════`);
     }
   }

@@ -12,6 +12,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use kennedy_chatend::hydrate_state_chatend_text;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -369,9 +370,10 @@ fn validate_version(value: i64) -> Result<(), ApiError> {
 
 fn row_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRecord> {
     let state_json: String = row.get(4)?;
-    let state = serde_json::from_str(&state_json).map_err(|error| {
+    let mut state = serde_json::from_str(&state_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    hydrate_state_chatend_text(&mut state);
     let failures_json: String = row.get(10)?;
     let ingress_failures = serde_json::from_str(&failures_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(error))
@@ -2412,6 +2414,52 @@ mod tests {
     }
 
     #[test]
+    fn legacy_checkpoint_reads_supply_canonical_chatend_text() {
+        let db = database();
+        let state = json!({
+            "archive": {
+                "format":"kennedy-chatend",
+                "messages":[{"role":"user","content":"Legacy conversation"}],
+                "fullHistory":{"segments":[{
+                    "messages":[{"role":"assistant","content":"Before reset"}]
+                }]}
+            },
+            "historyIngress": {
+                "format":"kennedy-chatend",
+                "messages":[{"role":"user","content":"Legacy ingress"}]
+            }
+        });
+        db.execute(
+            "INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version) VALUES('legacy-chatend','complete','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1,1)",
+            [serde_json::to_string(&state).unwrap()],
+        )
+        .unwrap();
+
+        let record = fetch_record(&db, "legacy-chatend").unwrap();
+        assert_eq!(
+            record
+                .state
+                .pointer("/archive/chatendText")
+                .and_then(Value::as_str),
+            Some("David\n\nLegacy conversation")
+        );
+        assert_eq!(
+            record
+                .state
+                .pointer("/archive/fullHistory/segments/0/chatendText")
+                .and_then(Value::as_str),
+            Some("Kennedy\n\nBefore reset")
+        );
+        assert_eq!(
+            record
+                .state
+                .pointer("/historyIngress/chatendText")
+                .and_then(Value::as_str),
+            Some("David\n\nLegacy ingress")
+        );
+    }
+
+    #[test]
     fn ingress_queue_is_oldest_activity_first_and_resumes_claimed_work() {
         let db = database();
         db.execute("INSERT INTO conversations(id,phase,started_at,updated_at,state_json,version,last_user_message_at) VALUES('newer','ingress_pending','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','{}',1,'2026-01-02T00:00:00Z')", []).unwrap();
@@ -2437,7 +2485,21 @@ mod tests {
         let record = update_ingress(&db, "c", 4, &state).unwrap();
         assert_eq!(record.phase, "ingress_in_progress");
         assert_eq!(record.version, 5);
-        assert_eq!(record.state, state);
+        assert_eq!(
+            record
+                .state
+                .pointer("/historyIngress/chatendText")
+                .and_then(Value::as_str),
+            Some("Kennedy\n\nMemory updated.")
+        );
+        let stored: String = db
+            .query_row(
+                "SELECT state_json FROM conversations WHERE id='c'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), state);
         assert_eq!(
             update_ingress(&db, "c", 4, &json!({})).unwrap_err().code,
             "state_conflict"

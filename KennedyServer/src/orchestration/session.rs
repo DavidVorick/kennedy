@@ -2,13 +2,15 @@ use std::{collections::HashSet, future::Future, time::Instant};
 
 use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use kennedy_chatend::canonical_chatend_text as format_chatend;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
     Api, ApiError, Manuals, RuntimeModel,
     context::{
-        KmapContext, MAX_DIRECTLY_LOADED_NODES, format_kmap_context, stored_fixed_ids,
+        KmapContext, MAX_DIRECTLY_LOADED_NODES, format_compact_memory_sections,
+        format_context_node, format_kmap_context, project_load_batch, stored_fixed_ids,
         stored_recent_ids,
     },
     http::{encode_path, idempotency_id},
@@ -16,7 +18,6 @@ use super::{
 
 const TOOL_PREFIX: &str = "KENNEDY_TOOL_CALLS";
 const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
-const CHATEND_SEPARATOR: &str = "\n\n────────────────────────\n\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -98,6 +99,7 @@ struct ToolCall {
 
 struct ToolOutcome {
     message: Value,
+    duration_ms: u64,
     reset: bool,
     end_turn: bool,
     self_message: Option<String>,
@@ -690,6 +692,18 @@ impl Session {
                     let accepted = truncate_tool_response(&content);
                     let assistant = json!({"role":"assistant","content":accepted});
                     self.messages.push(assistant.clone());
+                    let load_before = if calls.iter().any(|call| call.name == "LoadNode") {
+                        Some(self.context.snapshot()?)
+                    } else {
+                        None
+                    };
+                    let mut load_message_index = None;
+                    let mut load_requested = Vec::new();
+                    let mut load_active = Vec::new();
+                    let mut load_duration_ms = 0;
+                    let mut load_calls_in_batch = 0;
+                    let mut successful_loads = 0;
+                    let mut load_failures = Vec::new();
                     let reset_mixed =
                         calls.len() > 1 && calls.iter().any(|call| call.name == "ResetContext");
                     let end_mixed =
@@ -721,12 +735,59 @@ impl Session {
                                 self.tool_failure(&call, "tool_failed", &error.to_string())?
                             }
                         };
+                        let successful_load = outcome
+                            .message
+                            .get("tool_result")
+                            .and_then(|value| value.get("ok"))
+                            .and_then(Value::as_bool)
+                            == Some(true);
+                        if call.name == "LoadNode" {
+                            load_message_index.get_or_insert(self.messages.len());
+                            load_duration_ms += outcome.duration_ms;
+                            load_calls_in_batch += 1;
+                            if successful_load {
+                                let result = outcome
+                                    .message
+                                    .get("tool_result")
+                                    .and_then(|value| value.get("result"))
+                                    .unwrap_or(&Value::Null);
+                                if let Some(identifier) = result
+                                    .get("requestedNodeIdentifier")
+                                    .and_then(Value::as_u64)
+                                {
+                                    load_requested.push(identifier);
+                                }
+                                load_active.extend(
+                                    result
+                                        .get("activeConnectionNodes")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|node| {
+                                            node.get("identifier").and_then(Value::as_u64)
+                                        }),
+                                );
+                                successful_loads += 1;
+                            } else {
+                                let tool_result =
+                                    outcome.message.get("tool_result").unwrap_or(&Value::Null);
+                                load_failures.push(json!({
+                                    "identifier":call.arguments.get("identifier").cloned().unwrap_or(Value::Null),
+                                    "message":tool_result.get("error").and_then(|value| value.get("message")).and_then(Value::as_str).unwrap_or("The load failed."),
+                                }));
+                            }
+                            turn_ended |= outcome.end_turn;
+                            continue;
+                        }
                         if outcome.reset {
+                            let outgoing_chatend =
+                                format_chatend(&self.messages, Some(&self.usage));
                             self.full_history_segments.push(json!({
                                 "reason":"ResetContext",
                                 "messages":self.messages,
                                 "memory":outcome.previous_context,
                                 "usage":self.usage,
+                                "chatendText":outgoing_chatend,
                             }));
                             self.reset_history.push(outcome.reset_history_entry);
                             self.retained.retain(|message| {
@@ -745,6 +806,39 @@ impl Session {
                             self.messages.push(outcome.message);
                         }
                         turn_ended |= outcome.end_turn;
+                    }
+                    if load_calls_in_batch > 0 {
+                        let projection = project_load_batch(
+                            load_before
+                                .as_ref()
+                                .context("LoadNode batch omitted its initial context")?,
+                            &self.context.snapshot()?,
+                            &load_requested,
+                            &load_active,
+                        );
+                        let content = if successful_loads > 0 {
+                            let mut projection = projection;
+                            projection["loadFailures"] = json!(load_failures);
+                            json!({"ok":true,"result":projection})
+                        } else {
+                            let reasons = load_failures
+                                .iter()
+                                .map(|failure| {
+                                    format!(
+                                        "Node {}: {}",
+                                        result_text(failure.get("identifier"), "unknown"),
+                                        result_text(failure.get("message"), "The load failed.")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            json!({"ok":false,"error":{"message":reasons},"failures":load_failures})
+                        };
+                        let mut message =
+                            tool_result_message("LoadNode", content, load_duration_ms);
+                        message["tool_call_count"] = json!(load_calls_in_batch);
+                        self.messages
+                            .insert(load_message_index.unwrap_or(self.messages.len()), message);
                     }
                     checkpoint(self.snapshot()?).await?;
                     if turn_ended {
@@ -910,6 +1004,7 @@ impl Session {
         );
         Ok(ToolOutcome {
             message: tool_result_message(&call.name, json!({"ok":true,"result":result}), duration),
+            duration_ms: duration,
             reset,
             end_turn,
             self_message,
@@ -931,6 +1026,7 @@ impl Session {
                 json!({"ok":false,"error":{"code":code,"message":message}}),
                 0,
             ),
+            duration_ms: 0,
             reset: false,
             end_turn: false,
             self_message: None,
@@ -1115,7 +1211,13 @@ impl Session {
         self.assert_write_authorized().await?;
         let parent = self.context.stored_node(&parent_id)?;
         let mut fixed = stored_fixed_ids(&parent);
-        let replaced = fixed.get(slot - 1).cloned();
+        let replaced = self
+            .context
+            .context_node(&parent)?
+            .get("fixedConnections")
+            .and_then(Value::as_array)
+            .and_then(|connections| connections.get(slot - 1))
+            .cloned();
         if let Some(child) = child.clone() {
             anyhow::ensure!(
                 slot <= fixed.len() + 1,
@@ -1460,12 +1562,13 @@ impl Session {
     }
 
     pub(crate) fn archive(&mut self) -> anyhow::Result<Value> {
+        let chatend_text = format_chatend(&self.messages, Some(&self.usage));
         Ok(json!({
             "format":"kennedy-chatend","version":2,"sessionType":if matches!(self.mode, AgentMode::Ingress{..}) {"history-ingress"} else {self.session_type.as_str()},
             "sourceSessionType":self.source_session_type,"channel":self.channel,"freeTime":self.free_time,"orchestration":self.orchestration,
             "provenanceId":self.provenance_id,"rootNodeIds":self.root_node_ids,"referenceRootNodeIds":self.reference_root_node_ids,
             "groupContext":self.group_context,"startedAt":self.started_at,"provider":self.runtime.provider,"model":self.runtime.model,"systemPrompt":self.system_prompt,
-            "retained":self.retained,"transcript":self.transcript,"messages":self.messages,"fullHistory":{"segments":self.full_history_segments},
+            "retained":self.retained,"transcript":self.transcript,"messages":self.messages,"chatendText":chatend_text,"fullHistory":{"segments":self.full_history_segments},
             "context":{"snapshot":self.context.snapshot()?,"diagnostics":self.context.diagnostics(),"state":self.context.archive()},
             "tools":{"loadCalls":self.load_calls,"loadLimit":self.load_limit,"log":self.tool_log,"turnEndContent":self.turn_end_content},
             "usage":self.usage,"pendingExternalEventId":self.pending_external_event_id,"lastContextWarningBand":self.last_context_warning_band,"media":self.media,
@@ -1504,52 +1607,6 @@ fn replace_context_message(messages: &mut Vec<Value>, prompt: &str, context: Val
 
 fn retained_transcript(transcript: &[Value]) -> Vec<Value> {
     transcript.iter().map(|item| json!({"role":if item.get("role").and_then(Value::as_str)==Some("kennedy") {"assistant"} else {"user"},"content":item.get("content").and_then(Value::as_str).unwrap_or("")})).collect()
-}
-
-fn format_chatend(messages: &[Value], usage: Option<&Value>) -> String {
-    let mut value = messages
-        .iter()
-        .filter_map(|message| {
-            let content = message.get("content").and_then(Value::as_str)?.trim();
-            if content.is_empty() {
-                return None;
-            }
-            let role = message
-                .get("display_role")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| match message.get("role").and_then(Value::as_str) {
-                    Some("user") => "David",
-                    Some("assistant") => "Kennedy",
-                    _ => "System context",
-                });
-            Some(format!("{role}\n\n{content}"))
-        })
-        .collect::<Vec<_>>()
-        .join(CHATEND_SEPARATOR);
-    if let Some(usage) = usage {
-        let known = usage
-            .get("contextKnown")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let tokens = usage
-            .get("contextTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let window = usage
-            .get("contextWindowTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let progress = if known {
-            format!("context window usage: {tokens} / {window}")
-        } else {
-            format!("context window usage: unknown / {window}")
-        };
-        if !value.is_empty() {
-            value.push_str(CHATEND_SEPARATOR);
-        }
-        value.push_str(&progress);
-    }
-    value
 }
 
 fn parse_tool_calls(content: &str) -> Result<Option<Vec<ToolCall>>, String> {
@@ -1729,7 +1786,145 @@ fn format_tool_result(name: &str, content: &Value) -> String {
         );
     }
     let result = content.get("result").unwrap_or(&Value::Null);
-    match name{"ToolCheck"=>result.get("message").and_then(Value::as_str).unwrap_or("Tool calls are working.").into(),"EndTurn"=>result.get("message").and_then(Value::as_str).unwrap_or("The turn is ending.").into(),"LoadNode"=>format!("Memory load completed.\n\n{}",serde_json::to_string_pretty(result).unwrap_or_default()),"ResetContext"=>"Memory context reset completed. The rebuilt Kmap context above contains the newly loaded nodes.".into(),"WebSearch"=>format!("Web research completed.\n\nResearch answer:\n  {}\n\nSources:\n{}",result.get("answer").and_then(Value::as_str).unwrap_or(""),serde_json::to_string_pretty(result.get("sources").unwrap_or(&Value::Null)).unwrap_or_default()),"WebFetch"=>format!("Web page fetched.\n\n{}",result.get("content").and_then(Value::as_str).unwrap_or("")),"CreateNode"|"UpdateNode"|"ConnectNodes"|"ConsolidateFanout"|"SetFixedConnection"=>format!("Memory operation completed.\n\n{}",serde_json::to_string_pretty(result).unwrap_or_default()),_=>format!("{name} completed successfully.\n\n{}",serde_json::to_string_pretty(result).unwrap_or_default())}
+    match name {
+        "ToolCheck" => result_text(result.get("message"), "Tool calls are working."),
+        "EndTurn" => result_text(result.get("message"), "The turn is ending."),
+        "LoadNode" => {
+            let projection = format_compact_memory_sections(result);
+            let failures = result
+                .get("loadFailures")
+                .and_then(Value::as_array)
+                .map(|failures| {
+                    failures
+                        .iter()
+                        .map(|failure| format!(
+                            "- Node {}: {}",
+                            result_text(failure.get("identifier"), "unknown"),
+                            result_text(failure.get("message"), "The load failed.")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|failures| !failures.is_empty());
+            let mut sections = vec![if projection.is_empty() {
+                "Memory load completed. No new memory text was needed.".into()
+            } else {
+                format!("Memory load completed.\n\n{projection}")
+            }];
+            if let Some(failures) = failures {
+                sections.push(format!("Some requested nodes could not be loaded:\n{failures}"));
+            }
+            sections.join("\n\n")
+        }
+        "ResetContext" => "Memory context reset completed. The rebuilt Kmap context above contains the newly loaded nodes.".into(),
+        "ConnectNodes" => format!(
+            "Memory connections updated.\n\n{}",
+            format_result_nodes(
+                "Affected nodes",
+                result.get("nodes").and_then(Value::as_array).map(Vec::as_slice),
+            )
+        ),
+        "ConsolidateFanout" => format!(
+            "Fanout connections consolidated.\n\n{}",
+            format_result_nodes(
+                "Affected nodes",
+                result.get("nodes").and_then(Value::as_array).map(Vec::as_slice),
+            )
+        ),
+        "SetFixedConnection" => {
+            let status = if result.get("cleared").and_then(Value::as_bool) == Some(true) {
+                "Fixed connection slot cleared."
+            } else {
+                "Fixed connection assigned."
+            };
+            let mut sections = vec![status.to_owned(), format_result_nodes(
+                "Updated parent node",
+                result.get("node").map(std::slice::from_ref),
+            )];
+            if let Some(replaced) = result.get("replacedFixedConnection").filter(|value| !value.is_null()) {
+                sections.push(format!(
+                    "Replaced fixed connection: slot {}: {}: {}",
+                    replaced.get("slot").and_then(Value::as_u64).unwrap_or_default(),
+                    replaced.get("identifier").and_then(Value::as_u64).unwrap_or_default(),
+                    result_text(replaced.get("shortName"), "(none)")
+                ));
+            }
+            sections.join("\n\n")
+        }
+        "CreateNode" => format_result_nodes(
+            "Memory node created",
+            result.get("node").map(std::slice::from_ref),
+        ),
+        "UpdateNode" => format_result_nodes(
+            "Memory node updated",
+            result.get("node").map(std::slice::from_ref),
+        ),
+        "WebSearch" => {
+            let sources = result
+                .get("sources")
+                .and_then(Value::as_array)
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .enumerate()
+                        .map(|(index, source)| format!(
+                            "  {}. {}\n     URL: {}",
+                            index + 1,
+                            result_text(source.get("title").or_else(|| source.get("url")), "(untitled)"),
+                            result_text(source.get("url"), "(none)")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|sources| !sources.is_empty())
+                .unwrap_or_else(|| "  none returned".into());
+            format!(
+                "Web research completed.\n\nResearch answer:\n{}\n\nSources:\n{sources}",
+                indent_result(result_text(result.get("answer"), "(none)").as_str())
+            )
+        }
+        "WebFetch" => format!(
+            "Web page fetched.\n\nURL: {}\nTitle: {}\nRetrieved: {}\nContent type: {}\nTruncated: {}\n\nReadable page content:\n{}",
+            result_text(result.get("url"), "(none)"),
+            result_text(result.get("title"), "(none)"),
+            result_text(result.get("retrieved_at"), "(unknown)"),
+            result_text(result.get("content_type"), "(unknown)"),
+            if result.get("truncated").and_then(Value::as_bool) == Some(true) { "yes" } else { "no" },
+            indent_result(result_text(result.get("content"), "(none)").as_str()),
+        ),
+        _ => format!("{name} completed successfully."),
+    }
+}
+
+fn format_result_nodes(title: &str, nodes: Option<&[Value]>) -> String {
+    let Some(nodes) = nodes.filter(|nodes| !nodes.is_empty()) else {
+        return format!("{title}\n\nNone.");
+    };
+    format!(
+        "{title}\n\n{}",
+        nodes
+            .iter()
+            .map(|node| format_context_node(node, true))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
+fn result_text(value: Option<&Value>, fallback: &str) -> String {
+    match value {
+        Some(Value::String(value)) if !value.is_empty() => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => fallback.to_owned(),
+    }
+}
+
+fn indent_result(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn empty_usage(runtime: &RuntimeModel) -> Value {
@@ -2054,6 +2249,9 @@ fn model_readable_provenance(data: &str) -> anyhow::Result<String> {
     let Ok(archive) = serde_json::from_str::<Value>(data) else {
         return Ok(data.trim().to_owned());
     };
+    if let Some(chatend) = archive.get("chatendText").and_then(Value::as_str) {
+        return Ok(chatend.to_owned());
+    }
     let messages = archive
         .get("messages")
         .and_then(Value::as_array)
@@ -2119,12 +2317,13 @@ fn value_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
     use axum::{
         Json, Router,
+        extract::Path,
         routing::{get, post},
     };
 
@@ -2166,6 +2365,86 @@ mod tests {
                 .contains("2× Project | User Root")
         );
         assert!(message["content"].as_str().unwrap().contains("2/20"));
+    }
+
+    #[test]
+    fn model_facing_tool_results_are_readable_text_not_serialized_state() {
+        let node = json!({
+            "identifier": 3,
+            "shortName": "Project",
+            "shortDescription": "Project summary",
+            "longDescription": "Project details",
+            "ownerIdentifier": 1,
+            "fixedConnections": [],
+            "activeConnections": [{"identifier": 4, "shortName": "Related", "shortDescription": "Repeated summary"}],
+            "fanoutConnections": [{"identifier": 5, "shortName": "Later", "shortDescription": "Repeated summary"}],
+        });
+        let load = format_tool_result(
+            "LoadNode",
+            &json!({
+                "ok": true,
+                "result": {
+                    "directNodes": [node],
+                    "activeConnectionNodes": [{
+                        "identifier": 4, "shortName": "Related", "shortDescription": "OMIT ME", "longDescription": "Related details",
+                        "ownerIdentifier": 1, "fixedConnections": [], "activeConnections": [], "fanoutConnections": []
+                    }],
+                    "directFanoutNodes": [{"identifier": 5, "shortName": "Later", "shortDescription": "Later summary"}],
+                    "indirectFanoutNodes": [{"identifier": 6, "shortName": "Distant", "shortDescription": "OMIT ME TOO"}],
+                    "loadFailures": [{"identifier": 9, "message": "Unknown memory identifier 9."}],
+                }
+            }),
+        );
+        assert!(load.contains("Memory load completed."));
+        assert!(
+            load.find("Directly loaded nodes").unwrap()
+                < load.find("Full active-connection nodes").unwrap()
+        );
+        assert!(
+            load.find("Full active-connection nodes").unwrap()
+                < load.find("Fanout nodes of directly loaded nodes").unwrap()
+        );
+        assert!(
+            load.find("Fanout nodes of directly loaded nodes").unwrap()
+                < load
+                    .find("Fanout nodes only of full active-connection nodes")
+                    .unwrap()
+        );
+        assert!(!load.contains('{'));
+        assert!(!load.contains("shortName") && !load.contains("OMIT ME"));
+        assert!(load.contains("Node 9: Unknown memory identifier 9."));
+
+        let web = format_tool_result(
+            "WebSearch",
+            &json!({
+                "ok": true,
+                "result": {"answer":"Readable answer","sources":[{"title":"Example","url":"https://example.com"}]}
+            }),
+        );
+        assert!(web.contains("1. Example\n     URL: https://example.com"));
+        assert!(!web.contains('{') && !web.contains("\"title\""));
+
+        let mutation = format_tool_result(
+            "CreateNode",
+            &json!({
+                "ok": true,
+                "result": {"node": {
+                    "identifier": 7, "shortName": "Created", "shortDescription": "Summary", "longDescription": "Details",
+                    "ownerIdentifier": 1, "fixedConnections": [], "activeConnections": [], "fanoutConnections": []
+                }}
+            }),
+        );
+        assert!(mutation.contains("Node 7: Created"));
+        assert!(!mutation.contains('{') && !mutation.contains("shortDescription"));
+    }
+
+    #[test]
+    fn provenance_uses_the_backend_owned_chatend_text_without_reformatting() {
+        let readable = model_readable_provenance(
+            r#"{"chatendText":"Exact backend text\n  with spacing  ","messages":[{"role":"user","content":"MUST NOT BE REFORMATTED"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(readable, "Exact backend text\n  with spacing  ");
     }
 
     #[tokio::test]
@@ -2258,6 +2537,165 @@ mod tests {
         assert!(!session.pending_turn);
         assert_eq!(generations.load(Ordering::SeqCst), 2);
         assert!(checkpoints.load(Ordering::SeqCst) >= 2);
+        let archive = session.archive().unwrap();
+        assert_eq!(
+            archive.get("chatendText").and_then(Value::as_str),
+            Some(
+                format_chatend(
+                    archive.get("messages").and_then(Value::as_array).unwrap(),
+                    archive.get("usage"),
+                )
+                .as_str()
+            )
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_session_combines_loadnode_calls_before_rendering_the_batch() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let generations = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/api/v1/kmap/nodes/{id}",
+                get(|Path(id): Path<String>| async move {
+                    let (name, fixed, recent, summaries) = match id.as_str() {
+                        "root" => (
+                            "Root",
+                            vec!["a", "c"],
+                            Vec::new(),
+                            vec![
+                                json!({"id":"a","short_name":"Node A","short_description":"A summary"}),
+                                json!({"id":"c","short_name":"Node C","short_description":"C summary"}),
+                            ],
+                        ),
+                        "a" => (
+                            "Node A",
+                            Vec::new(),
+                            vec!["c", "d"],
+                            vec![
+                                json!({"id":"c","short_name":"Node C","short_description":"C summary"}),
+                                json!({"id":"d","short_name":"Node D","short_description":"D summary"}),
+                            ],
+                        ),
+                        "c" => ("Node C", Vec::new(), Vec::new(), Vec::new()),
+                        "d" => ("Node D", Vec::new(), Vec::new(), Vec::new()),
+                        _ => ("Unknown", Vec::new(), Vec::new(), Vec::new()),
+                    };
+                    Json(json!({
+                        "id":id,
+                        "owner_node_id":"root",
+                        "short_name":name,
+                        "short_description":format!("{name} summary"),
+                        "long_description":format!("{name} details"),
+                        "last_modified_by":"test-model-high",
+                        "last_modified_at":"2026-07-20T00:00:00Z",
+                        "fixed_connections":fixed,
+                        "recent_connections":recent,
+                        "connection_summaries":summaries,
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/generate",
+                post({
+                    let generations = generations.clone();
+                    let requests = requests.clone();
+                    move |Json(request): Json<Value>| {
+                        let call = generations.fetch_add(1, Ordering::SeqCst);
+                        requests.lock().unwrap().push(request);
+                        async move {
+                            let content = match call {
+                                0 => "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":2}},{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":3}},{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":999}}]}",
+                                1 => "The batch is loaded.",
+                                _ => "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"EndTurn\",\"arguments\":{}}]}",
+                            };
+                            Json(json!({
+                                "status":"complete",
+                                "message":{"content":content},
+                                "usage":{"input_tokens":100,"output_tokens":10,"cached_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0},
+                            }))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = super::super::Config {
+            system_prompts_directory: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../Frontend/SystemPrompts"),
+            kweb_base: base.clone(),
+            intelligence_base: base.clone(),
+            conversation_history_base: base.clone(),
+            telegram_relay_base: base.clone(),
+            audio_ingress_base: base,
+            telegram_web_user_handle: "@test".into(),
+        };
+        let api = Api::new(&config).unwrap();
+        let manuals = Manuals::load(&config.system_prompts_directory).unwrap();
+        let runtime = RuntimeModel {
+            provider: "test".into(),
+            provider_kind: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: "high".into(),
+            context_window_tokens: 100_000,
+            max_input_tokens: 90_000,
+        };
+        let mut session = Session::new(
+            api,
+            manuals,
+            runtime,
+            SessionOptions::conversation("conversation", vec!["root".into()]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(session.begin_user_turn("Load both nodes", &json!({})));
+        let answer = session
+            .run_pending_turn(Uuid::new_v4(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(answer.as_deref(), Some("The batch is loaded."));
+
+        let archive = session.archive().unwrap();
+        let load_results = archive
+            .get("messages")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter(|message| message.get("tool_name").and_then(Value::as_str) == Some("LoadNode"))
+            .collect::<Vec<_>>();
+        assert_eq!(load_results.len(), 1);
+        assert_eq!(
+            load_results[0]
+                .get("tool_call_count")
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        let rendered = load_results[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            rendered.find("Node 2: Node A").unwrap() < rendered.find("Node 3: Node C").unwrap()
+        );
+        assert!(
+            rendered.find("Node 3: Node C").unwrap() < rendered.find("Node 4: Node D").unwrap()
+        );
+        assert!(
+            rendered.find("Node 4: Node D").unwrap()
+                > rendered.find("Full active-connection nodes").unwrap()
+        );
+        assert_eq!(rendered.match_indices("Node 3: Node C").count(), 1);
+        assert!(!rendered.contains("\"shortName\"") && !rendered.contains("requestedNode"));
+        assert!(rendered.contains("Node 999: Unknown memory identifier 999."));
+
+        let sent = requests.lock().unwrap();
+        let second_chatend = sent[1].get("chatend").and_then(Value::as_str).unwrap();
+        assert!(second_chatend.contains(rendered));
+        assert_eq!(second_chatend.match_indices("Node 3: Node C").count(), 1);
         server.abort();
     }
 }

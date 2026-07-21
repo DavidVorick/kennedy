@@ -106,25 +106,27 @@ The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. The backend checkpoints an opaque recovery snapshot to
 the conversation history API. The versioned snapshot contains recovery fields
 plus a lossless JSON recovery archive: composed system prompt, retained
-content, structured messages, structured Kmap snapshot and durable-ID
-diagnostics, tool log and counters, usage telemetry, and a media collection
-containing original voice recordings plus future serializable media or
-attachment references. This JSON is storage format, not Chatend text and never
-becomes a generation prompt. Provider response IDs and credentials are
-transport details and are not archived.
+content, structured messages, the backend's current canonical `chatendText`,
+structured Kmap snapshot and durable-ID diagnostics, tool log and counters,
+usage telemetry, and a media collection containing original voice recordings
+plus future serializable media or attachment references. This JSON is storage
+format, not Chatend text and never becomes a generation prompt. Provider
+response IDs and credentials are transport details and are not archived.
 
-The archive never projects message `content` to text. Arrays and objects are
-preserved recursively, so future multimodal content blocks survive storage
-even before every inspector has a renderer for that media type. Active records
-reconstruct the canonical Chatend from the archived messages on a fresh Codex
-thread. Legacy
+The archive preserves message arrays and objects recursively, so future
+multimodal content blocks survive storage even before every inspector has a
+renderer for that media type. It also checkpoints the backend-formatted
+canonical plaintext separately for exact Full-view passthrough. Active records
+restore structured messages and have the backend regenerate canonical Chatend
+text before a fresh Codex thread. Legacy
 transcript-only snapshots remain readable and recover through the old rebuild
 path.
 
 The recovery archive also contains an inspector-only Full History. Immediately
 before every successful `ResetContext` rebuild, the backend snapshots the
 outgoing structured messages, Kmap snapshot, and usage state as one completed
-context segment. These segments are durable UI history only: they are never
+context segment, together with that segment's backend-formatted `chatendText`.
+These segments are durable UI history only: they are never
 restored into the active Chatend, formatted into generation input, or included
 when history ingress extracts the archived conversation's model-readable final
 Chatend.
@@ -138,15 +140,17 @@ read-only. Draft text is not durable until submitted as a backend command.
 ## 5. Chatend Model
 
 The Chatend is the canonical human-readable application prompt supplied to
-Kennedy. The Full inspector and generation path call the same formatter over
-the same current message list. Consequently the Full view shows the text sent
-for a fresh Codex thread exactly—role labels, separators, and content included;
-there is no hidden application-side JSON envelope or differently formatted
-prompt. This exactness is scoped to application-controlled plaintext. Codex or
-its upstream provider may add forced system content or structured tool metadata
-downstream; the application minimizes everything its environment exposes and
-does not claim those inaccessible layers appear in the inspector. Provider
-thread IDs and runtime protocol data are not Chatend content.
+Kennedy. The backend alone formats the current message list and includes that
+canonical plaintext in every durable checkpoint. The generation path submits
+that string, and Full view displays the supplied string verbatim without
+reconstructing it from archived messages. Consequently Full view shows the text
+sent for a fresh Codex thread exactly—role labels, separators, and content
+included; there is no hidden application-side JSON envelope or differently
+formatted prompt. This exactness is scoped to application-controlled plaintext.
+Codex or its upstream provider may add forced system content or structured tool
+metadata downstream; the application minimizes everything its environment
+exposes and does not claim those inaccessible layers appear in the inspector.
+Provider thread IDs and runtime protocol data are not Chatend content.
 It contains:
 
 - the composed system prompt,
@@ -210,9 +214,9 @@ visible ResetContext request and a compact success result. The result does not
 repeat the newly loaded nodes: they already appear once in the rebuilt Kmap
 context, immediately after the optional note to self. Reset abandons the old
 `previous_response_id` thread and submits the rebuilt chatend as a fresh
-request. Because the Full inspector is formatted from that same rebuilt message
-list, removed nodes and tool results disappear from both the inspector and
-Kennedy's next fresh-thread prompt.
+request. Because the backend checkpoints the text from that same rebuilt
+message list and Full view displays it verbatim, removed nodes and tool results
+disappear from both the inspector and Kennedy's next fresh-thread prompt.
 
 ### 5.2 Continuation, caching, and context growth
 
@@ -303,21 +307,24 @@ short identifiers, but do not count toward the ten-directly-loaded-node limit.
 The structured snapshot above remains available to frontend rendering and
 recovery, but the canonical model-readable Kmap text is a compact projection:
 
-1. Directly loaded nodes retain short and long descriptions. Their task,
+1. All directly loaded nodes retain short and long descriptions. Their task,
    active, and fanout edges contain identifiers only.
-2. Full active-connection nodes are emitted once globally with their names and
-   long descriptions; short descriptions are omitted. Their task, active, and
-   fanout edges also contain identifiers only.
-3. Non-full fanout nodes directly referenced by any directly loaded node are
-   emitted once with identifier, name, and short description.
-4. Non-full fanout nodes referenced only by full active-connection nodes are
-   emitted once with identifier and name. Nodes already represented in full or
-   through a direct-node connection are not repeated in this fourth tier.
+2. All full active-connection nodes not already emitted as directly loaded are
+   emitted once with their names and long descriptions; short descriptions are
+   omitted. Their task, active, and fanout edges also contain identifiers only.
+3. Fanout nodes of directly loaded nodes not emitted in either full-node tier
+   are emitted once with identifier, name, and short description.
+4. Fanout nodes of full active-connection nodes not emitted in any preceding
+   tier are emitted once with identifier and name.
 
-The same projection formats LoadNode results. The context glue derives which
-fanout references were already visible from the current graph, omits repeated
-references, and emits a richer direct-fanout summary if a name-only indirect
-fanout later becomes a direct fanout.
+The same whole-result precedence formats LoadNode results. A single tool
+envelope may contain multiple LoadNode calls: the backend executes them in
+written order, derives one combined delta against the context visible before
+the envelope, upgrades each node to its highest role in the completed batch,
+and only then emits all new direct nodes, all new full active nodes, direct
+fanouts, and indirect fanouts in that section order. Cross-envelope status
+upgrades may add newly available information, but no node appears in two
+sections of one projection.
 
 Every declared root is directly loaded at session start, survives every reset,
 and counts toward the shared limit. Web and private Telegram sessions declare
@@ -974,12 +981,18 @@ attempts do not increment the totals.
 
 The right panel has three views of Kennedy's current chatend. The Main view is
 selected by default and combines the ordinary conversation with progressively
-disclosed application context and activity. The Full view uses
-the exact same canonical formatter and current messages as generation; it is
-not a rendering of the recovery JSON and does not hide application prompt
-content. It displays the entire application-controlled plaintext boundary, not
-unobservable system/tool scaffolding that Codex or its provider may inject
-afterward:
+disclosed application context and activity. The Full view displays the
+backend-supplied canonical Chatend plaintext verbatim; it has no independent
+formatter or reconstruction step, is not a rendering of the recovery JSON, and
+does not hide application prompt content. It displays the entire
+application-controlled plaintext boundary, not unobservable system/tool
+scaffolding that Codex or its provider may inject afterward:
+
+Legacy archives with messages but no persisted `chatendText` are hydrated by
+the Rust backend on read using the same canonical formatter used for model
+requests. This applies to current conversation and ingress archives and to
+saved pre-reset segments. The browser never substitutes an unavailable notice
+or performs this compatibility formatting itself.
 
 - **Main view** leaves David and Kennedy's ordinary conversation responses
   visible. Kennedy responses longer than 500 Unicode characters show only the

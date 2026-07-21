@@ -73,9 +73,15 @@ stock instruction-bearing catalog when the mount is unavailable. Set
 `CODEX_SAFE_CATALOG_DIR` for a persistent custom cache path; the launcher
 already honors the same variable.
 
-The UI's Full Chatend inspector and generation path share one plaintext
-formatter: what the Full inspector shows is every application-controlled byte
-of the prompt supplied to Codex for Kennedy, not a formatted JSON archive.
+The backend owns the one canonical plaintext Chatend formatter used for
+generation and checkpoints its current output for the UI. The Full Chatend
+inspector displays that supplied string verbatim, so it shows every
+application-controlled byte of the prompt supplied to Codex for Kennedy, not a
+browser reconstruction or formatted JSON archive.
+Backend reads hydrate the same canonical field for legacy conversation,
+history-ingress, audio-ingress, and reset-segment archives that still contain
+their messages, so the Full inspector remains a verbatim passthrough for those
+checkpoints as well.
 Codex or its upstream provider can still add forced system/tool scaffolding
 outside the application's observable boundary. Versioned JSON archives exist
 only for recovery and provenance storage. History ingress parses an archive

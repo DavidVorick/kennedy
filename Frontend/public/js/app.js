@@ -141,6 +141,7 @@ function archivedDiagnostic(archive, mode, transcript = []) {
   return {
     mode, provider, model,
     chatend: archive?.messages || transcript.map(item => ({ role: item.role === "kennedy" ? "assistant" : "user", content: item.content })),
+    chatendText: typeof archive?.chatendText === "string" ? archive.chatendText : null,
     context: archive?.context?.diagnostics || {},
     loadCalls: archive?.tools?.loadCalls || 0,
     loadLimit: archive?.tools?.loadLimit || 0,
@@ -178,7 +179,7 @@ function historyPhase(label, status, source) {
     label,
     status,
     segments: source?.historySegments || [],
-    current: source ? { messages: source.chatend, memory: source.memory, usage: source.usage } : null,
+    current: source ? { messages: source.chatend, chatendText: source.chatendText, memory: source.memory, usage: source.usage } : null,
   };
 }
 

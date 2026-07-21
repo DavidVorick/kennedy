@@ -28,7 +28,7 @@ and observe backend state.
 
 'Chatend' refers to the canonical human-readable application text that is
 passed to Codex for Kennedy. The Full inspector displays every
-application-controlled plaintext byte using the same formatter; it is not a
+application-controlled plaintext byte composed by the backend's same formatter; it is not a
 pretty-printed recovery object or a second approximation. Forced Codex or
 upstream-provider system/tool scaffolding can exist outside this inspectable
 boundary. Kennedy minimizes all exposed layers the environment permits without
@@ -405,10 +405,11 @@ The conversation history backend durably stores active and completed
 conversation records separately from the kweb. The frontend first submits a
 durable message command. Before the backend sends that query to an LLM, it must
 save the query, pending-turn state, and a lossless
-versioned recovery archive of the whole Chatend: system prompts, structured messages,
-tool requests and results, loaded memory context, usage, and any serializable
-media content or attachment references. If that save fails, generation must
-not begin. This JSON archive is a durability format and is never itself sent to
+versioned recovery archive of the whole Chatend: system prompts, structured
+messages, the backend's canonical plaintext for exact Full-view display, tool
+requests and results, loaded memory context, usage, and any serializable media
+content or attachment references. If that save fails, generation must not
+begin. This JSON archive is a durability format and is never itself sent to
 Kennedy. Complete tool rounds are checkpointed while a turn is running.
 
 When `kennedy-server` starts, its orchestrator retrieves every durable
@@ -749,9 +750,11 @@ retry action above the collapsed transcript sections for the preserved piece.
 The conversation view includes a sidebar of durable active and completed
 conversations. Selecting an older entry loads its full saved transcript from
 the conversation history backend. Live entries remain continuable and closed
-entries are read-only. Its canonical Chatend is reconstructed from archived
-messages in the inspector, and its complete history-ingress session is appended
-after the transcript as one continuous scrolling history.
+entries are read-only. For an archive that predates persisted canonical text,
+the backend derives `chatendText` from the archived messages with the same
+formatter used for model requests before returning the record. The inspector
+passes that text through verbatim. Its complete history-ingress session is
+appended after the transcript as one continuous scrolling history.
 
 Below the sidebar history is a persistent activity log for sanitized
 user-visible operational failures. Entries are timestamped and repeated

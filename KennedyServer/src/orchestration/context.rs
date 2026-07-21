@@ -203,7 +203,8 @@ impl KmapContext {
     pub(crate) fn snapshot(&mut self) -> anyhow::Result<Value> {
         let roots = self.root_node_ids.clone();
         let loaded = self.loaded_node_ids.clone();
-        let full = self.full_node_ids.iter().cloned().collect::<Vec<_>>();
+        let mut full = self.full_node_ids.iter().cloned().collect::<Vec<_>>();
+        full.sort_by_key(|id| self.durable_to_short.get(id).copied().unwrap_or(u64::MAX));
         let root_identifiers = roots.iter().map(|id| self.short_id(id)).collect::<Vec<_>>();
         let directly_loaded_identifiers = loaded
             .iter()
@@ -433,6 +434,184 @@ impl KmapContext {
 pub(crate) fn format_kmap_context(snapshot: &Value) -> String {
     let roots = number_list(snapshot.get("rootIdentifiers"));
     let loaded = number_list(snapshot.get("directlyLoadedIdentifiers"));
+    let projection = project_snapshot(snapshot);
+    let nodes = format_compact_memory_sections(&projection);
+    format!(
+        "Current Kmap context\n\nAlways-loaded root identifiers: {roots}\nDirectly loaded node limit: 10\nDirectly loaded memory identifiers: {loaded}\n\n{}",
+        if nodes.is_empty() {
+            "No memory nodes are currently loaded.".to_owned()
+        } else {
+            nodes
+        }
+    )
+}
+
+pub(crate) fn project_load_batch(
+    before: &Value,
+    after: &Value,
+    requested_identifiers: &[u64],
+    active_identifiers: &[u64],
+) -> Value {
+    let before_projection = project_snapshot(before);
+    let before_roles = projection_roles(&before_projection);
+    let after_nodes = nodes_by_identifier(after);
+
+    let mut direct_nodes = Vec::new();
+    let mut direct_node_promotions = Vec::new();
+    let mut seen_direct = HashSet::new();
+    for identifier in requested_identifiers {
+        if !seen_direct.insert(*identifier) {
+            continue;
+        }
+        let previous_role = before_roles.get(identifier).copied().unwrap_or_default();
+        if previous_role < 3
+            && let Some(node) = after_nodes.get(identifier)
+        {
+            direct_nodes.push((*node).clone());
+        } else if previous_role == 3 {
+            direct_node_promotions.push(*identifier);
+        }
+    }
+
+    let direct_identifiers = requested_identifiers
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut active_nodes = Vec::new();
+    let mut seen_active = HashSet::new();
+    for identifier in active_identifiers {
+        if !direct_identifiers.contains(identifier)
+            && seen_active.insert(*identifier)
+            && before_roles.get(identifier).copied().unwrap_or_default() < 3
+            && let Some(node) = after_nodes.get(identifier)
+        {
+            active_nodes.push((*node).clone());
+        }
+    }
+
+    let full_identifiers = full_identifiers(after);
+    let batch_direct = requested_identifiers
+        .iter()
+        .filter_map(|identifier| after_nodes.get(identifier).copied())
+        .collect::<Vec<_>>();
+    let batch_active = active_identifiers
+        .iter()
+        .filter(|identifier| !direct_identifiers.contains(identifier))
+        .filter_map(|identifier| after_nodes.get(identifier).copied())
+        .collect::<Vec<_>>();
+    let direct_fanout_candidates =
+        unique_connections(&batch_direct, "fanoutConnections", &full_identifiers);
+    let direct_fanout_identifiers = direct_fanout_candidates
+        .iter()
+        .filter_map(node_identifier)
+        .collect::<HashSet<_>>();
+    let mut indirect_excluded = full_identifiers;
+    indirect_excluded.extend(direct_fanout_identifiers);
+    let indirect_fanout_candidates =
+        unique_connections(&batch_active, "fanoutConnections", &indirect_excluded);
+    let direct_fanout_nodes = direct_fanout_candidates
+        .into_iter()
+        .filter(|node| {
+            node_identifier(node).is_some_and(|identifier| {
+                before_roles.get(&identifier).copied().unwrap_or_default() < 2
+            })
+        })
+        .collect::<Vec<_>>();
+    let indirect_fanout_nodes = indirect_fanout_candidates
+        .into_iter()
+        .filter(|node| {
+            node_identifier(node).is_some_and(|identifier| {
+                before_roles.get(&identifier).copied().unwrap_or_default() < 1
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "directNodes": direct_nodes,
+        "directNodePromotions": direct_node_promotions,
+        "activeConnectionNodes": active_nodes,
+        "directFanoutNodes": direct_fanout_nodes,
+        "indirectFanoutNodes": indirect_fanout_nodes,
+    })
+}
+
+pub(crate) fn format_compact_memory_sections(projection: &Value) -> String {
+    let direct_nodes = array(projection.get("directNodes"));
+    let direct_promotions = projection
+        .get("directNodePromotions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .map(|identifier| identifier.to_string())
+        .collect::<Vec<_>>();
+    let active_nodes = array(projection.get("activeConnectionNodes"));
+    let direct_fanout = array(projection.get("directFanoutNodes"));
+    let indirect_fanout = array(projection.get("indirectFanoutNodes"));
+    let mut sections = Vec::new();
+    if !direct_nodes.is_empty() {
+        sections.push(format!(
+            "Directly loaded nodes\n\n{}",
+            direct_nodes
+                .iter()
+                .map(|node| format_context_node(node, true))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !direct_promotions.is_empty() {
+        sections.push(format!(
+            "Now directly loaded; full text already present: {}",
+            direct_promotions.join(", ")
+        ));
+    }
+    if !active_nodes.is_empty() {
+        sections.push(format!(
+            "Full active-connection nodes\n\n{}",
+            active_nodes
+                .iter()
+                .map(|node| format_context_node(node, false))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !direct_fanout.is_empty() {
+        sections.push(format!(
+            "Fanout nodes of directly loaded nodes\n\n{}",
+            direct_fanout
+                .iter()
+                .map(|node| format!(
+                    "{}: {}\n  Summary: {}",
+                    node.get("identifier")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    text(node.get("shortName"), "(none)"),
+                    text(node.get("shortDescription"), "(none)")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !indirect_fanout.is_empty() {
+        sections.push(format!(
+            "Fanout nodes only of full active-connection nodes\n\n{}",
+            indirect_fanout
+                .iter()
+                .map(|node| format!(
+                    "{}: {}",
+                    node.get("identifier")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    text(node.get("shortName"), "(none)")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    sections.join("\n\n")
+}
+
+fn project_snapshot(snapshot: &Value) -> Value {
     let direct = snapshot
         .get("directlyLoadedIdentifiers")
         .and_then(Value::as_array)
@@ -440,45 +619,99 @@ pub(crate) fn format_kmap_context(snapshot: &Value) -> String {
         .flatten()
         .filter_map(Value::as_u64)
         .collect::<HashSet<_>>();
+    let node_map = nodes_by_identifier(snapshot);
     let mut direct_nodes = Vec::new();
-    let mut active_nodes = Vec::new();
-    for node in snapshot
-        .get("nodes")
+    for identifier in snapshot
+        .get("directlyLoadedIdentifiers")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .filter_map(Value::as_u64)
     {
-        if node
-            .get("identifier")
-            .and_then(Value::as_u64)
-            .is_some_and(|identifier| direct.contains(&identifier))
-        {
-            direct_nodes.push(format_context_node(node, true));
-        } else {
-            active_nodes.push(format_context_node(node, false));
+        if let Some(node) = node_map.get(&identifier) {
+            direct_nodes.push((*node).clone());
         }
     }
-    let mut sections = Vec::new();
-    if !direct_nodes.is_empty() {
-        sections.push(format!(
-            "Directly loaded nodes\n\n{}",
-            direct_nodes.join("\n\n")
-        ));
-    }
-    if !active_nodes.is_empty() {
-        sections.push(format!(
-            "Full active-connection nodes\n\n{}",
-            active_nodes.join("\n\n")
-        ));
-    }
-    format!(
-        "Current Kmap context\n\nAlways-loaded root identifiers: {roots}\nDirectly loaded node limit: 10\nDirectly loaded memory identifiers: {loaded}\n\n{}",
-        if sections.is_empty() {
-            "No memory nodes are currently loaded.".to_owned()
-        } else {
-            sections.join("\n\n")
+    let active_nodes = array(snapshot.get("nodes"))
+        .iter()
+        .filter(|node| {
+            node_identifier(node).is_some_and(|identifier| !direct.contains(&identifier))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let full = full_identifiers(snapshot);
+    let direct_refs = direct_nodes.iter().collect::<Vec<_>>();
+    let direct_fanout_nodes = unique_connections(&direct_refs, "fanoutConnections", &full);
+    let mut indirect_excluded = full;
+    indirect_excluded.extend(direct_fanout_nodes.iter().filter_map(node_identifier));
+    let active_refs = active_nodes.iter().collect::<Vec<_>>();
+    let indirect_fanout_nodes =
+        unique_connections(&active_refs, "fanoutConnections", &indirect_excluded);
+    json!({
+        "directNodes": direct_nodes,
+        "directNodePromotions": [],
+        "activeConnectionNodes": active_nodes,
+        "directFanoutNodes": direct_fanout_nodes,
+        "indirectFanoutNodes": indirect_fanout_nodes,
+    })
+}
+
+fn nodes_by_identifier(snapshot: &Value) -> HashMap<u64, &Value> {
+    array(snapshot.get("nodes"))
+        .iter()
+        .filter_map(|node| Some((node_identifier(node)?, node)))
+        .collect()
+}
+
+fn full_identifiers(snapshot: &Value) -> HashSet<u64> {
+    array(snapshot.get("nodes"))
+        .iter()
+        .filter_map(node_identifier)
+        .collect()
+}
+
+fn projection_roles(projection: &Value) -> HashMap<u64, u8> {
+    let mut roles = HashMap::new();
+    for (key, role) in [
+        ("indirectFanoutNodes", 1),
+        ("directFanoutNodes", 2),
+        ("activeConnectionNodes", 3),
+        ("directNodes", 4),
+    ] {
+        for node in array(projection.get(key)) {
+            if let Some(identifier) = node_identifier(node) {
+                roles.insert(identifier, role);
+            }
         }
-    )
+    }
+    roles
+}
+
+fn unique_connections(nodes: &[&Value], field: &str, excluded: &HashSet<u64>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for node in nodes {
+        for connection in array(node.get(field)) {
+            let Some(identifier) = node_identifier(connection) else {
+                continue;
+            };
+            if !excluded.contains(&identifier) && seen.insert(identifier) {
+                result.push(connection.clone());
+            }
+        }
+    }
+    result
+}
+
+fn node_identifier(node: &Value) -> Option<u64> {
+    node.get("identifier").and_then(Value::as_u64)
+}
+
+fn array(value: Option<&Value>) -> &[Value] {
+    value
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 pub(crate) fn format_context_node(node: &Value, include_summary: bool) -> String {
@@ -663,6 +896,15 @@ fn indent(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn position(text: &str, needle: &str) -> usize {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{text}"))
+    }
+
+    fn occurrences(text: &str, needle: &str) -> usize {
+        text.match_indices(needle).count()
+    }
+
     #[test]
     fn compact_context_keeps_root_and_connection_identifiers() {
         let rendered = format_kmap_context(&json!({
@@ -681,5 +923,224 @@ mod tests {
         }));
         assert!(rendered.contains("Always-loaded root identifiers: 1, 2"));
         assert!(rendered.contains("Active connection identifiers: 3"));
+    }
+
+    #[test]
+    fn complete_context_is_classified_globally_before_rendering() {
+        let rendered = format_kmap_context(&json!({
+            "rootIdentifiers": [1],
+            "directlyLoadedIdentifiers": [1, 3],
+            "nodes": [
+                {
+                    "identifier": 1,
+                    "shortName": "Direct One",
+                    "shortDescription": "Direct one summary",
+                    "longDescription": "Direct one details",
+                    "ownerIdentifier": 1,
+                    "fixedConnections": [],
+                    "activeConnections": [{"identifier": 2, "shortName": "Active Two", "shortDescription": "Active two summary"}],
+                    "fanoutConnections": [
+                        {"identifier": 4, "shortName": "Direct Fanout Four", "shortDescription": "Four summary"},
+                        {"identifier": 2, "shortName": "Active Two", "shortDescription": "Must not become a fanout"}
+                    ]
+                },
+                {
+                    "identifier": 2,
+                    "shortName": "Active Two",
+                    "shortDescription": "ACTIVE SUMMARY MUST BE OMITTED",
+                    "longDescription": "Active two details",
+                    "ownerIdentifier": 1,
+                    "fixedConnections": [],
+                    "activeConnections": [],
+                    "fanoutConnections": [
+                        {"identifier": 4, "shortName": "Direct Fanout Four", "shortDescription": "Four summary"},
+                        {"identifier": 5, "shortName": "Indirect Fanout Five", "shortDescription": "INDIRECT SUMMARY MUST BE OMITTED"},
+                        {"identifier": 3, "shortName": "Direct Three", "shortDescription": "Must not become a fanout"}
+                    ]
+                },
+                {
+                    "identifier": 3,
+                    "shortName": "Direct Three",
+                    "shortDescription": "Direct three summary",
+                    "longDescription": "Direct three details",
+                    "ownerIdentifier": 1,
+                    "fixedConnections": [],
+                    "activeConnections": [{"identifier": 2, "shortName": "Active Two"}],
+                    "fanoutConnections": [{"identifier": 6, "shortName": "Direct Fanout Six", "shortDescription": "Six summary"}]
+                }
+            ]
+        }));
+
+        let direct_heading = position(&rendered, "Directly loaded nodes");
+        let active_heading = position(&rendered, "Full active-connection nodes");
+        let direct_fanout_heading = position(&rendered, "Fanout nodes of directly loaded nodes");
+        let indirect_heading = position(
+            &rendered,
+            "Fanout nodes only of full active-connection nodes",
+        );
+        assert!(direct_heading < active_heading);
+        assert!(active_heading < direct_fanout_heading);
+        assert!(direct_fanout_heading < indirect_heading);
+        assert!(
+            position(&rendered, "Node 1: Direct One") < position(&rendered, "Node 3: Direct Three")
+        );
+        assert!(
+            position(&rendered, "Node 3: Direct Three") < position(&rendered, "Node 2: Active Two")
+        );
+        assert_eq!(occurrences(&rendered, "2: Active Two"), 1);
+        assert_eq!(occurrences(&rendered, "3: Direct Three"), 1);
+        assert_eq!(occurrences(&rendered, "4: Direct Fanout Four"), 1);
+        assert!(rendered.contains("6: Direct Fanout Six\n  Summary: Six summary"));
+        assert!(rendered.contains("5: Indirect Fanout Five"));
+        assert!(!rendered.contains("ACTIVE SUMMARY MUST BE OMITTED"));
+        assert!(!rendered.contains("INDIRECT SUMMARY MUST BE OMITTED"));
+        assert!(!rendered.contains('{'));
+    }
+
+    #[test]
+    fn load_batch_upgrades_then_renders_each_final_role_once() {
+        let before = json!({
+            "directlyLoadedIdentifiers": [1],
+            "nodes": [
+                {
+                    "identifier": 1, "shortName": "Root", "shortDescription": "Root summary", "longDescription": "Root details",
+                    "fixedConnections": [], "activeConnections": [{"identifier": 2}],
+                    "fanoutConnections": [{"identifier": 5, "shortName": "Known Direct Fanout", "shortDescription": "Known summary"}]
+                },
+                {
+                    "identifier": 2, "shortName": "Previously Active", "shortDescription": "Hidden active summary", "longDescription": "Previously active details",
+                    "fixedConnections": [], "activeConnections": [],
+                    "fanoutConnections": [{"identifier": 6, "shortName": "Previously Indirect", "shortDescription": "Previously hidden summary"}]
+                }
+            ]
+        });
+        let after = json!({
+            "directlyLoadedIdentifiers": [1, 3, 2],
+            "nodes": [
+                {
+                    "identifier": 1, "shortName": "Root", "shortDescription": "Root summary", "longDescription": "Root details",
+                    "fixedConnections": [], "activeConnections": [{"identifier": 2}],
+                    "fanoutConnections": [{"identifier": 5, "shortName": "Known Direct Fanout", "shortDescription": "Known summary"}]
+                },
+                {
+                    "identifier": 2, "shortName": "Previously Active", "shortDescription": "Now directly visible", "longDescription": "Previously active details",
+                    "fixedConnections": [], "activeConnections": [],
+                    "fanoutConnections": [{"identifier": 6, "shortName": "Previously Indirect", "shortDescription": "Now direct summary"}]
+                },
+                {
+                    "identifier": 3, "shortName": "New Direct", "shortDescription": "New direct summary", "longDescription": "New direct details",
+                    "fixedConnections": [], "activeConnections": [{"identifier": 4}],
+                    "fanoutConnections": [
+                        {"identifier": 6, "shortName": "Previously Indirect", "shortDescription": "Now direct summary"},
+                        {"identifier": 8, "shortName": "New Direct Fanout", "shortDescription": "Eight summary"}
+                    ]
+                },
+                {
+                    "identifier": 4, "shortName": "New Active", "shortDescription": "Active summary omitted", "longDescription": "New active details",
+                    "fixedConnections": [], "activeConnections": [],
+                    "fanoutConnections": [
+                        {"identifier": 8, "shortName": "New Direct Fanout", "shortDescription": "Eight summary"},
+                        {"identifier": 9, "shortName": "New Indirect", "shortDescription": "Nine summary omitted"}
+                    ]
+                }
+            ]
+        });
+
+        let projection = project_load_batch(&before, &after, &[3, 2], &[2, 4, 3]);
+        let rendered = format_compact_memory_sections(&projection);
+        assert_eq!(
+            array(projection.get("directNodes"))
+                .iter()
+                .filter_map(node_identifier)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(projection.get("directNodePromotions"), Some(&json!([2])));
+        assert_eq!(
+            array(projection.get("activeConnectionNodes"))
+                .iter()
+                .filter_map(node_identifier)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_eq!(
+            array(projection.get("directFanoutNodes"))
+                .iter()
+                .filter_map(node_identifier)
+                .collect::<Vec<_>>(),
+            vec![6, 8]
+        );
+        assert_eq!(
+            array(projection.get("indirectFanoutNodes"))
+                .iter()
+                .filter_map(node_identifier)
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+        assert!(
+            position(&rendered, "Node 3: New Direct")
+                < position(
+                    &rendered,
+                    "Now directly loaded; full text already present: 2"
+                )
+        );
+        assert!(
+            position(
+                &rendered,
+                "Now directly loaded; full text already present: 2"
+            ) < position(&rendered, "Node 4: New Active")
+        );
+        assert!(
+            position(&rendered, "Node 4: New Active")
+                < position(&rendered, "6: Previously Indirect")
+        );
+        assert!(
+            position(&rendered, "6: Previously Indirect") < position(&rendered, "9: New Indirect")
+        );
+        assert_eq!(occurrences(&rendered, "8: New Direct Fanout"), 1);
+        assert!(!rendered.contains("Node 2: Previously Active"));
+        assert!(!rendered.contains("Previously active details"));
+        assert!(!rendered.contains("Known Direct Fanout"));
+        assert!(!rendered.contains("Nine summary omitted"));
+    }
+
+    #[test]
+    fn compact_projection_is_materially_smaller_than_structured_context() {
+        let connections = (100..164)
+            .map(|identifier| json!({
+                "identifier": identifier,
+                "shortName": format!("Fanout {identifier}"),
+                "shortDescription": "A repeated connection description that serialized structures duplicate many times."
+            }))
+            .collect::<Vec<_>>();
+        let nodes = (1..=8)
+            .map(|identifier| {
+                json!({
+                    "identifier": identifier,
+                    "shortName": format!("Dense node {identifier}"),
+                    "shortDescription": format!("Dense node {identifier} summary"),
+                    "longDescription": format!("Important durable details for node {identifier}."),
+                    "ownerIdentifier": 1,
+                    "fixedConnections": [],
+                    "activeConnections": [],
+                    "fanoutConnections": connections.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let snapshot = json!({
+            "rootIdentifiers": [1],
+            "directlyLoadedIdentifiers": [1, 2, 3, 4, 5, 6, 7, 8],
+            "nodes": nodes,
+        });
+        let rendered = format_kmap_context(&snapshot);
+        let structured = snapshot.to_string();
+        assert!(
+            rendered.len() * 2 < structured.len(),
+            "{} compact bytes versus {} structured bytes",
+            rendered.len(),
+            structured.len()
+        );
+        assert!(!rendered.contains("shortDescription"));
+        assert!(!rendered.contains('{'));
     }
 }

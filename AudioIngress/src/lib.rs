@@ -21,6 +21,7 @@ use kcode_gemini_api::{
     CompletionStatus, GEMINI_31_PRO, Gemini, GenerationOptions, MediaInput, MultimodalRequest,
     ServiceTier, StructuredOutput, ThinkingLevel,
 };
+use kennedy_chatend::hydrate_state_chatend_text;
 use ruopus::encode_ogg_opus;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -1562,6 +1563,10 @@ fn piece_select() -> &'static str {
 fn row_piece(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngressPieceRecord> {
     let state_json: String = row.get(11)?;
     let failures_json: String = row.get(14)?;
+    let mut piece_state = serde_json::from_str(&state_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    hydrate_state_chatend_text(&mut piece_state);
     Ok(IngressPieceRecord {
         id: row.get(0)?,
         recording_id: row.get(1)?,
@@ -1574,13 +1579,7 @@ fn row_piece(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngressPieceRecord> {
         estimated_tokens: row.get(8)?,
         phase: row.get(9)?,
         provenance_id: row.get(10)?,
-        state: serde_json::from_str(&state_json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                11,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
+        state: piece_state,
         version: row.get(12)?,
         ingress_failure_count: row.get(13)?,
         ingress_failures: serde_json::from_str(&failures_json).map_err(|error| {
@@ -2153,7 +2152,7 @@ mod tests {
         let now = "2026-07-16T10:00:00Z";
         db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning,final_transcript) VALUES('r',?1,'note.wav','audio/wav',10,?2,?2,?2,'originals/x.wav','complete',?3,?4,?5,'Final transcript')",params!["a".repeat(64),now,GEMINI_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
         db.execute("INSERT INTO audio_chunks(recording_id,chunk_index,audio_start_ms,audio_end_ms,relative_path,transcript_json) VALUES('r',0,0,1000,'chunks/0.wav',?1)",[r#"{"lines":[{"speaker":"Speaker 1","text":"Hello"}]}"#]).unwrap();
-        db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,state_json,created_at,updated_at) VALUES('p','r',0,'Final transcript',4,'complete',?1,?2,?2)",params![r#"{"historyIngress":{"completed":true}}"#,now]).unwrap();
+        db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,state_json,created_at,updated_at) VALUES('p','r',0,'Final transcript',4,'complete',?1,?2,?2)",params![r#"{"historyIngress":{"format":"kennedy-chatend","completed":true,"messages":[{"role":"user","content":"Legacy audio ingress"}]}}"#,now]).unwrap();
 
         let history = fetch_recording_history(&db, "r").unwrap();
         assert_eq!(
@@ -2167,6 +2166,10 @@ mod tests {
         );
         assert_eq!(history.pieces.len(), 1);
         assert_eq!(history.pieces[0].state["historyIngress"]["completed"], true);
+        assert_eq!(
+            history.pieces[0].state["historyIngress"]["chatendText"],
+            "David\n\nLegacy audio ingress"
+        );
     }
 
     #[test]
