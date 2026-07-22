@@ -38,50 +38,29 @@ uploaded -> chunking -> transcribing -> reconciling -> ready_for_ingress
 
 Provider or transport failure retains the current stage, concise error, attempt
 count, and next-attempt time. Delay grows exponentially to one hour. A killed
-process can repeat the current idempotent stage but cannot lose an accepted
-original, completed chunk transcript, final transcript, or ingress checkpoint.
+process cannot lose an accepted original, completed final transcript, prepared
+piece, or ingress checkpoint. It does lose the active external transcription
+job and starts a new one from the original bytes, potentially repeating provider
+work.
 Structurally invalid or truncated WAV input is terminal instead of being
 retried forever; its accepted original and diagnostic remain available.
 
 Only WAV input is processed. The accepted original is archived byte-for-byte.
-Windows are equalized for the whole recording,
-are at most 240 seconds, and overlap their neighbors by 15 seconds. Each window
-is a restartable working WAV under `chunks/{recording_id}/` and has an ordered
-database row with recording-relative bounds. Immediately before a request, the
-working WAV is decoded and resampled to the encoder's 48 kHz input rate entirely
-in memory, without changing its mono or stereo channel count. It is encoded as
-Ogg Opus at 192 kbps per channel (384 kbps for stereo). `kcode-gemini-api` sends
-those bytes inline and requests the transcription JSON with a response schema;
-neither an Opus file nor a Gemini Files API object is created. Once every
-Kennedy-ingress piece completes, the local working WAV directory is deleted
-while the raw original and all database transcript/history results remain.
-Startup performs the same cleanup for older completed recordings.
+The service gives those bytes to an in-memory `kcode-audio-transcribe` job. The
+external library owns validation, working audio, chunk planning, provider
+calls, retries within that job, and canonical transcript reconciliation.
+AudioIngress polls the job, persists its serialized status snapshot for browser
+progress and diagnostics, and maps the reported steps to its durable
+`chunking`, `transcribing`, and `reconciling` stages. It creates no working WAV
+files or `audio_chunks` rows for new jobs. Those rows and the
+`chunks/{recording_id}/` directory are retained only for older data; startup and
+final completion remove old shard directories when present.
 
-`gemini-3.1-pro-preview` receives up to four independent windows concurrently
-and returns structured utterances with relative timestamps, chunk-local
-speakers, language, original text, English translation, annotations, and
-confidence. Each successful result is committed immediately; a retry sends
-only unfinished windows. `gpt-5.6-sol` with `xhigh` reasoning receives all
-resulting JSON in database order. It produces the canonical complete Markdown
-transcript, removes the known overlap, and reconciles speaker labels without
-inventing unsupported real identities.
-
-Before the worker starts, it requests the same cached, sanitized Codex catalog
-as the Intelligence backend. Concurrent startup performs one shared load or
-discovery. Provider base instructions are blank, model message templates and
-agent-tool selectors are removed, model-selected skill instructions are off,
-and advertised context limits must remain unchanged. Codex runtime and
-developer instructions are empty. A `debug prompt-input` probe must show
-exactly the one supplied transcript-prompt item. Its successful result is
-cached for the exact Codex/catalog and audio prompt-configuration version;
-either an uncached validation failure or a bad catalog aborts startup rather
-than silently using stock or hidden Codex instructions.
-
-The estimate is `ceil(Unicode characters / 4)`. Sol inserts
-`<!-- KENNEDY_INGRESS_BREAK -->` only at sensible boundaries when a transcript
-needs more than one piece. The service strips markers and refuses to publish
-any empty or greater-than-50,000-token piece. It asks Sol for a second
-copy-only boundary pass if the initial result exceeds that contract.
+On library completion, AudioIngress stores the canonical transcript and splits
+it at paragraph or line boundaries when necessary. The estimate is
+`ceil(Unicode characters / 4)`, and no nonempty prepared piece may exceed
+50,000 estimated tokens. It records the library's transcription and
+reconciliation model attribution in the transcript header.
 
 ## Kennedy ingress queue
 
@@ -105,8 +84,8 @@ start. It supplies the `end-session-v2` completion-protocol
 identifier when claiming work, and the backend rejects claims from older
 clients. It runs the normal mutation tool loop with the additional
 audio-ingress prompt policy under the backend's serialized Kmap-writer gate.
-Completing the final piece atomically marks the recording complete and then
-removes its generated local WAV shards.
+Completing the final piece atomically marks the recording complete and removes
+any legacy local WAV shards.
 The completion endpoint independently requires a successful
 `EndSession` entry in the persisted history-ingress tool log. Historical
 pieces identified as prematurely completed remain terminal with

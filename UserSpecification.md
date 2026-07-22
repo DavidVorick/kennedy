@@ -76,14 +76,15 @@ the Kmap.
 
 ## The Data Store
 
-An SQLite database stores 3 types of data:
+The Kweb stores three logical data types in SQLite:
 
 + A knowledge node
 + A data provenance node
 + A data history node
 
-The SQLite database is the only form of persistant storage for the kweb.
-Everything must be stored as one of these three types of nodes.
+Knowledge and history state is represented by those three types. Large
+provenance payloads and attached artifacts may live in the Kweb's sibling
+immutable artifact tree, referenced by provenance metadata in SQLite.
 
 ### The Knowledge Node
 
@@ -103,8 +104,7 @@ These are the fields for the knowledge node:
 Storage assigns no active/fanout meaning to recent order. The backend session
 treats the first eight recent identifiers as active and the remainder as
 fanout; the frontend mirrors that projection for rendering. It
-also applies any three-slot fixed-connection UI policy. A migrated node without
-a timestamp receives and persists the current time when first loaded.
+also applies the three-slot fixed-connection UI policy.
 
 The unique identifier is the key for the data history node within the SQLite
 database that serves as the head of the linked list establishing the data
@@ -166,11 +166,11 @@ metadata:
 
 + A directly loaded node includes its short identifier, short name, short and
   long descriptions, latest modifying model/thinking mode and timestamp, and
-  identifier-only task, active, and fanout connection lists.
+  identifier-only fixed, active, and fanout connection lists.
 + Each full node pulled in through an active connection appears once in a later
   section. It includes its short identifier, short name, long description, and
   latest modifying model and thinking mode, but omits its short description.
-  Its task, active, and fanout connections are identifier-only.
+  Its fixed, active, and fanout connections are identifier-only.
 + Fanout nodes directly connected to a loaded node appear once with identifier,
   name, and short description, unless that node is already represented in full.
 + Fanout nodes reached only from an active-connection node appear once with
@@ -621,27 +621,18 @@ and a restartable database job. SHA-256 is the idempotency identity, so a large
 historical repository can query or resubmit files without ingressing renamed or
 recopied audio twice.
 
-The server divides a recording into equalized audio windows no longer than four
-minutes, with fifteen seconds of overlap between neighbors. It sends up to four
-independent windows concurrently to Gemini 3.1 Pro Preview for structured
-speaker-aware transcription, preserving original-language utterances, per-line
-English translation when needed, timestamps, annotations, and uncertainty.
-Each working WAV window is resampled to 48 kHz only as part of the in-memory
-Opus conversion, retaining its mono or stereo channel count and using 192 kbps
-per channel (384 kbps for stereo). It is sent inline through
-`kcode-gemini-api`; the raw original remains byte-for-byte as received, and the
-compressed request buffer is discarded after the response.
-Each result is stored under its original window index so reconciliation remains
-strictly chronological, and retries send only unfinished windows. Gemini's
-longer advertised duration is deliberately not used because observed
-transcription fidelity degrades sharply beyond roughly five minutes.
+Kennedy passes the retained WAV bytes to the published
+`kcode-audio-transcribe` library. That dependency owns WAV validation,
+transcription, provider calls, and reconciliation into the canonical
+speaker-aware transcript. Kennedy persists pollable status snapshots for
+display, but the active transcription job and all working audio are
+in-memory. A process restart starts a new library job from the durable original
+and may repeat provider work; it does not resume individual windows.
 
-One `gpt-5.6-sol` `xhigh` pass receives the complete ordered set, removes only
-the repeated overlap, reconciles speakers across independently transcribed
-windows, and produces the canonical final transcript. If the result exceeds an
-estimate of 50,000 tokens, Sol selects sensible conversational or topical
-boundaries so every piece stays at or below that ceiling. Pieces are not forced
-to equal size.
+After the library returns the canonical transcript, Kennedy divides an
+oversized result at readable text boundaries so every memory-ingress piece is
+at or below the 50,000 estimated-token ceiling. Pieces are not forced to equal
+size.
 
 Kennedy ingresses those final pieces individually and chronologically under the
 same global serialization as conversation history. Every provenance node and
@@ -651,11 +642,11 @@ superseded, or then-current statements from knowledge independently marked as
 current. The audio-ingress prompt treats transcription and speaker identity as
 fallible, preserves important uncertainty or contradiction, and permits dated
 clarification notes or concrete follow-up tasks when context is materially
-missing. Preparation and Kmap mutation are server-side and restartable;
-durable checkpoints resume whenever `kennedy-server` is available.
-After every final piece completes Kennedy ingress, the generated local audio
-windows are deleted. The raw content-addressed original and all transcript,
-retry, and ingress metadata remain archived.
+missing. Preparation and Kmap mutation are server-side. Accepted originals,
+completed transcripts, prepared pieces, and Kmap-ingress checkpoints are
+restartable; only an active external transcription job is ephemeral. The raw
+content-addressed original and all persisted transcript, retry, and ingress
+metadata remain archived.
 
 ### Self Time
 
@@ -779,10 +770,12 @@ paid transcription.
 
 Audio Ingress lists the complete durable recording history by recording-start
 time, newest first, regardless of when each vnote was uploaded or ingressed.
-Selecting a vnote shows its recording time and hash, processing status, Gemini
-chunk transcripts, Sol's reconciled final transcript, Kennedy-sized pieces,
-retry failures, and the saved Kennedy ingress Chatend for every piece. The full
-transcript and other large artifacts begin collapsed. The large center display
+Selecting a vnote shows its recording time and hash, external transcription-job
+progress, the reconciled final transcript, Kennedy-sized pieces, retry failures,
+and the saved Kennedy ingress Chatend for every piece. Legacy per-chunk
+transcripts remain visible when an older recording has them; new byte-only jobs
+do not create those records. The full transcript and other large artifacts
+begin collapsed. The large center display
 appends a conversation-style History Ingress section for every transcript
 piece, while the inspector's Full History orders those piece sessions and
 retains all pre-reset contexts. A terminal memory-ingress failure exposes an

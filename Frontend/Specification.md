@@ -308,11 +308,11 @@ short identifiers, but do not count toward the ten-directly-loaded-node limit.
 The structured snapshot above remains available to frontend rendering and
 recovery, but the canonical model-readable Kmap text is a compact projection:
 
-1. All directly loaded nodes retain short and long descriptions. Their task,
+1. All directly loaded nodes retain short and long descriptions. Their fixed,
    active, and fanout edges contain identifiers only.
 2. All full active-connection nodes not already emitted as directly loaded are
    emitted once with their names and long descriptions; short descriptions are
-   omitted. Their task, active, and fanout edges also contain identifiers only.
+   omitted. Their fixed, active, and fanout edges also contain identifiers only.
 3. Fanout nodes of directly loaded nodes not emitted in either full-node tier
    are emitted once with identifier, name, and short description.
 4. Fanout nodes of full active-connection nodes not emitted in any preceding
@@ -621,8 +621,7 @@ checkpointed before the loop returns its control sentinel. In self time it
 accepts `{}` or `{"message":"A message for the next self-time session."}`; the
 optional non-empty message is limited to 400,000 characters and is forwarded
 only if another clean-slate slice can open. With less than five minutes left,
-the self-time run ends and no message is forwarded. The old session-specific
-end-tool names and `EndTurn` are not exposed or accepted. `EndSession` may be
+the self-time run ends and no message is forwarded. `EndSession` may be
 requested beside other calls. It fails if another call in that native call
 group failed; after the failure is handled, Kennedy may call it again.
 
@@ -929,9 +928,9 @@ pieces with the same source time remain ordered by their persisted piece index.
 For audio, the backend creates `audio-vnote` provenance with the
 recording-start `source_created_at`; the recording hash and piece index remain
 inside the provenance content. The
-retained content is the Sol-produced final transcript piece, not Gemini JSON or
-audio bytes. Its heading repeats recording time, hash, filename, and piece
-position. Prompt composition selects `AudioIngressSession.txt`, then adds the
+retained content is the reconciled final transcript piece, not provider working
+data or audio bytes. Its heading repeats recording time, hash, filename, and
+piece position. Prompt composition selects `AudioIngressSession.txt`, then adds the
 same Kmap basics, read tools, and write tools used by other sessions. The
 audio-provenance context explicitly tells Kennedy that `Created` is historical
 recording time. The audio backend stores the same complete ingress Chatend checkpoints,
@@ -1079,15 +1078,19 @@ until a newer successful call replaces it.
 ### 11.3 Audio Ingress History
 
 `Audio Ingress` is a top-level tab with no composer. Its sidebar lists all
-durable audio recordings in newest-received order, showing filename,
+durable audio recordings in newest-recording-time order, showing filename,
 recording-start date, and current processing or ingress status. Selecting a
-recording loads one complete history response containing its metadata, ordered
-Gemini chunk transcripts, Sol-produced final transcript, Kennedy transcript
-pieces, durable retry failures, and each piece's checkpointed ingress archive.
+recording loads one complete history response containing its metadata, latest
+external transcription-job status snapshot, reconciled final transcript,
+Kennedy transcript pieces, durable retry failures, and each piece's
+checkpointed ingress archive. Older records may also contain ordered Gemini
+chunk transcripts; new byte-only library jobs do not create them.
 
 The center panel uses disclosure rows for the potentially large final
-transcript, chunk JSON, and transcript-piece text. All are closed by default,
-including the full Sol transcript. Below the transcript pieces, each Kennedy
+transcript, legacy chunk JSON when present, and transcript-piece text. All are
+closed by default, including the full reconciled transcript. Above them, the
+pollable external-job steps show preparation progress. Below the transcript
+pieces, each Kennedy
 piece renders the same inline history-ingress continuation used by conversation
 and Telegram records: status, retry failures, mutation summary, usage, Kennedy
 messages, and collapsible tool traffic. The right inspector also treats each
@@ -1104,7 +1107,7 @@ The explorer starts at the user root and provides persistent toolbar actions
 for jumping directly to either the user root or Kennedy root. It also supports:
 
 - viewing a full knowledge node with `GET /api/v1/kmap/nodes/{node_id}`,
-- following task, active, and fanout connections,
+- following fixed, active, and fanout connections,
 - viewing the node's history chain with
   `GET /api/v1/kmap/nodes/{node_id}/history`,
 - opening a history entry's source with

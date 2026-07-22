@@ -7,7 +7,7 @@ Kennedy is a local-first memory application built around the kweb described in
 document defines the architecture used to implement that behavior, and the
 component specifications define the detailed contracts.
 
-The MVP has seven logical runtime components:
+The MVP has eight logical runtime components:
 
 1. **Frontend**: a browser-native HTML/CSS/JavaScript observer and command
    client. It renders durable state, keeps unsent drafts and capture state, and
@@ -34,17 +34,20 @@ The MVP has seven logical runtime components:
    without constructing prompts or running Kennedy itself. Kennedy passes the bot token and an identity
    callback into the library; Kennedy's user directory separately owns
    whitelist/TOFU identity, `/adduser` capability, and Kmap-root assignments.
-7. **Audio ingress library**: an in-process Rust router. It durably accepts vnote WAV
-   files, owns content-hash idempotency and restartable preparation, transcribes
-   ordered overlapping chunks with Gemini, reconciles a final transcript with
-   Sol, and queues timestamped transcript pieces for Kennedy ingress.
+7. **Audio ingress library**: an in-process Rust router. It durably accepts
+   vnote WAV files, owns content-hash idempotency, delegates byte-only
+   transcription to `kcode-audio-transcribe`, persists the completed transcript,
+   and submits timestamped transcript pieces for Kennedy ingress.
+8. **Memory ingress library**: a storage-only Rust queue shared by Conversation
+   History and Audio Ingress. It owns the single durable claim, provenance
+   binding, checkpoints, retries, failures, and completion for Kmap updates.
 
-The Rust services are library crates compiled into one `kennedy-server`
+The Kennedy-owned Rust services are library crates compiled into one `kennedy-server`
 executable, whose Tokio runtime also runs the native Rust orchestrator. Kmap,
 intelligence, conversation history, audio ingress, Telegram identity, and the
-frontend are merged into one Axum application on port 4321. All Kennedy
-coordination happens in the backend orchestrator through the same public HTTP
-APIs used for durable boundaries. The published Telegram transport remains on
+frontend are merged into one Axum application on port 4321. The orchestrator
+calls Kennedy-owned service handles directly; their HTTP routes are browser
+adapters. The published Telegram transport remains on
 port 4324 until its crate exposes a mergeable router instead of owning a
 listener.
 The exact-pinned `kcode-rust-libs-v2` 1.1.0 adapter is also imported into the main
@@ -84,8 +87,8 @@ The backend appends the provider-reported current model and thinking mode.
   root roles.
 - The conversation history backend is the single authority for unfinished and
   completed conversation records.
-- Logical service isolation is preserved except for the deliberate in-process
-  Kmap storage-library adapter in the main server.
+- Logical service isolation is preserved through crate and service-handle
+  boundaries even though Kennedy-owned calls are deliberately in-process.
 - The intelligence backend never needs to understand the kweb, short
   identifiers, or individual Ktool contracts.
 - The backend sends the full formatted application context when starting a
@@ -147,6 +150,7 @@ later check stages are offline. Version 1.1.0 is approved for Kennedy's
 One kennedy-server process
   ├─ Encrypted credential vault -------- data/kennedy-secrets.age
   ├─ Managed Rust libraries ------------ /home/user/dev/kennedy/kcode/kcode-rust-libs
+  ├─ Shared memory-ingress queue -------- data/kennedy-memory-ingress.sqlite3
   ├─ Main HTTP application :4321
   │    ├─ /api/v1/kmap/* via kweb-db-core
   │    ├─ intelligence routes via kcode libraries
@@ -172,7 +176,7 @@ cross-origin and permits requests from the frontend origin. Both listeners
 bind to loopback by default.
 
 The encrypted vault is portable rather than machine-bound. Copying it with the
-five databases and audio media preserves configured credentials and queued
+six databases and audio media preserves configured credentials and queued
 vnotes on a new machine, where the same passphrase unlocks the vault. The vault
 is excluded from Git. Kennedy has no tracked runtime configuration file.
 
@@ -186,8 +190,9 @@ backup fails while Kennedy is running, and a competing server fails before it
 can mutate a backup source.
 
 While that boundary is held, the command uses SQLite's backup API to create
-standalone snapshots of the audio-ingress, Telegram transport, user directory,
-conversation-history, and Kweb databases, copies the complete Kweb provenance-artifact and audio media trees and still-encrypted
+standalone snapshots of the audio-ingress, memory-ingress, Telegram transport,
+user-directory, conversation-history, and Kweb databases, copies the complete
+Kweb provenance-artifact and audio media trees and still-encrypted
 credential vault when present, verifies SQLite integrity and foreign keys, and
 atomically publishes a private timestamped `.tar.gz`. The archive contains a
 checksummed JSON manifest and a recovery README beginning with the creating
@@ -229,10 +234,11 @@ adds downstream content that its client cannot observe, Full view shows exactly
 what Kennedy sent to Codex and does not claim to show the hidden addition.
 Legacy archives retain their former backend-hydrated plaintext compatibility
 view and are never used to replace a v3 transport transcript. Main view uses
-the separate structured recovery fields. It provides full-context,
-system-prompt-only, and expandable Kmap-memory views. The memory view derives
-node provenance from the Kweb context snapshot so direct loads, task edges,
-active-edge expansions, and summary-only fanout references remain visually distinct.
+the separate structured recovery fields and presents system context, tool
+activity, and expandable Kmap memory as collapsible content. The memory view
+derives node provenance from the Kweb context snapshot so direct loads, fixed
+edges, active-edge expansions, and summary-only fanout references remain
+visually distinct.
 Token, context-window, and cache telemetry is displayed in the Chatend header.
 
 The canonical Kmap formatter normalizes memory by role instead of repeating
@@ -256,16 +262,15 @@ The server emits one concise log per LLM call and tool call plus an aggregate
 turn line that separates LLM, tool, and other orchestration time.
 Provider IDs and credentials remain hidden.
 
-The frontend itself has no persistent state. It saves versioned, opaque,
-lossless recovery archives to the conversation history API before generation,
-after complete tool rounds, and after final output. Structured content is
-preserved for future media support, but the JSON archive is never used as a
-model prompt. It reconstructs the live session from that backend after a reload
-or abrupt close while refreshing the active manuals and required root context.
-Conversation History persists a bounded summary beside each opaque archive.
-The frontend starts from those compact records so a large collection of media
-and Chatend histories cannot block the sidebar, then retrieves the complete
-state only for a conversation it opens or restores.
+The frontend itself has no persistent state. The backend orchestrator saves
+versioned, opaque, lossless recovery archives to Conversation History before
+generation, after complete tool rounds, and after final output. Structured
+content is preserved for future media support, but the JSON archive is never
+used as a model prompt. The backend restores live sessions after restart;
+browsers only reload the resulting durable state. Conversation History persists
+a bounded summary beside each opaque archive. The frontend starts from those
+compact records so a large collection of media and Chatend histories cannot
+block the sidebar, then retrieves the complete state only for a record it opens.
 
 ### 4.2 Kmap Storage Library and HTTP Adapter
 
@@ -302,26 +307,25 @@ directory instead of duplicating the frontend's filename manifest in Rust.
 Adding a new mode prompt therefore cannot fail merely because a second
 hardcoded allowlist was not updated.
 
-Frontend startup treats Kweb, prompt assets, conversation history,
-intelligence, Telegram, and audio ingress as separate feature dependencies.
-Successful subsystems remain usable when a sibling subsystem fails. Shared
-identity, Kmap-basics, and read-tools assets gate every model session;
-session-specific and write assets gate only modes that consume them. In
-particular, `AudioIngressSession.txt` gates audio Kmap mutation without gating
-conversation chat, ordinary history ingress, audio preparation, or audio
-history inspection. Conversation and audio ingress queue polls also isolate
-transient failures from one another.
+The orchestration worker waits until Kmap, intelligence, Conversation History,
+Telegram, Audio Ingress, roots, provider metadata, and every prompt manual are
+available, then restores backend-owned work. AudioIngress preparation has its
+own worker and does not require an open browser or an active orchestration
+session. The browser polls durable view data and does not participate in either
+startup path.
 
 ### 4.3 Intelligence Adapter and Standalone Libraries
 
-`kcode-codex-runtime` owns Codex generation, native Codex web search, login and
-prompt-boundary validation, and the process-wide versioned sanitized model
-catalog cache shared with AudioIngress. `kcode-gemini-api` owns Gemini grounded
-search, `kcode-openai-api` owns paid transcription and image generation,
+`kcode-codex-runtime` owns the v1 Codex path used for isolated web research and
+audio reconciliation, including login and prompt-boundary validation, and the
+process-wide versioned sanitized model catalog cache. `kcode-codex-runtime-v2`
+owns Kennedy's app-server conversation turns. `kcode-gemini-api` owns Gemini
+grounded search and supplies the configured audio-transcription client;
+`kcode-openai-api` owns paid conversational-audio transcription,
 `kcode-web-fetch` owns safe bounded local HTTP fetching, and
 `kcode-doc-extraction` owns local PDF, DOCX, spreadsheet, and text extraction.
-Each is standalone and can be moved to its own repository and crates.io without
-Kennedy code.
+Each is a published dependency maintained outside this repository and contains
+no Kennedy-specific orchestration.
 
 `kcode-rust-libs-v2` owns managed-library migration, immutable source
 generations, optimistic complete replacement, disposable Podman checks, and
@@ -359,8 +363,8 @@ conversation continuation chain.
 
 ### 4.4 Conversation History Backend
 
-The conversation history backend owns its own SQLite database, opaque frontend
-checkpoints, optimistic record versions, and the conversation phase machine:
+The conversation history backend owns its own SQLite database, opaque backend
+session checkpoints, optimistic record versions, and the conversation phase machine:
 
 ```text
 active -> ingress_pending -> ingress_in_progress -> complete
@@ -438,38 +442,31 @@ never receives the rest of the Chatend.
 
 ### 4.6 Audio Ingress Backend
 
-The audio-ingress backend owns a fourth SQLite database and a private media
+The audio-ingress backend owns its own SQLite database and a private media
 tree. Upload is streaming and complete only after the WAV has been synced,
 hashed, content-addressed, and represented by a durable `uploaded` row. The
 SHA-256 uniqueness constraint is the recording identity used by both normal and
 historical imports; filename changes do not create duplicate ingestion.
 
-Its restartable worker advances one oldest job through `chunking`,
-`transcribing`, `reconciling`, and `ready_for_ingress`. WAV chunks are equalized
-for a recording, never exceed four minutes, and overlap adjacent windows by
-fifteen seconds. The archived original is the byte-for-byte uploaded WAV. For
-each request, AudioIngress resamples a working WAV to 48 kHz only inside the
-in-memory Ogg Opus conversion, retains its mono or stereo channel count, and
-encodes at 192 kbps per channel (384 kbps for stereo). `kcode-gemini-api` sends
-the Opus bytes inline to `gemini-3.1-pro-preview` and applies the JSON response
-schema for utterances with local speaker labels, original language, English
-translation, timestamps, annotations, and confidence. No compressed audio is
-persisted and no Gemini Files API object is created. Failed provider stages
-retain their exact durable stage and retry with bounded exponential delay after
-restart.
+Its worker passes the retained original bytes to an in-memory
+`kcode-audio-transcribe` job and persists serialized status snapshots as the
+job reports validation, chunk planning, transcription, and reconciliation
+progress. The external library owns the working audio, provider interaction,
+and canonical transcript construction; Audio Ingress does not create durable
+chunks for new jobs. If the process exits, Kennedy starts a new job from the
+retained original and may repeat provider work. The status snapshot is useful
+for display and diagnostics, not a resumable library checkpoint.
 
-One fresh ephemeral `gpt-5.6-sol`/`xhigh` turn receives all chunk transcripts
-in exact chronological order, reconciles speakers, removes repeated overlap,
-and produces the canonical final transcript without summarizing it. Sol inserts
-explicit sensible boundaries when necessary; a second copy-only Sol pass is
-used if a resulting piece exceeds the shared estimate of one token per four
-Unicode characters and hard limit of 50,000 estimated tokens. The database
-then owns one independently checkpointed Kennedy-ingress row per final piece.
-The service calls neither Kweb nor the intelligence backend.
-After every Kennedy-ingress row reaches `complete`, the service deletes the
-recording's generated WAV shard directory. The raw content-addressed original,
-chunk transcript JSON, canonical transcript, and ingress history remain
-durable; startup also removes shard directories left by older completed jobs.
+When the library completes, Audio Ingress persists the canonical transcript
+and divides it at paragraph or line boundaries as needed to keep every piece
+within the shared estimate of one token per four Unicode characters and the
+50,000 estimated-token limit. The database then owns one independently
+checkpointed Kennedy-ingress row per final piece. The service calls neither
+Kweb nor the intelligence adapter. The raw content-addressed original,
+canonical transcript, latest library status, and ingress history remain
+durable. Historical `audio_chunks` rows and generated shard directories are
+compatibility data only; new jobs create neither, and completed-record cleanup
+removes any old shard directory.
 
 ## 5. Session Model
 
@@ -703,13 +700,14 @@ without a browser, and Kmap mutation resumes automatically while
 `kennedy-server` is running.
 
 The UI's `Audio Ingress` tab lists durable recording jobs independently of
-conversation history. A recording-detail endpoint returns its final transcript,
-ordered Gemini chunk transcripts, Kennedy ingress pieces, retry records, and
-each piece's checkpointed Chatend. The center pane displays preparation
-artifacts and piece text as closed disclosures, then renders every piece's
-history ingress in the same inline continuation format as conversation and
-Telegram records. The existing inspector renders every piece as an ordered Full
-History phase, including pre-reset segments.
+conversation history. A recording-detail endpoint returns its latest external
+job-status snapshot, final transcript, Kennedy ingress pieces, retry records,
+and each piece's checkpointed Chatend. It also returns legacy Gemini chunk rows
+when an older recording has them; new byte-only jobs create none. The center
+pane displays preparation artifacts and piece text as closed disclosures, then
+renders every piece's history ingress in the same inline continuation format as
+conversation and Telegram records. The existing inspector renders every piece
+as an ordered Full History phase, including pre-reset segments.
 
 Shared rendering captures the current record/view identity, scroll position,
 bottom-following state, open disclosure keys, and focused keyed control before
@@ -747,9 +745,10 @@ artifact metadata without placing the bytes back in JSON.
 
 Connections are normalized into ordered `fixed_connections` and
 `recent_connections` tables only to preserve ID arrays and foreign-key
-integrity. The storage layer gives those arrays no graph semantics. The frontend treats
-the first eight recent IDs as active and the remainder as fanout and performs
-connect/consolidate/fixed workflows using ordinary complete-state updates.
+integrity. The storage layer gives those arrays no graph semantics. The backend
+session treats the first eight recent IDs as active and the remainder as fanout
+and performs connect/consolidate/fixed workflows using ordinary complete-state
+updates. The frontend mirrors that projection for rendering.
 
 `knowledge_nodes.owner_node_id` is nullable. Null is exposed as `unowned`; a
 self-owner sentinel resolves to the created/updated node ID. The library does
@@ -802,7 +801,13 @@ specification.
 ```text
 UserSpecification.md
 TechnicalDesign.md
+AudioIngress/
+  Specification.md
+Chatend/
+  src/lib.rs
 ConversationHistory/
+  Specification.md
+MemoryIngress/
   Specification.md
 Frontend/
   Specification.md
@@ -830,11 +835,12 @@ KennedyServer/
     worker.rs
 ```
 
-Implementation code belongs under its owning component directory.
-The Kweb storage and six kcode libraries are external crates.io dependencies,
-not workspace members. Credential-bearing provider libraries use exact version
-requirements; the other kcode libraries use compatible version requirements
-resolved by the workspace lockfile.
+Implementation code belongs under its owning component directory. Kweb
+storage, Telegram transport, audio transcription, managed Rust libraries, and
+provider/content-processing runtimes are external crates.io dependencies, not
+workspace members. Credential-bearing dependencies use exact version
+requirements; the others use compatible version requirements resolved by the
+workspace lockfile.
 
 ## 9. MVP Non-Goals
 
