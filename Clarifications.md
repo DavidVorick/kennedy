@@ -990,3 +990,15 @@ canonical documents; this file is not an append-only log.
 - The Chatend context-usage display shows the latest available measurement of
   current context-window occupancy, not cumulative tokens consumed across the
   provider thread. Keep cumulative token totals separate as usage telemetry.
+
+## AudioIngress and MemoryIngress Boundary
+
+- `kennedy-audio-ingress` may remain Kennedy-specific and accept a
+  `kennedy-memory-ingress` queue, but it owns only durable audio intake,
+  transcription, and preparation of the final transcript. Its interaction
+  with MemoryIngress should end after inserting the immutable transcript
+  payload or ordered transcript pieces into that queue.
+- MemoryIngress owns the submitted payload and every later claim, checkpoint,
+  retry, failure, repair, and completion transition. The orchestration worker
+  must consume audio payloads directly from MemoryIngress instead of fetching
+  pieces from, or proxying lifecycle operations through, AudioIngress.

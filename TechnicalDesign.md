@@ -340,12 +340,15 @@ environment-backed `view_image` schemas despite their exposed switches being
 false, but Kennedy receives no invisible instruction about them. The session
 executor recognizes WebSearch and WebFetch inside native `call_ktool` requests,
 invokes the corresponding intelligence API, checkpoints the result, and returns
-it through the matching Codex tool-call ID. Quality and balanced search runs are
-fresh ephemeral Codex threads; fast search is a stateless Gemini 3.1 Flash-Lite
-interaction with Google Search grounding. Callers cannot override search
-deadlines, and the adapter does not cap source count or ask Gemini for an
-artificial output-token ceiling. None can alter the conversation continuation
-chain.
+it through the matching Codex tool-call ID. The outer agent turn owns the root
+cancellation registration; nested WebSearch and WebFetch requests use distinct
+request IDs and subscribe to that root, so cancelling a turn stops whichever
+stage is active without registering the root operation twice. Quality and
+balanced search runs are fresh ephemeral Codex threads; fast search is a
+stateless Gemini 3.1 Flash-Lite interaction with Google Search grounding.
+Callers cannot override search deadlines, and the adapter does not cap source
+count or ask Gemini for an artificial output-token ceiling. None can alter the
+conversation continuation chain.
 
 ### 4.4 Conversation History Backend
 

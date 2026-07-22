@@ -86,6 +86,7 @@ struct ActiveOperation {
     id: Uuid,
     operations: ActiveOperations,
     cancellation: watch::Receiver<bool>,
+    owns_registration: bool,
 }
 
 pub(crate) struct AgentTurn {
@@ -114,7 +115,54 @@ impl ActiveOperations {
             id,
             operations: self.clone(),
             cancellation,
+            owns_registration: true,
         })
+    }
+
+    fn join(&self, id: Uuid) -> Result<ActiveOperation, ApiError> {
+        let cancellation = self
+            .senders
+            .lock()
+            .map_err(|_| {
+                ApiError::internal(
+                    "operation_registry_unavailable",
+                    "The operation registry is unavailable.",
+                )
+            })?
+            .get(&id)
+            .map(watch::Sender::subscribe)
+            .ok_or_else(|| {
+                ApiError::conflict(
+                    "parent_operation_not_running",
+                    "The parent operation is no longer running.",
+                )
+            })?;
+        Ok(ActiveOperation {
+            id,
+            operations: self.clone(),
+            cancellation,
+            owns_registration: false,
+        })
+    }
+
+    fn register_request(
+        &self,
+        request_id: Uuid,
+        parent_operation_id: Option<Uuid>,
+    ) -> Result<ActiveOperation, ApiError> {
+        if let Some(parent_operation_id) = parent_operation_id {
+            if parent_operation_id == request_id {
+                return Err(ApiError::invalid(
+                    "operation_id and parent_operation_id must be different.",
+                )
+                .with_request_id(request_id));
+            }
+            self.join(parent_operation_id)
+                .map_err(|error| error.with_request_id(request_id))
+        } else {
+            self.register(request_id)
+                .map_err(|error| error.with_request_id(request_id))
+        }
     }
 
     fn cancel(&self, id: Uuid) -> Result<bool, ApiError> {
@@ -154,7 +202,9 @@ impl ActiveOperation {
 
 impl Drop for ActiveOperation {
     fn drop(&mut self) {
-        self.operations.remove(self.id);
+        if self.owns_registration {
+            self.operations.remove(self.id);
+        }
     }
 }
 
@@ -276,6 +326,8 @@ struct WebSearchRequest {
     #[serde(default)]
     operation_id: Option<Uuid>,
     #[serde(default)]
+    parent_operation_id: Option<Uuid>,
+    #[serde(default)]
     mode: WebSearchMode,
 }
 
@@ -343,6 +395,8 @@ struct WebFetchRequest {
     url: String,
     #[serde(default)]
     operation_id: Option<Uuid>,
+    #[serde(default)]
+    parent_operation_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -933,7 +987,9 @@ async fn web_search(
         request.model.as_deref(),
     )?;
     let request_id = request.operation_id.unwrap_or_else(Uuid::new_v4);
-    let mut operation = state.active_operations.register(request_id)?;
+    let mut operation = state
+        .active_operations
+        .register_request(request_id, request.parent_operation_id)?;
     let mode = request.mode;
     let started = Instant::now();
     let search = async {
@@ -1049,7 +1105,9 @@ async fn web_fetch(
     Json(request): Json<WebFetchRequest>,
 ) -> Result<Json<WebFetchResponse>, ApiError> {
     let request_id = request.operation_id.unwrap_or_else(Uuid::new_v4);
-    let mut operation = state.active_operations.register(request_id)?;
+    let mut operation = state
+        .active_operations
+        .register_request(request_id, request.parent_operation_id)?;
     let fetched = tokio::select! {
         _ = operation.cancelled() => Err(ApiError::cancelled(request_id)),
         result = state.web_fetcher.fetch(&request.url) => result.map_err(|error| web_fetch_error(error, request_id)),
@@ -1371,6 +1429,37 @@ mod tests {
         operation.cancelled().await;
         drop(operation);
         assert!(!operations.cancel(id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn nested_operations_join_the_parent_cancellation_scope() {
+        let operations = ActiveOperations::default();
+        let parent_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let parent = operations.register(parent_id).unwrap();
+        let mut nested = operations
+            .register_request(request_id, Some(parent_id))
+            .unwrap();
+
+        let duplicate = operations.register(parent_id).err().unwrap();
+        assert_eq!(duplicate.code, "operation_in_progress");
+        assert!(operations.cancel(parent_id).unwrap());
+        nested.cancelled().await;
+
+        drop(nested);
+        assert!(operations.cancel(parent_id).unwrap());
+        drop(parent);
+        assert!(!operations.cancel(parent_id).unwrap());
+    }
+
+    #[test]
+    fn nested_operations_require_a_running_parent() {
+        let operations = ActiveOperations::default();
+        let error = operations
+            .register_request(Uuid::new_v4(), Some(Uuid::new_v4()))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "parent_operation_not_running");
     }
 
     #[test]

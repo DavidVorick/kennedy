@@ -967,7 +967,7 @@ impl Session {
                     "mode must be quality, balanced, or fast"
                 );
                 self.api.intelligence_post( "/api/v1/web/search", json!({
-                    "provider":self.runtime.provider,"model":self.runtime.model,"question":question,"mode":mode,"operation_id":operation_id,
+                    "provider":self.runtime.provider,"model":self.runtime.model,"question":question,"mode":mode,"parent_operation_id":operation_id,
                 })).await?
             }
             "WebFetch" => {
@@ -976,7 +976,7 @@ impl Session {
                 self.api
                     .intelligence_post(
                         "/api/v1/web/fetch",
-                        json!({"url":url,"operation_id":operation_id}),
+                        json!({"url":url,"parent_operation_id":operation_id}),
                     )
                     .await?
             }
