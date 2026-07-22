@@ -637,33 +637,41 @@ an older backend build before it can consume newly released repair work.
 
 ### 8.12 Kmap-documented Rust library tools
 
-`CreateRustLib`, `OpenRustLib`, `WriteRustLib`, `CheckRustLib`, and
-`PublishRustLib` are always available in every Kennedy execution mode,
+`kcode-rust-libs-v2/create`, `kcode-rust-libs-v2/open`,
+`kcode-rust-libs-v2/docs`, `kcode-rust-libs-v2/write`,
+`kcode-rust-libs-v2/check`, and `kcode-rust-libs-v2/publish` are always
+available in every Kennedy execution mode,
 including browser conversation, private/group Telegram, self time, history
 ingress, and audio ingress. Their Kennedy-facing contracts are absent from the
 static prompt assets and live entirely in the Kmap; `KmapBasics.txt` supplies
 only the generic discovery notice and native-call contract.
 
-The native backend validates the model-visible name and complete-file write
+The native backend validates model-visible names and complete-source write
 shapes, automatically attaches a durable tool-session identifier that never
 appears in Kennedy's arguments, and calls the synchronous exact-pinned
-`kcode-rust-libs` crate in-process on a blocking worker. Create/open results
-contain every sorted UTF-8 file; write results contain accepted paths and the
-canonical manifest version; check results distinguish code-quality failures
-from infrastructure errors; and publish results never expose the operator's
-token.
+`kcode-rust-libs-v2` 1.1.0 crate in-process on a blocking worker. Create/open
+results contain every useful sorted UTF-8 source file exactly once and exclude
+`Cargo.lock` and repository metadata. Docs returns only canonical version and
+documentation. Write treats the submitted files as the entire replacement;
+check success is compact while failure returns one bounded diagnostic; publish
+never exposes the operator's token.
 
 The hidden tool-session identifier survives Chatend and ingress recovery. The
-server owns at most one open handle per library across all Kennedy sessions and
+server may retain one optimistic snapshot per library per Kennedy session and
 releases it on conversation close/reset/timeout, self-time completion, or
-successful history/audio ingress completion. Idle abandoned ownership expires
-after 24 hours. There is no Kennedy-facing close, reload, delete, list, patch,
-arbitrary-command, credential, root-path, or Podman-configuration call.
+successful history/audio ingress completion. Different sessions may open the
+same library; a writer whose generation is stale must explicitly reopen and
+reconcile. Idle abandoned snapshots expire after 24 hours. There is no
+Kennedy-facing close, repository list, patch, arbitrary-command, credential,
+root-path, or Podman-configuration call.
 
 Rust-library mutations are external filesystem or registry effects and are not
-rolled back when a later checkpoint fails. Complete-file writes are safely
-repeatable. After an ambiguous create Kennedy opens the library; after an
-ambiguous publish she verifies the exact version on crates.io before retrying.
+rolled back when a later checkpoint fails. Complete-replacement writes are
+optimistic and atomic at `HEAD`. After an ambiguous create Kennedy opens the
+library; after a stale write she reopens and reconciles; after an ambiguous
+publish she verifies the exact version on crates.io before retrying. The first
+open or docs read of a valid flat legacy library migrates it under the
+managed-root lock before returning.
 
 ### 8.13 Tool Failures
 
@@ -710,6 +718,8 @@ operations continue with no browser open.
 4. The backend starts a standard Codex app-server turn. A fresh thread receives
    the complete formatted application context and one dynamic `call_ktool`
    definition; a resumed thread receives only newly appended application text.
+   Each browser Codex turn has a 30-minute complete-turn deadline, including
+   native tool handling.
 5. For each native tool request, the backend executes one Ktool, checkpoints
    the updated recovery archive, and returns the result through the matching
    JSON-RPC call ID on the same Codex turn. Codex may request several calls;

@@ -54,7 +54,7 @@ intelligence, conversation history, audio ingress, Telegram identity, and the
 frontend on one local listener while retaining separate storage. The published
 Telegram relay remains on its own loopback listener until its crate exposes a
 mergeable router.
-The main server also imports the exact-pinned `kcode-rust-libs` crate and calls
+The main server also imports exact-pinned `kcode-rust-libs-v2` 1.1.0 and calls
 it directly from the backend-owned Kennedy tool loop; managed-library tools are
 not a browser API or an independent backend.
 
@@ -202,11 +202,12 @@ kweb, researching the web, and working with managed Rust libraries:
 + SetFixedConnection
 + WebSearch
 + WebFetch
-+ CreateRustLib
-+ OpenRustLib
-+ WriteRustLib
-+ CheckRustLib
-+ PublishRustLib
++ kcode-rust-libs-v2/create
++ kcode-rust-libs-v2/open
++ kcode-rust-libs-v2/docs
++ kcode-rust-libs-v2/write
++ kcode-rust-libs-v2/check
++ kcode-rust-libs-v2/publish
 
 Not every tool is available in every session, the session type determines which
 tools are available.
@@ -373,23 +374,25 @@ and ingress sessions.
 
 ### Managed Rust libraries
 
-The main server imports exact-pinned `kcode-rust-libs` 0.2.2, retrieves the
+The main server imports exact-pinned `kcode-rust-libs-v2` 1.1.0, retrieves the
 required `cratesio-key` from Kennedy's encrypted credential vault, and
 initializes it with the managed root
-`/home/user/dev/kennedy/kcode/kcode-rust-libs`. Kennedy uses `CreateRustLib`,
-`OpenRustLib`, `WriteRustLib`, `CheckRustLib`, and `PublishRustLib`; their exact
-contracts and workflow live in the Kmap-ingress document
+`/home/user/dev/kennedy/kcode/kcode-rust-libs`. Kennedy uses the six
+`kcode-rust-libs-v2/{create,open,docs,write,check,publish}` operations; their
+exact contracts and workflow live in the Kmap-ingress document
 `KennedyRustLibTools.md`, not in a static system-prompt asset.
 
-Each Kennedy session may open multiple libraries, but only one session may own
-an open handle for a particular library at a time. The backend attaches a
-hidden durable tool-session identifier and releases all matching handles when
-that session ends; abandoned idle ownership expires after 24 hours. The crate
-owns relative-path validation, complete-file writes, standard Podman checks,
-manifest-version validation, and publication with the operator-provisioned
-vault token held in memory. The managed root contains no credential file.
-Kennedy receives no delete, patch, reload, list, arbitrary-command, root-path,
-Podman-image, credential, or close argument.
+Each Kennedy session may retain independent optimistic snapshots of multiple
+libraries. Different sessions may open the same library; only a complete write
+from the current generation commits, and stale writers must reopen and
+reconcile. The backend attaches a hidden durable tool-session identifier and
+releases all matching snapshots when that session ends; abandoned snapshots
+expire after 24 hours. The crate owns safe legacy migration, relative-path and
+metadata validation, complete-source replacement, standard Podman checks, and
+publication with the operator-provisioned vault token held in memory. The
+managed root contains no credential file. Kennedy receives no patch,
+repository-list, arbitrary-command, root-path, Podman-image, credential, or
+close argument.
 
 ## Harness Instructions
 
@@ -448,6 +451,8 @@ last user query has no answer, Kennedy can resume that turn from a fresh Codex
 thread. Failed generation and
 checkpoint attempts roll back transient Chatend, memory context, tool-log,
 usage, and continuation state to the last durable snapshot before retrying.
+Each browser Codex turn has a 30-minute complete-turn deadline, including its
+native tool work; other session families retain their dedicated deadlines.
 
 The user may keep multiple conversations live, switch freely among them, and
 create another at any time. Each live conversation keeps its own independent
@@ -511,7 +516,7 @@ the preserved conversation for ingress without requiring the user to retry it
 first, including for conversations restored from before backend ownership.
 
 While the conversation session is ongoing, Kennedy may call LoadNode,
-ResetContext, WebSearch, WebFetch, and the five Kmap-documented Rust library
+ResetContext, WebSearch, WebFetch, and the six Kmap-documented Rust library
 tools. The coding tools are always available in every Kennedy execution mode,
 including private/group Telegram, self time, history ingress, and audio
 ingress. Conversation sessions cannot mutate the Kmap. When the

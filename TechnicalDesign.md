@@ -47,7 +47,7 @@ coordination happens in the backend orchestrator through the same public HTTP
 APIs used for durable boundaries. The published Telegram transport remains on
 port 4324 until its crate exposes a mergeable router instead of owning a
 listener.
-The exact-pinned `kcode-rust-libs` adapter is also imported into the main
+The exact-pinned `kcode-rust-libs-v2` 1.1.0 adapter is also imported into the main
 process and called directly from Kennedy's native tool executor on blocking
 workers; it has no browser-facing route.
 
@@ -129,13 +129,17 @@ the audited version or revision and its conclusion so the pin and audit are
 verifiable together. Automated vulnerability or license scans may supplement
 this review but do not replace it.
 
-Audit record: `kcode-rust-libs` `0.2.2` was fully source-audited on 2026-07-21
-before restoration. The published crate has no dependencies or build script.
-It keeps the supplied crates.io token in a private, redacted in-memory value,
-never discovers or writes credential files, excludes the token from validation
-containers and process arguments, passes it by environment only to the final
+Audit record: `kcode-rust-libs-v2` 1.1.0 was fully source-audited on 2026-07-22
+before adoption. The published crate has no dependencies or build script. It
+keeps the supplied crates.io token in a private redacted value, never discovers
+or writes credential files, excludes the token from validation containers and
+process arguments, passes it by environment only to the final
 `cargo publish --no-verify` container, and redacts it from publication errors.
-The version is approved for Kennedy's `cratesio-key` credential.
+Its legacy migration validates complete source before mutation, serializes on
+the configured root, commits `HEAD` last, and recovers its own recorded partial
+migrations. Network access is limited to dependency fetch and publication; all
+later check stages are offline. Version 1.1.0 is approved for Kennedy's
+`cratesio-key` credential.
 
 ## 3. Runtime Topology
 
@@ -319,10 +323,13 @@ search, `kcode-openai-api` owns paid transcription and image generation,
 Each is standalone and can be moved to its own repository and crates.io without
 Kennedy code.
 
-`kcode-rust-libs` owns managed-library filesystem validation, complete-file
-writes, disposable Podman checks, and crates.io publication. The orchestration
-session layer owns tool schemas, hidden durable ownership IDs, exclusive open
-handles, lease expiry, lifecycle release, and readable result formatting.
+`kcode-rust-libs-v2` owns managed-library migration, immutable source
+generations, optimistic complete replacement, disposable Podman checks, and
+crates.io publication. The orchestration session layer owns the six namespaced
+tool schemas, hidden durable session IDs, independent retained snapshots,
+lease expiry, lifecycle release, error normalization, and readable result
+formatting. Repository locks are call-scoped; competing stale writers must
+reopen and reconcile.
 
 KennedyServer's thin intelligence adapter owns:
 
@@ -525,6 +532,9 @@ remain queryable from the sidebar.
 Session construction does not insert a fake tool call. The shared agent loop
 handles native `call_ktool` requests inside one Codex turn. A terminal assistant
 item completes an ordinary conversation or Telegram turn immediately.
+The orchestrator gives each browser Codex turn a 30-minute complete-turn
+deadline. Other session families retain their separately bounded request or
+run-level deadline policies.
 
 The history-ingress agent loop cannot complete from ordinary assistant text.
 Such text is checkpointed, followed by a controller continuation, and

@@ -15,10 +15,11 @@ long-term memory. The MVP has five API domains and a browser-native frontend:
   `kcode-web-fetch` and `kcode-doc-extraction` own bounded local fetching and
   document parsing. `kennedy-server` adds only Kennedy's HTTP contract,
   cancellation registry, and fixed search-mode policy.
-- `kcode-rust-libs` is an exact-pinned library used in-process for Kennedy's
-  managed Rust crate create/open/write/check/publish tools. It keeps validation
-  work in disposable Podman environments and publishing authority outside the
-  managed-library tree.
+- `kcode-rust-libs-v2` 1.1.0 is an exact-pinned library used in-process for
+  Kennedy's six namespaced managed-Rust tools. It migrates valid legacy flat
+  libraries, commits complete source generations optimistically, keeps checks
+  in disposable Podman environments, and keeps publishing authority outside
+  the managed-library tree.
 - `kennedy-conversation-history` checkpoints active conversations and durably
   stores complete conversation and history-ingress recovery archives. It also
   owns idempotent start intents and per-conversation command queues.
@@ -130,7 +131,7 @@ it in Kennedy's encrypted credential vault under the conventional name
 cargo run -p kennedy-server -- secrets set cratesio-key
 ```
 
-Kennedy passes this key directly to the exact-pinned `kcode-rust-libs`
+Kennedy passes this key directly to exact-pinned `kcode-rust-libs-v2` 1.1.0
 dependency. The managed libraries directory contains no credential file.
 
 No OpenAI API key is required for ordinary Kennedy generation. Startup rejects
@@ -360,7 +361,7 @@ connections replace the former priority/task terminology.
 
 Kennedy's local tools use the native `call_ktool` function documented once in
 `KmapBasics.txt`. Every session can read
-Kmap memory, use WebSearch/WebFetch, and access the five managed Rust-library
+Kmap memory, use WebSearch/WebFetch, and access the six managed Rust-library
 tools documented in `KennedyRustLibTools.md`. Live conversations cannot mutate the
 Kmap; the serialized, offline history-ingress worker owns memory mutation. Kennedy
 chooses `quality`, `balanced`, or `fast` for each WebSearch call; the concrete
@@ -414,6 +415,9 @@ native dynamic function and may call it several times before continuing
 inference. A normal terminal assistant response completes a browser or Telegram
 turn. History/audio ingress and self time continue after terminal prose until a
 successful `EndSession` Ktool call is durably recorded.
+Browser Codex turns have a 30-minute complete-turn deadline so substantial
+reasoning and native tool work are not interrupted by the runtime's shorter
+default. Telegram, ingress, and self-time retain their dedicated deadlines.
 
 The dedicated **Self Time** tab starts an autonomous run with a duration in
 minutes (30 by default, fractional values allowed for tests) and an optional

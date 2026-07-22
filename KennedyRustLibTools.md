@@ -1,155 +1,119 @@
 # Kennedy Rust Library Tools
 
-Kennedy can create, inspect, edit, validate, and publish small Rust libraries through five local tools. These tools are documented in the Kmap rather than in Kennedy's static prompt. They are always available in every Kennedy execution mode, including browser conversations, private and group Telegram conversations, self-time sessions, history ingress, and audio ingress.
+Kennedy can create, inspect, replace, validate, and publish small Rust libraries through six local tools. They are available in every Kennedy execution mode. The server uses exact-pinned `kcode-rust-libs-v2` 1.1.0 and owns the configured filesystem root, crates.io credential, authorization, and transport. Kennedy supplies only the arguments documented here.
 
-The server uses the published `kcode-rust-libs` crate and manages the filesystem, Podman validation environment, and crates.io credentials. Kennedy supplies only the arguments documented here. Kennedy must never attempt to supply a filesystem root, absolute path, shell command, Podman image, registry token, or other infrastructure setting.
-
-Each operation uses the native `call_ktool` function. Codex may issue multiple
-function calls before its next inference; the runtime may deliver them
-sequentially. A typical call's arguments are:
+Invoke each operation through the native `call_ktool` function. For example:
 
 ```json
-{"name":"OpenRustLib","arguments":{"name":"example-lib"}}
+{"name":"kcode-rust-libs-v2/open","arguments":{"name":"example-lib"}}
 ```
 
-## Session ownership
+## Snapshots and concurrency
 
-Creating or opening a library gives the current Kennedy session exclusive ownership of that library's open handle. The same session may own several different libraries. Another Kennedy session cannot open or modify an owned library until the owning session ends and the server drops its handle.
+`kcode-rust-libs-v2/create` and `kcode-rust-libs-v2/open` retain a complete source snapshot for the current Kennedy session. Open before writing, checking, or publishing. Several sessions may open the same library; no session holds a persistent filesystem lock.
 
-Create or open a library before writing, checking, or publishing it. An idle handle left behind by an abandoned session expires after 24 hours. If the server reports that a library is not open—such as after a server restart or that lease expires—call `OpenRustLib` and continue from the complete files it returns. If it reports that another active Kennedy session owns the library, do not repeatedly retry; continue in the owning session or wait for that session to end.
+Writes are optimistic. If another snapshot commits first, `kcode-rust-libs-v2/write` fails with `stale_snapshot`. Call `kcode-rust-libs-v2/open` to reload the current complete source, reconcile the intended change, and retry. Calling `open` again always replaces the session's retained snapshot with the current repository generation.
 
-There is no model-facing close operation. Handles are released automatically when the Kennedy session ends, is reset into history ingress, is purged, or otherwise terminates.
+Retained snapshots are discarded when the Kennedy session ends and abandoned snapshots expire after 24 hours. If an operation reports that the library is not open, call `kcode-rust-libs-v2/open` and continue from the returned source.
 
-## `CreateRustLib`
+## `kcode-rust-libs-v2/create`
 
-Create a new Rust 2024 library and open it in the current Kennedy session.
+Create a new Rust 2024 library at version `0.1.0` and retain its initial snapshot.
 
 ```json
 {"name":"example-lib"}
 ```
 
-The name must begin with an ASCII letter or digit. Its remaining characters may be ASCII letters, digits, `-`, or `_`. Creation fails if that library already exists.
+The name must begin with an ASCII letter or digit and then contain only ASCII letters, digits, `-`, or `_`. Creation fails if the library already exists.
 
-The result contains the library name, canonical version, complete `Documentation.md` text, and every file sorted by path. The readable result represents each complete file body as a JSON string so newlines, quotes, empty files, and the presence or absence of a final newline are exact rather than visually ambiguous.
+The result contains the library name and every useful UTF-8 source file in canonical path order. A new library contains `Cargo.toml`, `Documentation.md`, and `src/lib.rs`. File bodies are exact JSON strings. `Documentation.md` appears once inside `files`; `Cargo.lock` and private repository metadata are excluded.
 
-A newly created library contains at least:
+## `kcode-rust-libs-v2/open`
 
-- `Cargo.toml`, with a Rust 2024 root package at version `0.1.0`;
-- `Documentation.md`; and
-- `src/lib.rs`.
-
-Creation already opens the returned library. Do not call `OpenRustLib` immediately afterward unless the tool result was ambiguous or lost.
-
-## `OpenRustLib`
-
-Open an existing managed library and return its complete current in-memory snapshot.
+Open or reload an existing library and return its complete useful source.
 
 ```json
 {"name":"example-lib"}
 ```
 
-The result has the same complete form as `CreateRustLib`: name, canonical version, documentation, and every UTF-8 file. Read the existing files before editing. Do not guess at omitted source, tests, manifests, documentation, or version metadata.
+Read every returned file before editing. Do not infer omitted source. Opening a valid library stored by the legacy `kcode-rust-libs` backend automatically migrates its flat repository into the current generation format while preserving the original flat files as recovery material.
 
-Calling `OpenRustLib` again from the same session returns the already-open handle's current snapshot. It does not reload changes made outside these tools. The library API intentionally has no reload operation.
+## `kcode-rust-libs-v2/docs`
 
-The tool library is itself a managed library named `kcode-rust-libs`. Kennedy can inspect and maintain its source, tests, specification, and documentation with:
+Read only the canonical package version and complete root `Documentation.md`.
 
 ```json
-{"name":"kcode-rust-libs"}
+{"name":"example-lib"}
 ```
 
-## `WriteRustLib`
+The result contains `name`, `version`, and `documentation`. This operation does not retain a source snapshot, so call `open` separately before writing, checking, or publishing. A first docs read may perform the same safe legacy migration as `open`.
 
-Create or completely overwrite one or more files in an already-open library.
+## `kcode-rust-libs-v2/write`
+
+Commit a complete replacement for the snapshot retained by this session.
 
 ```json
 {
   "name":"example-lib",
   "files":[
     {
-      "path":"src/lib.rs",
-      "contents":"/// Return the answer.\npub fn answer() -> u8 {\n    42\n}\n"
+      "path":"Cargo.toml",
+      "contents":"[package]\nname = \"example-lib\"\nversion = \"0.2.0\"\nedition = \"2024\"\n"
     },
     {
-      "path":"tests/answer.rs",
-      "contents":"#[test]\nfn answer_is_42() {\n    assert_eq!(example_lib::answer(), 42);\n}\n"
+      "path":"Documentation.md",
+      "contents":"# API\n"
+    },
+    {
+      "path":"src/lib.rs",
+      "contents":"pub fn answer() -> u8 { 42 }\n"
     }
   ]
 }
 ```
 
-Every `contents` value is the complete desired text of that file, not a patch, diff, search-and-replace fragment, or insertion. An empty string creates or overwrites an empty file. Files omitted from the batch remain unchanged. Duplicate paths in one batch are rejected.
+`files` is the entire desired source. Omitted files are deleted. Every content value is a complete UTF-8 file body, not a patch. Root `Cargo.toml` and `Documentation.md` are required. `[package].name` must equal the managed-library name and `[package].version` must be a double-quoted canonical stable `major.minor.patch`. `Cargo.lock` is ephemeral and must not be supplied.
 
-Paths use `/`, are UTF-8, and are relative to the library root. Absolute paths, backslashes, empty components, `.`, `..`, traversal, trailing `/`, NUL, and drive-like `:` paths are rejected. The library also rejects symlinks, non-UTF-8 files, and unsupported filesystem entries.
+Paths are slash-separated and relative to the library root. Empty components, `.`, `..`, absolute paths, backslashes, colons, NUL, symlinks, special files, duplicates, and non-UTF-8 source are rejected.
 
-There is no deletion API. Plan a library so obsolete code can be replaced with harmless text or left unused. Do not simulate deletion through shell commands or filesystem tricks.
+A successful result reports the canonical paths and file count. A failed write does not advance the repository. Reopen after `stale_snapshot`; correct the complete file set directly after an ordinary validation error.
 
-Every managed library must always contain root-level `Cargo.toml` and `Documentation.md`. The root manifest's `[package].version` must be a literal stable canonical `major.minor.patch` string such as `0.2.2`. Workspace-inherited versions, prefixes, leading zeroes, prerelease suffixes, build suffixes, and missing components are invalid. A write batch is rejected if its projected result violates these requirements.
+## `kcode-rust-libs-v2/check`
 
-The result confirms the written paths and the canonical version after the write. It does not repeat every file; Kennedy already has the exact submitted text. Call `OpenRustLib` to view the current complete in-memory snapshot again when needed.
-
-## `CheckRustLib`
-
-Run the complete standardized quality pipeline for an already-open library.
+Validate the exact retained in-memory source.
 
 ```json
 {"name":"example-lib"}
 ```
 
-The server runs the work in disposable Podman environments outside the managed library. Kennedy does not choose commands, flags, images, or target directories. The stages run fail-fast in this order:
+The fixed fail-fast pipeline performs dependency fetch, formatting, locked/offline build, Clippy with warnings denied, tests, and documentation tests in disposable Podman work. Success returns `passed: true`. Failure is a failed tool invocation containing one bounded category and relevant diagnostic excerpt; successful stage logs are not returned.
 
-1. dependency fetch;
-2. formatting;
-3. build;
-4. Clippy;
-5. tests; and
-6. documentation tests.
+## `kcode-rust-libs-v2/publish`
 
-The result contains `passed` and every stage that ran, including its stage name, success flag, optional exit code, stdout, and stderr. A code-quality failure is a successful tool invocation with `passed: false`; read the first failed stage's output, replace the relevant complete files, and run `CheckRustLib` again. An infrastructure failure is instead a failed tool invocation and is not evidence that the source code is wrong.
-
-Do not treat a partial stage list as success. `passed` becomes true only when all six stages ran and passed.
-
-## `PublishRustLib`
-
-Validate and publish the root Cargo package of an already-open library to crates.io.
+Recheck and publish the exact retained in-memory source to crates.io.
 
 ```json
 {"name":"example-lib"}
 ```
 
-Publication is an external, durable action. Before publishing:
+Publication is durable. Finish source, tests, documentation, and the intended version; run `check`; inspect `passed: true`; then publish. The server-provisioned token never appears in Kennedy's arguments, source, command line, or returned diagnostics.
 
-1. update the library source, tests, and public documentation;
-2. choose the intended new stable version;
-3. set the root `Cargo.toml` `[package].version` to that exact literal string;
-4. run `CheckRustLib` and inspect a `passed: true` result; and
-5. call `PublishRustLib` only when the crate name, version, API, documentation, and behavior are ready to become public.
-
-The literal `[package].version` in the root `Cargo.toml` is the canonical version; workspace-inherited versions are rejected. `PublishRustLib` runs the full check again even if a previous explicit check passed, then publishes using the operator-provisioned `cratesio-key` value that the server retrieved from its encrypted vault and supplied to the library at initialization. The managed libraries root contains no credential file. Kennedy never sees or supplies that token.
-
-A successful result confirms the published crate name and version. A validation failure stops publication. Server startup rejects a missing or invalid operator credential; Podman/crates.io failures are infrastructure errors. Do not work around them by placing credentials in library files.
-
-Publication may succeed even if a later browser transport or Chatend checkpoint fails before its success result is retained. Do not blindly repeat an ambiguous `PublishRustLib` call. First verify whether that exact crate version is already present on crates.io, using web research when necessary. The same recovery issue is harmless for complete-file writes because repeating the identical write is idempotent; after an ambiguous create, call `OpenRustLib` rather than creating the same name again.
+Publication may succeed even if a later transport or checkpoint loses the result. Do not blindly repeat an ambiguous publish. Verify the exact version on crates.io first.
 
 ## Recommended workflow
 
-For a new crate:
+For a new library:
 
-1. `CreateRustLib`.
-2. Study the generated manifest and files.
-3. `WriteRustLib` with complete source, tests, `Documentation.md`, and any manifest changes.
-4. `CheckRustLib`.
-5. Fix complete files and repeat checks until `passed: true`.
-6. Update the root manifest version when preparing a release.
-7. Run a final check.
-8. `PublishRustLib` only when publication is intended.
+1. `kcode-rust-libs-v2/create`.
+2. Replace the complete source with `kcode-rust-libs-v2/write`.
+3. Run `kcode-rust-libs-v2/check` and repair bounded failures.
+4. Publish only when explicitly intended.
 
-For an existing crate:
+For an existing library:
 
-1. `OpenRustLib` and read every relevant file.
-2. Make bounded complete-file writes.
-3. Check after meaningful changes rather than accumulating a large unvalidated rewrite.
-4. Preserve existing behavior and tests unless the requested design intentionally changes them.
-5. Publish only after setting the intended manifest version and obtaining a clean final result.
+1. `kcode-rust-libs-v2/docs` when only API documentation is needed, or `kcode-rust-libs-v2/open` for source work.
+2. Submit the complete desired source with `kcode-rust-libs-v2/write`.
+3. On `stale_snapshot`, reopen, reconcile, and retry.
+4. Check, then publish only when ready.
 
-The tools provide no arbitrary commands, patches, deletion, listing of library names, reload, or model-controlled close. If a task requires one of those absent capabilities, report the limitation rather than inventing a call.
+The tools expose no arbitrary commands, host paths, credentials, Podman settings, repository listing, rename, patch, or model-controlled close operation.

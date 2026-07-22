@@ -1,10 +1,19 @@
-use std::{collections::HashSet, future::Future, time::Instant};
+use std::{
+    collections::HashSet,
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use kennedy_chatend::canonical_chatend_text as format_chatend;
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use crate::rust_lib_tools::{
+    CHECK_RUST_LIB_TOOL, CREATE_RUST_LIB_TOOL, DOCS_RUST_LIB_TOOL, OPEN_RUST_LIB_TOOL,
+    PUBLISH_RUST_LIB_TOOL, RUST_LIB_TOOLS, WRITE_RUST_LIB_TOOL,
+};
 
 use super::{
     Api, ApiError, Manuals, RuntimeModel,
@@ -17,14 +26,7 @@ use super::{
 };
 
 const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
-const RUST_LIB_TOOLS: [&str; 5] = [
-    "CreateRustLib",
-    "OpenRustLib",
-    "WriteRustLib",
-    "CheckRustLib",
-    "PublishRustLib",
-];
-
+const BROWSER_CONVERSATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
     Conversation,
@@ -726,8 +728,8 @@ impl Session {
             request.reasoning_effort = codex_reasoning_effort(&self.runtime.reasoning_effort)?;
             request.previous_thread_id = previous_thread_id;
             request.tools = vec![call_ktool_definition()];
-            if let Some(timeout) = self.free_time_request_timeout_seconds() {
-                request.timeout = std::time::Duration::from_secs(timeout);
+            if let Some(timeout) = self.agent_request_timeout() {
+                request.timeout = timeout;
             }
             let mut turn = self.api.start_agent_turn(operation_id, request).await?;
             let mut end_session = false;
@@ -1371,7 +1373,7 @@ impl Session {
     async fn rust_lib_tool(&self, name: &str, args: &Value) -> anyhow::Result<Value> {
         validate_arguments(
             args,
-            if name == "WriteRustLib" {
+            if name == WRITE_RUST_LIB_TOOL {
                 &["name", "files"]
             } else {
                 &["name"]
@@ -1379,10 +1381,13 @@ impl Session {
             &[],
         )?;
         let name_value = nonempty_string(args, "name", 255)?;
+        let mut characters = name_value.chars();
         anyhow::ensure!(
-            name_value
-                .chars()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_')),
+            characters
+                .next()
+                .is_some_and(|value| value.is_ascii_alphanumeric())
+                && characters
+                    .all(|value| { value.is_ascii_alphanumeric() || matches!(value, '-' | '_') }),
             "invalid Rust library name"
         );
         self.api
@@ -1434,6 +1439,14 @@ impl Session {
         let deadline = deadline(&self.free_time)?;
         let seconds = (deadline - Utc::now()).num_seconds().max(1) + 120;
         Some(seconds as u64)
+    }
+
+    fn agent_request_timeout(&self) -> Option<Duration> {
+        if matches!(self.mode, AgentMode::Conversation) && self.session_type == "conversation" {
+            return Some(BROWSER_CONVERSATION_REQUEST_TIMEOUT);
+        }
+        self.free_time_request_timeout_seconds()
+            .map(Duration::from_secs)
     }
 
     fn add_context_warning(&mut self, response: &mut Value) {
@@ -1907,20 +1920,25 @@ fn format_tool_result(name: &str, content: &Value) -> String {
             if result.get("truncated").and_then(Value::as_bool) == Some(true) { "yes" } else { "no" },
             indent_result(result_text(result.get("content"), "(none)").as_str()),
         ),
-        "CreateRustLib" | "OpenRustLib" => format!(
+        CREATE_RUST_LIB_TOOL | OPEN_RUST_LIB_TOOL => format!(
             "Managed Rust library {}.\n\nComplete library snapshot (every UTF-8 file; file bodies are exact JSON strings):\n{}",
-            if name == "CreateRustLib" { "created" } else { "opened" },
+            if name == CREATE_RUST_LIB_TOOL { "created" } else { "opened" },
             serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
         ),
-        "WriteRustLib" => format!(
-            "Managed Rust library files written.\n\n{}",
+        DOCS_RUST_LIB_TOOL => format!(
+            "Managed Rust library documentation loaded.\n\nVersion: {}\n\nDocumentation.md:\n{}",
+            result_text(result.get("version"), "(unknown)"),
+            indent_result(result_text(result.get("documentation"), "(empty)").as_str()),
+        ),
+        WRITE_RUST_LIB_TOOL => format!(
+            "Managed Rust library source replaced.\n\n{}",
             serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
         ),
-        "CheckRustLib" => format!(
+        CHECK_RUST_LIB_TOOL => format!(
             "Managed Rust library check completed.\n\n{}",
             serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
         ),
-        "PublishRustLib" => format!(
+        PUBLISH_RUST_LIB_TOOL => format!(
             "Managed Rust library publication completed.\n\n{}",
             serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
         ),
@@ -2633,11 +2651,9 @@ mod tests {
     }
 
     #[test]
-    fn open_rust_lib_exposes_the_complete_snapshot_to_the_model() {
+    fn namespaced_open_rust_lib_exposes_the_complete_snapshot_to_the_model() {
         let result = json!({
             "name": "complete-lib",
-            "version": "0.3.0",
-            "documentation": "Complete docs\n",
             "files": [
                 {"path":"Cargo.toml","contents":"[package]\nname = \"complete-lib\"\nversion = \"0.3.0\"\n"},
                 {"path":"Documentation.md","contents":"Complete docs\n"},
@@ -2648,11 +2664,11 @@ mod tests {
         });
         let payload = json!({"ok":true,"result":result});
         let exact_snapshot = serde_json::to_string_pretty(&payload["result"]).unwrap();
-        let readable = format_tool_result("OpenRustLib", &payload);
+        let readable = format_tool_result(OPEN_RUST_LIB_TOOL, &payload);
         assert!(readable.ends_with(&exact_snapshot));
         assert_eq!(readable.matches("\"contents\":").count(), 5);
 
-        let message = tool_result_message("OpenRustLib", payload, 1);
+        let message = tool_result_message(OPEN_RUST_LIB_TOOL, payload, 1);
         let chatend = format_chatend(std::slice::from_ref(&message), None);
         assert!(chatend.contains(&exact_snapshot));
     }
@@ -2670,6 +2686,7 @@ mod tests {
     async fn native_session_runs_a_complete_read_only_conversation_turn() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let generations = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let app = Router::new()
             .route(
                 "/api/v1/kmap/nodes/{id}",
@@ -2690,8 +2707,10 @@ mod tests {
                 "/api/v1/generate",
                 post({
                     let generations = generations.clone();
-                    move || {
+                    let requests = requests.clone();
+                    move |Json(request): Json<Value>| {
                         generations.fetch_add(1, Ordering::SeqCst);
+                        requests.lock().unwrap().push(request);
                         async move {
                             Json(json!({
                                 "status":"complete",
@@ -2750,6 +2769,7 @@ mod tests {
         assert_eq!(answer.as_deref(), Some("A native Rust response."));
         assert!(!session.pending_turn);
         assert_eq!(generations.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.lock().unwrap()[0]["timeout_seconds"], 30 * 60);
         assert!(checkpoints.load(Ordering::SeqCst) >= 1);
         let archive = session.archive().unwrap();
         assert_eq!(

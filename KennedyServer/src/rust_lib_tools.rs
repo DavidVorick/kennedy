@@ -1,16 +1,30 @@
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
 use axum::http::StatusCode;
-use kcode_rust_libs::{
-    CheckResult, Error as RustLibError, KcodeRustLibs, OpenedRustLib, RustLibFile, RustLibPath,
-};
+use kcode_rust_libs_v2::{Error as RustLibError, File as RustLibFile, Lib as OpenedRustLib};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
+
+pub(crate) const CREATE_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/create";
+pub(crate) const OPEN_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/open";
+pub(crate) const DOCS_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/docs";
+pub(crate) const WRITE_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/write";
+pub(crate) const CHECK_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/check";
+pub(crate) const PUBLISH_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/publish";
+pub(crate) const RUST_LIB_TOOLS: [&str; 6] = [
+    CREATE_RUST_LIB_TOOL,
+    OPEN_RUST_LIB_TOOL,
+    DOCS_RUST_LIB_TOOL,
+    WRITE_RUST_LIB_TOOL,
+    CHECK_RUST_LIB_TOOL,
+    PUBLISH_RUST_LIB_TOOL,
+];
 
 const SESSION_LEASE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SESSION_ID_BYTES: usize = 128;
@@ -21,7 +35,8 @@ pub(crate) struct RustLibToolService {
 }
 
 struct ServiceInner {
-    rust_libs: KcodeRustLibs,
+    root: PathBuf,
+    registry_token: Zeroizing<String>,
     registry: Arc<RegistryState>,
 }
 
@@ -32,11 +47,16 @@ struct RegistryState {
 
 #[derive(Default)]
 struct Registry {
-    libraries: HashMap<String, OwnedLibrary>,
+    libraries: HashMap<HandleKey, OpenLibrary>,
 }
 
-struct OwnedLibrary {
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HandleKey {
     session_id: String,
+    library_name: String,
+}
+
+struct OpenLibrary {
     handle: Arc<Mutex<OpenedRustLib>>,
     active_operations: usize,
     closing: bool,
@@ -45,8 +65,7 @@ struct OwnedLibrary {
 
 struct ActiveOperation {
     registry: Arc<RegistryState>,
-    library_name: String,
-    session_id: String,
+    key: HandleKey,
 }
 
 impl Drop for ActiveOperation {
@@ -54,10 +73,10 @@ impl Drop for ActiveOperation {
         let Ok(mut registry) = self.registry.entries.lock() else {
             return;
         };
-        let Some(entry) = registry.libraries.get_mut(&self.library_name) else {
+        let Some(entry) = registry.libraries.get_mut(&self.key) else {
             return;
         };
-        if entry.session_id != self.session_id || entry.active_operations == 0 {
+        if entry.active_operations == 0 {
             return;
         }
         entry.active_operations -= 1;
@@ -101,9 +120,25 @@ impl ToolError {
         }
     }
 
+    fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code,
+            message: message.into(),
+        }
+    }
+
     fn conflict(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn unprocessable(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
             code,
             message: message.into(),
         }
@@ -130,10 +165,43 @@ impl RustLibToolService {
     pub(crate) fn new(
         root: impl AsRef<Path>,
         crates_io_registry_token: impl Into<String>,
-    ) -> kcode_rust_libs::Result<Self> {
+    ) -> anyhow::Result<Self> {
+        let registry_token = crates_io_registry_token.into();
+        let registry_token = registry_token.trim();
+        anyhow::ensure!(
+            !registry_token.is_empty(),
+            "the crates.io registry token is empty"
+        );
+
+        let root = root.as_ref();
+        std::fs::create_dir_all(root).map_err(|error| {
+            anyhow::anyhow!(
+                "creating managed Rust libraries root {}: {error}",
+                root.display()
+            )
+        })?;
+        let metadata = std::fs::symlink_metadata(root).map_err(|error| {
+            anyhow::anyhow!(
+                "inspecting managed Rust libraries root {}: {error}",
+                root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "managed Rust libraries root {} must be a real directory",
+            root.display()
+        );
+        let root = std::fs::canonicalize(root).map_err(|error| {
+            anyhow::anyhow!(
+                "canonicalizing managed Rust libraries root {}: {error}",
+                root.display()
+            )
+        })?;
+
         Ok(Self {
             inner: Arc::new(ServiceInner {
-                rust_libs: KcodeRustLibs::new(root.as_ref(), crates_io_registry_token)?,
+                root,
+                registry_token: Zeroizing::new(registry_token.to_owned()),
                 registry: Arc::new(RegistryState {
                     entries: Mutex::new(Registry::default()),
                     changed: Condvar::new(),
@@ -166,55 +234,72 @@ impl RustLibToolService {
     ) -> Result<Value, ToolError> {
         self.remove_expired_handles()?;
         match tool_name {
-            "CreateRustLib" => {
+            CREATE_RUST_LIB_TOOL => {
                 let arguments: NameArguments = parse_arguments(arguments)?;
                 validate_library_name(&arguments.name)?;
-                self.create_or_open(session_id, &arguments.name, true)
+                self.create(session_id, &arguments.name)
             }
-            "OpenRustLib" => {
+            OPEN_RUST_LIB_TOOL => {
                 let arguments: NameArguments = parse_arguments(arguments)?;
                 validate_library_name(&arguments.name)?;
-                self.create_or_open(session_id, &arguments.name, false)
+                self.open(session_id, &arguments.name)
             }
-            "WriteRustLib" => {
+            DOCS_RUST_LIB_TOOL => {
+                let arguments: NameArguments = parse_arguments(arguments)?;
+                validate_library_name(&arguments.name)?;
+                let (version, documentation) =
+                    kcode_rust_libs_v2::docs(&self.inner.root, &arguments.name)
+                        .map_err(|error| self.map_library_error(error))?;
+                Ok(json!({
+                    "name":arguments.name,
+                    "version":version,
+                    "documentation":documentation,
+                }))
+            }
+            WRITE_RUST_LIB_TOOL => {
                 let arguments: WriteArguments = parse_arguments(arguments)?;
                 validate_library_name(&arguments.name)?;
-                if arguments.files.is_empty() {
-                    return Err(ToolError::invalid("files must contain at least one file."));
-                }
                 let files = arguments
                     .files
                     .into_iter()
-                    .map(|file| {
-                        RustLibPath::new(file.path)
-                            .map(|path| RustLibFile::new(path, file.contents))
-                            .map_err(map_library_error)
+                    .map(|file| RustLibFile {
+                        path: file.path,
+                        contents: file.contents,
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.with_open_library(session_id, &arguments.name, |rust_lib| {
-                    rust_lib.write(&files).map_err(map_library_error)?;
+                    .collect::<Vec<_>>();
+                let result_name = arguments.name.clone();
+                self.with_open_library(session_id, &arguments.name, move |rust_lib| {
+                    let previous = std::mem::replace(&mut rust_lib.files, files);
+                    if let Err(error) = rust_lib.write() {
+                        rust_lib.files = previous;
+                        return Err(self.map_library_error(error));
+                    }
                     Ok(json!({
-                        "name":rust_lib.name(),
-                        "version":rust_lib.docs().version,
-                        "written_paths":files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+                        "name":result_name,
+                        "written":true,
+                        "file_count":rust_lib.files.len(),
+                        "paths":rust_lib.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
                     }))
                 })
             }
-            "CheckRustLib" => {
+            CHECK_RUST_LIB_TOOL => {
                 let arguments: NameArguments = parse_arguments(arguments)?;
                 validate_library_name(&arguments.name)?;
                 self.with_open_library(session_id, &arguments.name, |rust_lib| {
-                    let result = rust_lib.check().map_err(map_library_error)?;
-                    Ok(check_result(rust_lib.name(), &result))
+                    rust_lib
+                        .check()
+                        .map_err(|error| self.map_library_error(error))?;
+                    Ok(json!({"name":arguments.name,"passed":true}))
                 })
             }
-            "PublishRustLib" => {
+            PUBLISH_RUST_LIB_TOOL => {
                 let arguments: NameArguments = parse_arguments(arguments)?;
                 validate_library_name(&arguments.name)?;
                 self.with_open_library(session_id, &arguments.name, |rust_lib| {
-                    let version = rust_lib.docs().version.clone();
-                    rust_lib.publish().map_err(map_library_error)?;
-                    Ok(json!({"name":rust_lib.name(),"version":version,"published":true}))
+                    rust_lib
+                        .publish()
+                        .map_err(|error| self.map_library_error(error))?;
+                    Ok(json!({"name":arguments.name,"published":true}))
                 })
             }
             _ => Err(ToolError::invalid(format!(
@@ -223,47 +308,50 @@ impl RustLibToolService {
         }
     }
 
-    fn create_or_open(
-        &self,
-        session_id: &str,
-        name: &str,
-        create: bool,
-    ) -> Result<Value, ToolError> {
+    fn create(&self, session_id: &str, name: &str) -> Result<Value, ToolError> {
+        let key = HandleKey::new(session_id, name);
         let mut registry = self.inner.registry.entries.lock().map_err(|_| {
-            ToolError::internal("The Rust library ownership registry is unavailable.")
+            ToolError::internal("The Rust library snapshot registry is unavailable.")
         })?;
-        if let Some(entry) = registry.libraries.get(name) {
-            if entry.session_id != session_id {
-                return Err(library_owned_error());
-            }
-            if create {
-                return Err(ToolError::conflict(
-                    "rust_lib_already_open",
-                    format!("Rust library {name:?} is already open in this Kennedy session."),
-                ));
-            }
+        if registry.libraries.contains_key(&key) {
+            return Err(ToolError::conflict(
+                "rust_lib_already_open",
+                format!("Rust library {name:?} is already open in this Kennedy session."),
+            ));
+        }
+        let rust_lib =
+            kcode_rust_libs_v2::create(&self.inner.root, name, self.inner.registry_token.as_str())
+                .map_err(|error| self.map_library_error(error))?;
+        let snapshot = library_snapshot(name, &rust_lib);
+        registry.libraries.insert(key, OpenLibrary::new(rust_lib));
+        Ok(snapshot)
+    }
+
+    fn open(&self, session_id: &str, name: &str) -> Result<Value, ToolError> {
+        let key = HandleKey::new(session_id, name);
+        let registry = self.inner.registry.entries.lock().map_err(|_| {
+            ToolError::internal("The Rust library snapshot registry is unavailable.")
+        })?;
+        if registry.libraries.contains_key(&key) {
             drop(registry);
-            return self
-                .with_open_library(session_id, name, |rust_lib| Ok(library_snapshot(rust_lib)));
+            return self.with_open_library(session_id, name, |rust_lib| {
+                let reopened = kcode_rust_libs_v2::open(
+                    &self.inner.root,
+                    name,
+                    self.inner.registry_token.as_str(),
+                )
+                .map_err(|error| self.map_library_error(error))?;
+                *rust_lib = reopened;
+                Ok(library_snapshot(name, rust_lib))
+            });
         }
 
-        let rust_lib = if create {
-            self.inner.rust_libs.create_rust_lib(name)
-        } else {
-            self.inner.rust_libs.open_rust_lib(name)
-        }
-        .map_err(map_library_error)?;
-        let snapshot = library_snapshot(&rust_lib);
-        registry.libraries.insert(
-            name.to_owned(),
-            OwnedLibrary {
-                session_id: session_id.to_owned(),
-                handle: Arc::new(Mutex::new(rust_lib)),
-                active_operations: 0,
-                closing: false,
-                last_used: Instant::now(),
-            },
-        );
+        let mut registry = registry;
+        let rust_lib =
+            kcode_rust_libs_v2::open(&self.inner.root, name, self.inner.registry_token.as_str())
+                .map_err(|error| self.map_library_error(error))?;
+        let snapshot = library_snapshot(name, &rust_lib);
+        registry.libraries.insert(key, OpenLibrary::new(rust_lib));
         Ok(snapshot)
     }
 
@@ -288,24 +376,22 @@ impl RustLibToolService {
         session_id: &str,
         name: &str,
     ) -> Result<(Arc<Mutex<OpenedRustLib>>, ActiveOperation), ToolError> {
+        let key = HandleKey::new(session_id, name);
         let mut registry = self.inner.registry.entries.lock().map_err(|_| {
-            ToolError::internal("The Rust library ownership registry is unavailable.")
+            ToolError::internal("The Rust library snapshot registry is unavailable.")
         })?;
-        let Some(entry) = registry.libraries.get_mut(name) else {
+        let Some(entry) = registry.libraries.get_mut(&key) else {
             return Err(ToolError::conflict(
                 "rust_lib_not_open",
                 format!(
-                    "Rust library {name:?} is not open in this Kennedy session. Call OpenRustLib first."
+                    "Rust library {name:?} is not open in this Kennedy session. Call {OPEN_RUST_LIB_TOOL} first."
                 ),
             ));
         };
-        if entry.session_id != session_id {
-            return Err(library_owned_error());
-        }
         if entry.closing {
             return Err(ToolError::conflict(
                 "rust_lib_session_ending",
-                "The Kennedy session is releasing its Rust libraries.",
+                "The Kennedy session is releasing its Rust library snapshots.",
             ));
         }
         entry.active_operations += 1;
@@ -315,8 +401,7 @@ impl RustLibToolService {
             handle,
             ActiveOperation {
                 registry: Arc::clone(&self.inner.registry),
-                library_name: name.to_owned(),
-                session_id: session_id.to_owned(),
+                key,
             },
         ))
     }
@@ -334,44 +419,109 @@ impl RustLibToolService {
 
     fn release_blocking(&self, session_id: &str) -> Result<usize, ToolError> {
         let mut registry = self.inner.registry.entries.lock().map_err(|_| {
-            ToolError::internal("The Rust library ownership registry is unavailable.")
+            ToolError::internal("The Rust library snapshot registry is unavailable.")
         })?;
-        let names = registry
+        let keys = registry
             .libraries
-            .iter()
-            .filter(|(_, entry)| entry.session_id == session_id)
-            .map(|(name, _)| name.clone())
+            .keys()
+            .filter(|key| key.session_id == session_id)
+            .cloned()
             .collect::<Vec<_>>();
-        for name in &names {
-            if let Some(entry) = registry.libraries.get_mut(name) {
+        for key in &keys {
+            if let Some(entry) = registry.libraries.get_mut(key) {
                 entry.closing = true;
             }
         }
-        while names.iter().any(|name| {
+        while keys.iter().any(|key| {
             registry
                 .libraries
-                .get(name)
+                .get(key)
                 .is_some_and(|entry| entry.active_operations > 0)
         }) {
             registry = self.inner.registry.changed.wait(registry).map_err(|_| {
-                ToolError::internal("The Rust library ownership registry is unavailable.")
+                ToolError::internal("The Rust library snapshot registry is unavailable.")
             })?;
         }
-        for name in &names {
-            registry.libraries.remove(name);
+        for key in &keys {
+            registry.libraries.remove(key);
         }
-        Ok(names.len())
+        Ok(keys.len())
     }
 
     fn remove_expired_handles(&self) -> Result<(), ToolError> {
         let mut registry = self.inner.registry.entries.lock().map_err(|_| {
-            ToolError::internal("The Rust library ownership registry is unavailable.")
+            ToolError::internal("The Rust library snapshot registry is unavailable.")
         })?;
         let now = Instant::now();
         registry.libraries.retain(|_, entry| {
             entry.active_operations > 0 || now.duration_since(entry.last_used) < SESSION_LEASE
         });
         Ok(())
+    }
+
+    fn map_library_error(&self, error: RustLibError) -> ToolError {
+        let rendered = error.to_string();
+        let category = rendered
+            .split_once(':')
+            .map_or("unknown", |(value, _)| value);
+        let safe = rendered.replace(
+            self.inner.root.to_string_lossy().as_ref(),
+            "<managed-rust-libraries>",
+        );
+        match category {
+            "invalid_name" | "unsafe_path" | "invalid_source" | "invalid_metadata" => {
+                ToolError::invalid(safe)
+            }
+            "already_exists" => ToolError::conflict("rust_lib_exists", safe),
+            "not_found" => ToolError::not_found("rust_lib_not_found", safe),
+            "stale_snapshot" => ToolError::conflict("rust_lib_stale_snapshot", safe),
+            "invalid_repository" | "unsafe_source" => {
+                ToolError::unprocessable("rust_lib_invalid_repository", safe)
+            }
+            "migration" => ToolError::unavailable("rust_lib_migration_failure", safe),
+            "invalid_token" => ToolError::unavailable(
+                "registry_token_unavailable",
+                "Rust library publication is unavailable because the operator-provisioned crates.io token is missing or invalid.",
+            ),
+            value if value.starts_with("check.") => {
+                ToolError::unprocessable("rust_lib_check_failed", safe)
+            }
+            "publish" => ToolError::unavailable("rust_lib_publish_failed", safe),
+            value if value.starts_with("sandbox.") || value == "io" => {
+                tracing::error!(error=%rendered, "Rust library infrastructure operation failed");
+                ToolError::unavailable(
+                    "rust_lib_infrastructure_failure",
+                    "The Rust library operation failed in local validation or publication infrastructure.",
+                )
+            }
+            _ => {
+                tracing::error!(error=%rendered, "Rust library operation failed");
+                ToolError::unavailable(
+                    "rust_lib_infrastructure_failure",
+                    "The Rust library operation failed unexpectedly.",
+                )
+            }
+        }
+    }
+}
+
+impl HandleKey {
+    fn new(session_id: &str, library_name: &str) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            library_name: library_name.to_owned(),
+        }
+    }
+}
+
+impl OpenLibrary {
+    fn new(rust_lib: OpenedRustLib) -> Self {
+        Self {
+            handle: Arc::new(Mutex::new(rust_lib)),
+            active_operations: 0,
+            closing: false,
+            last_used: Instant::now(),
+        }
     }
 }
 
@@ -411,89 +561,12 @@ fn validate_library_name(name: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn library_owned_error() -> ToolError {
-    ToolError::conflict(
-        "rust_lib_owned",
-        "That Rust library is already open in another active Kennedy session.",
-    )
-}
-
-fn map_library_error(error: RustLibError) -> ToolError {
-    match error {
-        RustLibError::InvalidRustLibName(_)
-        | RustLibError::InvalidRustLibPath { .. }
-        | RustLibError::DuplicateWritePath(_)
-        | RustLibError::MissingRequiredFile(_)
-        | RustLibError::InvalidVersion(_)
-        | RustLibError::InvalidCargoManifest(_)
-        | RustLibError::VersionMismatch { .. } => ToolError::invalid(error.to_string()),
-        RustLibError::RustLibAlreadyExists(_) => {
-            ToolError::conflict("rust_lib_exists", error.to_string())
-        }
-        RustLibError::RustLibNotFound(_) => ToolError {
-            status: StatusCode::NOT_FOUND,
-            code: "rust_lib_not_found",
-            message: error.to_string(),
-        },
-        RustLibError::RustLibIsNotDirectory(_)
-        | RustLibError::NonUtf8Path(_)
-        | RustLibError::NonUtf8File(_)
-        | RustLibError::SymlinkNotAllowed(_)
-        | RustLibError::UnsupportedFileType(_) => ToolError::invalid(
-            "The managed Rust library contains an unsupported path, file, symlink, or entry type.",
-        ),
-        RustLibError::InvalidRegistryToken => ToolError::unavailable(
-            "registry_token_unavailable",
-            "Rust library publication is unavailable because the operator-provisioned crates.io token is missing or invalid.",
-        ),
-        RustLibError::CheckFailed(result) => {
-            let stage = result
-                .failure()
-                .map(|stage| stage.stage.as_str())
-                .unwrap_or("validation");
-            ToolError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "rust_lib_check_failed",
-                message: format!(
-                    "Rust library publication stopped because its {stage} check failed. Run CheckRustLib for complete diagnostics."
-                ),
-            }
-        }
-        RustLibError::RootsOverlap { .. }
-        | RustLibError::Io { .. }
-        | RustLibError::Sandbox { .. }
-        | RustLibError::Publish(_) => {
-            tracing::error!(error=%error, "Rust library operation failed");
-            ToolError::unavailable(
-                "rust_lib_infrastructure_failure",
-                "The Rust library operation failed in local validation or publication infrastructure.",
-            )
-        }
-    }
-}
-
-fn library_snapshot(rust_lib: &OpenedRustLib) -> Value {
-    json!({
-        "name":rust_lib.name(),
-        "version":rust_lib.docs().version,
-        "documentation":rust_lib.docs().documentation,
-        "files":rust_lib.files().iter().map(|file| json!({
-            "path":file.path.as_str(),
-            "contents":file.contents,
-        })).collect::<Vec<_>>(),
-    })
-}
-
-fn check_result(name: &str, result: &CheckResult) -> Value {
+fn library_snapshot(name: &str, rust_lib: &OpenedRustLib) -> Value {
     json!({
         "name":name,
-        "passed":result.passed(),
-        "stages":result.stages.iter().map(|stage| json!({
-            "stage":stage.stage.as_str(),
-            "success":stage.success,
-            "exit_code":stage.exit_code,
-            "stdout":stage.stdout,
-            "stderr":stage.stderr,
+        "files":rust_lib.files.iter().map(|file| json!({
+            "path":file.path,
+            "contents":file.contents,
         })).collect::<Vec<_>>(),
     })
 }
@@ -511,147 +584,190 @@ mod tests {
         RustLibToolService::new(root, "test-crates-io-key").unwrap()
     }
 
+    fn complete_files(name: &str, documentation: &str, source: &str) -> Value {
+        json!([
+            {
+                "path":"Cargo.toml",
+                "contents":format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            },
+            {"path":"Documentation.md","contents":documentation},
+            {"path":"src/lib.rs","contents":source},
+        ])
+    }
+
     #[tokio::test]
-    async fn one_session_owns_a_library_until_release() {
+    async fn concurrent_sessions_use_stale_snapshot_detection_instead_of_exclusive_ownership() {
         let root = temporary_root();
         let service = service(&root);
-        let created = service
+        service
             .execute(
                 "conversation:first".into(),
-                "CreateRustLib".into(),
+                CREATE_RUST_LIB_TOOL.into(),
                 json!({"name":"example-lib"}),
             )
             .await
             .unwrap();
-        assert_eq!(created["name"], "example-lib");
-        assert_eq!(created["version"], "0.1.0");
-        assert_eq!(created["files"].as_array().unwrap().len(), 3);
-
-        let conflict = service
+        service
             .execute(
                 "conversation:second".into(),
-                "OpenRustLib".into(),
+                OPEN_RUST_LIB_TOOL.into(),
                 json!({"name":"example-lib"}),
             )
             .await
-            .unwrap_err();
-        assert_eq!(conflict.code, "rust_lib_owned");
+            .unwrap();
 
+        service
+            .execute(
+                "conversation:first".into(),
+                WRITE_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"example-lib",
+                    "files":complete_files("example-lib", "first\n", "pub fn first() {}\n"),
+                }),
+            )
+            .await
+            .unwrap();
+        let stale = service
+            .execute(
+                "conversation:second".into(),
+                WRITE_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"example-lib",
+                    "files":complete_files("example-lib", "second\n", "pub fn second() {}\n"),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code, "rust_lib_stale_snapshot");
+
+        service
+            .execute(
+                "conversation:second".into(),
+                OPEN_RUST_LIB_TOOL.into(),
+                json!({"name":"example-lib"}),
+            )
+            .await
+            .unwrap();
+        service
+            .execute(
+                "conversation:second".into(),
+                WRITE_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"example-lib",
+                    "files":complete_files("example-lib", "second\n", "pub fn second() {}\n"),
+                }),
+            )
+            .await
+            .unwrap();
+        let docs = service
+            .execute(
+                "conversation:third".into(),
+                DOCS_RUST_LIB_TOOL.into(),
+                json!({"name":"example-lib"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(docs["documentation"], "second\n");
         assert_eq!(
             service.release("conversation:first".into()).await.unwrap(),
             1
         );
-        let opened = service
-            .execute(
-                "conversation:second".into(),
-                "OpenRustLib".into(),
-                json!({"name":"example-lib"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(opened["name"], "example-lib");
-        service.release("conversation:second".into()).await.unwrap();
+        assert_eq!(
+            service.release("conversation:second".into()).await.unwrap(),
+            1
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn write_replaces_complete_files_and_reports_canonical_version() {
+    async fn write_replaces_the_complete_file_set() {
         let root = temporary_root();
         let service = service(&root);
         service
             .execute(
                 "conversation:test".into(),
-                "CreateRustLib".into(),
-                json!({"name":"write-test"}),
+                CREATE_RUST_LIB_TOOL.into(),
+                json!({"name":"complete-lib"}),
+            )
+            .await
+            .unwrap();
+        let mut first = complete_files("complete-lib", "docs\n", "pub fn answer() -> u8 { 42 }\n")
+            .as_array()
+            .unwrap()
+            .clone();
+        first.push(json!({"path":"tests/temporary.rs","contents":"#[test]\nfn temporary() {}\n"}));
+        service
+            .execute(
+                "conversation:test".into(),
+                WRITE_RUST_LIB_TOOL.into(),
+                json!({"name":"complete-lib","files":first}),
             )
             .await
             .unwrap();
         let written = service
             .execute(
                 "conversation:test".into(),
-                "WriteRustLib".into(),
+                WRITE_RUST_LIB_TOOL.into(),
                 json!({
-                    "name":"write-test",
-                    "files":[
-                        {"path":"Cargo.toml","contents":"[package]\nname = \"write-test\"\nversion = \"0.2.0\"\nedition = \"2024\"\n"},
-                        {"path":"src/lib.rs","contents":"pub fn answer() -> u8 { 42 }\n"}
-                    ]
+                    "name":"complete-lib",
+                    "files":complete_files("complete-lib", "updated\n", "pub fn answer() -> u8 { 43 }\n"),
                 }),
             )
             .await
             .unwrap();
-        assert_eq!(written["version"], "0.2.0");
-        assert_eq!(
-            written["written_paths"],
-            json!(["Cargo.toml", "src/lib.rs"])
-        );
+        assert_eq!(written["file_count"], 3);
 
         let opened = service
             .execute(
                 "conversation:test".into(),
-                "OpenRustLib".into(),
-                json!({"name":"write-test"}),
+                OPEN_RUST_LIB_TOOL.into(),
+                json!({"name":"complete-lib"}),
             )
             .await
             .unwrap();
-        assert!(opened["files"].as_array().unwrap().iter().any(|file| {
-            file["path"] == "src/lib.rs" && file["contents"].as_str().unwrap().contains("answer")
-        }));
+        assert!(
+            opened["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file["path"] != "tests/temporary.rs")
+        );
         service.release("conversation:test".into()).await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn reopening_returns_every_nested_file_with_exact_contents() {
+    async fn docs_migrates_a_flat_legacy_library_without_opening_a_session_snapshot() {
         let root = temporary_root();
+        let repository = root.join("legacy-lib");
+        std::fs::create_dir_all(repository.join("src")).unwrap();
+        std::fs::write(
+            repository.join("Cargo.toml"),
+            "[package]\nname = \"legacy-lib\"\nversion = \"2.3.4\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("Documentation.md"), "legacy docs\n").unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "pub fn legacy() {}\n").unwrap();
+        std::fs::write(repository.join("Cargo.lock"), "version = 4\n").unwrap();
+
         let service = service(&root);
-        service
+        let docs = service
             .execute(
-                "conversation:writer".into(),
-                "CreateRustLib".into(),
-                json!({"name":"complete-lib"}),
+                "conversation:test".into(),
+                DOCS_RUST_LIB_TOOL.into(),
+                json!({"name":"legacy-lib"}),
             )
             .await
             .unwrap();
-        let nested = "pub fn nested() -> &'static str { \"nested\" }\n";
-        let integration =
-            "#[test]\nfn it_works() { assert_eq!(complete_lib::nested(), \"nested\"); }\n";
-        service
-            .execute(
-                "conversation:writer".into(),
-                "WriteRustLib".into(),
-                json!({
-                    "name":"complete-lib",
-                    "files":[
-                        {"path":"src/internal/mod.rs","contents":nested},
-                        {"path":"tests/integration.rs","contents":integration}
-                    ]
-                }),
-            )
-            .await
-            .unwrap();
-        service.release("conversation:writer".into()).await.unwrap();
-
-        let opened = service
-            .execute(
-                "conversation:reader".into(),
-                "OpenRustLib".into(),
-                json!({"name":"complete-lib"}),
-            )
-            .await
-            .unwrap();
-        let files = opened["files"].as_array().unwrap();
-        assert_eq!(files.len(), 5);
-        assert!(
-            files.iter().any(|file| {
-                file["path"] == "src/internal/mod.rs" && file["contents"] == nested
-            })
+        assert_eq!(docs["version"], "2.3.4");
+        assert_eq!(docs["documentation"], "legacy docs\n");
+        assert!(repository.join("HEAD").is_file());
+        assert!(repository.join(".lock").is_file());
+        assert!(repository.join("generations").is_dir());
+        assert_eq!(
+            service.release("conversation:test".into()).await.unwrap(),
+            0
         );
-        assert!(files.iter().any(|file| {
-            file["path"] == "tests/integration.rs" && file["contents"] == integration
-        }));
-
-        service.release("conversation:reader".into()).await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }
