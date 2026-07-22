@@ -10,7 +10,8 @@ use super::{
     Api, ApiError, Manuals, RuntimeModel,
     context::{
         KmapContext, MAX_DIRECTLY_LOADED_NODES, format_compact_memory_sections,
-        format_context_node, format_kmap_context, stored_fixed_ids, stored_recent_ids,
+        format_context_node, format_kmap_context, format_projected_kmap_context, stored_fixed_ids,
+        stored_recent_ids,
     },
     http::{encode_path, idempotency_id},
 };
@@ -114,6 +115,24 @@ struct ToolOutcome {
     self_message: Option<String>,
     previous_context: Value,
     reset_history_entry: Value,
+}
+
+#[derive(Debug)]
+struct AgentLoopRoundLimitError;
+
+impl std::fmt::Display for AgentLoopRoundLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Kennedy exceeded the {AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit"
+        )
+    }
+}
+
+impl std::error::Error for AgentLoopRoundLimitError {}
+
+pub(crate) fn is_agent_loop_round_limit(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AgentLoopRoundLimitError>().is_some()
 }
 
 impl Session {
@@ -325,10 +344,7 @@ impl Session {
                 .and_then(|archive| archive.get("completed"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            rounds_used: archive
-                .and_then(|archive| archive.get("roundsUsed"))
-                .and_then(Value::as_u64)
-                .unwrap_or_default(),
+            rounds_used: restored_rounds_used(archive, &options.mode),
             mode: options.mode,
             source_session_type,
             group_context,
@@ -435,7 +451,7 @@ impl Session {
             "content":content,
         });
         self.retained.push(message.clone());
-        self.rebuild_chatend()?;
+        self.rebuild_chatend(None)?;
         Ok(())
     }
 
@@ -612,12 +628,25 @@ impl Session {
         if self.pending_turn || !self.stage_user_input(text, metadata) {
             return false;
         }
+        // The safety allowance belongs to one user turn. Ingress intentionally
+        // retains its counter for the whole logical ingress session instead.
+        if matches!(self.mode, AgentMode::Conversation) {
+            self.rounds_used = 0;
+        }
         self.pending_turn = true;
         self.pending_external_event_id = metadata
             .get("externalEventId")
             .and_then(Value::as_str)
             .map(str::to_owned);
         true
+    }
+
+    pub(crate) fn reset_exhausted_turn_rounds_for_retry(&mut self) {
+        if matches!(self.mode, AgentMode::Conversation)
+            && self.rounds_used >= AGENT_LOOP_ROUND_LIMIT
+        {
+            self.rounds_used = 0;
+        }
     }
 
     pub(crate) async fn run_pending_turn<C, F>(
@@ -782,6 +811,11 @@ impl Session {
                             rejected_end_session,
                         );
                         if outcome.reset {
+                            let projection = outcome
+                                .message
+                                .pointer("/tool_result/result")
+                                .cloned()
+                                .context("ResetContext result omitted its memory projection")?;
                             if reset_segment.is_none() {
                                 reset_segment = Some(json!({
                                     "reason":"ResetContext",
@@ -800,7 +834,7 @@ impl Session {
                             if let Some(message) = outcome.self_message {
                                 self.retained.push(json!({"role":"assistant","display_role":"Kennedy note to self","context_kind":"reset-note","content":message}));
                             }
-                            self.rebuild_chatend()?;
+                            self.rebuild_chatend(Some(&projection))?;
                             reset_context = true;
                         }
                         let result = outcome
@@ -808,18 +842,20 @@ impl Session {
                             .get("tool_result")
                             .cloned()
                             .unwrap_or(Value::Null);
+                        let model_result =
+                            if matches!(call.name.as_str(), "LoadNode" | "ResetContext") {
+                                format_model_memory_tool_result(&call.name, &result)
+                            } else {
+                                serde_json::to_string(&result)?
+                            };
                         self.messages.push(outcome.message);
                         checkpoint(self.snapshot()?).await?;
                         turn.respond(
                             &native.call_id,
                             if ok {
-                                kcode_codex_runtime_v2::ToolResult::success(serde_json::to_string(
-                                    &result,
-                                )?)
+                                kcode_codex_runtime_v2::ToolResult::success(model_result)
                             } else {
-                                kcode_codex_runtime_v2::ToolResult::failure(serde_json::to_string(
-                                    &result,
-                                )?)
+                                kcode_codex_runtime_v2::ToolResult::failure(model_result)
                             },
                         )
                         .await?;
@@ -879,7 +915,7 @@ impl Session {
             }));
             checkpoint(self.snapshot()?).await?;
         }
-        anyhow::bail!("Kennedy exceeded the {AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit")
+        Err(AgentLoopRoundLimitError.into())
     }
 
     async fn execute_tool(
@@ -1426,10 +1462,15 @@ impl Session {
         self.last_context_warning_band = band;
     }
 
-    fn rebuild_chatend(&mut self) -> anyhow::Result<()> {
+    fn rebuild_chatend(&mut self, projection: Option<&Value>) -> anyhow::Result<()> {
         self.messages = vec![instruction_message(&self.system_prompt)];
         self.messages.extend(self.retained.clone());
-        self.messages.push(json!({"role":"system","display_role":"Kmap context","context_kind":"memory","content":format_kmap_context(&self.context.snapshot()?)}));
+        let snapshot = self.context.snapshot()?;
+        let content = match projection {
+            Some(projection) => format_projected_kmap_context(&snapshot, projection),
+            None => format_kmap_context(&snapshot),
+        };
+        self.messages.push(json!({"role":"system","display_role":"Kmap context","context_kind":"memory","content":content}));
         Ok(())
     }
 
@@ -1560,7 +1601,7 @@ impl Session {
             "context":{"snapshot":self.context.snapshot()?,"diagnostics":self.context.diagnostics(),"state":self.context.archive()},
             "tools":{"loadCalls":self.load_calls,"loadLimit":self.load_limit,"log":self.tool_log},
             "usage":self.usage,"pendingExternalEventId":self.pending_external_event_id,"lastContextWarningBand":self.last_context_warning_band,"media":self.media,
-            "completed":self.completed,"roundsUsed":self.rounds_used,
+            "completed":self.completed,"roundsUsed":self.rounds_used,"roundsUsedScope":rounds_used_scope(&self.mode),
         }))
     }
 
@@ -1884,6 +1925,18 @@ fn format_tool_result(name: &str, content: &Value) -> String {
             serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
         ),
         _ => format!("{name} completed successfully."),
+    }
+}
+
+fn format_model_memory_tool_result(name: &str, content: &Value) -> String {
+    if name != "ResetContext" || content.get("ok").and_then(Value::as_bool) != Some(true) {
+        return format_tool_result(name, content);
+    }
+    let projection = format_compact_memory_sections(content.get("result").unwrap_or(&Value::Null));
+    if projection.is_empty() {
+        "Memory context reset completed. No memory text was loaded.".into()
+    } else {
+        format!("Memory context reset completed.\n\n{projection}")
     }
 }
 
@@ -2281,6 +2334,31 @@ fn model_readable_provenance(data: &str) -> anyhow::Result<String> {
         .context("Ingress provenance does not contain readable source data.")?;
     Ok(format_chatend(messages, archive.get("usage")))
 }
+fn rounds_used_scope(mode: &AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Conversation => "turn",
+        AgentMode::FreeTime => "slice",
+        AgentMode::Ingress { .. } => "session",
+    }
+}
+fn restored_rounds_used(archive: Option<&Value>, mode: &AgentMode) -> u64 {
+    let rounds = archive
+        .and_then(|archive| archive.get("roundsUsed"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if matches!(mode, AgentMode::Conversation)
+        && archive
+            .and_then(|archive| archive.get("roundsUsedScope"))
+            .and_then(Value::as_str)
+            != Some("turn")
+    {
+        // Archives written before round scoping used a conversation-lifetime
+        // counter. Discard it once so a long-lived conversation can recover.
+        0
+    } else {
+        rounds
+    }
+}
 fn value_in(state: &Value, archive: Option<&Value>, key: &str) -> Option<Value> {
     state
         .get(key)
@@ -2349,6 +2427,35 @@ mod tests {
         extract::Path,
         routing::{get, post},
     };
+
+    #[test]
+    fn legacy_conversation_round_counts_migrate_to_per_turn_accounting() {
+        let legacy = json!({"roundsUsed":AGENT_LOOP_ROUND_LIMIT});
+        assert_eq!(
+            restored_rounds_used(Some(&legacy), &AgentMode::Conversation),
+            0
+        );
+
+        let current = json!({"roundsUsed":37,"roundsUsedScope":"turn"});
+        assert_eq!(
+            restored_rounds_used(Some(&current), &AgentMode::Conversation),
+            37
+        );
+        assert_eq!(
+            restored_rounds_used(Some(&legacy), &AgentMode::Ingress { record_id: None }),
+            AGENT_LOOP_ROUND_LIMIT
+        );
+    }
+
+    #[test]
+    fn round_limit_error_is_typed_and_stable() {
+        let error = anyhow::Error::new(AgentLoopRoundLimitError);
+        assert!(is_agent_loop_round_limit(&error));
+        assert_eq!(
+            error.to_string(),
+            "Kennedy exceeded the 100-round tool-loop safety limit"
+        );
+    }
 
     #[test]
     fn context_occupancy_uses_latest_provider_measurement_not_thread_totals() {
@@ -2500,6 +2607,29 @@ mod tests {
         );
         assert!(mutation.contains("Node 7: Created"));
         assert!(!mutation.contains('{') && !mutation.contains("shortDescription"));
+
+        let reset = format_model_memory_tool_result(
+            "ResetContext",
+            &json!({
+                "ok": true,
+                "result": {
+                    "directNodes": [{
+                        "identifier": 1, "shortName": "Root", "shortDescription": "Root summary", "longDescription": "Root details",
+                        "ownerIdentifier": 1, "fixedConnections": [], "activeConnections": [], "fanoutConnections": []
+                    }],
+                    "directNodePromotions": [],
+                    "activeConnectionNodes": [{
+                        "identifier": 2, "shortName": "Related", "longDescription": "Related details",
+                        "ownerIdentifier": 1, "fixedConnections": [], "activeConnections": [], "fanoutConnections": []
+                    }],
+                    "directFanoutNodes": [],
+                    "indirectFanoutNodes": [],
+                }
+            }),
+        );
+        assert!(reset.contains("Memory context reset completed."));
+        assert!(reset.find("Node 1: Root").unwrap() < reset.find("Node 2: Related").unwrap());
+        assert!(!reset.contains('{') && !reset.contains("directNodes"));
     }
 
     #[test]
@@ -2626,6 +2756,13 @@ mod tests {
             archive.get("chatendText").and_then(Value::as_str),
             Some(archive["providerInputs"][0].as_str().unwrap())
         );
+        assert_eq!(archive["roundsUsedScope"], "turn");
+        session.rounds_used = AGENT_LOOP_ROUND_LIMIT;
+        assert!(session.begin_user_turn("A second turn", &json!({})));
+        assert_eq!(session.rounds_used, 0);
+        session.rounds_used = AGENT_LOOP_ROUND_LIMIT;
+        session.reset_exhausted_turn_rounds_for_retry();
+        assert_eq!(session.rounds_used, 0);
         server.abort();
     }
 
@@ -2755,7 +2892,34 @@ mod tests {
         assert_eq!(load_results[0]["tool_result"]["ok"], true);
         assert_eq!(load_results[1]["tool_result"]["ok"], true);
         assert_eq!(load_results[2]["tool_result"]["ok"], false);
-
+        let first_projection = &load_results[0]["tool_result"]["result"];
+        assert_eq!(first_projection["directNodes"][0]["identifier"], 2);
+        assert_eq!(first_projection["directNodes"][0]["shortName"], "Node A");
+        assert_eq!(
+            first_projection["activeConnectionNodes"][0]["identifier"],
+            3
+        );
+        assert_eq!(
+            first_projection["activeConnectionNodes"][1]["identifier"],
+            4
+        );
+        assert!(first_projection.get("requestedNode").is_none());
+        assert!(
+            load_results[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Node 2: Node A")
+        );
+        assert_eq!(
+            load_results[1]["tool_result"]["result"]["directNodePromotions"],
+            json!([3])
+        );
+        assert!(
+            load_results[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Now directly loaded; full text already present: 3")
+        );
         let sent = requests.lock().unwrap();
         let second_chatend = sent[1].get("chatend").and_then(Value::as_str).unwrap();
         assert!(second_chatend.contains("Continue the same turn"));

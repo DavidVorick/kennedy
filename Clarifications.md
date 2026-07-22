@@ -310,6 +310,11 @@ canonical documents; this file is not an append-only log.
   Deduplicate that delta against earlier Chatend memory output. Richer structured
   summaries may remain in recovery state and the memory UI, but never serialize
   those structures into model-facing Chatend text.
+- `LoadNode` and `ResetContext` must share the same selected-first,
+  role-deduplicating load projection and renderer. `ResetContext` is only a
+  context clear followed by that loader over the automatic roots and the
+  explicitly retained nodes; it must not rebuild memory through a separate
+  whole-snapshot rendering path.
 - The backend is the sole owner of canonical Chatend composition. Every
   generation receives that backend-produced plaintext, and every checkpoint
   exposes the same current plaintext to the browser. Full view displays the
@@ -764,6 +769,9 @@ canonical documents; this file is not an append-only log.
   arbitrary numbered fixed-connection slots. Kennedy may set, replace, or clear
   slots 1, 2, and 3. Preserve the existing reserved connection-order storage so
   no edge rewrite is required.
+- Kmap topology hygiene belongs to Kennedy. The harness should not
+  automatically promote connections or otherwise clean the graph; Kennedy can
+  assign fixed connections when an edge is important.
 - Supersede the independent one-invocation group-session rule above. Keep one
   active session per `(group root, Telegram user)`, distinct from that user's
   DMs and sessions in other groups. The session remains open after replies and

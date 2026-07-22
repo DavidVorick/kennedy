@@ -727,7 +727,12 @@ retry from continuing from tool results or assistant output that the
 conversation backend never saved. A cold-start retry follows the same fresh
 provider-chain path and sends the pending user query exactly once.
 
-A conversation permits at most 20 model-requested LoadNode calls per user turn.
+A conversation permits at most 20 model-requested LoadNode calls and 100 model
+rounds per user turn. Both counters survive automatic recovery of that saved
+turn and reset when the next user turn begins. Reaching the round limit stops
+the durable command instead of automatically retrying an already exhausted
+checkpoint; the explicit Retry Saved Query action starts a fresh round
+allowance for the same saved query.
 The UI derives busy/stop/retry state from the durable checkpoint for the entire
 tool loop. A stop request marks the processing message/retry command for
 cancellation; the backend owns the actual cancellation.
@@ -1272,6 +1277,8 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - optional ResetContext note retention, ordering, and 400,000-character cap,
 - compact, complete, restorable ResetContext history with duplicate grouping,
 - non-resetting 100-round history-ingress safety across checkpoints and retries,
+- per-turn conversation round limits, legacy counter migration, and terminal
+  stop behavior for exhausted browser commands,
 - model-visible final context progress using exact previous-response usage and
   fresh-thread stale-usage clearing,
 - durable five-attempt ingress failure logs and terminal queue advancement,

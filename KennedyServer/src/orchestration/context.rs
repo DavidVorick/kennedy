@@ -7,6 +7,11 @@ use super::Api;
 
 pub(crate) const MAX_DIRECTLY_LOADED_NODES: usize = 10;
 
+struct LoadReceipt {
+    requested_identifier: u64,
+    active_identifiers: Vec<u64>,
+}
+
 #[derive(Clone)]
 pub(crate) struct KmapContext {
     api: Api,
@@ -51,10 +56,12 @@ impl KmapContext {
         for id in &roots {
             self.short_id(id);
         }
-        for id in roots {
-            if !self.loaded_node_ids.contains(&id) {
-                self.load_durable(&id).await?;
-            }
+        let missing = roots
+            .into_iter()
+            .filter(|id| !self.loaded_node_ids.contains(id))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.load_durable_batch(&missing).await?;
         }
         Ok(())
     }
@@ -106,6 +113,28 @@ impl KmapContext {
     }
 
     pub(crate) async fn load_durable(&mut self, durable_id: &str) -> anyhow::Result<Value> {
+        self.load_durable_batch(&[durable_id.to_owned()]).await
+    }
+
+    async fn load_durable_batch(&mut self, durable_ids: &[String]) -> anyhow::Result<Value> {
+        let before = self.snapshot()?;
+        let mut requested_identifiers = Vec::new();
+        let mut active_identifiers = Vec::new();
+        for durable_id in durable_ids {
+            let receipt = self.load_durable_one(durable_id).await?;
+            requested_identifiers.push(receipt.requested_identifier);
+            active_identifiers.extend(receipt.active_identifiers);
+        }
+        let after = self.snapshot()?;
+        Ok(project_load_batch(
+            &before,
+            &after,
+            &requested_identifiers,
+            &active_identifiers,
+        ))
+    }
+
+    async fn load_durable_one(&mut self, durable_id: &str) -> anyhow::Result<LoadReceipt> {
         anyhow::ensure!(
             !self.loaded_node_ids.iter().any(|id| id == durable_id),
             "That node is already directly loaded."
@@ -131,42 +160,18 @@ impl KmapContext {
             self.ingest_node(node.clone(), true, "active")?;
         }
         self.loaded_node_ids.push(durable_id.to_owned());
-        let requested_already_loaded = previously_full.contains(&requested_id);
-        let requested_context = if requested_already_loaded {
-            Value::Null
-        } else {
-            self.context_node(&requested)?
-        };
-        let mut active_context = Vec::new();
+        let requested_identifier = self.short_id(&requested_id);
+        let mut active_identifiers = Vec::new();
         for node in &active {
             let id = string_field(node, "id")?;
             if !previously_full.contains(id) {
-                active_context.push(self.context_node(node)?);
+                active_identifiers.push(self.short_id(id));
             }
         }
-        let full = self.full_node_ids.clone();
-        let direct_fanout = requested
-            .get("fanout_connections")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| !full.contains(id))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let direct_fanout = self.summaries(&direct_fanout);
-        Ok(json!({
-            "requestedNode": requested_context,
-            "requestedNodeIdentifier": self.short_id(&requested_id),
-            "requestedNodeAlreadyLoaded": requested_already_loaded,
-            "activeConnectionNodes": active_context,
-            "directFanoutNodes": direct_fanout,
-            "indirectFanoutNodes": [],
-        }))
+        Ok(LoadReceipt {
+            requested_identifier,
+            active_identifiers,
+        })
     }
 
     pub(crate) async fn reset(&mut self, durable_ids: &[String]) -> anyhow::Result<Value> {
@@ -185,12 +190,12 @@ impl KmapContext {
             "Reset would exceed the ten directly loaded node limit."
         );
         self.clear(true);
-        self.ensure_roots_loaded().await?;
-        let mut loads = Vec::new();
-        for id in durable_ids {
-            loads.push(self.load_durable(id).await?);
+        let mut loads = self.root_node_ids.clone();
+        for id in &loads {
+            self.short_id(id);
         }
-        Ok(json!({"loads": loads, "context": self.snapshot()?}))
+        loads.extend_from_slice(durable_ids);
+        self.load_durable_batch(&loads).await
     }
 
     pub(crate) fn refresh(&mut self, nodes: Vec<Value>) -> anyhow::Result<()> {
@@ -415,27 +420,16 @@ impl KmapContext {
             })
             .collect()
     }
-
-    fn summaries(&mut self, connections: &[Value]) -> Vec<Value> {
-        connections
-            .iter()
-            .filter_map(|connection| {
-                let id = connection.get("id").and_then(Value::as_str)?;
-                Some(json!({
-                    "identifier": self.short_id(id),
-                    "shortName": connection.get("short_name").and_then(Value::as_str).unwrap_or("Unloaded node"),
-                    "shortDescription": connection.get("short_description").and_then(Value::as_str).unwrap_or(""),
-                }))
-            })
-            .collect()
-    }
 }
 
 pub(crate) fn format_kmap_context(snapshot: &Value) -> String {
+    format_projected_kmap_context(snapshot, &project_snapshot(snapshot))
+}
+
+pub(crate) fn format_projected_kmap_context(snapshot: &Value, projection: &Value) -> String {
     let roots = number_list(snapshot.get("rootIdentifiers"));
     let loaded = number_list(snapshot.get("directlyLoadedIdentifiers"));
-    let projection = project_snapshot(snapshot);
-    let nodes = format_compact_memory_sections(&projection);
+    let nodes = format_compact_memory_sections(projection);
     format!(
         "Current Kmap context\n\nAlways-loaded root identifiers: {roots}\nDirectly loaded node limit: 10\nDirectly loaded memory identifiers: {loaded}\n\n{}",
         if nodes.is_empty() {
@@ -446,7 +440,6 @@ pub(crate) fn format_kmap_context(snapshot: &Value) -> String {
     )
 }
 
-#[cfg(test)]
 pub(crate) fn project_load_batch(
     before: &Value,
     after: &Value,
@@ -671,7 +664,6 @@ fn full_identifiers(snapshot: &Value) -> HashSet<u64> {
         .collect()
 }
 
-#[cfg(test)]
 fn projection_roles(projection: &Value) -> HashMap<u64, u8> {
     let mut roles = HashMap::new();
     for (key, role) in [
@@ -897,6 +889,7 @@ fn indent(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::Path, routing::get};
 
     fn position(text: &str, needle: &str) -> usize {
         text.find(needle)
@@ -1104,6 +1097,92 @@ mod tests {
         assert!(!rendered.contains("Previously active details"));
         assert!(!rendered.contains("Known Direct Fanout"));
         assert!(!rendered.contains("Nine summary omitted"));
+    }
+
+    #[tokio::test]
+    async fn reset_is_a_single_load_batch_for_roots_and_retained_nodes() {
+        let app = Router::new().route(
+            "/api/v1/kmap/nodes/{id}",
+            get(|Path(id): Path<String>| async move {
+                let (name, fixed, recent, summaries) = match id.as_str() {
+                    "root" => (
+                        "Root",
+                        vec!["a", "c"],
+                        Vec::new(),
+                        vec![
+                            json!({"id":"a","short_name":"Node A","short_description":"A summary"}),
+                            json!({"id":"c","short_name":"Node C","short_description":"C summary"}),
+                        ],
+                    ),
+                    "a" => (
+                        "Node A",
+                        Vec::new(),
+                        vec!["c", "d"],
+                        vec![
+                            json!({"id":"c","short_name":"Node C","short_description":"C summary"}),
+                            json!({"id":"d","short_name":"Node D","short_description":"D summary"}),
+                        ],
+                    ),
+                    "c" => ("Node C", Vec::new(), Vec::new(), Vec::new()),
+                    "d" => ("Node D", Vec::new(), Vec::new(), Vec::new()),
+                    _ => ("Unknown", Vec::new(), Vec::new(), Vec::new()),
+                };
+                Json(json!({
+                    "id":id,
+                    "owner_node_id":"root",
+                    "short_name":name,
+                    "short_description":format!("{name} summary"),
+                    "long_description":format!("{name} details"),
+                    "last_modified_by":"test-model-high",
+                    "last_modified_at":"2026-07-20T00:00:00Z",
+                    "fixed_connections":fixed,
+                    "recent_connections":recent,
+                    "connection_summaries":summaries,
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = super::super::Config {
+            system_prompts_directory: std::path::PathBuf::new(),
+            kweb_base: base.clone(),
+            intelligence_base: base.clone(),
+            conversation_history_base: base.clone(),
+            telegram_relay_base: base.clone(),
+            audio_ingress_base: base,
+            telegram_web_user_handle: "@test".into(),
+        };
+        let api = Api::new(&config).unwrap();
+        let mut context = KmapContext::new(api, vec!["root".into()]).unwrap();
+        context.initialize().await.unwrap();
+
+        let projection = context.reset(&["a".into()]).await.unwrap();
+        assert_eq!(
+            array(projection.get("directNodes"))
+                .iter()
+                .filter_map(node_identifier)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            array(projection.get("activeConnectionNodes"))
+                .iter()
+                .filter_map(node_identifier)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(projection.get("loads").is_none());
+        assert!(projection.get("context").is_none());
+
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot["directlyLoadedIdentifiers"], json!([1, 2]));
+        let rendered = format_projected_kmap_context(&snapshot, &projection);
+        assert!(position(&rendered, "Node 1: Root") < position(&rendered, "Node 2: Node A"));
+        assert!(position(&rendered, "Node 2: Node A") < position(&rendered, "Node 3: Node C"));
+        assert_eq!(occurrences(&rendered, "Node 2: Node A"), 1);
+        assert_eq!(occurrences(&rendered, "Node 3: Node C"), 1);
+        server.abort();
     }
 
     #[test]

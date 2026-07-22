@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::{
     AgentMode, Api, Config, Manuals, RuntimeModel, Session,
     http::{data_url, encode_path, stable_idempotency_id},
-    session::SessionOptions,
+    session::{SessionOptions, is_agent_loop_round_limit},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -363,14 +363,27 @@ impl Orchestrator {
                         .await;
                     self.active_operations.lock().await.remove(&conversation_id);
                     if let Err(error) = result {
+                        let round_limit = is_agent_loop_round_limit(&error);
                         session.orchestration = if is_cancelled(&error) {
                             json!({"owner":"backend","status":"stopped"})
+                        } else if round_limit {
+                            json!({"owner":"backend","status":"stopped","lastError":bounded_error(&error)})
                         } else {
                             json!({"owner":"backend","status":"retrying","lastError":bounded_error(&error)})
                         };
-                        persist_record(&self.api, &record, session.snapshot()?, false)
-                            .await
-                            .ok();
+                        let persisted =
+                            persist_record(&self.api, &record, session.snapshot()?, false).await;
+                        if round_limit {
+                            persisted?;
+                            tracing::warn!(command_id=%command_id, "Browser conversation stopped at the tool-loop round limit");
+                            self.complete_command(
+                                &command_id,
+                                json!({"status":"stopped","reason":"tool_loop_round_limit"}),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        persisted.ok();
                         if is_cancelled(&error) {
                             self.complete_command(&command_id, json!({"status":"stopped"}))
                                 .await?;
@@ -391,6 +404,7 @@ impl Orchestrator {
             }
             "retry" => {
                 if session.pending_turn {
+                    session.reset_exhausted_turn_rounds_for_retry();
                     session.orchestration = json!({"owner":"backend","status":"working"});
                     persist_record(&self.api, &record, session.snapshot()?, false).await?;
                     let operation = Uuid::new_v4();
@@ -412,14 +426,27 @@ impl Orchestrator {
                         .await;
                     self.active_operations.lock().await.remove(&conversation_id);
                     if let Err(error) = result {
+                        let round_limit = is_agent_loop_round_limit(&error);
                         session.orchestration = if is_cancelled(&error) {
                             json!({"owner":"backend","status":"stopped"})
+                        } else if round_limit {
+                            json!({"owner":"backend","status":"stopped","lastError":bounded_error(&error)})
                         } else {
                             json!({"owner":"backend","status":"retrying","lastError":bounded_error(&error)})
                         };
-                        persist_record(&self.api, &record, session.snapshot()?, false)
-                            .await
-                            .ok();
+                        let persisted =
+                            persist_record(&self.api, &record, session.snapshot()?, false).await;
+                        if round_limit {
+                            persisted?;
+                            tracing::warn!(command_id=%command_id, "Browser conversation stopped at the tool-loop round limit");
+                            self.complete_command(
+                                &command_id,
+                                json!({"status":"stopped","reason":"tool_loop_round_limit"}),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        persisted.ok();
                         if is_cancelled(&error) {
                             self.complete_command(&command_id, json!({"status":"stopped"}))
                                 .await?;
