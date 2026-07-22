@@ -13,7 +13,7 @@ Selection resumes that job first and otherwise chooses the oldest eligible
 source and position.
 
 Submission and transition methods are idempotent where a lost response may be
-replayed. Completion requires a successful `EndTurn` receipt in the durable
+replayed. Completion requires a successful `EndSession` receipt in the durable
 history-ingress checkpoint. An input-too-large error or fifth consecutive
 failure becomes terminal; an explicit retry preserves diagnostics while
 resetting the consecutive count.

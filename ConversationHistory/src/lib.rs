@@ -1665,13 +1665,14 @@ fn complete_self_time(
         .and_then(Value::as_str);
     if !matches!(ended_reason, Some("tool" | "deadline" | "hard-stop")) {
         return Err(ApiError::bad(
-            "Self time can complete only after EndTurn or the shared deadline.",
+            "Self time can complete only after EndSession or the shared deadline.",
         ));
     }
-    if ended_reason == Some("tool") && !tool_log_has_success(state, "/archive/tools/log", "EndTurn")
+    if ended_reason == Some("tool")
+        && !tool_log_has_success(state, "/archive/tools/log", "EndSession")
     {
         return Err(ApiError::bad(
-            "Self time cannot complete from a tool ending without a successful EndTurn receipt.",
+            "Self time cannot complete from a tool ending without a successful EndSession receipt.",
         ));
     }
     update_active(db, id, expected_version, state, "complete")
@@ -2312,13 +2313,13 @@ mod tests {
 
         let unfinished = complete_self_time(&db, "self-time", 1, &active_state).unwrap_err();
         assert_eq!(unfinished.code, "invalid_request");
-        assert!(unfinished.message.contains("EndTurn"));
+        assert!(unfinished.message.contains("EndSession"));
         assert_eq!(fetch_record(&db, "self-time").unwrap().phase, "active");
 
         let state = json!({
             "sessionType":"free-time",
             "freeTime":{"sliceEndedReason":"tool"},
-            "archive":{"format":"kennedy-chatend","sessionType":"free-time","tools":{"log":[{"name":"EndTurn","ok":true}]}}
+            "archive":{"format":"kennedy-chatend","sessionType":"free-time","tools":{"log":[{"name":"EndSession","ok":true}]}}
         });
         let completed = complete_self_time(&db, "self-time", 1, &state).unwrap();
         assert_eq!(completed.phase, "complete");

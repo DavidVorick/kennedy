@@ -161,6 +161,8 @@ test("self-time validation and display timing use the backend deadline", () => {
 test("Chatend formatting uses the latest complete context measurement", () => {
   const usage = {
     contextWindowTokens: 128_000,
+    contextKnown: true,
+    contextTokens: 88_000,
     lastContext: { inputTokens: 20_000, outputTokens: 1_000 },
   };
   assert.deepEqual(contextUsageMeasurement(usage), {
@@ -177,11 +179,11 @@ test("Chatend formatting uses the latest complete context measurement", () => {
   ], usage), /System context[\s\S]*David[\s\S]*Kennedy[\s\S]*21,000/);
 });
 
-test("Full inspector displays the exact backend Chatend string without reconstruction", () => {
+test("Full inspector displays the exact backend provider input without reconstruction", () => {
   const chatend = [
     { role: "system", content: "FRONTEND RECONSTRUCTION MUST NOT APPEAR" },
   ];
-  const exact = "Backend-owned Chatend\n\n  spacing is preserved  \n\n{ordinary tool request JSON remains text}";
+  const exact = '{"id":3,"method":"turn/start","params":{"input":[{"type":"text","text":"Exact input"}]}}\n';
   const rendered = inspectorText({ chatend, chatendText: exact, usage: { contextKnown: true, contextTokens: 999 }, context: { privateDiagnostic: true } });
   assert.equal(rendered, exact);
   assert.doesNotMatch(rendered, /FRONTEND RECONSTRUCTION|privateDiagnostic|999/);
@@ -198,7 +200,8 @@ test("Main inspector consumes one combined result for a LoadNode batch", () => {
   });
   const entries = mainViewEntries({
     chatend: [
-      { role: "assistant", content: 'KENNEDY_TOOL_CALLS\n{"calls":[{"name":"LoadNode","arguments":{"identifier":2}},{"name":"LoadNode","arguments":{"identifier":3}}]}' },
+      { role: "assistant", context_kind: "tool-call", tool_name: "LoadNode", tool_arguments: { identifier: 2 }, content: 'call_ktool · LoadNode\n\n{"identifier":2}' },
+      { role: "assistant", context_kind: "tool-call", tool_name: "LoadNode", tool_arguments: { identifier: 3 }, content: 'call_ktool · LoadNode\n\n{"identifier":3}' },
       {
         role: "user",
         display_role: "Memory tool result",

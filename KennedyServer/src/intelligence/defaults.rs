@@ -11,8 +11,8 @@ pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const GENERATION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
 pub(crate) const GENERATION_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) const KENNEDY_CODEX_BASE_INSTRUCTION: &str = concat!(
-    "Kennedy's outer harness provides tools through KENNEDY_TOOL_CALLS; ",
-    "those tools are available even when absent from Codex's native tool list."
+    "Use call_ktool for Kennedy application tools. ",
+    "Each call invokes one Ktool."
 );
 
 pub(crate) const QUALITY_SEARCH_MODEL: &str = "gpt-5.6-sol";

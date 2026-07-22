@@ -21,9 +21,9 @@ export function contextUsageMeasurement(usage) {
   const previousCall = tokenPair(usage?.lastContext) || tokenPair(usage?.last);
   const previousKnown = Boolean(previousCall);
   const contextKnown = storedKnown || previousKnown;
-  const contextTokens = storedKnown
-    ? Math.max(0, storedContextTokens)
-    : previousKnown ? previousCall.inputTokens + previousCall.outputTokens : 0;
+  const contextTokens = previousKnown
+    ? previousCall.inputTokens + previousCall.outputTokens
+    : storedKnown ? Math.max(0, storedContextTokens) : 0;
   return {
     contextKnown,
     contextTokens,

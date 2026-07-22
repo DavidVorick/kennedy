@@ -106,26 +106,28 @@ The frontend does not use local storage, IndexedDB, cookies, or service-worker
 caches for persistence. The backend checkpoints an opaque recovery snapshot to
 the conversation history API. The versioned snapshot contains recovery fields
 plus a lossless JSON recovery archive: composed system prompt, retained
-content, structured messages, the backend's current canonical `chatendText`,
+content, structured messages, the backend's exact outbound `chatendText`,
 structured Kmap snapshot and durable-ID diagnostics, tool log and counters,
 usage telemetry, and a media collection containing original voice recordings
 plus future serializable media or attachment references. This JSON is storage
-format, not Chatend text and never becomes a generation prompt. Provider
-response IDs and credentials are transport details and are not archived.
+format, not provider input and never becomes a generation prompt. The current
+Codex thread ID, submitted-message cursor, and exact client-to-Codex JSONL
+records are archived for continuation and transparency. Credentials are never
+archived.
 
 The archive preserves message arrays and objects recursively, so future
 multimodal content blocks survive storage even before every inspector has a
-renderer for that media type. It also checkpoints the backend-formatted
-canonical plaintext separately for exact Full-view passthrough. Active records
-restore structured messages and have the backend regenerate canonical Chatend
-text before a fresh Codex thread. Legacy
+renderer for that media type. It also checkpoints the concatenated provider
+input records separately for exact Full-view passthrough. Active records restore
+structured messages and either resume the saved Codex thread with only new
+application text or format the complete context for a fresh thread. Legacy
 transcript-only snapshots remain readable and recover through the old rebuild
 path.
 
 The recovery archive also contains an inspector-only Full History. Immediately
 before every successful `ResetContext` rebuild, the backend snapshots the
 outgoing structured messages, Kmap snapshot, and usage state as one completed
-context segment, together with that segment's backend-formatted `chatendText`.
+context segment, together with that segment's exact provider-input `chatendText`.
 These segments are durable UI history only: they are never
 restored into the active Chatend, formatted into generation input, or included
 when history ingress extracts the archived conversation's model-readable final
@@ -139,38 +141,40 @@ read-only. Draft text is not durable until submitted as a backend command.
 
 ## 5. Chatend Model
 
-The Chatend is the canonical human-readable application prompt supplied to
-Kennedy. The backend alone formats the current message list and includes that
-canonical plaintext in every durable checkpoint. The generation path submits
-that string, and Full view displays the supplied string verbatim without
-reconstructing it from archived messages. Consequently Full view shows the text
-sent for a fresh Codex thread exactly—role labels, separators, and content
-included; there is no hidden application-side JSON envelope or differently
-formatted prompt. This exactness is scoped to application-controlled plaintext.
-Codex or its upstream provider may add forced system content or structured tool
-metadata downstream; the application minimizes everything its environment
-exposes and does not claim those inaccessible layers appear in the inspector.
-Provider thread IDs and runtime protocol data are not Chatend content.
-It contains:
+For v3 archives, `chatendText` is the exact client-to-Codex JSONL byte stream
+that Kennedy's backend wrote for the current context, represented as UTF-8.
+This includes initialize, thread start/resume, turn start, and native tool-result
+responses, with their exact JSON serialization and trailing newlines. Full view
+must display that string byte for byte. It must not parse, pretty-print,
+reconstruct, summarize, omit, add, relabel, or reorder anything. The purpose of
+Full view is transparency, not human friendliness: whatever Kennedy's backend
+sent to Codex is exactly what the user sees.
+
+Codex may add provider-side instructions, schemas, or metadata after this
+observable boundary. If Codex exposes those bytes to the client they belong in
+the transcript; if it does not, the UI displays only the exact bytes Kennedy
+sent to Codex and makes no claim about hidden additions. Structured messages
+remain in the recovery archive for Main view and replay construction, but they
+are not an alternate Full-view representation.
+The application context encoded inside fresh-thread or continuation input contains:
 
 - the composed system prompt,
 - the clean conversation transcript,
 - the current Kweb context,
-- transparent text tool requests and readable tool results that remain in
-  context.
+- structured native Ktool activity retained for Main view and reset recovery.
 
 Canonical formatting labels system messages `System context`, user messages
 `David`, and assistant messages `Kennedy` unless a message supplies a more
 specific visible role. Nonempty messages are separated by
-`────────────────────────`. The backend submits the entire formatted Chatend
-when starting a Codex thread. Later requests use `previous_response_id` as the
-Codex thread ID and submit the canonically formatted newly appended suffix;
+`────────────────────────`. The backend places the entire formatted application
+context in the `turn/start` text item when starting a Codex thread. Later
+requests resume the Codex thread and submit only the canonically formatted new
+application messages. These text items remain nested inside the exact JSONL
+shown by Full view;
 the preceding Chatend is already in that provider thread. System instructions
-are prose sections, Kmap context is YAML-like text, tool requests are ordinary
-assistant text, and local tool results are readable memory updates.
-If the backend rejects a continuation because its thread predates the current
-verified prompt boundary, the backend clears that continuation and immediately
-replays the complete visible Chatend into a fresh thread.
+are prose sections and Kmap context is YAML-like text. Native function calls and
+results live in the Codex thread and in Kennedy's structured recovery log; they
+are not encoded as fake assistant/user dialogue in provider input.
 
 The clean transcript is maintained separately for the uncluttered conversation
 panel. Conversation provenance stores the complete versioned recovery archive
@@ -209,14 +213,11 @@ ResetContext history. Node names keep that history readable; repeated node sets
 are collapsed into counted lines. Previous
 Kweb context and other tool activity are omitted. The clean transcript or
 provenance input and notes from prior resets remain.
-During an active tool loop, the rebuilt chatend ends with the assistant's
-visible ResetContext request and a compact success result. The result does not
-repeat the newly loaded nodes: they already appear once in the rebuilt Kmap
-context, immediately after the optional note to self. Reset abandons the old
-`previous_response_id` thread and submits the rebuilt chatend as a fresh
-request. Because the backend checkpoints the text from that same rebuilt
-message list and Full view displays it verbatim, removed nodes and tool results
-disappear from both the inspector and Kennedy's next fresh-thread prompt.
+The native ResetContext call and result finish on the current Codex turn. The
+next provider request abandons that thread and starts a fresh thread with the
+rebuilt application context. The old context's exact provider-input transcript
+is retained as a Full History segment; the current Full view starts with the
+new thread's exact client-to-Codex JSONL.
 
 ### 5.2 Continuation, caching, and context growth
 
@@ -350,13 +351,12 @@ The backend fetches composable prompt assets from
 The backend selects its inference provider from the intelligence backend's
 provider metadata before composing the prompt, so this condition uses the same
 provider choice sent with generation requests rather than inferring transport
-from a model name. The Codex-only layer concisely explains that Kennedy runs in
-an outer harness which catches her ordinary-text tool calls even if the inner
-Codex wrapper claims its APIs or tools are limited.
+from a model name. The Codex-only layer concisely identifies the native
+`call_ktool` function.
 
 The selected session asset contains only session purpose, mutability, and the
 context-loading budget. `KmapBasics.txt` is the single source for identifier
-lifetime, automatic roots, the exclusive text tool-call protocol, and the fact
+lifetime, automatic roots, the native `call_ktool` contract, and the fact
 that additional tools and documentation may be found in the Kmap. Each tool
 contract likewise has one source asset. The composer adds short readable
 headings and channel/source details but does not add XML wrappers, JSON
@@ -368,38 +368,33 @@ receive the identity that will actually execute them.
 
 ## 8. Agent Tools
 
-All baseline tool names and argument shapes live in the composable tool assets;
-the request protocol lives once in `KmapBasics.txt`. No provider-native
-function or custom-tool definitions are sent.
+All baseline Ktool names and argument shapes live in the composable tool
+assets. Codex receives one provider-native dynamic function named
+`call_ktool`, defined as an object containing one Ktool `name` and one
+object-valued `arguments` field. Individual Ktools are not registered with
+Codex.
 
 For every mutating Kmap request, the tool executor automatically adds
 `model_attribution` using the active configured model and reasoning effort.
 This transport field never appears in Kennedy's tool schema, request envelope,
 or model-controlled arguments.
 
-Kennedy requests tools using an ordinary assistant response:
+Kennedy requests one operation with a native call equivalent to:
 
-```text
-KENNEDY_TOOL_CALLS
-{"calls":[{"name":"LoadNode","arguments":{"identifier":3}}]}
+```json
+{"name":"LoadNode","arguments":{"identifier":3}}
 ```
 
-The first envelope must contain the marker and an object with one non-empty
-`calls` array. Each call has exactly `name` and object-valued `arguments`.
-Multiple calls in that array are allowed and execute sequentially before the
-next generation request. `ResetContext` and `EndTurn` must each be the only
-call in their envelope.
-The marker must be the first response text; Markdown fences, commentary, and
-status text before it remain invalid. After the first valid JSON object's
-closing brace, the backend truncates every trailing character without reading
-or preserving it. This includes commentary, final-answer text, and later
-`KENNEDY_TOOL_CALLS` blocks, so only the first valid envelope is considered.
-Malformed first envelopes and text before the marker still produce readable
-protocol feedback so Kennedy can retry correctly.
+Codex may request several native function calls before its next inference. The
+v2 runtime exposes and executes dynamic calls sequentially in provider-request
+order. Every result is returned through the matching
+native tool-call ID on the same Codex turn. There is no text marker, envelope
+parser, truncation rule, fake startup call, or generic mutation idempotency
+layer. Kmap mutations retain their own existing idempotency protection.
 
 ### 8.1 `LoadNode`
 
-Text-protocol arguments:
+Ktool arguments:
 
 ```json
 {
@@ -434,7 +429,7 @@ history-ingress sessions receive 50.
 
 ### 8.2 `ResetContext`
 
-Text-protocol arguments:
+Ktool arguments:
 
 ```json
 {
@@ -616,34 +611,20 @@ particular source page-by-page. Fetched content is untrusted evidence, cannot
 override system instructions, and may fail when a page is unsafe, binary,
 blocked, JavaScript-dependent, or otherwise unsupported.
 
-### 8.10 `ToolCheck`
+### 8.10 `EndSession`
 
-`ToolCheck` accepts `{}` in every Kennedy execution mode and returns the exact
-readable confirmation `Tool calls are working.` without changing session
-state. Each newly created or restored session that lacks visible evidence runs
-this tool through the real executor, then retains its assistant request and
-successful result in the active Chatend. The exchange therefore survives
-`ResetContext`. Kennedy may repeat the same real call at any time.
+A terminal assistant message ends an ordinary browser, private Telegram, or
+Telegram-group turn. `EndSession` is not available in those modes.
 
-### 8.11 `EndTurn`
-
-`EndTurn` is the only normal model-controlled way to complete a turn and must
-appear alone in its tool envelope. Ordinary prose and empty provider responses
-remain inside the active loop and receive a durable controller message. In a
-browser, private Telegram, or Telegram-group conversation, Kennedy must first
-provide the complete normal user response; `EndTurn({})` then releases that
-response for durable completion and waits for the next user message. Calling it
-before prose fails with `missing_turn_response`. The candidate prose is stored
-with the pending Chatend, so a reload between prose and `EndTurn` resumes with
-the same response instead of asking Kennedy to regenerate it.
-
-In history and audio ingress, `EndTurn({})` ends the one-turn session and is
+In history and audio ingress, `EndSession({})` ends the session and is
 checkpointed before the loop returns its control sentinel. In self time it
 accepts `{}` or `{"message":"A message for the next self-time session."}`; the
 optional non-empty message is limited to 400,000 characters and is forwarded
 only if another clean-slate slice can open. With less than five minutes left,
 the self-time run ends and no message is forwarded. The old session-specific
-end-tool names are not exposed or accepted.
+end-tool names and `EndTurn` are not exposed or accepted. `EndSession` may be
+requested beside other calls. It fails if another call in that native call
+group failed; after the failure is handled, Kennedy may call it again.
 
 At startup, the backend asks both durable ingress services to release records
 carrying the one-time historical repair marker. A release failure is shown as a
@@ -651,7 +632,7 @@ repair-specific warning but does not make ordinary conversation history or
 audio browsing unavailable; the marked records remain safely quarantined until
 the corrected service is reachable.
 Every corrected conversation or audio claim also supplies
-`completion_protocol: "end-turn-v1"`, allowing the backend to reject
+`completion_protocol: "end-session-v2"`, allowing the backend to reject
 an older backend build before it can consume newly released repair work.
 
 ### 8.12 Kmap-documented Rust library tools
@@ -661,7 +642,7 @@ an older backend build before it can consume newly released repair work.
 including browser conversation, private/group Telegram, self time, history
 ingress, and audio ingress. Their Kennedy-facing contracts are absent from the
 static prompt assets and live entirely in the Kmap; `KmapBasics.txt` supplies
-only the generic discovery notice and text-call protocol.
+only the generic discovery notice and native-call contract.
 
 The native backend validates the model-visible name and complete-file write
 shapes, automatically attaches a durable tool-session identifier that never
@@ -726,17 +707,15 @@ operations continue with no browser open.
 3. The backend appends the user message, resets the per-turn LoadNode counter,
    and checkpoints the pending query with `user_activity: true`. If this fails,
    it does not contact the LLM.
-4. The backend submits the canonical plaintext for newly appended messages, the previous
-   response ID when available, a stable session-type cache key, and the
-   configured model to the intelligence backend. The first request sends the
-   complete formatted Chatend.
-5. If Kennedy emits a tool envelope, the backend appends the visible assistant text, executes
-   every call sequentially in array order, append readable result messages, and
-   continue from the returned response ID. State changes from one call are
-   visible to the next call in the same response.
-   After every complete response-sized tool round, checkpoint the updated full
-   recovery archive before requesting another model response.
-6. Continue until Kennedy returns final text.
+4. The backend starts a standard Codex app-server turn. A fresh thread receives
+   the complete formatted application context and one dynamic `call_ktool`
+   definition; a resumed thread receives only newly appended application text.
+5. For each native tool request, the backend executes one Ktool, checkpoints
+   the updated recovery archive, and returns the result through the matching
+   JSON-RPC call ID on the same Codex turn. Codex may request several calls;
+   v2 handles them sequentially in provider-request order.
+6. Continue the same provider turn until Codex emits its terminal assistant
+   item and `turn/completed`.
 7. The backend appends final text to the clean transcript and Chatend,
    checkpoints the completed turn, and completes the durable command before
    accepting the next command for that conversation.
@@ -776,7 +755,7 @@ message/retry command for that conversation, and the backend then:
 5. store the returned opaque provenance ID while transitioning the history
    record to `ingress_in_progress`,
 6. run history ingress using that provenance ID in the background and
-   checkpoint its complete Chatend after every tool round,
+   checkpoint its complete Chatend after every native tool call,
 7. only after success transition the history record to `complete`, then claim
    the next queued record.
 
@@ -838,7 +817,7 @@ launch prompt plus the session number, falling back to `Self time · session N`
 when no prompt was supplied.
 
 The backend's single Kmap-writer gate owns the complete run; browser tabs do
-not execute or lock it. Only a successful `EndTurn`, the shared deadline, or
+not execute or lock it. Only a successful `EndSession`, the shared deadline, or
 its hard-stop grace
 finalizes the current record directly into read-only `complete` history without
 submitting its Chatend to history ingress: the live self-time session already
@@ -1011,18 +990,17 @@ attempts do not increment the totals.
 
 The right panel has three views of Kennedy's current chatend. The Main view is
 selected by default and combines the ordinary conversation with progressively
-disclosed application context and activity. The Full view displays the
-backend-supplied canonical Chatend plaintext verbatim; it has no independent
-formatter or reconstruction step, is not a rendering of the recovery JSON, and
-does not hide application prompt content. It displays the entire
-application-controlled plaintext boundary, not unobservable system/tool
-scaffolding that Codex or its provider may inject afterward:
+disclosed application context and activity. Full view is a byte-for-byte
+display of the backend-supplied `chatendText`. For v3 records that field is the
+exact outbound Codex app-server JSONL transcript described in section 5. Full
+view has no independent formatter or reconstruction step and is intentionally
+not optimized for readability.
 
 Legacy archives with messages but no persisted `chatendText` are hydrated by
-the Rust backend on read using the same canonical formatter used for model
-requests. This applies to current conversation and ingress archives and to
-saved pre-reset segments. The browser never substitutes an unavailable notice
-or performs this compatibility formatting itself.
+the Rust backend using the former canonical plaintext formatter. This is a
+read-only compatibility representation for records created before exact
+provider-input capture existed; it is never substituted for a v3 provider
+transcript. The browser never formats either representation itself.
 
 - **Main view** leaves David and Kennedy's ordinary conversation responses
   visible. Kennedy responses longer than 500 Unicode characters show only the
@@ -1045,8 +1023,8 @@ or performs this compatibility formatting itself.
   result adds one closed event row for the requested node only; full active
   connections remain reachable inside that row and are not repeated as sibling
   event rows.
-- **Full view** shows system context, conversation, transparent JSON tool
-  envelopes, readable tool results, and loaded Kmap context.
+- **Full view** shows the exact outbound Codex JSONL, including native function
+  definitions, turn input, and tool-result responses exactly as sent.
 - **Full History** renders every completed pre-reset context and the current
   context using Main-view disclosure rules. A prominent `ResetContext` barrier
   separates adjacent context segments. It also separates the closed
@@ -1054,21 +1032,24 @@ or performs this compatibility formatting itself.
   from both phases, and follows live ingress checkpoints through their final
   completed or failed state.
 
-Full view continues to show timing messages in their exact Chatend positions;
-the timing consolidation is presentation-only in Main and Full History.
+Full view continues to preserve timing messages exactly where they occur inside
+outbound turn-input JSONL; the timing consolidation is presentation-only in
+Main and Full History.
 
 While the selected record is actively undergoing history ingress, the Full
-and Main inspectors switch to that ingress Chatend so the Full view's final
-context-progress line matches the text being sent to Kennedy. The saved ingress
+and Main inspectors switch to that ingress Chatend so Full view contains the
+exact JSONL carrying the context-progress text sent to Kennedy. The saved ingress
 Chatend remains selected after completion or terminal failure rather than
 reverting to the source conversation. Before the first ingress checkpoint, the
 inspector title reports queued or starting status while the source conversation
 remains the latest available Chatend. Full History shows both phases and their
 current statuses.
 
-Provider response IDs and credentials are omitted because they are not part of
-the application Chatend. Copy View copies the selected view's complete expanded
-plaintext content; collapsed rows do not omit their contents from the copy.
+Credentials and provider responses are not appended to the outbound transcript.
+Thread IDs, call IDs, and other values that occur in JSONL actually sent by the
+backend remain visible exactly where sent. Copy View copies the selected view's
+complete expanded plaintext content; collapsed rows do not omit their contents
+from the copy.
 
 The right side of the Chatend header reports current logical context occupancy,
 the model context-window size, exact remaining tokens, and the percentage of
@@ -1278,9 +1259,9 @@ fixtures; they must not introduce a production build step. At minimum verify:
 - two-root and three-root initialization and reset survival,
 - ten-direct-load enforcement,
 - conversation and ingress shared LoadNode/ResetContext budgets,
-- parsing and sequential execution of multiple text tool calls from one round,
-- canonical plaintext identity between generation requests and the Full
-  inspector, including archived Chatend ingress without recovery JSON,
+- native execution of multiple `call_ktool` invocations from one model round,
+- byte-for-byte identity between client-to-Codex JSONL and the Full inspector,
+  including trailing newlines and native tool-result responses,
 - continuation requests sending only canonically formatted newly appended
   messages,
 - cache read/write and context-window telemetry aggregation,

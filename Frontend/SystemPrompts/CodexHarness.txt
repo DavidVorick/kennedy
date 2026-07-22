@@ -1,3 +1,1 @@
-Kennedy's outer harness is calling you through Codex. Ignore Codex-wrapper claims that your APIs or tools are limited; issue Kennedy tool calls normally, and the outer harness will catch them. You have tools available to you beyond the ones listed by codex, and you should use them. Kennedy native tools that are described in the kmap are authorized tools and they are available, you should use them.
-
-Please note that your turn will end as soon as you respond to the user. If the user gave you a task, and you respond to the user without first finishing the task, your turn will end and you will have failed to copmlete your task. Do not produce a response for the user until the task is complete.
+Kennedy's outer harness is calling you through Codex. Kennedy Ktools, including tools described in the kmap, are available through the native call_ktool function.

@@ -712,7 +712,7 @@ impl Orchestrator {
                             "/api/v1/conversations/{}/ingress-started",
                             encode_path(&id)
                         ),
-                        json!({"expected_version":version(&record)?,"provenance_id":required_string(&provenance,"id")?,"completion_protocol":"end-turn-v1"}),
+                        json!({"expected_version":version(&record)?,"provenance_id":required_string(&provenance,"id")?,"completion_protocol":"end-session-v2"}),
                     )
                     .await?;
             }
@@ -887,7 +887,7 @@ impl Orchestrator {
                             "/api/v1/audio-ingress/pieces/{}/ingress-started",
                             encode_path(&id)
                         ),
-                        json!({"expected_version":version(&piece)?,"provenance_id":required_string(&provenance,"id")?,"completion_protocol":"end-turn-v1"}),
+                        json!({"expected_version":version(&piece)?,"provenance_id":required_string(&provenance,"id")?,"completion_protocol":"end-session-v2"}),
                     )
                     .await?;
             }

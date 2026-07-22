@@ -82,20 +82,19 @@ stock instruction-bearing catalog when the mount is unavailable. Set
 `CODEX_SAFE_CATALOG_DIR` for a persistent custom cache path; the launcher
 already honors the same variable.
 
-The backend owns the one canonical plaintext Chatend formatter used for
-generation and checkpoints its current output for the UI. The Full Chatend
-inspector displays that supplied string verbatim, so it shows every
-application-controlled byte of the prompt supplied to Codex for Kennedy, not a
-browser reconstruction or formatted JSON archive.
-Backend reads hydrate the same canonical field for legacy conversation,
-history-ingress, audio-ingress, and reset-segment archives that still contain
-their messages, so the Full inspector remains a verbatim passthrough for those
-checkpoints as well.
-Codex or its upstream provider can still add forced system/tool scaffolding
-outside the application's observable boundary. Versioned JSON archives exist
-only for recovery and provenance storage. History ingress parses an archive
-and sends its human-readable message text under `Archived Chatend`; it does not
-send the archive envelope, media blobs, counters, or diagnostics.
+For current v3 archives, `chatendText` is the exact UTF-8 JSONL stream Kennedy's
+backend wrote to Codex app-server: initialize, thread start/resume, turn input,
+and native tool-result responses, including every trailing newline. The Full
+Chatend inspector displays those bytes verbatim. It never parses, pretty-prints,
+reconstructs, omits, adds, relabels, or reorders them. Full view is a
+transparency surface, not a human-friendly rendering.
+
+Codex or its upstream provider can add content after this observable boundary.
+If Codex exposes an addition to the client, it belongs in the transcript; if it
+does not, Full view shows exactly what Kennedy sent to Codex and makes no claim
+about the hidden content. Legacy archives without an exact transcript retain
+their former backend-hydrated plaintext compatibility view. Versioned JSON
+archives remain recovery data and are never substituted for provider input.
 
 The launcher must also forward `codex-safe debug models` and `codex-safe debug
 prompt-input`. Kennedy refuses to invent a fallback context window. On a Codex
@@ -103,19 +102,15 @@ version/cache miss it derives a mandatory sanitized catalog from advertised
 metadata, blanks provider base instructions, removes model message templates
 and agent-tool selectors, disables model-selected skill instructions, and
 verifies that all advertised effective limits are unchanged. Intelligence and
-AudioIngress share that work. Kennedy turns add exactly one fixed Codex base
-instruction stating that `KENNEDY_TOOL_CALLS` tools remain available even when
-absent from Codex's native list; developer instructions remain empty. Isolated
-search and AudioIngress reconciliation keep both instruction overrides empty.
-All exposed optional instruction/tool/plugin scaffolding is disabled. The
-prompt-input probe requires the supplied sentinel to be the only reported
-input message. Successful probes are cached per Codex/catalog and prompt
-configuration instead of rerunning every launch. Codex still registers its
-forced `update_plan` and `view_image` schemas despite every exposed switch
-being false.
+AudioIngress share that work. Conversation generation uses the separate
+`kcode-codex-runtime-v2` app-server client. It registers exactly one application
+function, `call_ktool`, returns native tool results on the same Codex turn, and
+waits for Codex's terminal assistant item. Its fixed base instruction only
+identifies that function. Audio reconciliation and isolated web research
+continue to use the unchanged v1 runtime and its prompt-boundary validation.
 All Codex turns set the auto-compaction threshold beyond any reachable window
 so Kmap context is not silently compacted.
-Each model-facing Chatend ends with the terse line
+Each application-context text item sent inside a Codex turn ends with the terse line
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
 History ingress
 records up to five concise failure diagnostics, then marks the conversation's
@@ -363,8 +358,8 @@ load the group root. Full nodes identify their Kennedy, user, or group owner;
 legacy null owners are shown as unowned. Three arbitrary numbered fixed
 connections replace the former priority/task terminology.
 
-Kennedy's local tools use a text protocol documented once in `KmapBasics.txt`,
-so tool requests and results are visible in the chatend. Every session can read
+Kennedy's local tools use the native `call_ktool` function documented once in
+`KmapBasics.txt`. Every session can read
 Kmap memory, use WebSearch/WebFetch, and access the five managed Rust-library
 tools documented in `KennedyRustLibTools.md`. Live conversations cannot mutate the
 Kmap; the serialized, offline history-ingress worker owns memory mutation. Kennedy
@@ -414,26 +409,24 @@ durable backend command that checkpoints a final user message without asking
 Kennedy to answer, then closes the conversation into the normal
 history-ingress queue.
 
-Every Kennedy session begins with a genuine retained `ToolCheck({})` exchange
-whose result says `Tool calls are working.` Kennedy can repeat it at any time.
-Ordinary prose never completes a turn: all normal paths require a successful
-standalone `EndTurn` call. In browser and Telegram conversations that releases
-the preceding prose response and waits for the next user message; in history
-or audio ingress it ends the one-turn session and is required before the
-durable record can become complete.
+No fake startup tool exchange is inserted. Codex receives `call_ktool` as a
+native dynamic function and may call it several times before continuing
+inference. A normal terminal assistant response completes a browser or Telegram
+turn. History/audio ingress and self time continue after terminal prose until a
+successful `EndSession` Ktool call is durably recorded.
 
 The dedicated **Self Time** tab starts an autonomous run with a duration in
 minutes (30 by default, fractional values allowed for tests) and an optional
 user prompt that carries into every clean-slate slice. Kennedy receives the
-full read/web/Kmap-write tool set and can call `EndTurn({})`, or pass
+full read/web/Kmap-write tool set and can call `EndSession({})`, or pass
 the next session a note with
-`EndTurn({"message":"Continue this investigation."})`, to choose a
+`EndSession({"message":"Continue this investigation."})`, to choose a
 fresh Chatend without giving up any remaining time. The complete run is owned
 by the backend and survives browser closure or reload. Self-time records become
 read-only history directly; they bypass normal history
 ingress because the live run already performs Kmap memory work. A notice is
 injected for the last three minutes; at the deadline substantive tools are
-blocked but `ToolCheck` and `EndTurn` remain available for one wrap-up round,
+blocked but `EndSession` remains available for one wrap-up round,
 and a hard cancellation follows two minutes later. Start feedback is
 immediate and the durable history service prevents overlapping runs. Model and search
 requests retain their provider/profile timeout, including long quality
@@ -459,7 +452,7 @@ The Rust suite covers Kmap storage/migration/history/idempotency integrity, conv
 state transitions, Telegram authorization/queue behavior, normalized request validation, cached continuation request
 shape, and provider usage normalization. The frontend suite covers short IDs,
 resets, load limits, checkpoint-before-generation ordering, pending-query
-recovery, multi-call text-tool execution, usage aggregation, clean provenance,
+recovery, multi-call native-tool execution, usage aggregation, clean provenance,
 and safe rendering. Intelligence tests also cover Codex event normalization,
 thread-ID validation, and search-source extraction.
 

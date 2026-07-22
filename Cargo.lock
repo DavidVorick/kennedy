@@ -1926,6 +1926,8 @@ dependencies = [
 [[package]]
 name = "kcode-audio-transcribe"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e122db2065431df5af3ef3250ae890efc31884809d4639bdbeca8defa464a591"
 dependencies = [
  "anyhow",
  "futures",
@@ -1952,6 +1954,16 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "kcode-codex-runtime-v2"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7132d7840b4ef3f188572fe668aab45ed27026df914f4c7d705032ff0b6aa34"
+dependencies = [
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2118,6 +2130,7 @@ dependencies = [
  "hex",
  "kcode-audio-transcribe",
  "kcode-codex-runtime",
+ "kcode-codex-runtime-v2",
  "kcode-doc-extraction",
  "kcode-gemini-api",
  "kcode-openai-api",

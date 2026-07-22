@@ -29,6 +29,8 @@ canonical documents; this file is not an append-only log.
   validation, equalized overlapping chunks, in-memory Opus conversion, Gemini
   transcription, concurrent chunk processing, Codex/Sol reconciliation,
   speaker/timestamp/translation handling, and final transcript behavior.
+- Kennedy consumes the published crates.io package rather than retaining a
+  local source copy of `kcode-audio-transcribe` in this repository.
 - Parallelize every independent per-chunk stage under the current bounded
   concurrency of four: interval decoding, resampling, in-memory Opus encoding,
   Gemini submission, and response validation may overlap across chunks. Commit
@@ -938,3 +940,53 @@ canonical documents; this file is not an append-only log.
 
 - Sort the Audio Ingress vnote history by recording-start time from most recent
   to least recent, independently of upload or ingress time.
+
+## Native Codex Turns and Exact Provider Transparency
+
+- Do not modify or upgrade `kcode-codex-runtime`. Audio tools and isolated web
+  research continue using it. Add a separate, publishable
+  `kcode-codex-runtime-v2` library, following the same standalone kcode
+  Rust-library packaging, documentation, safety, and dependency-audit
+  conventions. Kennedy consumes its published crates.io package rather than
+  retaining a local source copy in this repository.
+- Use Codex app-server's standard turn and dynamic-function protocol for
+  Kennedy conversation generation. Register one function named `call_ktool`;
+  its arguments contain one Ktool name and one object-valued Ktool arguments
+  field. Do not register every Ktool separately and do not add a nested
+  `call_ktools` batch API.
+- A model may issue several native `call_ktool` invocations before its next
+  inference. Preserve Codex's native delivery behavior. Parallel execution is
+  not required; sequential delivery and execution are valid because outputs
+  from calls in one model response cannot feed sibling calls.
+- Return every Ktool result through the matching native tool-call response and
+  let Codex continue inference on the same provider turn. Do not add generic
+  mutation idempotency; mutating Ktools retain their own protections.
+- Remove the textual `KENNEDY_TOOL_CALLS` protocol, its parser and truncation
+  rules, the fake initial `ToolCheck`, and `EndTurn`. A terminal assistant
+  response normally completes a browser or Telegram turn.
+- Add `EndSession` for history ingress, audio ingress, and self time. Terminal
+  prose without it receives a minimal controller continuation. `EndSession`
+  may appear alongside other Ktool calls and fails if another call in its
+  native call group fails. Its optional self-time handoff message retains the
+  existing validation and rollover semantics.
+- Keep the live system prompts minimal and consistent with their existing
+  style: explain only `call_ktool`, relevant Ktool contracts, ordinary terminal
+  conversation responses, and `EndSession` where applicable.
+- Full view is a transparency surface, not a human-friendly rendering. For
+  current archives it must be byte-for-byte identical to the complete UTF-8
+  JSONL Kennedy's backend sent to Codex, including exact serialization and
+  trailing newlines for initialize, thread start/resume, turn input, and native
+  tool-result responses. It must never parse, reconstruct, pretty-print, hide,
+  add, relabel, reorder, or otherwise transform those bytes.
+- The exactness requirement is scoped to the provider client boundary. When
+  Codex is the provider, display exactly what Kennedy sent to Codex. Include
+  additions Codex exposes to the client; do not claim visibility into content
+  Codex or its upstream provider adds internally and does not expose. Legacy
+  records may retain their old backend-hydrated plaintext compatibility view,
+  but it must never replace or alter a current exact provider transcript.
+
+## Chatend Context Usage
+
+- The Chatend context-usage display shows the latest available measurement of
+  current context-window occupancy, not cumulative tokens consumed across the
+  provider thread. Keep cumulative token totals separate as usage telemetry.

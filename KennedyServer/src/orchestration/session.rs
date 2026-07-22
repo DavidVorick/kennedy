@@ -10,13 +10,11 @@ use super::{
     Api, ApiError, Manuals, RuntimeModel,
     context::{
         KmapContext, MAX_DIRECTLY_LOADED_NODES, format_compact_memory_sections,
-        format_context_node, format_kmap_context, project_load_batch, stored_fixed_ids,
-        stored_recent_ids,
+        format_context_node, format_kmap_context, stored_fixed_ids, stored_recent_ids,
     },
     http::{encode_path, idempotency_id},
 };
 
-const TOOL_PREFIX: &str = "KENNEDY_TOOL_CALLS";
 const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
 const RUST_LIB_TOOLS: [&str; 5] = [
     "CreateRustLib",
@@ -97,7 +95,9 @@ pub(crate) struct Session {
     load_calls: u64,
     load_limit: u64,
     tool_log: Vec<Value>,
-    turn_end_content: Option<String>,
+    provider_thread_id: Option<String>,
+    provider_message_cursor: usize,
+    provider_inputs: Vec<String>,
     usage: Value,
     free_time_end_reason: Option<String>,
 }
@@ -109,9 +109,8 @@ struct ToolCall {
 
 struct ToolOutcome {
     message: Value,
-    duration_ms: u64,
     reset: bool,
-    end_turn: bool,
+    end_session: bool,
     self_message: Option<String>,
     previous_context: Value,
     reset_history_entry: Value,
@@ -289,7 +288,8 @@ impl Session {
         } else {
             50
         };
-        let mut session = Self {
+        let message_count = messages.len();
+        let session = Self {
             api,
             runtime,
             session_type: options.session_type,
@@ -355,15 +355,27 @@ impl Session {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
-            turn_end_content: archive
-                .and_then(|archive| archive.get("tools"))
-                .and_then(|tools| tools.get("turnEndContent"))
+            provider_thread_id: archive
+                .and_then(|archive| archive.get("providerThreadId"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            provider_message_cursor: archive
+                .and_then(|archive| archive.get("providerMessageCursor"))
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or_default()
+                .min(message_count),
+            provider_inputs: archive
+                .and_then(|archive| archive.get("providerInputs"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
             usage,
             free_time_end_reason: None,
         };
-        session.ensure_initial_tool_check();
         Ok(session)
     }
 
@@ -446,7 +458,6 @@ impl Session {
         if content.is_empty() && attachments.is_empty() {
             return false;
         }
-        self.turn_end_content = None;
         let external_event_id = metadata.get("externalEventId").and_then(Value::as_str);
         let input_kind = if metadata.get("inputKind").and_then(Value::as_str) == Some("voice") {
             "voice"
@@ -622,11 +633,6 @@ impl Session {
             return Ok(None);
         }
         let result = self.run_agent_loop(operation_id, checkpoint).await?;
-        let answer = if result == LoopResult::Ended {
-            self.turn_end_content.take()
-        } else {
-            None
-        };
         if matches!(self.mode, AgentMode::Ingress { .. }) {
             self.completed = true;
             self.pending_turn = false;
@@ -634,9 +640,9 @@ impl Session {
             return Ok(None);
         }
         if self.session_type != "free-time" {
-            let answer = answer.filter(|answer| !answer.trim().is_empty()).context(
-                "Kennedy ended the turn without first providing a response for the user",
-            )?;
+            let LoopResult::Answer(answer) = result else {
+                anyhow::bail!("Kennedy ended a conversation without an assistant response")
+            };
             let mut response = json!({"role":"kennedy","content":answer});
             if let Some(id) = &self.pending_external_event_id {
                 response["externalEventId"] = json!(id);
@@ -648,12 +654,6 @@ impl Session {
             self.pending_turn = false;
             self.pending_external_event_id = None;
             return Ok(Some(answer));
-        }
-        if let Some(answer) = answer.filter(|answer| !answer.trim().is_empty()) {
-            self.transcript
-                .push(json!({"role":"kennedy","content":answer}));
-            self.retained
-                .push(json!({"role":"assistant","content":answer}));
         }
         self.pending_turn = false;
         self.pending_external_event_id = None;
@@ -672,141 +672,124 @@ impl Session {
         for round in self.rounds_used..AGENT_LOOP_ROUND_LIMIT {
             self.rounds_used = round + 1;
             let deadline_after_response = self.prepare_free_time_round()?;
-            if matches!(self.mode, AgentMode::Ingress { .. }) {
+            let previous_thread_id = self.provider_thread_id.take();
+            let previous_provider_totals = self
+                .usage
+                .get("providerThreadTotals")
+                .cloned()
+                .unwrap_or(Value::Null);
+            self.usage["providerThreadTotals"] = Value::Null;
+            if matches!(self.mode, AgentMode::Ingress { .. }) || previous_thread_id.is_some() {
                 checkpoint(self.snapshot()?).await?;
             }
-            let chatend = format_chatend(&self.messages, Some(&self.usage));
+            let fresh_thread = previous_thread_id.is_none();
+            let input = if fresh_thread {
+                format_chatend(&self.messages, Some(&self.usage))
+            } else {
+                format_chatend(&self.messages[self.provider_message_cursor..], None)
+            };
             anyhow::ensure!(
-                !chatend.is_empty(),
+                !input.is_empty(),
                 "Kennedy has no new context to continue from"
             );
-            let mut request = json!({
-                "provider":self.runtime.provider,
-                "model":self.runtime.model,
-                "chatend":chatend,
-                "operation_id":operation_id,
-            });
+            let mut request =
+                kcode_codex_runtime_v2::AgentRequest::new(input, self.runtime.model.clone());
+            request.reasoning_effort = codex_reasoning_effort(&self.runtime.reasoning_effort)?;
+            request.previous_thread_id = previous_thread_id;
+            request.tools = vec![call_ktool_definition()];
             if let Some(timeout) = self.free_time_request_timeout_seconds() {
-                request["timeout_seconds"] = json!(timeout);
+                request.timeout = std::time::Duration::from_secs(timeout);
             }
-            let response = self
-                .api
-                .intelligence_post("/api/v1/generate", request)
-                .await?;
-            record_usage(&mut self.usage, response.get("usage"));
-            anyhow::ensure!(
-                response.get("status").and_then(Value::as_str) == Some("complete"),
-                "the intelligence service returned an incomplete generation"
-            );
-            let content = response
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(Value::as_str)
-                .context("the intelligence service returned no text")?
-                .to_owned();
-            let parsed = parse_tool_calls(&content);
-            match parsed {
-                Ok(Some(calls)) => {
-                    let accepted = truncate_tool_response(&content);
-                    let assistant = json!({"role":"assistant","content":accepted});
-                    self.messages.push(assistant.clone());
-                    let load_before = if calls.iter().any(|call| call.name == "LoadNode") {
-                        Some(self.context.snapshot()?)
-                    } else {
-                        None
-                    };
-                    let mut load_message_index = None;
-                    let mut load_requested = Vec::new();
-                    let mut load_active = Vec::new();
-                    let mut load_duration_ms = 0;
-                    let mut load_calls_in_batch = 0;
-                    let mut successful_loads = 0;
-                    let mut load_failures = Vec::new();
-                    let reset_mixed =
-                        calls.len() > 1 && calls.iter().any(|call| call.name == "ResetContext");
-                    let end_mixed =
-                        calls.len() > 1 && calls.iter().any(|call| call.name == "EndTurn");
-                    let mut turn_ended = false;
-                    for call in calls {
-                        if !matches!(call.name.as_str(), "EndTurn" | "ToolCheck") {
-                            self.turn_end_content = None;
-                        }
-                        let outcome = if reset_mixed && call.name == "ResetContext" {
-                            self.tool_failure(&call, "mixed_reset_call", "ResetContext must be requested by itself so the chatend can be rebuilt safely.")
-                        } else if end_mixed && call.name == "EndTurn" {
+            let mut turn = self.api.start_agent_turn(operation_id, request).await?;
+            let mut end_session = false;
+            let mut reset_context = false;
+            let mut reset_segment = None;
+            let mut tool_failed = false;
+            let mut used_tool = false;
+            let completed = loop {
+                let event = turn
+                    .next_event()
+                    .await
+                    .context("Codex ended without a terminal turn event")??;
+                match event {
+                    kcode_codex_runtime_v2::AgentEvent::ProviderInput(exact) => {
+                        self.provider_inputs.push(exact);
+                        checkpoint(self.snapshot()?).await?;
+                    }
+                    kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
+                        used_tool = true;
+                        let call = match native_ktool_call(&native) {
+                            Ok(call) => call,
+                            Err(error) => {
+                                tool_failed = true;
+                                end_session = false;
+                                let result = json!({
+                                    "ok":false,
+                                    "error":{"code":"invalid_call_ktool","message":error.to_string()}
+                                });
+                                self.tool_log.push(json!({
+                                    "name":"call_ktool",
+                                    "arguments":native.arguments,
+                                    "ok":false,
+                                    "code":"invalid_call_ktool",
+                                    "message":error.to_string(),
+                                    "durationMs":0,
+                                }));
+                                checkpoint(self.snapshot()?).await?;
+                                turn.respond(
+                                    &native.call_id,
+                                    kcode_codex_runtime_v2::ToolResult::failure(
+                                        serde_json::to_string(&result)?,
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        self.messages.push(native_tool_call_message(&call));
+                        let rejected_end_session = call.name == "EndSession" && tool_failed;
+                        let outcome = if rejected_end_session {
+                            tool_failed = false;
                             self.tool_failure(
                                 &call,
-                                "mixed_end_turn_call",
-                                "EndTurn must be requested by itself so the turn can close safely.",
-                            )
+                                "parallel_tool_failed",
+                                "EndSession was rejected because another tool call in this group failed. Resolve the failure, then call EndSession again.",
+                            )?
                         } else {
-                            self.execute_tool(&call, operation_id).await
-                        };
-                        let outcome = match outcome {
-                            Ok(outcome) => outcome,
-                            Err(error) => {
-                                if let Some(api) = error.downcast_ref::<ApiError>()
-                                    && api.code == "operation_cancelled"
-                                {
-                                    return Err(anyhow::Error::new(api.clone()));
+                            match self.execute_tool(&call, operation_id).await {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    if let Some(api) = error.downcast_ref::<ApiError>()
+                                        && api.code == "operation_cancelled"
+                                    {
+                                        return Err(anyhow::Error::new(api.clone()));
+                                    }
+                                    tool_failed = true;
+                                    self.tool_failure(&call, "tool_failed", &error.to_string())?
                                 }
-                                self.tool_failure(&call, "tool_failed", &error.to_string())?
                             }
                         };
-                        let successful_load = outcome
+                        let ok = outcome
                             .message
-                            .get("tool_result")
-                            .and_then(|value| value.get("ok"))
+                            .pointer("/tool_result/ok")
                             .and_then(Value::as_bool)
                             == Some(true);
-                        if call.name == "LoadNode" {
-                            load_message_index.get_or_insert(self.messages.len());
-                            load_duration_ms += outcome.duration_ms;
-                            load_calls_in_batch += 1;
-                            if successful_load {
-                                let result = outcome
-                                    .message
-                                    .get("tool_result")
-                                    .and_then(|value| value.get("result"))
-                                    .unwrap_or(&Value::Null);
-                                if let Some(identifier) = result
-                                    .get("requestedNodeIdentifier")
-                                    .and_then(Value::as_u64)
-                                {
-                                    load_requested.push(identifier);
-                                }
-                                load_active.extend(
-                                    result
-                                        .get("activeConnectionNodes")
-                                        .and_then(Value::as_array)
-                                        .into_iter()
-                                        .flatten()
-                                        .filter_map(|node| {
-                                            node.get("identifier").and_then(Value::as_u64)
-                                        }),
-                                );
-                                successful_loads += 1;
-                            } else {
-                                let tool_result =
-                                    outcome.message.get("tool_result").unwrap_or(&Value::Null);
-                                load_failures.push(json!({
-                                    "identifier":call.arguments.get("identifier").cloned().unwrap_or(Value::Null),
-                                    "message":tool_result.get("error").and_then(|value| value.get("message")).and_then(Value::as_str).unwrap_or("The load failed."),
+                        observe_tool_outcome(
+                            &mut tool_failed,
+                            &mut end_session,
+                            ok,
+                            outcome.end_session,
+                            rejected_end_session,
+                        );
+                        if outcome.reset {
+                            if reset_segment.is_none() {
+                                reset_segment = Some(json!({
+                                    "reason":"ResetContext",
+                                    "messages":self.messages,
+                                    "memory":outcome.previous_context,
+                                    "usage":self.usage,
                                 }));
                             }
-                            turn_ended |= outcome.end_turn;
-                            continue;
-                        }
-                        if outcome.reset {
-                            let outgoing_chatend =
-                                format_chatend(&self.messages, Some(&self.usage));
-                            self.full_history_segments.push(json!({
-                                "reason":"ResetContext",
-                                "messages":self.messages,
-                                "memory":outcome.previous_context,
-                                "usage":self.usage,
-                                "chatendText":outgoing_chatend,
-                            }));
                             self.reset_history.push(outcome.reset_history_entry);
                             self.retained.retain(|message| {
                                 message.get("context_kind").and_then(Value::as_str)
@@ -818,82 +801,83 @@ impl Session {
                                 self.retained.push(json!({"role":"assistant","display_role":"Kennedy note to self","context_kind":"reset-note","content":message}));
                             }
                             self.rebuild_chatend()?;
-                            self.messages.push(assistant.clone());
-                            self.messages.push(outcome.message);
-                        } else {
-                            self.messages.push(outcome.message);
+                            reset_context = true;
                         }
-                        turn_ended |= outcome.end_turn;
+                        let result = outcome
+                            .message
+                            .get("tool_result")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        self.messages.push(outcome.message);
+                        checkpoint(self.snapshot()?).await?;
+                        turn.respond(
+                            &native.call_id,
+                            if ok {
+                                kcode_codex_runtime_v2::ToolResult::success(serde_json::to_string(
+                                    &result,
+                                )?)
+                            } else {
+                                kcode_codex_runtime_v2::ToolResult::failure(serde_json::to_string(
+                                    &result,
+                                )?)
+                            },
+                        )
+                        .await?;
                     }
-                    if load_calls_in_batch > 0 {
-                        let projection = project_load_batch(
-                            load_before
-                                .as_ref()
-                                .context("LoadNode batch omitted its initial context")?,
-                            &self.context.snapshot()?,
-                            &load_requested,
-                            &load_active,
-                        );
-                        let content = if successful_loads > 0 {
-                            let mut projection = projection;
-                            projection["loadFailures"] = json!(load_failures);
-                            json!({"ok":true,"result":projection})
-                        } else {
-                            let reasons = load_failures
-                                .iter()
-                                .map(|failure| {
-                                    format!(
-                                        "Node {}: {}",
-                                        result_text(failure.get("identifier"), "unknown"),
-                                        result_text(failure.get("message"), "The load failed.")
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("; ");
-                            json!({"ok":false,"error":{"message":reasons},"failures":load_failures})
-                        };
-                        let mut message =
-                            tool_result_message("LoadNode", content, load_duration_ms);
-                        message["tool_call_count"] = json!(load_calls_in_batch);
-                        self.messages
-                            .insert(load_message_index.unwrap_or(self.messages.len()), message);
-                    }
-                    checkpoint(self.snapshot()?).await?;
-                    if turn_ended {
-                        self.completed = matches!(self.mode, AgentMode::Ingress { .. });
-                        return Ok(LoopResult::Ended);
-                    }
+                    kcode_codex_runtime_v2::AgentEvent::Completed(completed) => break completed,
                 }
-                Ok(None) => {
-                    if !content.trim().is_empty() {
-                        self.messages
-                            .push(json!({"role":"assistant","content":content}));
-                        self.turn_end_content = Some(content.clone());
-                    }
-                    if deadline_after_response {
-                        return Ok(LoopResult::Ended);
-                    }
-                    self.messages.push(json!({
-                        "role":"user",
-                        "display_role":controller_role(&self.mode),
-                        "context_kind":controller_kind(&self.mode),
-                        "content":controller_message(&self.mode, content.trim().is_empty(), &self.free_time),
-                    }));
-                    checkpoint(self.snapshot()?).await?;
-                }
-                Err(message) => {
-                    self.messages.push(json!({
-                        "role":"assistant",
-                        "content":content,
-                    }));
-                    self.messages.push(json!({
-                        "role":"user",
-                        "display_role":"Tool protocol error",
-                        "content":format!("Kennedy tool protocol error\n\n{message}\nReturn either normal prose with no {TOOL_PREFIX} marker, or a tool request containing only {TOOL_PREFIX}, one newline, and one valid JSON envelope. Normal prose does not end the turn; EndTurn must eventually be called by itself."),
-                    }));
-                    checkpoint(self.snapshot()?).await?;
-                }
+            };
+            if let Some(mut segment) = reset_segment {
+                segment["providerInputs"] = json!(self.provider_inputs);
+                segment["chatendText"] = json!(self.provider_inputs.concat());
+                self.full_history_segments.push(segment);
+                self.provider_inputs.clear();
             }
+            self.provider_thread_id = if reset_context {
+                None
+            } else {
+                Some(completed.thread_id.clone())
+            };
+            if !fresh_thread {
+                self.usage["providerThreadTotals"] = previous_provider_totals;
+            }
+            record_codex_v2_usage(&mut self.usage, completed.usage.as_ref());
+            if reset_context {
+                self.usage["providerThreadTotals"] = Value::Null;
+            }
+            let content = completed.answer.trim().to_owned();
+            if !content.is_empty() {
+                self.messages
+                    .push(json!({"role":"assistant","content":content}));
+            }
+            self.provider_message_cursor = if reset_context {
+                0
+            } else {
+                self.messages.len()
+            };
+            if !matches!(self.mode, AgentMode::Conversation) && !content.is_empty() {
+                self.transcript
+                    .push(json!({"role":"kennedy","content":content}));
+                self.retained
+                    .push(json!({"role":"assistant","content":content}));
+            }
+            if end_session || deadline_after_response {
+                self.completed = matches!(self.mode, AgentMode::Ingress { .. });
+                return Ok(LoopResult::Ended);
+            }
+            if matches!(self.mode, AgentMode::Conversation) {
+                if !content.is_empty() {
+                    return Ok(LoopResult::Answer(content));
+                }
+                anyhow::ensure!(used_tool, "Codex completed without an assistant response");
+            }
+            self.messages.push(json!({
+                "role":"user",
+                "display_role":controller_role(&self.mode),
+                "context_kind":controller_kind(&self.mode),
+                "content":controller_message(&self.mode, content.is_empty(), &self.free_time),
+            }));
+            checkpoint(self.snapshot()?).await?;
         }
         anyhow::bail!("Kennedy exceeded the {AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit")
     }
@@ -906,32 +890,20 @@ impl Session {
         let started = Instant::now();
         self.assert_tool_allowed(&call.name)?;
         let mut reset = false;
-        let mut end_turn = false;
+        let mut end_session = false;
         let mut self_message = None;
         let mut previous_context = Value::Null;
         let mut reset_history_entry = Value::Null;
         let result = match call.name.as_str() {
-            "ToolCheck" => {
-                validate_arguments(&call.arguments, &[], &[])?;
-                json!({"toolCallsWorking":true,"message":"Tool calls are working."})
-            }
-            "EndTurn" => {
+            "EndSession" => {
                 validate_arguments(&call.arguments, &[], &["message"])?;
-                end_turn = true;
+                anyhow::ensure!(
+                    !matches!(self.mode, AgentMode::Conversation),
+                    "EndSession is available only during history ingress or self time."
+                );
+                end_session = true;
                 match self.mode {
-                    AgentMode::Conversation => {
-                        anyhow::ensure!(
-                            call.arguments.get("message").is_none(),
-                            "EndTurn.message is available only during self time."
-                        );
-                        anyhow::ensure!(
-                            self.turn_end_content
-                                .as_deref()
-                                .is_some_and(|value| !value.trim().is_empty()),
-                            "Give the user a normal response first, then call EndTurn by itself."
-                        );
-                        json!({"turnEnding":true,"message":"The response is complete. Kennedy is now waiting for the user's next message."})
-                    }
+                    AgentMode::Conversation => unreachable!("conversation mode was rejected"),
                     AgentMode::FreeTime => {
                         self.free_time_end_reason = Some("tool".into());
                         let message = call.arguments.get("message").and_then(Value::as_str);
@@ -943,7 +915,7 @@ impl Session {
                     AgentMode::Ingress { .. } => {
                         anyhow::ensure!(
                             call.arguments.get("message").is_none(),
-                            "EndTurn.message is available only during self time."
+                            "EndSession.message is available only during self time."
                         );
                         json!({"sessionEnding":true,"message":"History ingress is complete and its final checkpoint is being saved."})
                     }
@@ -1024,9 +996,8 @@ impl Session {
         );
         Ok(ToolOutcome {
             message: tool_result_message(&call.name, json!({"ok":true,"result":result}), duration),
-            duration_ms: duration,
             reset,
-            end_turn,
+            end_session,
             self_message,
             previous_context,
             reset_history_entry,
@@ -1046,9 +1017,8 @@ impl Session {
                 json!({"ok":false,"error":{"code":code,"message":message}}),
                 0,
             ),
-            duration_ms: 0,
             reset: false,
-            end_turn: false,
+            end_session: false,
             self_message: None,
             previous_context: Value::Null,
             reset_history_entry: Value::Null,
@@ -1072,7 +1042,7 @@ impl Session {
             );
         }
         if matches!(self.mode, AgentMode::FreeTime)
-            && !matches!(name, "EndTurn" | "ToolCheck")
+            && name != "EndSession"
             && free_time_timing(&self.free_time).expired
         {
             anyhow::bail!(
@@ -1410,7 +1380,7 @@ impl Session {
         }
         if timing.warning_due && self.free_time.get("warningNoticeAt").is_none() {
             self.free_time["warningNoticeAt"] = json!(Utc::now().to_rfc3339());
-            self.append_timer("About three minutes remain in this self-time run. Begin wrapping up the current work and use EndTurn when this clean-slate session is complete.");
+            self.append_timer("About three minutes remain in this self-time run. Begin wrapping up the current work and use EndSession when this clean-slate session is complete.");
         }
         Ok(false)
     }
@@ -1454,28 +1424,6 @@ impl Session {
             ));
         }
         self.last_context_warning_band = band;
-    }
-
-    fn ensure_initial_tool_check(&mut self) {
-        if self.messages.iter().any(|message| {
-            message.get("tool_name").and_then(Value::as_str) == Some("ToolCheck")
-                && message
-                    .get("tool_result")
-                    .and_then(|value| value.get("ok"))
-                    .and_then(Value::as_bool)
-                    == Some(true)
-        }) {
-            return;
-        }
-        let request = json!({"role":"assistant","display_role":"Kennedy","context_kind":"tool-check","content":format!("{TOOL_PREFIX}\n{{\"calls\":[{{\"name\":\"ToolCheck\",\"arguments\":{{}}}}]}}")});
-        let mut result = tool_result_message(
-            "ToolCheck",
-            json!({"ok":true,"result":{"toolCallsWorking":true,"message":"Tool calls are working."}}),
-            0,
-        );
-        result["context_kind"] = json!("tool-check");
-        self.retained.extend([request.clone(), result.clone()]);
-        self.messages.extend([request, result]);
     }
 
     fn rebuild_chatend(&mut self) -> anyhow::Result<()> {
@@ -1602,15 +1550,15 @@ impl Session {
     }
 
     pub(crate) fn archive(&mut self) -> anyhow::Result<Value> {
-        let chatend_text = format_chatend(&self.messages, Some(&self.usage));
+        let chatend_text = self.provider_inputs.concat();
         Ok(json!({
-            "format":"kennedy-chatend","version":2,"sessionType":if matches!(self.mode, AgentMode::Ingress{..}) {"history-ingress"} else {self.session_type.as_str()},
+            "format":"kennedy-chatend","version":3,"sessionType":if matches!(self.mode, AgentMode::Ingress{..}) {"history-ingress"} else {self.session_type.as_str()},
             "sourceSessionType":self.source_session_type,"channel":self.channel,"freeTime":self.free_time,"orchestration":self.orchestration,
             "provenanceId":self.provenance_id,"rustLibSessionId":self.rust_lib_session_id,"rootNodeIds":self.root_node_ids,"referenceRootNodeIds":self.reference_root_node_ids,
             "groupContext":self.group_context,"startedAt":self.started_at,"provider":self.runtime.provider,"model":self.runtime.model,"systemPrompt":self.system_prompt,
-            "retained":self.retained,"transcript":self.transcript,"messages":self.messages,"chatendText":chatend_text,"fullHistory":{"segments":self.full_history_segments},
+            "retained":self.retained,"transcript":self.transcript,"messages":self.messages,"chatendText":chatend_text,"providerInputs":self.provider_inputs,"providerThreadId":self.provider_thread_id,"providerMessageCursor":self.provider_message_cursor,"fullHistory":{"segments":self.full_history_segments},
             "context":{"snapshot":self.context.snapshot()?,"diagnostics":self.context.diagnostics(),"state":self.context.archive()},
-            "tools":{"loadCalls":self.load_calls,"loadLimit":self.load_limit,"log":self.tool_log,"turnEndContent":self.turn_end_content},
+            "tools":{"loadCalls":self.load_calls,"loadLimit":self.load_limit,"log":self.tool_log},
             "usage":self.usage,"pendingExternalEventId":self.pending_external_event_id,"lastContextWarningBand":self.last_context_warning_band,"media":self.media,
             "completed":self.completed,"roundsUsed":self.rounds_used,
         }))
@@ -1624,6 +1572,7 @@ impl Session {
 #[derive(PartialEq, Eq)]
 enum LoopResult {
     Ended,
+    Answer(String),
 }
 
 fn instruction_message(prompt: &str) -> Value {
@@ -1653,98 +1602,78 @@ fn retained_transcript(transcript: &[Value]) -> Vec<Value> {
     transcript.iter().map(|item| json!({"role":if item.get("role").and_then(Value::as_str)==Some("kennedy") {"assistant"} else {"user"},"content":item.get("content").and_then(Value::as_str).unwrap_or("")})).collect()
 }
 
-fn parse_tool_calls(content: &str) -> Result<Option<Vec<ToolCall>>, String> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with(TOOL_PREFIX) {
-        if trimmed.contains(TOOL_PREFIX) {
-            return Err(format!(
-                "{TOOL_PREFIX} must be the first text in a tool-request response."
-            ));
-        }
-        return Ok(None);
-    }
-    let tail = trimmed
-        .strip_prefix(&format!("{TOOL_PREFIX}\n"))
-        .ok_or_else(|| format!("Tool requests must put JSON on the line after {TOOL_PREFIX}."))?
-        .trim();
-    let object = first_json_object(tail);
-    let envelope: Value = serde_json::from_str(object)
-        .map_err(|_| format!("The tool request after {TOOL_PREFIX} was not valid JSON."))?;
-    let map = envelope
-        .as_object()
-        .ok_or_else(|| "The tool request must be a JSON object.".to_owned())?;
-    if map.len() != 1 {
-        return Err("The tool request must contain exactly a calls field.".into());
-    }
-    let calls = map
-        .get("calls")
-        .and_then(Value::as_array)
-        .filter(|calls| !calls.is_empty())
-        .ok_or_else(|| "The tool request calls field must be a non-empty array.".to_owned())?;
-    calls
-        .iter()
-        .enumerate()
-        .map(|(index, call)| {
-            let map = call
-                .as_object()
-                .filter(|map| map.len() == 2)
-                .ok_or_else(|| {
-                    format!(
-                        "Tool call {} must contain exactly name and arguments.",
-                        index + 1
-                    )
-                })?;
-            let name = map
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("Tool call {} has no string name.", index + 1))?;
-            let arguments = map
-                .get("arguments")
-                .filter(|value| value.is_object())
-                .ok_or_else(|| format!("Tool call {} has no arguments object.", index + 1))?;
-            Ok(ToolCall {
-                name: name.into(),
-                arguments: arguments.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
+    kcode_codex_runtime_v2::DynamicTool::new(
+        "call_ktool",
+        "Call one Kennedy Ktool. Use multiple function calls when several independent operations are needed.",
+        json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["name","arguments"],
+            "properties":{
+                "name":{"type":"string","description":"Ktool name from the Kennedy manuals."},
+                "arguments":{"type":"object","description":"Arguments for that Ktool."}
+            }
+        }),
+    )
 }
 
-fn first_json_object(value: &str) -> &str {
-    let mut depth = 0;
-    let mut string = false;
-    let mut escaped = false;
-    for (index, ch) in value.char_indices() {
-        if string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                string = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            string = true;
-        } else if ch == '{' {
-            depth += 1;
-        } else if ch == '}' {
-            depth -= 1;
-            if depth == 0 {
-                return &value[..index + ch.len_utf8()];
-            }
-        }
-    }
-    value
+fn codex_reasoning_effort(value: &str) -> anyhow::Result<kcode_codex_runtime_v2::ReasoningEffort> {
+    use kcode_codex_runtime_v2::ReasoningEffort;
+
+    Ok(match value {
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" => ReasoningEffort::XHigh,
+        "max" => ReasoningEffort::Max,
+        _ => anyhow::bail!("Unsupported Codex reasoning effort {value}"),
+    })
 }
-fn truncate_tool_response(content: &str) -> String {
-    let trimmed = content.trim();
-    if let Some(tail) = trimmed.strip_prefix(&format!("{TOOL_PREFIX}\n")) {
-        format!("{TOOL_PREFIX}\n{}", first_json_object(tail.trim()))
-    } else {
-        content.into()
+
+fn native_ktool_call(call: &kcode_codex_runtime_v2::DynamicToolCall) -> anyhow::Result<ToolCall> {
+    anyhow::ensure!(
+        call.tool == "call_ktool",
+        "Codex requested an unknown native tool"
+    );
+    validate_arguments(&call.arguments, &["name", "arguments"], &[])?;
+    let name = nonempty_string(&call.arguments, "name", 100)?;
+    let arguments = call
+        .arguments
+        .get("arguments")
+        .filter(|value| value.is_object())
+        .context("call_ktool.arguments must be an object")?
+        .clone();
+    Ok(ToolCall { name, arguments })
+}
+
+fn native_tool_call_message(call: &ToolCall) -> Value {
+    json!({
+        "role":"assistant",
+        "display_role":"Kennedy Ktool call",
+        "context_kind":"tool-call",
+        "tool_name":call.name,
+        "tool_arguments":call.arguments,
+        "content":format!("call_ktool · {}\n\n{}", call.name, serde_json::to_string_pretty(&call.arguments).unwrap_or_else(|_| "{}".into())),
+    })
+}
+
+fn observe_tool_outcome(
+    tool_failed: &mut bool,
+    end_session: &mut bool,
+    ok: bool,
+    requested_end_session: bool,
+    rejected_end_session: bool,
+) {
+    if !rejected_end_session {
+        *tool_failed |= !ok;
+    }
+    if !ok {
+        *end_session = false;
+    } else if requested_end_session && !*tool_failed {
+        *end_session = true;
     }
 }
 
@@ -1809,7 +1738,7 @@ fn nonempty_string(value: &Value, key: &str, max: usize) -> anyhow::Result<Strin
 }
 
 fn tool_result_message(name: &str, content: Value, duration: u64) -> Value {
-    let display = if matches!(name, "ToolCheck" | "EndTurn") {
+    let display = if name == "EndSession" {
         "Control tool result"
     } else if matches!(name, "WebSearch" | "WebFetch") {
         "Web tool result"
@@ -1833,8 +1762,7 @@ fn format_tool_result(name: &str, content: &Value) -> String {
     }
     let result = content.get("result").unwrap_or(&Value::Null);
     match name {
-        "ToolCheck" => result_text(result.get("message"), "Tool calls are working."),
-        "EndTurn" => result_text(result.get("message"), "The turn is ending."),
+        "EndSession" => result_text(result.get("message"), "The session is ending."),
         "LoadNode" => {
             let projection = format_compact_memory_sections(result);
             let failures = result
@@ -1993,7 +1921,7 @@ fn indent_result(value: &str) -> String {
 fn empty_usage(runtime: &RuntimeModel) -> Value {
     json!({"requests":0,"contextWindowTokens":runtime.context_window_tokens,"maxInputTokens":runtime.max_input_tokens,"contextKnown":false,"contextTokens":0,"contextRemaining":Value::Null,"totalInputTokens":0,"totalOutputTokens":0,"totalCachedTokens":0,"totalCacheWriteTokens":0,"totalReasoningTokens":0,"cacheReadPercent":0,"last":Value::Null,"lastContext":Value::Null,"providerThreadTotals":Value::Null})
 }
-fn record_usage(target: &mut Value, usage: Option<&Value>) {
+fn record_codex_v2_usage(target: &mut Value, usage: Option<&kcode_codex_runtime_v2::TokenUsage>) {
     target["requests"] = json!(
         target
             .get("requests")
@@ -2004,34 +1932,60 @@ fn record_usage(target: &mut Value, usage: Option<&Value>) {
     let Some(usage) = usage else {
         return;
     };
-    let input = usage
-        .get("last_input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| usage.get("input_tokens").and_then(Value::as_u64))
-        .unwrap_or_default();
-    let output = usage
-        .get("last_output_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| usage.get("output_tokens").and_then(Value::as_u64))
-        .unwrap_or_default();
+    let input = usage.last_input_tokens.unwrap_or(usage.input_tokens);
+    let output = usage.last_output_tokens.unwrap_or(usage.output_tokens);
+    let context_tokens = input.saturating_add(output);
     target["contextKnown"] = json!(true);
-    target["contextTokens"] = json!(input + output);
+    target["contextTokens"] = json!(context_tokens);
+    target["contextRemaining"] = target
+        .get("contextWindowTokens")
+        .and_then(Value::as_u64)
+        .map(|window| json!(window.saturating_sub(context_tokens)))
+        .unwrap_or(Value::Null);
     target["lastContext"] = json!({"inputTokens":input,"outputTokens":output});
-    for (source, dest) in [
-        ("input_tokens", "totalInputTokens"),
-        ("output_tokens", "totalOutputTokens"),
-        ("cached_tokens", "totalCachedTokens"),
-        ("cache_write_tokens", "totalCacheWriteTokens"),
-        ("reasoning_tokens", "totalReasoningTokens"),
-    ] {
-        target[dest] = json!(
-            target.get(dest).and_then(Value::as_u64).unwrap_or_default()
-                + usage
-                    .get(source)
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
+    let previous = |key| {
+        target
+            .pointer(&format!("/providerThreadTotals/{key}"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    };
+    let deltas = [
+        (
+            usage.input_tokens.saturating_sub(previous("inputTokens")),
+            "totalInputTokens",
+        ),
+        (
+            usage.output_tokens.saturating_sub(previous("outputTokens")),
+            "totalOutputTokens",
+        ),
+        (
+            usage
+                .cached_input_tokens
+                .saturating_sub(previous("cachedTokens")),
+            "totalCachedTokens",
+        ),
+        (
+            usage
+                .reasoning_output_tokens
+                .saturating_sub(previous("reasoningTokens")),
+            "totalReasoningTokens",
+        ),
+    ];
+    for (delta, total_key) in deltas {
+        target[total_key] = json!(
+            target
+                .get(total_key)
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                + delta
         );
     }
+    target["providerThreadTotals"] = json!({
+        "inputTokens":usage.input_tokens,
+        "outputTokens":usage.output_tokens,
+        "cachedTokens":usage.cached_input_tokens,
+        "reasoningTokens":usage.reasoning_output_tokens,
+    });
 }
 
 fn controller_role(mode: &AgentMode) -> &'static str {
@@ -2051,7 +2005,7 @@ fn controller_kind(mode: &AgentMode) -> &'static str {
 fn controller_message(mode: &AgentMode, no_answer: bool, free_time: &Value) -> String {
     match mode {
         AgentMode::Ingress { .. } => format!(
-            "History-ingress controller: {} This ingress session is still active. Use KENNEDY_TOOL_CALLS to persist every useful update. When fully ingressed, call EndTurn with empty arguments by itself.",
+            "History-ingress controller: {} This ingress session is still active. Use call_ktool for every useful update. When fully ingressed, call EndSession with empty arguments.",
             if no_answer {
                 "no assistant answer was returned."
             } else {
@@ -2059,11 +2013,11 @@ fn controller_message(mode: &AgentMode, no_answer: bool, free_time: &Value) -> S
             }
         ),
         AgentMode::FreeTime => format!(
-            "Self-time controller: this clean-slate session remains active. {} Continue useful autonomous work, or call EndTurn when this session is complete.",
+            "Self-time controller: this clean-slate session remains active. {} Continue useful autonomous work, or call EndSession when this session is complete.",
             free_time_schedule(free_time)
         ),
         AgentMode::Conversation => format!(
-            "Kennedy turn controller: {} Kennedy tool calls are available through KENNEDY_TOOL_CALLS. If more tool work is needed, continue. If the response is complete, call EndTurn with empty arguments by itself.",
+            "Kennedy turn controller: {} Continue the same turn and return a final response for the user.",
             if no_answer {
                 "no assistant answer was returned, so this turn is still active."
             } else {
@@ -2156,7 +2110,7 @@ fn free_time_schedule(value: &Value) -> String {
 }
 fn free_time_opening(value: &Value) -> String {
     format!(
-        "Kennedy self time has started. {} Work autonomously on anything useful. End this clean-slate session with EndTurn; the backend may begin another clean-slate session while time remains.",
+        "Kennedy self time has started. {} Work autonomously on anything useful. End this clean-slate session with EndSession; the backend may begin another clean-slate session while time remains.",
         free_time_schedule(value)
     )
 }
@@ -2312,7 +2266,13 @@ fn model_readable_provenance(data: &str) -> anyhow::Result<String> {
     let Ok(archive) = serde_json::from_str::<Value>(data) else {
         return Ok(data.trim().to_owned());
     };
-    if let Some(chatend) = archive.get("chatendText").and_then(Value::as_str) {
+    if archive
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        < 3
+        && let Some(chatend) = archive.get("chatendText").and_then(Value::as_str)
+    {
         return Ok(chatend.to_owned());
     }
     let messages = archive
@@ -2391,16 +2351,57 @@ mod tests {
     };
 
     #[test]
-    fn tool_protocol_requires_marker_at_the_start() {
-        assert!(parse_tool_calls("hello KENNEDY_TOOL_CALLS\n{}").is_err());
-        assert!(parse_tool_calls("ordinary answer").unwrap().is_none());
-        let calls = parse_tool_calls(
-            "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"ToolCheck\",\"arguments\":{}}]}",
-        )
-        .unwrap()
+    fn context_occupancy_uses_latest_provider_measurement_not_thread_totals() {
+        let mut target = json!({
+            "requests": 0,
+            "contextWindowTokens": 128_000,
+            "providerThreadTotals": Value::Null,
+        });
+        let usage = kcode_codex_runtime_v2::TokenUsage {
+            input_tokens: 80_000,
+            output_tokens: 8_000,
+            cached_input_tokens: 30_000,
+            reasoning_output_tokens: 2_000,
+            last_input_tokens: Some(20_000),
+            last_output_tokens: Some(1_000),
+        };
+
+        record_codex_v2_usage(&mut target, Some(&usage));
+
+        assert_eq!(target["contextTokens"], 21_000);
+        assert_eq!(target["contextRemaining"], 107_000);
+        assert_eq!(target["lastContext"]["inputTokens"], 20_000);
+        assert_eq!(target["lastContext"]["outputTokens"], 1_000);
+        assert_eq!(target["totalInputTokens"], 80_000);
+        assert_eq!(target["totalOutputTokens"], 8_000);
+    }
+
+    #[test]
+    fn native_call_ktool_requires_one_name_and_arguments_object() {
+        let call = native_ktool_call(&kcode_codex_runtime_v2::DynamicToolCall {
+            call_id: "call-1".into(),
+            tool: "call_ktool".into(),
+            arguments: json!({"name":"LoadNode","arguments":{"identifier":1}}),
+        })
         .unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "ToolCheck");
+        assert_eq!(call.name, "LoadNode");
+        assert_eq!(call.arguments["identifier"], 1);
+    }
+
+    #[test]
+    fn end_session_is_invalidated_by_a_later_peer_failure() {
+        let mut failed = false;
+        let mut ended = false;
+        observe_tool_outcome(&mut failed, &mut ended, true, true, false);
+        assert!(ended);
+        observe_tool_outcome(&mut failed, &mut ended, false, false, false);
+        assert!(failed);
+        assert!(!ended);
+        observe_tool_outcome(&mut failed, &mut ended, false, false, true);
+        assert!(!ended);
+        failed = false;
+        observe_tool_outcome(&mut failed, &mut ended, true, true, false);
+        assert!(ended);
     }
 
     #[test]
@@ -2560,16 +2561,11 @@ mod tests {
                 post({
                     let generations = generations.clone();
                     move || {
-                        let call = generations.fetch_add(1, Ordering::SeqCst);
+                        generations.fetch_add(1, Ordering::SeqCst);
                         async move {
-                            let content = if call == 0 {
-                                "A native Rust response."
-                            } else {
-                                "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"EndTurn\",\"arguments\":{}}]}"
-                            };
                             Json(json!({
                                 "status":"complete",
-                                "message":{"content":content},
+                                "message":{"content":"A native Rust response."},
                                 "usage":{"input_tokens":10,"output_tokens":2,"cached_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0},
                             }))
                         }
@@ -2623,24 +2619,18 @@ mod tests {
             .unwrap();
         assert_eq!(answer.as_deref(), Some("A native Rust response."));
         assert!(!session.pending_turn);
-        assert_eq!(generations.load(Ordering::SeqCst), 2);
-        assert!(checkpoints.load(Ordering::SeqCst) >= 2);
+        assert_eq!(generations.load(Ordering::SeqCst), 1);
+        assert!(checkpoints.load(Ordering::SeqCst) >= 1);
         let archive = session.archive().unwrap();
         assert_eq!(
             archive.get("chatendText").and_then(Value::as_str),
-            Some(
-                format_chatend(
-                    archive.get("messages").and_then(Value::as_array).unwrap(),
-                    archive.get("usage"),
-                )
-                .as_str()
-            )
+            Some(archive["providerInputs"][0].as_str().unwrap())
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn native_session_combines_loadnode_calls_before_rendering_the_batch() {
+    async fn native_session_executes_multiple_loadnode_calls_sequentially() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let generations = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -2694,16 +2684,19 @@ mod tests {
                         let call = generations.fetch_add(1, Ordering::SeqCst);
                         requests.lock().unwrap().push(request);
                         async move {
-                            let content = match call {
-                                0 => "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":2}},{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":3}},{\"name\":\"LoadNode\",\"arguments\":{\"identifier\":999}}]}",
-                                1 => "The batch is loaded.",
-                                _ => "KENNEDY_TOOL_CALLS\n{\"calls\":[{\"name\":\"EndTurn\",\"arguments\":{}}]}",
-                            };
-                            Json(json!({
+                            let mut response = json!({
                                 "status":"complete",
-                                "message":{"content":content},
+                                "message":{"content":if call == 1 {"The batch is loaded."} else {""}},
                                 "usage":{"input_tokens":100,"output_tokens":10,"cached_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0},
-                            }))
+                            });
+                            if call == 0 {
+                                response["tool_calls"] = json!([
+                                    {"name":"LoadNode","arguments":{"identifier":2}},
+                                    {"name":"LoadNode","arguments":{"identifier":3}},
+                                    {"name":"LoadNode","arguments":{"identifier":999}},
+                                ]);
+                            }
+                            Json(response)
                         }
                     }
                 }),
@@ -2753,37 +2746,19 @@ mod tests {
             .and_then(Value::as_array)
             .unwrap()
             .iter()
-            .filter(|message| message.get("tool_name").and_then(Value::as_str) == Some("LoadNode"))
+            .filter(|message| {
+                message.get("tool_name").and_then(Value::as_str) == Some("LoadNode")
+                    && message.get("tool_result").is_some()
+            })
             .collect::<Vec<_>>();
-        assert_eq!(load_results.len(), 1);
-        assert_eq!(
-            load_results[0]
-                .get("tool_call_count")
-                .and_then(Value::as_u64),
-            Some(3)
-        );
-        let rendered = load_results[0]
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap();
-        assert!(
-            rendered.find("Node 2: Node A").unwrap() < rendered.find("Node 3: Node C").unwrap()
-        );
-        assert!(
-            rendered.find("Node 3: Node C").unwrap() < rendered.find("Node 4: Node D").unwrap()
-        );
-        assert!(
-            rendered.find("Node 4: Node D").unwrap()
-                > rendered.find("Full active-connection nodes").unwrap()
-        );
-        assert_eq!(rendered.match_indices("Node 3: Node C").count(), 1);
-        assert!(!rendered.contains("\"shortName\"") && !rendered.contains("requestedNode"));
-        assert!(rendered.contains("Node 999: Unknown memory identifier 999."));
+        assert_eq!(load_results.len(), 3);
+        assert_eq!(load_results[0]["tool_result"]["ok"], true);
+        assert_eq!(load_results[1]["tool_result"]["ok"], true);
+        assert_eq!(load_results[2]["tool_result"]["ok"], false);
 
         let sent = requests.lock().unwrap();
         let second_chatend = sent[1].get("chatend").and_then(Value::as_str).unwrap();
-        assert!(second_chatend.contains(rendered));
-        assert_eq!(second_chatend.match_indices("Node 3: Node C").count(), 1);
+        assert!(second_chatend.contains("Continue the same turn"));
         server.abort();
     }
 }

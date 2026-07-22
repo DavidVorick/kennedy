@@ -2,7 +2,10 @@ use serde_json::Value;
 
 const CHATEND_SEPARATOR: &str = "\n\n────────────────────────\n\n";
 
-/// Compose the exact plain text supplied to the model from backend-owned messages.
+/// Compose application turn text from backend-owned messages.
+///
+/// Current Codex transport wraps this text in an exact JSONL provider request;
+/// this formatter is not itself the Full-view transport transcript.
 pub fn canonical_chatend_text(messages: &[Value], usage: Option<&Value>) -> String {
     let mut value = messages
         .iter()
@@ -50,10 +53,15 @@ pub fn canonical_chatend_text(messages: &[Value], usage: Option<&Value>) -> Stri
     value
 }
 
-/// Add canonical text to an archive produced before `chatendText` was persisted.
+/// Add compatibility text to a legacy archive produced before `chatendText` was persisted.
 /// Existing canonical text is never reinterpreted or replaced.
 pub fn hydrate_archive_chatend_text(archive: &mut Value) {
-    if archive.get("chatendText").and_then(Value::as_str).is_none()
+    if archive
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        < 3
+        && archive.get("chatendText").and_then(Value::as_str).is_none()
         && let Some(messages) = archive.get("messages").and_then(Value::as_array)
     {
         let text = canonical_chatend_text(messages, archive.get("usage"));
@@ -90,7 +98,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn canonical_text_preserves_the_model_facing_format() {
+    fn canonical_text_preserves_the_application_context_format() {
         let messages = json!([
             {"role":"system","display_role":"Agent manuals","content":"  Instructions  "},
             {"role":"user","content":"Hello"},
@@ -157,5 +165,16 @@ mod tests {
             archive.get("chatendText").and_then(Value::as_str),
             Some("Exact backend text\n  including spacing  ")
         );
+    }
+
+    #[test]
+    fn current_archives_never_invent_a_provider_transcript() {
+        let mut archive = json!({
+            "format":"kennedy-chatend",
+            "version":3,
+            "messages":[{"role":"user","content":"Not yet sent"}]
+        });
+        hydrate_archive_chatend_text(&mut archive);
+        assert!(archive.get("chatendText").is_none());
     }
 }

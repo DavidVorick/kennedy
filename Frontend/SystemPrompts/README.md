@@ -13,7 +13,7 @@ or JavaScript rebuild is needed.
   and `AudioIngressSession.txt` are mutually exclusive, minimal descriptions of
   the current session and its context-loading budget.
 - `KmapBasics.txt` defines identifier lifetime, the session's automatic root
-  set, the text tool-call protocol, and the fact that more tools and
+  set, the native `call_ktool` protocol, and the fact that more tools and
   documentation may be available through the kmap.
 - `ReadTools.txt` defines all shared read-only tools, including kmap reads and
   web research.

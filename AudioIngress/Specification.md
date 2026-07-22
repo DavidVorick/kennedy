@@ -101,14 +101,14 @@ instead of repeating the same oversized request five times.
 
 The backend creates provenance with source `audio-vnote`, a stable
 piece-specific idempotency key, and `source_created_at` equal to recording
-start. It supplies the `end-turn-v1` completion-protocol
+start. It supplies the `end-session-v2` completion-protocol
 identifier when claiming work, and the backend rejects claims from older
 clients. It runs the normal mutation tool loop with the additional
 audio-ingress prompt policy under the backend's serialized Kmap-writer gate.
 Completing the final piece atomically marks the recording complete and then
 removes its generated local WAV shards.
 The completion endpoint independently requires a successful
-`EndTurn` entry in the persisted history-ingress tool log. Historical
+`EndSession` entry in the persisted history-ingress tool log. Historical
 pieces identified as prematurely completed remain terminal with
 `historyIngressRepairRequired: true` until the corrected backend worker invokes
 repair release through the in-process adapter; release removes the old ingress

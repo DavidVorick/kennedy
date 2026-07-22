@@ -1,5 +1,5 @@
 import { formatKmapContext } from "./human_format.js?v=20260720.2";
-import { contextUsageMeasurement, formatChatend } from "./chatend_format.js?v=20260720.2";
+import { contextUsageMeasurement, formatChatend } from "./chatend_format.js?v=20260722.1";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
 
@@ -586,7 +586,7 @@ export function ingressMutationSummary(diagnostic) {
 
 export function ingressEntryPresentation(message) {
   const content = typeof message?.content === "string" ? message.content.trim() : "";
-  if (message?.role === "assistant" && content.startsWith("KENNEDY_TOOL_CALLS")) {
+  if (message?.context_kind === "tool-call" || (message?.role === "assistant" && content.startsWith("KENNEDY_TOOL_CALLS"))) {
     return { collapsed: true, label: "Kennedy tool call" };
   }
   if (message?.display_role === "Memory tool result") {
@@ -641,6 +641,7 @@ function isToolResult(message) {
   return message?.display_role === "Memory tool result" ||
     message?.display_role === "Web tool result" ||
     message?.display_role === "Coding tool result" ||
+    message?.display_role === "Control tool result" ||
     message?.display_role === "Tool protocol error" ||
     (typeof message?.content === "string" && message.content.startsWith("Kennedy tool result"));
 }
@@ -733,7 +734,9 @@ export function mainViewEntries(diagnostic) {
       else addEntryTiming(lastVisibleEntry, timing);
       continue;
     }
-    const calls = message?.role === "assistant" ? parseToolRequest(message.content) : [];
+    const calls = message?.context_kind === "tool-call" && typeof message?.tool_name === "string"
+      ? [{ name: message.tool_name, arguments: message.tool_arguments || {} }]
+      : message?.role === "assistant" ? parseToolRequest(message.content) : [];
     if (calls.length) {
       for (const [callIndex, call] of calls.entries()) {
         const entry = {
@@ -846,11 +849,12 @@ export function inspectorText(diagnostic, view = "full") {
   if (view === "tools") {
     messages = messages.filter(message => {
       const content = typeof message.content === "string" ? message.content.trim() : "";
-      const isRequest = message.role === "assistant" && content.startsWith("KENNEDY_TOOL_CALLS");
+      const isRequest = message.context_kind === "tool-call" || (message.role === "assistant" && content.startsWith("KENNEDY_TOOL_CALLS"));
       const isResult = message.role === "user" && (
         message.display_role === "Memory tool result" ||
         message.display_role === "Web tool result" ||
         message.display_role === "Coding tool result" ||
+        message.display_role === "Control tool result" ||
         content.startsWith("Kennedy tool result")
       );
       return isRequest || isResult;

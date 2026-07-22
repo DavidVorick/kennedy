@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -50,6 +52,17 @@ enum ServiceBackend {
     Local(std::sync::Arc<LocalServices>),
     #[cfg(test)]
     Http(TestBases),
+}
+
+pub(crate) enum AgentTurn {
+    Local(crate::intelligence::AgentTurn),
+    #[cfg(test)]
+    Http(HttpAgentTurn),
+}
+
+#[cfg(test)]
+pub(crate) struct HttpAgentTurn {
+    events: VecDeque<Result<kcode_codex_runtime_v2::AgentEvent, ApiError>>,
 }
 
 #[cfg(test)]
@@ -117,6 +130,109 @@ impl Api {
     pub async fn intelligence_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
         self.service_request(ServiceKind::Intelligence, Method::POST, path, Some(body))
             .await
+    }
+
+    pub async fn start_agent_turn(
+        &self,
+        operation_id: Uuid,
+        request: kcode_codex_runtime_v2::AgentRequest,
+    ) -> Result<AgentTurn, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .intelligence
+                .start_agent_turn(operation_id, request)
+                .await
+                .map(AgentTurn::Local)
+                .map_err(intelligence_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let body = json!({
+                    "provider":"primary",
+                    "model":request.model,
+                    "chatend":request.input,
+                    "previous_response_id":request.previous_thread_id,
+                    "timeout_seconds":request.timeout.as_secs(),
+                });
+                let exact = format!(
+                    "{}\n",
+                    serde_json::to_string(&body).expect("JSON values always serialize")
+                );
+                let response = self
+                    .request(
+                        Method::POST,
+                        &bases.intelligence,
+                        "/api/v1/generate",
+                        Some(body),
+                    )
+                    .await?;
+                let content = response
+                    .pointer("/message/content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mut events =
+                    VecDeque::from([Ok(kcode_codex_runtime_v2::AgentEvent::ProviderInput(exact))]);
+                let calls = response
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| {
+                        Some((
+                            call.get("name")?.as_str()?.to_owned(),
+                            call.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                for (index, (name, arguments)) in calls.iter().enumerate() {
+                    events.push_back(Ok(kcode_codex_runtime_v2::AgentEvent::ToolCall(
+                        kcode_codex_runtime_v2::DynamicToolCall {
+                            call_id: format!("test-call-{index}"),
+                            tool: "call_ktool".into(),
+                            arguments: json!({"name":name,"arguments":arguments}),
+                        },
+                    )));
+                }
+                let usage = response
+                    .get("usage")
+                    .map(|usage| kcode_codex_runtime_v2::TokenUsage {
+                        input_tokens: usage
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        output_tokens: usage
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        cached_input_tokens: usage
+                            .get("cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        reasoning_output_tokens: usage
+                            .get("reasoning_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        last_input_tokens: usage.get("last_input_tokens").and_then(Value::as_u64),
+                        last_output_tokens: usage.get("last_output_tokens").and_then(Value::as_u64),
+                    });
+                events.push_back(Ok(kcode_codex_runtime_v2::AgentEvent::Completed(
+                    kcode_codex_runtime_v2::CompletedTurn {
+                        thread_id: response
+                            .get("response_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("00000000-0000-0000-0000-000000000000")
+                            .to_owned(),
+                        turn_id: Uuid::new_v4().to_string(),
+                        answer: if calls.is_empty() {
+                            content.to_owned()
+                        } else {
+                            String::new()
+                        },
+                        usage,
+                    },
+                )));
+                Ok(AgentTurn::Http(HttpAgentTurn { events }))
+            }
+        }
     }
 
     pub async fn history_get(&self, path: &str) -> Result<Value, ApiError> {
@@ -596,6 +712,36 @@ impl Api {
                 };
                 self.request(method, base, path, body).await
             }
+        }
+    }
+}
+
+impl AgentTurn {
+    pub(crate) async fn next_event(
+        &mut self,
+    ) -> Option<Result<kcode_codex_runtime_v2::AgentEvent, ApiError>> {
+        match self {
+            Self::Local(turn) => match turn.next_event().await {
+                Ok(event) => event.map(Ok),
+                Err(error) => Some(Err(intelligence_error(error))),
+            },
+            #[cfg(test)]
+            Self::Http(turn) => turn.events.pop_front(),
+        }
+    }
+
+    pub(crate) async fn respond(
+        &self,
+        call_id: &str,
+        result: kcode_codex_runtime_v2::ToolResult,
+    ) -> Result<(), ApiError> {
+        match self {
+            Self::Local(turn) => turn
+                .respond(call_id, result)
+                .await
+                .map_err(intelligence_error),
+            #[cfg(test)]
+            Self::Http(_) => Ok(()),
         }
     }
 }

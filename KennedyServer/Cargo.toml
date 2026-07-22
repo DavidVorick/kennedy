@@ -19,6 +19,7 @@ kennedy-chatend = { path = "../Chatend" }
 kennedy-memory-ingress = { path = "../MemoryIngress" }
 kcode-audio-transcribe.workspace = true
 kcode-codex-runtime.workspace = true
+kcode-codex-runtime-v2.workspace = true
 kcode-doc-extraction.workspace = true
 kcode-gemini-api.workspace = true
 kcode-openai-api.workspace = true

@@ -68,6 +68,7 @@ pub(crate) struct Service {
     default_provider: &'static str,
     providers: Arc<HashMap<&'static str, ProviderRuntime>>,
     codex: Codex,
+    agent: kcode_codex_runtime_v2::Codex,
     openai: Option<OpenAi>,
     gemini: Option<Gemini>,
     web_fetcher: WebFetcher,
@@ -85,6 +86,12 @@ struct ActiveOperation {
     id: Uuid,
     operations: ActiveOperations,
     cancellation: watch::Receiver<bool>,
+}
+
+pub(crate) struct AgentTurn {
+    inner: kcode_codex_runtime_v2::AgentTurn,
+    operation: ActiveOperation,
+    request_id: Uuid,
 }
 
 impl ActiveOperations {
@@ -437,6 +444,15 @@ pub(crate) async fn open(
     let codex = Codex::open(codex_config, codex_catalog_cache)
         .await
         .context("opening Kennedy Codex runtime")?;
+    let agent_config = kcode_codex_runtime_v2::CodexConfig {
+        executable: codex.catalog().executable().to_owned(),
+        base_instruction: KENNEDY_CODEX_BASE_INSTRUCTION.into(),
+        model_catalog: Some(codex.catalog().path().to_owned()),
+        ..kcode_codex_runtime_v2::CodexConfig::default()
+    };
+    let agent = kcode_codex_runtime_v2::Codex::open(agent_config)
+        .await
+        .context("opening Kennedy Codex runtime v2")?;
     let provider_config = ProviderConfig::default();
     let mut model_limits = HashMap::new();
     for model in &provider_config.models {
@@ -462,6 +478,7 @@ pub(crate) async fn open(
         default_provider: DEFAULT_PROVIDER_NAME,
         providers: Arc::new(providers),
         codex,
+        agent,
         openai,
         gemini,
         web_fetcher: WebFetcher::default(),
@@ -482,6 +499,24 @@ pub(crate) fn router(state: Service) -> Router {
 }
 
 impl Service {
+    pub(crate) async fn start_agent_turn(
+        &self,
+        request_id: Uuid,
+        request: kcode_codex_runtime_v2::AgentRequest,
+    ) -> Result<AgentTurn, ApiError> {
+        let operation = self.active_operations.register(request_id)?;
+        let inner = self
+            .agent
+            .start_turn(request)
+            .await
+            .map_err(|error| codex_v2_error(error, request_id))?;
+        Ok(AgentTurn {
+            inner,
+            operation,
+            request_id,
+        })
+    }
+
     pub(crate) async fn get_json(&self, path: &str) -> Result<Value, ApiError> {
         match path {
             "/health" => {
@@ -681,6 +716,35 @@ impl Service {
             text: transcription.text,
             usage: transcription.usage.map(transcription_usage_json),
         })
+    }
+}
+
+impl AgentTurn {
+    pub(crate) async fn next_event(
+        &mut self,
+    ) -> Result<Option<kcode_codex_runtime_v2::AgentEvent>, ApiError> {
+        tokio::select! {
+            _ = self.operation.cancelled() => {
+                self.inner.cancel();
+                Err(ApiError::cancelled(self.request_id))
+            }
+            event = self.inner.next_event() => match event {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(error)) => Err(codex_v2_error(error, self.request_id)),
+                None => Ok(None),
+            }
+        }
+    }
+
+    pub(crate) async fn respond(
+        &self,
+        call_id: &str,
+        result: kcode_codex_runtime_v2::ToolResult,
+    ) -> Result<(), ApiError> {
+        self.inner
+            .respond(call_id, result)
+            .await
+            .map_err(|error| codex_v2_error(error, self.request_id))
     }
 }
 
@@ -1166,6 +1230,20 @@ fn codex_error(error: kcode_codex_runtime::Error, request_id: Uuid) -> ApiError 
         CodexErrorKind::InputTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "input_too_large"),
         CodexErrorKind::EmptyOutput => (StatusCode::BAD_GATEWAY, "empty_assistant_message"),
         CodexErrorKind::Protocol => (StatusCode::BAD_GATEWAY, "provider_error"),
+    };
+    ApiError::new(status, code, error.message()).with_request_id(request_id)
+}
+
+fn codex_v2_error(error: kcode_codex_runtime_v2::Error, request_id: Uuid) -> ApiError {
+    use kcode_codex_runtime_v2::ErrorKind;
+
+    let (status, code) = match error.kind() {
+        ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, "invalid_request"),
+        ErrorKind::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "provider_unavailable"),
+        ErrorKind::Authentication => (StatusCode::UNAUTHORIZED, "provider_auth_failed"),
+        ErrorKind::Timeout => (StatusCode::GATEWAY_TIMEOUT, "provider_timeout"),
+        ErrorKind::Protocol => (StatusCode::BAD_GATEWAY, "provider_error"),
+        ErrorKind::Cancelled => (StatusCode::CONFLICT, "operation_cancelled"),
     };
     ApiError::new(status, code, error.message()).with_request_id(request_id)
 }

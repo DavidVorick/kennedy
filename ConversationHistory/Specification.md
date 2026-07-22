@@ -89,19 +89,19 @@ active -> ingress_pending -> ingress_in_progress -> complete
 - Completing a `free-time` record checkpoints its final state and changes it
   directly from `active` to `complete`; the submitted state must record a
   `tool`, `deadline`, or `hard-stop` slice-ending reason. A `tool` ending also
-  requires a successful `EndTurn` receipt in the archived tool log. Both the
+  requires a successful `EndSession` receipt in the archived tool log. Both the
   direct-completion transition and queue selection verify its stored session
   type. Existing queued or failed self-time records are migrated to `complete`.
 - Shared queue ordering uses last user activity, falling back to conversation
   start time, and compares that timestamp directly with audio source times. An
   active global claim wins; deferred jobs are skipped until their next attempt.
 - The backend orchestrator creates or retrieves idempotent Kweb provenance, records its ID,
-  supplies the `end-turn-v1` completion-protocol identifier, and
+  supplies the `end-session-v2` completion-protocol identifier, and
   changes the selected record to `ingress_in_progress`. The backend rejects a
   claim from an older client that does not identify that protocol.
 - Ordinary conversation records change to `complete` only after successful
   history ingress. The completion endpoint independently requires a successful
-  `EndTurn` entry in the persisted history-ingress tool log; a normal
+  `EndSession` entry in the persisted history-ingress tool log; a normal
   assistant answer cannot satisfy this transition even if a stale worker
   attempts it.
 - Self-time records normally bypass history ingress. A narrowly scoped
@@ -193,7 +193,7 @@ discarded records. Direct completion accepts `expected_version` and the final
 state, verifies that both stored and supplied states identify `free-time`, and
 makes the record read-only without creating a history-ingress obligation.
 Ingress start accepts `expected_version`, `provenance_id`, and the required
-`completion_protocol: "end-turn-v1"` capability identifier.
+`completion_protocol: "end-session-v2"` capability identifier.
 The failure endpoint accepts `expected_version`, stage, optional error code,
 message, round count, and optional context usage. It normalizes and bounds
 diagnostic text before atomically incrementing the attempt count.

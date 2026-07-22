@@ -4,11 +4,12 @@ Kennedy can create, inspect, edit, validate, and publish small Rust libraries th
 
 The server uses the published `kcode-rust-libs` crate and manages the filesystem, Podman validation environment, and crates.io credentials. Kennedy supplies only the arguments documented here. Kennedy must never attempt to supply a filesystem root, absolute path, shell command, Podman image, registry token, or other infrastructure setting.
 
-All calls use Kennedy's ordinary `KENNEDY_TOOL_CALLS` envelope. Multiple Rust library calls may appear in one envelope and execute sequentially. A typical single call looks like:
+Each operation uses the native `call_ktool` function. Codex may issue multiple
+function calls before its next inference; the runtime may deliver them
+sequentially. A typical call's arguments are:
 
-```text
-KENNEDY_TOOL_CALLS
-{"calls":[{"name":"OpenRustLib","arguments":{"name":"example-lib"}}]}
+```json
+{"name":"OpenRustLib","arguments":{"name":"example-lib"}}
 ```
 
 ## Session ownership

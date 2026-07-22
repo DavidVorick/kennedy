@@ -26,15 +26,17 @@ The live parameters in the codebase may be materially different.
 has no persistent or execution state, and relies on APIs to submit user intent
 and observe backend state.
 
-'Chatend' refers to the canonical human-readable application text that is
-passed to Codex for Kennedy. The Full inspector displays every
-application-controlled plaintext byte composed by the backend's same formatter; it is not a
-pretty-printed recovery object or a second approximation. Forced Codex or
-upstream-provider system/tool scaffolding can exist outside this inspectable
-boundary. Kennedy minimizes all exposed layers the environment permits without
-claiming to reveal inaccessible provider prompts. It includes one concise latency line per LLM/tool call and one final line with
+'Chatend' refers to Kennedy's model context and its transparent provider
+boundary. For current v3 archives, the Full inspector displays the exact UTF-8
+JSONL bytes the backend sent to Codex, including trailing newlines. It performs
+no parsing, reconstruction, pretty-printing, hiding, or human-friendly
+transformation. If Codex adds content that is visible to the client, that
+content must be included; if Codex does not expose an internal addition, Full
+view shows exactly what Kennedy sent and does not claim otherwise. The recovery
+archive and Main view remain separate representations. The human-readable
+application context includes one concise latency line per LLM/tool call and one final line with
 total and combined call time so Kennedy can reason about response latency
-without a repeated step list. Every request also ends with the terse line
+without a repeated step list. Every application-context text item also ends with the terse line
 `context window usage: {used-or-unknown} / {advertised-effective-limit}`.
 It uses the most recent successful LLM call's reported occupancy, even after a
 reload or provider-thread reset, and uses `unknown` only before any successful
@@ -399,7 +401,7 @@ files in this order:
    `ConversationSession.txt`, `SelfTimeSession.txt`, `HistoryIngressSession.txt`, or
    `AudioIngressSession.txt`.
 3. `KmapBasics.txt` defines temporary node identifiers, always-loaded roots,
-   and the exact text protocol for tool calls. It also tells Kennedy that the
+   and the native `call_ktool` function. It also tells Kennedy that the
    Kmap may contain additional tools and more detailed tool documentation.
 4. `ReadTools.txt` lists all shared read-only tools, including Kmap reads and
    web research.
@@ -417,15 +419,15 @@ Kennedy—automatically records that combined identity on every affected node as
 its latest modifier. Node context and the memory explorer display this metadata;
 it is not part of any Kennedy tool signature.
 
-Every newly created or restored Kennedy session begins with a real
-`ToolCheck({})` request executed through the same text-tool dispatcher Kennedy
-uses later. Its retained result says `Tool calls are working.`, survives context
-resets, and the call remains repeatable. Ordinary prose never completes a
-normal Kennedy turn. Kennedy must finish every model-controlled turn with the
-universal standalone `EndTurn` tool. In browser and Telegram conversations it
-releases the preceding prose response and waits for the user; in self time and
-history/audio ingress it ends the entire one-turn session. Shared deadline and
-hard-stop enforcement may still terminate self time externally.
+Kennedy receives one provider-native function named `call_ktool`. Each call
+contains one Ktool name and one arguments object. The model may issue several
+native function calls before its next inference; the runtime uses Codex's
+native ordering and may execute them sequentially. No fake startup tool call is
+inserted. In browser and Telegram conversations, the terminal assistant message
+ends the turn normally. History/audio ingress and self time remain active after
+a terminal message and receive a controller continuation until `EndSession`
+succeeds. Shared deadline and hard-stop enforcement may still terminate self
+time externally.
 
 ## Conversation Persistence
 
@@ -434,7 +436,7 @@ conversation records separately from the kweb. The frontend first submits a
 durable message command. Before the backend sends that query to an LLM, it must
 save the query, pending-turn state, and a lossless
 versioned recovery archive of the whole Chatend: system prompts, structured
-messages, the backend's canonical plaintext for exact Full-view display, tool
+messages, the backend's exact client-to-Codex JSONL for Full-view display, tool
 requests and results, loaded memory context, usage, and any serializable media
 content or attachment references. If that save fails, generation must not
 begin. This JSON archive is a durability format and is never itself sent to
@@ -515,7 +517,8 @@ including private/group Telegram, self time, history ingress, and audio
 ingress. Conversation sessions cannot mutate the Kmap. When the
 conversation session ends, the complete recovery archive—not merely the clean
 dialog—is turned into a history provenance node. History Ingress then extracts
-the canonical Chatend message text from that archive.
+readable source text from its structured application messages; the exact
+provider JSONL remains a transparency record and is not used as prose.
 
 Starting a new conversation does not end existing live conversations.
 Conversations end when the user deliberately ends them, or by the 24-hour idle
@@ -667,10 +670,10 @@ recovery and every clean-slate rollover use the same remaining allowance.
 Kennedy is told to have fun, follow her own interests, and not wait for user
 work. Self time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
 Kmap write tools, plus the Kmap-documented Rust library tools. A run-level
-provenance record is supplied automatically for memory mutations. The universal
-`EndTurn({})` call, or
-`EndTurn({"message":"A message for the next self-time session."})`, must be
-called alone. The optional self-time-only message is a non-empty string of at
+provenance record is supplied automatically for memory mutations.
+`EndSession({})`, or
+`EndSession({"message":"A message for the next self-time session."})`, is
+called through `call_ktool`. The optional self-time-only message is a non-empty string of at
 most 400,000 characters. The call closes and
 archives the current session without reducing the shared allowance; if at least
 five minutes remain, a fresh self-time Chatend opens immediately and receives
@@ -679,7 +682,7 @@ not forwarded. Ordinary final text does not close or roll over the session.
 
 When less than three minutes remain, the harness injects one timer notification
 into the current Chatend. At the deadline substantive tools are blocked while
-`ToolCheck` and `EndTurn` remain available, and Kennedy receives one final
+`EndSession` remains available, and Kennedy receives one final
 wrap-up round. The active intelligence
 operation is cancelled at a hard stop two minutes later. Generation and search
 requests retain the intelligence provider's profile-specific allowance, so a
@@ -703,9 +706,8 @@ times in aggregate during the session.
 Kennedy will update as many nodes as she feels is appropriate during the
 history ingress session. Zero updates is also valid. A normal answer does not
 complete history ingress. When Kennedy has fully reviewed the source and every
-required mutation has succeeded, she must call `EndTurn({})` by
-itself. Any other final text receives a durable controller message affirming
-that the text-protocol tools are available and directing her to continue or
+required mutation has succeeded, she must call `EndSession({})` through
+`call_ktool`. Any other final text receives a durable controller message directing her to continue or
 call the end tool. History ingress may use WebSearch and WebFetch when external evidence
 would help. It may use ConnectNodes, ConsolidateFanout, SetFixedConnection,
 CreateNode, and UpdateNode when justified.
@@ -732,15 +734,18 @@ and just keeps building upon it unless ResetContext is called. That means that
 if Kennedy calls 'LoadNode', a whole bunch of new data is pulled into the
 context window, rather than rewriting the context window.
 
-LLM turns run through the host's `codex-safe` launcher, which keeps the Codex
-CLI and its persistent ChatGPT login inside a Podman sandbox while using the
-user's subscription limits. The configured model is `gpt-5.6-sol` with
-`xhigh` reasoning. Conversation and tool loops resume their Codex thread;
-ResetContext starts a fresh one. Kennedy supplies exactly one non-Chatend base
-instruction: the outer `KENNEDY_TOOL_CALLS` harness remains available even when
-its tools are absent from Codex's native tool list. Developer instructions stay
-empty, exposed optional instruction/tool/plugin scaffolding is disabled, and a
-sanitized catalog is derived from Codex's live model metadata. The catalog
+Conversation turns run through `kcode-codex-runtime-v2` and Codex app-server
+using JSON-RPC over the host's `codex-safe` launcher. Fresh threads register one
+dynamic function, `call_ktool`; native tool results are returned on the same
+Codex turn, after which Codex continues inference until its terminal assistant
+item. Continued conversation turns send only new application text on the same
+thread. ResetContext makes the next request start a fresh thread with rebuilt
+context. Built-in shell, web, MCP, environment, and remote-plugin capabilities
+are disabled for this path. The configured model is `gpt-5.6-sol` with `xhigh`
+reasoning.
+
+The unchanged v1 runtime remains in use for audio reconciliation and web
+research. Its sanitized catalog is derived from Codex's live model metadata. The catalog
 blanks provider prompt fields while preserving every advertised effective
 context limit. A prompt-input probe must show only the supplied Chatend item at
 the boundary Codex exposes; catalog or prompt-boundary failure aborts startup

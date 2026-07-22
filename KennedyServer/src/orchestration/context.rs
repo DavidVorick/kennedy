@@ -446,6 +446,7 @@ pub(crate) fn format_kmap_context(snapshot: &Value) -> String {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn project_load_batch(
     before: &Value,
     after: &Value,
@@ -670,6 +671,7 @@ fn full_identifiers(snapshot: &Value) -> HashSet<u64> {
         .collect()
 }
 
+#[cfg(test)]
 fn projection_roles(projection: &Value) -> HashMap<u64, u8> {
     let mut roles = HashMap::new();
     for (key, role) in [

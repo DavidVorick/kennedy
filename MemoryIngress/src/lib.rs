@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
-pub const COMPLETION_PROTOCOL: &str = "end-turn-v1";
+pub const COMPLETION_PROTOCOL: &str = "end-session-v2";
 const FAILURE_LIMIT: i64 = 5;
 const RETRY_DELAY_SECONDS: i64 = 15;
 
@@ -335,7 +335,7 @@ impl Queue {
         }
         if !was_explicitly_ended(&existing.state) {
             return Err(Error::conflict(
-                "Memory ingress cannot complete without a successful EndTurn tool call.",
+                "Memory ingress cannot complete without a successful EndSession tool call.",
             ));
         }
         let changed = db.execute(
@@ -561,7 +561,7 @@ fn was_explicitly_ended(state: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|entries| {
             entries.iter().any(|entry| {
-                entry.get("name").and_then(Value::as_str) == Some("EndTurn")
+                entry.get("name").and_then(Value::as_str) == Some("EndSession")
                     && entry.get("ok").and_then(Value::as_bool) == Some(true)
             })
         })
@@ -711,7 +711,7 @@ mod tests {
                 SourceKind::Conversation,
                 "c",
                 active.version,
-                &json!({"historyIngress":{"tools":{"log":[{"name":"EndTurn","ok":true}]}}}),
+                &json!({"historyIngress":{"tools":{"log":[{"name":"EndSession","ok":true}]}}}),
             )
             .unwrap();
         assert_eq!(
