@@ -176,6 +176,13 @@ pub enum Representation {
     Summarized { based_on: EventId, text: String },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoxRepresentation {
+    Hydrated,
+    Dehydrated,
+    Summarized(String),
+}
+
 impl Representation {
     fn based_on(&self) -> EventId {
         match self {
@@ -449,7 +456,65 @@ impl Chatend {
     }
 
     pub fn history_context_limit(&self) -> u64 {
-        self.metadata.effective_context_tokens
+        self.metadata.effective_context_tokens.saturating_mul(75) / 100
+    }
+
+    pub fn projection_with_box_representations(
+        &self,
+        desired: &BTreeMap<BoxId, BoxRepresentation>,
+    ) -> anyhow::Result<ContextProjection> {
+        let mut preview = self.clone();
+        let events = preview.box_representation_events("preview", desired)?;
+        if !events.is_empty() {
+            preview.apply_transition(&Transition {
+                recorded_at: "preview".into(),
+                events,
+            })?;
+        }
+        Ok(preview.projection())
+    }
+
+    fn box_representation_events(
+        &self,
+        recorded_at: &str,
+        desired: &BTreeMap<BoxId, BoxRepresentation>,
+    ) -> anyhow::Result<Vec<Event>> {
+        let mut next = self.next_id;
+        let mut events = Vec::new();
+        for (box_id, desired) in desired {
+            let state = self
+                .box_state(*box_id)
+                .with_context(|| format!("box {box_id} does not exist"))?;
+            ensure!(state.active, "box {box_id} is retired");
+            let kind = match (desired, &state.representation) {
+                (BoxRepresentation::Hydrated, Representation::Hydrated { .. })
+                | (BoxRepresentation::Dehydrated, Representation::Dehydrated { .. }) => None,
+                (
+                    BoxRepresentation::Summarized(desired),
+                    Representation::Summarized { text, .. },
+                ) if desired == text => None,
+                (BoxRepresentation::Hydrated, _) => {
+                    Some(EventKind::BoxRehydrated { box_id: *box_id })
+                }
+                (BoxRepresentation::Dehydrated, _) => {
+                    Some(EventKind::BoxDehydrated { box_id: *box_id })
+                }
+                (BoxRepresentation::Summarized(text), _) => Some(EventKind::BoxSummarized {
+                    box_id: *box_id,
+                    text: text.clone(),
+                }),
+            };
+            let Some(kind) = kind else {
+                continue;
+            };
+            events.push(Event {
+                id: EventId(next),
+                recorded_at: recorded_at.into(),
+                kind,
+            });
+            next = next.checked_add(1).context("event ID overflow")?;
+        }
+        Ok(events)
     }
 
     pub fn projection(&self) -> ContextProjection {
@@ -1693,31 +1758,19 @@ impl SessionJournal {
         Ok(ids)
     }
 
-    pub fn fully_dehydrate_for_ingress(
+    pub fn apply_box_representations(
         &mut self,
         recorded_at: impl Into<String>,
-        keep_hydrated: &[BoxId],
+        desired: &BTreeMap<BoxId, BoxRepresentation>,
     ) -> anyhow::Result<Vec<EventId>> {
         let recorded_at = recorded_at.into();
-        let mut next = self.chatend.next_id;
-        let mut events = Vec::new();
-        for state in self.chatend.active_boxes() {
-            if keep_hydrated.contains(&state.id)
-                || matches!(state.representation, Representation::Dehydrated { .. })
-            {
-                continue;
-            }
-            events.push(Event {
-                id: EventId(next),
-                recorded_at: recorded_at.clone(),
-                kind: EventKind::BoxDehydrated { box_id: state.id },
-            });
-            next += 1;
-        }
+        let events = self
+            .chatend
+            .box_representation_events(&recorded_at, desired)?;
         if events.is_empty() {
             return Ok(Vec::new());
         }
-        let ids = events.iter().map(|event| event.id).collect();
+        let ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
         self.commit_events(recorded_at, events)?;
         Ok(ids)
     }
@@ -1940,7 +1993,15 @@ mod tests {
         let second = journal
             .create_box("t2", "second", BoxOwner::Kennedy, BoxContent::text("two"))
             .unwrap();
-        journal.fully_dehydrate_for_ingress("t3", &[]).unwrap();
+        journal
+            .apply_box_representations(
+                "t3",
+                &BTreeMap::from([
+                    (first, BoxRepresentation::Dehydrated),
+                    (second, BoxRepresentation::Dehydrated),
+                ]),
+            )
+            .unwrap();
         drop(journal);
 
         let mut bytes = std::fs::read(&path).unwrap();
@@ -2169,7 +2230,63 @@ mod tests {
         });
         assert_eq!(state.live_context_limit(), 70);
         assert_eq!(state.emergency_context_limit(), 72);
-        assert_eq!(state.history_context_limit(), 101);
+        assert_eq!(state.history_context_limit(), 75);
         assert_eq!(estimate_tokens("1234"), 2);
+    }
+
+    #[test]
+    fn box_representation_preview_matches_the_batched_append() {
+        let path = path("representation-plan");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        let hydrated = journal
+            .create_box(
+                "t1",
+                "large result",
+                BoxOwner::Controller,
+                BoxContent::text("x".repeat(3_000)),
+            )
+            .unwrap();
+        let summarized = journal
+            .create_box(
+                "t2",
+                "Kennedy summary",
+                BoxOwner::Kennedy,
+                BoxContent::text("y".repeat(3_000)),
+            )
+            .unwrap();
+        journal
+            .summarize_box("t3", summarized, "important points")
+            .unwrap();
+        let desired = BTreeMap::from([
+            (hydrated, BoxRepresentation::Dehydrated),
+            (
+                summarized,
+                BoxRepresentation::Summarized("important points".into()),
+            ),
+        ]);
+        let preview = journal
+            .state()
+            .projection_with_box_representations(&desired)
+            .unwrap();
+        let next_id = journal.state().next_id;
+        let ids = journal.apply_box_representations("t4", &desired).unwrap();
+        assert_eq!(ids, vec![EventId(next_id)]);
+        assert_eq!(journal.state().projection(), preview);
+        assert!(matches!(
+            journal.state().box_state(hydrated).unwrap().representation,
+            Representation::Dehydrated { .. }
+        ));
+        assert_eq!(
+            journal
+                .state()
+                .box_state(summarized)
+                .unwrap()
+                .representation,
+            Representation::Summarized {
+                based_on: EventId(2),
+                text: "important points".into(),
+            }
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

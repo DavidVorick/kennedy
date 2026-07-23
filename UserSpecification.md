@@ -79,9 +79,10 @@ A box is:
 - **stale** when a dehydrated or summarized representation predates the latest
   canonical revision.
 
-Kennedy alone decides when to dehydrate, summarize, or hydrate. The controller
-does not invent diffs for stale boxes. The only automatic bulk dehydration is
-preparation for history ingress.
+Kennedy normally decides when to dehydrate, summarize, or hydrate. The
+controller does not invent diffs for stale boxes. History-ingress preparation
+retains Kennedy-authored summaries and automatically fits the remaining
+context to its model-relative budget.
 
 The retired terms “blanched” and “dirty” are not used.
 
@@ -113,6 +114,15 @@ third. Active means the first eight recent connections. A full node shows its
 ID, name, summary, long description, and identifier-only fixed, active, and
 fanout lists. Per-loaded-node fanout boxes and the three second-layer aggregate
 boxes add summaries or names only for nodes not already represented earlier.
+
+A manual `LoadNode` invocation remains visible in its normal JSON call box.
+The successful result is not copied into a generic JSON result box. Instead,
+the native tool response contains exactly the Kweb boxes that the load created
+or revised, using their current Chatend-rendered representation and Kweb
+layout order. This lets the already-running provider turn see the state it
+just loaded without duplicating it. A no-change reload and a failed load
+return short plain text. The journal retains only a compact completion receipt
+for the operation.
 
 ## Temporary IDs and staged objects
 
@@ -152,11 +162,11 @@ exact-once behavior.
 ## Context budgets
 
 A normal source session may use 70% of the model's effective context window.
-The remaining capacity is for history ingress. History ingress may use 100%.
+History ingress may use 75% of the context window of the model it calls.
 
 If a hydration or tool result would exceed capacity, Kennedy receives an
 error. If repeated failures push an ordinary source above 72%, the controller
-force-ends it and queues history ingress. If history ingress fills 100% and
+force-ends it and queues history ingress. If history ingress fills 75% and
 cannot continue, it commits the useful work completed so far.
 
 ## History ingress
@@ -164,12 +174,19 @@ cannot continue, it commits the useful work completed so far.
 History ingress begins from the same journal. The controller:
 
 - preserves the complete event history;
-- dehydrates ordinary source boxes;
-- rehydrates system prompt boxes;
+- retains Kennedy-authored summaries;
+- hydrates all other source boxes when the resulting context fits;
+- otherwise reduces eligible boxes from largest to smallest until the context
+  is below 75% of the ingress model's context window;
+- protects the system prompt, conversation messages, full directly
+  loaded/fixed/active Kweb nodes, and short tool invocations from automatic
+  dehydration;
+- programmatically summarizes a tool invocation longer than 1,000 characters
+  only if the largest-first fitting pass reaches it;
 - loads Kennedy's and the user's root nodes;
 - revalidates nodes after obtaining the global writer lane;
 - posts compact update occurrences for changed nodes;
-- leaves stale representations compact until Kennedy hydrates them.
+- keeps canonical content available for later hydration.
 
 Kennedy may inspect any event or box, then builds the final Kweb plan.
 

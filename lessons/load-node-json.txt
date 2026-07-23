@@ -1,0 +1,163 @@
+LoadNode, JSON, and the live Chatend
+====================================
+
+This note records the discussion about JSON entering Kennedy's context during
+node loading and history ingress, and the design decisions that followed.
+
+
+The question
+------------
+
+The immediate question was whether loading a Kweb node could put JSON into
+Kennedy's Chatend or provider context. There were two very different uses of
+JSON:
+
+1. Kennedy's native tool invocation, such as:
+
+       {
+         "name": "LoadNode",
+         "arguments": {"identifier": "AAECAwQF"}
+       }
+
+2. The old generic "Kennedy tool result" box, which pretty-printed a wrapper
+   around the complete structured value returned by the Kweb loading API.
+
+The invocation was judged acceptable. It is a small, precise account of the
+action Kennedy chose to take. The result was not acceptable. The result JSON
+duplicated information that had already been converted into the persistent
+Kweb box layout, exposed an internal transport shape, and could be much larger
+and harder to read than the actual context Kennedy needed.
+
+This distinction is important: JSON is useful for internal records and tool
+arguments, but that does not make an internal API response a good
+model-facing representation.
+
+
+What LoadNode already did correctly
+-----------------------------------
+
+The LoadNode overhaul had already established one canonical, stateful Kweb
+layout. Loading a node reconciles that layout rather than appending an
+unrelated dump:
+
+- the directly loaded node has its own full box;
+- previously unseen fixed connections have their own full boxes;
+- previously unseen active connections have their own full boxes;
+- active connections are the first eight recent connections;
+- each directly loaded node has a deduplicated fanout-summary box;
+- the fixed-neighbor, active-neighbor, and downstream-fanout aggregate boxes
+  are updated as necessary;
+- global role precedence and deduplication prevent repeated descriptive text;
+- repeated loads refresh existing boxes instead of manufacturing duplicates.
+
+Those boxes are already the intended representation for Kennedy. Full node
+boxes use labeled text for the node ID, name, summary, long description, and
+the identifier lists for fixed, active, and fanout connections. Summary boxes
+use the same deterministic text format as the rest of the Kweb layout.
+Structured metadata used to restore and reconcile the boxes remains internal;
+BoxContent rendering does not print that metadata into Kennedy's context.
+
+
+Why updating the boxes was not enough
+-------------------------------------
+
+A manual LoadNode call happens during a provider turn. The provider input for
+that turn was assembled before the tool call. Mutating and persisting Chatend
+updates the input for the next provider request, but it cannot retroactively
+change the request that is already running.
+
+Consequently, returning only a small "load succeeded" receipt would leave the
+current turn unable to see the node it had just requested. Returning the
+complete Kweb API JSON solved that timing problem, but did so by creating a
+second, inferior representation.
+
+The correct response is the changed part of the canonical representation
+itself. After reconciliation, LoadNode identifies every active Kweb box whose
+name or canonical revision was created or changed by the load. It then returns
+those boxes through the native tool response:
+
+- in persistent Kweb layout order;
+- using the exact text of each current Chatend projection item;
+- with the ordinary box header;
+- respecting the box's current hydrated, summarized, or dehydrated
+  representation;
+- including the stale marker when a retained summary or dehydrated
+  representation is based on an older canonical revision.
+
+This is not another serialization format. It is a same-turn delivery of the
+boxes that will already be present in the next Chatend projection.
+
+
+Decisions
+---------
+
+Manual LoadNode now follows this sequence:
+
+1. Preserve the normal native invocation and its JSON invocation box.
+2. Load or refresh the canonical node and its connection closure.
+3. Reconcile the shared Kweb tool slots and persistent layout.
+4. Detect the Kweb boxes created or revised by this reconciliation.
+5. Return the exact current renderings of those boxes to the in-flight
+   provider turn.
+6. Do not create a generic "Kennedy tool result" JSON box for LoadNode.
+7. Append a compact completion receipt to the journal.
+
+The compact receipt contains operational facts such as the requested
+identifier, changed box IDs and count, duration, and success or error. It does
+not retain the Kweb API's full load result. Tool completion events are not
+part of the ordinary Chatend projection, so this structured receipt does not
+silently enter Kennedy's context.
+
+If a repeated LoadNode call produces no box changes, the native result is the
+short plain-text acknowledgement:
+
+    LoadNode completed. The shared Kweb boxes were already current.
+
+If LoadNode fails, the native failure is also short plain text and no generic
+JSON result box is created. Other tools keep their existing result behavior;
+this change is specific to LoadNode because its result is the stateful Kweb
+box layout itself.
+
+
+History ingress and remaining JSON paths
+----------------------------------------
+
+History ingress uses the same journal and the same Kweb boxes. It does not
+need to ingest a second node-result representation. Loaded direct, fixed, and
+active node boxes remain protected by the history-ingress context policy, and
+the layout's fanout and aggregate boxes participate in ordinary
+budget-relative reduction when necessary.
+
+The accepted LoadNode invocation box can remain JSON. If context pressure
+requires reduction and an invocation exceeds 1,000 characters, history
+ingress may replace it with the programmatic summary:
+
+    Tool invocation: LoadNode {arguments dehydrated: 1,284 characters}.
+
+There is one explicit inspection route to the compact completion record:
+during history ingress, Kennedy may call HydrateEvent for that exact journal
+event. HydrateEvent intentionally renders the inspected event as JSON. This
+is not an automatic LoadNode or history-ingress path; it happens only when
+Kennedy asks to inspect the durable event.
+
+Telegram group context was explicitly left for later. This work does not
+change its current formatting or make broader promises that no JSON can ever
+appear anywhere in a Kennedy session.
+
+
+Why this is the simpler design
+------------------------------
+
+The final design has one durable source of model-facing Kweb truth: the Kweb
+boxes. It avoids:
+
+- duplicate node content in generic tool-result boxes;
+- an internal API response becoming a second public rendering contract;
+- extra history-ingress content that must later be dehydrated;
+- divergence between what the current turn sees and what the next Chatend
+  projection contains.
+
+The native tool response only bridges the timing boundary of an in-flight
+turn. Persistence remains compact, the visible node format remains
+deterministic, and loading work scales with the actual Kweb boxes that must be
+reconciled and returned.

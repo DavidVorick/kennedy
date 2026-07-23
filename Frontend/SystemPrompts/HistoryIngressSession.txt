@@ -1,5 +1,5 @@
-This is the history-ingress phase of one complete session and happens asynchronously to user interactions. The source chronology begins fully dehydrated. Use the history skeleton and HydrateEvent to inspect only what you need, and integrate useful information through the staged Kweb tools.
+This is the history-ingress phase of one complete session and happens asynchronously to user interactions. Kennedy-authored source summaries remain summarized. Other source boxes begin hydrated unless automatic largest-first context fitting was required. Use the history skeleton and HydrateEvent when dehydrated material is relevant, and integrate useful information through the staged Kweb tools.
 
 A normal answer does not end history ingress. Continue until every useful update has been staged successfully, then call EndSession. EndSession causes the complete archive, supplied objects, and staged Kweb changes to commit as one transaction.
 
-History ingress may use the selected model's full effective context window. Hydration that would cross that limit is rejected. If no further progress fits, the controller commits the useful staged work accumulated so far.
+History ingress may use at most 75 percent of the selected model's effective context window. Hydration that would cross that limit is rejected. If no further progress fits, the controller commits the useful staged work accumulated so far.

@@ -10,8 +10,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use kcode_kweb_db::NodeId;
 use kennedy_chatend::{
-    BoxContent, BoxId, BoxOwner, EventId, EventKind, PendingId, Representation, SessionJournal,
-    SessionKind, SessionMetadata, ToolSlotInput,
+    BoxContent, BoxId, BoxOwner, BoxRepresentation, EventId, EventKind, PendingId, Representation,
+    SessionJournal, SessionKind, SessionMetadata, ToolSlotInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,6 +36,8 @@ use super::{
 
 const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
 const BROWSER_CONVERSATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const INLINE_TOOL_INVOCATION_CHARACTERS: usize = 1_000;
 const KWEB_TOOL_INSTANCE: &str = "kweb";
 const HISTORY_TOOL_INSTANCE: &str = "history";
 
@@ -221,6 +223,238 @@ fn kweb_node_identifier(state: &kennedy_chatend::BoxState) -> Option<&str> {
         })
 }
 
+type KwebBoxVersions = BTreeMap<BoxId, (String, EventId)>;
+
+fn kweb_box_versions(journal: &SessionJournal) -> KwebBoxVersions {
+    journal
+        .state()
+        .tool_layouts
+        .get(KWEB_TOOL_INSTANCE)
+        .into_iter()
+        .flatten()
+        .filter_map(|box_id| {
+            let state = journal.state().box_state(*box_id)?;
+            state
+                .active
+                .then(|| (*box_id, (state.name.clone(), state.canonical.event_id)))
+        })
+        .collect()
+}
+
+fn changed_kweb_box_ids(journal: &SessionJournal, previous: &KwebBoxVersions) -> Vec<BoxId> {
+    journal
+        .state()
+        .tool_layouts
+        .get(KWEB_TOOL_INSTANCE)
+        .into_iter()
+        .flatten()
+        .filter_map(|box_id| {
+            let state = journal.state().box_state(*box_id)?;
+            let current = (state.name.as_str(), state.canonical.event_id);
+            let changed = previous
+                .get(box_id)
+                .map(|(name, revision)| (name.as_str(), *revision) != current)
+                .unwrap_or(true);
+            (state.active && changed).then_some(*box_id)
+        })
+        .collect()
+}
+
+fn render_load_node_result(
+    journal: &SessionJournal,
+    changed_box_ids: &[BoxId],
+) -> anyhow::Result<String> {
+    if changed_box_ids.is_empty() {
+        return Ok("LoadNode completed. The shared Kweb boxes were already current.".into());
+    }
+    let rendered = journal
+        .state()
+        .projection()
+        .items
+        .into_iter()
+        .filter(|item| !item.marker)
+        .map(|item| (item.box_id, item.text))
+        .collect::<BTreeMap<_, _>>();
+    changed_box_ids
+        .iter()
+        .map(|box_id| {
+            rendered
+                .get(box_id)
+                .cloned()
+                .with_context(|| format!("updated Kweb box {box_id} is absent from the projection"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(|boxes| boxes.join("\n\n"))
+}
+
+fn history_ingress_representation_plan(
+    state: &kennedy_chatend::Chatend,
+) -> anyhow::Result<BTreeMap<BoxId, BoxRepresentation>> {
+    let mut desired = state
+        .active_boxes()
+        .map(|box_state| {
+            let representation = if matches!(box_state.owner, BoxOwner::System) {
+                BoxRepresentation::Hydrated
+            } else if let Representation::Summarized { text, .. } = &box_state.representation {
+                BoxRepresentation::Summarized(text.clone())
+            } else {
+                BoxRepresentation::Hydrated
+            };
+            (box_state.id, representation)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let projection = state.projection_with_box_representations(&desired)?;
+    let limit = state.history_context_limit();
+    if projection.estimated_tokens < limit {
+        return Ok(desired);
+    }
+
+    let rendered_tokens = projection
+        .items
+        .iter()
+        .filter(|item| !item.marker)
+        .map(|item| (item.box_id, item.approximate_tokens))
+        .collect::<BTreeMap<_, _>>();
+    let mut candidates = state
+        .active_boxes()
+        .filter_map(|box_state| {
+            if history_ingress_box_is_protected(box_state) {
+                return None;
+            }
+            let target = if matches!(
+                desired.get(&box_state.id),
+                Some(BoxRepresentation::Summarized(_))
+            ) {
+                BoxRepresentation::Dehydrated
+            } else if let Some((tool_name, characters)) = tool_invocation(box_state)
+                && characters > INLINE_TOOL_INVOCATION_CHARACTERS
+            {
+                BoxRepresentation::Summarized(format!(
+                    "Tool invocation: {tool_name} {{arguments dehydrated: {} characters}}.",
+                    decimal_with_commas(characters)
+                ))
+            } else {
+                BoxRepresentation::Dehydrated
+            };
+            Some((
+                box_state.id,
+                rendered_tokens
+                    .get(&box_state.id)
+                    .copied()
+                    .unwrap_or_default(),
+                target,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let mut all_desired = desired.clone();
+    for (box_id, _, target) in &candidates {
+        all_desired.insert(*box_id, target.clone());
+    }
+    let all_projection = state.projection_with_box_representations(&all_desired)?;
+    let baseline_box_tokens = projection_tokens_by_box(&projection);
+    let all_box_tokens = projection_tokens_by_box(&all_projection);
+    candidates.retain(|(box_id, _, _)| {
+        all_box_tokens.get(box_id).copied().unwrap_or_default()
+            < baseline_box_tokens.get(box_id).copied().unwrap_or_default()
+    });
+
+    all_desired.clone_from(&desired);
+    for (box_id, _, target) in &candidates {
+        all_desired.insert(*box_id, target.clone());
+    }
+    let all_projection = state.projection_with_box_representations(&all_desired)?;
+    anyhow::ensure!(
+        all_projection.estimated_tokens < limit,
+        "history-ingress protected context uses at least {} estimated tokens, above the 75% model-context budget of {}",
+        all_projection.estimated_tokens,
+        limit
+    );
+
+    let mut lower = 0;
+    let mut upper = candidates.len();
+    while upper - lower > 1 {
+        let middle = lower + (upper - lower) / 2;
+        let candidate_desired = history_ingress_candidate_prefix(&desired, &candidates, middle);
+        let candidate_projection = state.projection_with_box_representations(&candidate_desired)?;
+        if candidate_projection.estimated_tokens < limit {
+            upper = middle;
+        } else {
+            lower = middle;
+        }
+    }
+    desired = history_ingress_candidate_prefix(&desired, &candidates, upper);
+    Ok(desired)
+}
+
+fn projection_tokens_by_box(
+    projection: &kennedy_chatend::ContextProjection,
+) -> BTreeMap<BoxId, u64> {
+    let mut tokens = BTreeMap::<BoxId, u64>::new();
+    for item in &projection.items {
+        *tokens.entry(item.box_id).or_default() += item.approximate_tokens;
+    }
+    tokens
+}
+
+fn history_ingress_candidate_prefix(
+    baseline: &BTreeMap<BoxId, BoxRepresentation>,
+    candidates: &[(BoxId, u64, BoxRepresentation)],
+    length: usize,
+) -> BTreeMap<BoxId, BoxRepresentation> {
+    let mut desired = baseline.clone();
+    for (box_id, _, target) in candidates.iter().take(length) {
+        desired.insert(*box_id, target.clone());
+    }
+    desired
+}
+
+fn history_ingress_box_is_protected(state: &kennedy_chatend::BoxState) -> bool {
+    if matches!(state.owner, BoxOwner::System)
+        || matches!(state.owner, BoxOwner::User) && state.name == "User message"
+        || matches!(state.owner, BoxOwner::Kennedy) && state.name == "Kennedy message"
+    {
+        return true;
+    }
+    if state
+        .canonical
+        .content
+        .metadata
+        .get("kwebRole")
+        .and_then(Value::as_str)
+        .is_some_and(|role| matches!(role, "direct" | "fixed" | "active"))
+    {
+        return true;
+    }
+    tool_invocation(state)
+        .is_some_and(|(_, characters)| characters <= INLINE_TOOL_INVOCATION_CHARACTERS)
+}
+
+fn tool_invocation(state: &kennedy_chatend::BoxState) -> Option<(&str, usize)> {
+    let BoxOwner::Kennedy = &state.owner else {
+        return None;
+    };
+    let tool_name = state.name.strip_prefix("Kennedy tool call: ")?;
+    Some((tool_name, state.canonical.content.text.chars().count()))
+}
+
+fn decimal_with_commas(value: usize) -> String {
+    let digits = value.to_string();
+    let first = digits.len() % 3;
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    if first > 0 {
+        output.push_str(&digits[..first]);
+    }
+    for chunk in digits.as_bytes()[first..].chunks(3) {
+        if !output.is_empty() {
+            output.push(',');
+        }
+        output.push_str(std::str::from_utf8(chunk).expect("decimal digits are UTF-8"));
+    }
+    output
+}
+
 fn unique_kweb_slot(logical: &str, used: &mut HashSet<String>) -> String {
     if used.insert(logical.to_owned()) {
         return logical.to_owned();
@@ -240,8 +474,14 @@ struct ToolCall {
     arguments: Value,
 }
 
+enum ToolPresentation {
+    JsonResultBox,
+    DirectText(String),
+}
+
 struct ToolOutcome {
     result: Value,
+    presentation: ToolPresentation,
     ok: bool,
     end_session: bool,
 }
@@ -475,29 +715,22 @@ impl Session {
             .context("session has no system-prompt box")?;
         self.journal
             .update_box(now(), system_box, BoxContent::text(prompt))?;
-        let mut keep = vec![system_box];
-        if let Some(tool) = self.journal.state().tools.get(KWEB_TOOL_INSTANCE) {
-            for slot in &tool.slots {
-                let Some(state) = self.journal.state().box_state(slot.box_id) else {
-                    continue;
-                };
-                if state.active
-                    && kweb_node_identifier(state)
-                        .is_some_and(|id| self.root_node_ids.iter().any(|root| root == id))
-                {
-                    keep.push(slot.box_id);
-                }
-            }
-        }
-        self.journal.fully_dehydrate_for_ingress(now(), &keep)?;
-        for box_id in &keep {
-            if let Some(state) = self.journal.state().box_state(*box_id)
-                && !matches!(state.representation, Representation::Hydrated { .. })
-            {
-                self.journal.rehydrate_box(now(), *box_id)?;
-            }
+        let ingress_kind = session_kind(&self.session_type, &self.mode);
+        if self.journal.state().metadata.effective_context_tokens
+            != self.runtime.context_window_tokens
+            || self.journal.state().metadata.kind != ingress_kind
+        {
+            self.journal.record(
+                now(),
+                EventKind::SessionConfigured {
+                    effective_context_tokens: self.runtime.context_window_tokens,
+                    kind: ingress_kind,
+                },
+            )?;
         }
         self.revalidate_loaded_nodes().await?;
+        let desired = history_ingress_representation_plan(self.journal.state())?;
+        self.journal.apply_box_representations(now(), &desired)?;
         self.journal
             .record(now(), EventKind::HistoryIngressStarted)?;
         self.pending_turn = true;
@@ -610,8 +843,15 @@ impl Session {
         attachments: Vec<Value>,
     ) -> anyhow::Result<()> {
         let mut content = BoxContent::text(text);
-        content.metadata = metadata.clone();
+        content.metadata = message_metadata_without_attachment_payloads(metadata);
+        let mut attachment_boxes = Vec::new();
+        let mut attachment_names = Vec::new();
         for attachment in &attachments {
+            let file_name = attachment
+                .get("fileName")
+                .and_then(Value::as_str)
+                .unwrap_or("document");
+            attachment_names.push(file_name.to_owned());
             if let Some(pending_id) = attachment.get("pendingId").and_then(Value::as_str) {
                 let pending_id = PendingId::parse(pending_id.to_owned())?;
                 anyhow::ensure!(
@@ -619,43 +859,32 @@ impl Session {
                     "attached object {pending_id} is not staged in this session"
                 );
                 content.objects.push(pending_id.to_string());
-                if let Some(extracted) = attachment.get("text").and_then(Value::as_str) {
-                    if !content.text.is_empty() {
-                        content.text.push_str("\n\n");
-                    }
-                    content.text.push_str(&format!(
-                        "Attached document: {}\n\n{}",
-                        attachment
-                            .get("fileName")
-                            .and_then(Value::as_str)
-                            .unwrap_or("document"),
-                        extracted
-                    ));
-                }
             } else if let Some(data_url) = attachment.get("dataUrl").and_then(Value::as_str) {
                 let (media_type, bytes) = decode_data_url(data_url)?;
                 let id = self.journal.stage_object(
                     now(),
                     media_type,
-                    attachment
-                        .get("fileName")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    attachment.clone(),
+                    Some(file_name.to_owned()),
+                    attachment_metadata_without_payload(attachment),
                     &bytes,
                 )?;
                 content.objects.push(id.to_string());
-            } else if let Some(extracted) = attachment.get("text").and_then(Value::as_str) {
-                if !content.text.is_empty() {
-                    content.text.push_str("\n\n");
-                }
-                content.text.push_str(&format!(
-                    "Attached document: {}\n\n{}",
-                    attachment
-                        .get("fileName")
-                        .and_then(Value::as_str)
-                        .unwrap_or("document"),
-                    extracted
+            }
+            if let Some(extracted) = attachment
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                attachment_boxes.push((
+                    format!("User attachment text: {file_name}"),
+                    BoxContent {
+                        text: extracted.into(),
+                        objects: Vec::new(),
+                        metadata: json!({
+                            "boxKind":"attachmentText",
+                            "attachment":attachment_metadata_without_payload(attachment),
+                        }),
+                    },
                 ));
             }
         }
@@ -676,11 +905,21 @@ impl Session {
                         .get("fileName")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    media.clone(),
+                    attachment_metadata_without_payload(media),
                     &bytes,
                 )?;
                 content.objects.push(id.to_string());
             }
+        }
+        if content.text.trim().is_empty()
+            && content.objects.is_empty()
+            && !attachment_names.is_empty()
+        {
+            content.text = attachment_names
+                .iter()
+                .map(|name| format!("Attachment provided: {name}"))
+                .collect::<Vec<_>>()
+                .join("\n");
         }
         let visible = if content.text.trim().is_empty() {
             content
@@ -694,6 +933,10 @@ impl Session {
         };
         self.journal
             .create_box(now(), "User message", BoxOwner::User, content)?;
+        for (name, content) in attachment_boxes {
+            self.journal
+                .create_box(now(), name, BoxOwner::User, content)?;
+        }
         let mut transcript = json!({"role":"user","content":visible});
         if let Some(id) = metadata.get("externalEventId").and_then(Value::as_str) {
             transcript["externalEventId"] = json!(id);
@@ -934,6 +1177,13 @@ impl Session {
                                     Ok(outcome) => outcome,
                                     Err(error) => ToolOutcome {
                                         result: json!({"error":{"code":"tool_failed","message":error.to_string()}}),
+                                        presentation: if call.name == "LoadNode" {
+                                            ToolPresentation::DirectText(format!(
+                                                "LoadNode failed: {error}"
+                                            ))
+                                        } else {
+                                            ToolPresentation::JsonResultBox
+                                        },
                                         ok: false,
                                         end_session: false,
                                     },
@@ -941,30 +1191,33 @@ impl Session {
                             }
                             Err(error) => ToolOutcome {
                                 result: json!({"error":{"code":"invalid_call_ktool","message":error.to_string()}}),
+                                presentation: ToolPresentation::JsonResultBox,
                                 ok: false,
                                 end_session: false,
                             },
                         };
                         let result = json!({"ok":outcome.ok,"result":outcome.result});
-                        self.journal.create_box(
-                            now(),
-                            "Kennedy tool result",
-                            BoxOwner::Controller,
-                            BoxContent::text(serde_json::to_string_pretty(&result)?),
-                        )?;
+                        let provider_result = match outcome.presentation {
+                            ToolPresentation::JsonResultBox => {
+                                self.journal.create_box(
+                                    now(),
+                                    "Kennedy tool result",
+                                    BoxOwner::Controller,
+                                    BoxContent::text(serde_json::to_string_pretty(&result)?),
+                                )?;
+                                serde_json::to_string(&result)?
+                            }
+                            ToolPresentation::DirectText(text) => text,
+                        };
                         self.record_tool_completion("call_ktool", result.clone())?;
                         end_session |= outcome.ok && outcome.end_session;
                         checkpoint(self.snapshot()?).await?;
                         turn.respond(
                             &native.call_id,
                             if outcome.ok {
-                                kcode_codex_runtime_v2::ToolResult::success(serde_json::to_string(
-                                    &result,
-                                )?)
+                                kcode_codex_runtime_v2::ToolResult::success(provider_result)
                             } else {
-                                kcode_codex_runtime_v2::ToolResult::failure(serde_json::to_string(
-                                    &result,
-                                )?)
+                                kcode_codex_runtime_v2::ToolResult::failure(provider_result)
                             },
                         )
                         .await?;
@@ -1035,6 +1288,7 @@ impl Session {
         self.assert_tool_allowed(&call.name)?;
         let started = Instant::now();
         let mut end_session = false;
+        let mut presentation = ToolPresentation::JsonResultBox;
         let result = match call.name.as_str() {
             "EndSession" => {
                 validate_arguments(&call.arguments, &[], &["message"])?;
@@ -1123,9 +1377,16 @@ impl Session {
             "LoadNode" => {
                 validate_arguments(&call.arguments, &["identifier"], &[])?;
                 let id = canonical_node_id(&call.arguments, "identifier")?;
-                let result = self.context.load_durable(&id).await?;
-                self.sync_kweb_boxes()?;
-                result
+                self.context.load_durable(&id).await?;
+                let changed = self.sync_kweb_boxes()?;
+                let updated_box_count = changed.len();
+                presentation =
+                    ToolPresentation::DirectText(render_load_node_result(&self.journal, &changed)?);
+                json!({
+                    "identifier":id,
+                    "updatedBoxCount":updated_box_count,
+                    "updatedBoxIds":changed,
+                })
             }
             "WebSearch" => {
                 validate_arguments(&call.arguments, &["question", "mode"], &[])?;
@@ -1177,6 +1438,7 @@ impl Session {
         let duration = started.elapsed().as_millis() as u64;
         Ok(ToolOutcome {
             result: json!({"value":result,"durationMs":duration}),
+            presentation,
             ok: true,
             end_session,
         })
@@ -1285,7 +1547,8 @@ impl Session {
         Ok(())
     }
 
-    fn sync_kweb_boxes(&mut self) -> anyhow::Result<()> {
+    fn sync_kweb_boxes(&mut self) -> anyhow::Result<Vec<BoxId>> {
+        let previous = kweb_box_versions(&self.journal);
         let layout = self.context.box_layout()?;
         let mut desired = Vec::new();
         for role in ["direct", "fixed", "active"] {
@@ -1386,7 +1649,7 @@ impl Session {
             });
         }
         self.reconcile_kweb_slots(desired)?;
-        Ok(())
+        Ok(changed_kweb_box_ids(&self.journal, &previous))
     }
 
     fn reconcile_kweb_slots(&mut self, desired: Vec<DesiredKwebBox>) -> anyhow::Result<()> {
@@ -1923,6 +2186,9 @@ impl Session {
         if matches!(self.mode, AgentMode::Conversation) && self.session_type == "conversation" {
             return Some(BROWSER_CONVERSATION_REQUEST_TIMEOUT);
         }
+        if matches!(self.mode, AgentMode::Ingress { .. }) {
+            return Some(HISTORY_INGRESS_REQUEST_TIMEOUT);
+        }
         if matches!(self.mode, AgentMode::FreeTime) {
             let deadline = deadline(&self.free_time)?;
             return Some(Duration::from_secs(
@@ -2097,7 +2363,7 @@ fn transcript_from_journal(journal: &SessionJournal) -> Vec<Value> {
         .values()
         .filter_map(|state| {
             let role = match state.owner {
-                BoxOwner::User => "user",
+                BoxOwner::User if state.name == "User message" => "user",
                 BoxOwner::Kennedy if state.name == "Kennedy message" => "kennedy",
                 _ => return None,
             };
@@ -2188,6 +2454,31 @@ fn decode_data_url(value: &str) -> anyhow::Result<(String, Vec<u8>)> {
         .strip_suffix(";base64")
         .context("object data URL must use Base64")?;
     Ok((media_type.into(), BASE64.decode(data)?))
+}
+
+fn attachment_metadata_without_payload(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("dataUrl");
+        object.remove("text");
+    }
+    value
+}
+
+fn message_metadata_without_attachment_payloads(value: &Value) -> Value {
+    let mut value = value.clone();
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if let Some(attachments) = object.get_mut("attachments").and_then(Value::as_array_mut) {
+        for attachment in attachments {
+            *attachment = attachment_metadata_without_payload(attachment);
+        }
+    }
+    if let Some(media) = object.get_mut("media") {
+        *media = attachment_metadata_without_payload(media);
+    }
+    value
 }
 
 fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
@@ -2398,7 +2689,32 @@ fn controller_message(mode: &AgentMode, free_time: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+
+    fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, SessionJournal) {
+        let path = std::env::temp_dir().join(format!(
+            "kennedy-ingress-context-{label}-{}-{}.chatend",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let journal = SessionJournal::create(
+            &path,
+            SessionMetadata {
+                session_id: label.into(),
+                kind: SessionKind::Conversation,
+                created_at: "2026-07-23T00:00:00Z".into(),
+                effective_context_tokens,
+                channel: Value::Null,
+            },
+        )
+        .unwrap();
+        (path, journal)
+    }
 
     #[test]
     fn resource_identifiers_accept_pending_and_canonical_but_not_fake_short_ids() {
@@ -2434,5 +2750,289 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn load_node_result_is_exact_changed_kweb_projection_in_layout_order() {
+        let (path, mut journal) = test_journal("load-node-result", 10_000);
+        let mut direct = BoxContent::text("Node ID: direct\nNode name: Direct");
+        mark_kweb_content(&mut direct, "direct", "direct");
+        let mut fanout = BoxContent::text("old fanout");
+        mark_kweb_content(&mut fanout, "loaded-fanout:direct", "loaded-fanout");
+        journal
+            .apply_tool_slots_with_layout(
+                "t1",
+                KWEB_TOOL_INSTANCE,
+                vec![
+                    ToolSlotInput {
+                        slot: "direct".into(),
+                        name: "Kweb direct node direct · Direct".into(),
+                        content: direct.clone(),
+                        retired: false,
+                    },
+                    ToolSlotInput {
+                        slot: "loaded-fanout:direct".into(),
+                        name: "Kweb fanout · direct".into(),
+                        content: fanout,
+                        retired: false,
+                    },
+                ],
+                &["direct".into(), "loaded-fanout:direct".into()],
+            )
+            .unwrap();
+        let fanout_id = journal.state().tool_layouts[KWEB_TOOL_INSTANCE][1];
+        journal
+            .summarize_box("t2", fanout_id, "Kennedy's retained fanout summary")
+            .unwrap();
+        let previous = kweb_box_versions(&journal);
+
+        let mut refreshed_fanout = BoxContent::text("new canonical fanout");
+        mark_kweb_content(
+            &mut refreshed_fanout,
+            "loaded-fanout:direct",
+            "loaded-fanout",
+        );
+        let mut active = BoxContent::text("Node ID: active\nNode name: Active");
+        mark_kweb_content(&mut active, "active", "active");
+        journal
+            .apply_tool_slots_with_layout(
+                "t3",
+                KWEB_TOOL_INSTANCE,
+                vec![
+                    ToolSlotInput {
+                        slot: "direct".into(),
+                        name: "Kweb direct node direct · Direct".into(),
+                        content: direct,
+                        retired: false,
+                    },
+                    ToolSlotInput {
+                        slot: "loaded-fanout:direct".into(),
+                        name: "Kweb fanout · direct".into(),
+                        content: refreshed_fanout,
+                        retired: false,
+                    },
+                    ToolSlotInput {
+                        slot: "active".into(),
+                        name: "Kweb active node active · Active".into(),
+                        content: active,
+                        retired: false,
+                    },
+                ],
+                &[
+                    "direct".into(),
+                    "active".into(),
+                    "loaded-fanout:direct".into(),
+                ],
+            )
+            .unwrap();
+
+        let changed = changed_kweb_box_ids(&journal, &previous);
+        let active_id = journal.state().tool_layouts[KWEB_TOOL_INSTANCE][1];
+        assert_eq!(changed, vec![active_id, fanout_id]);
+
+        let projected = journal
+            .state()
+            .projection()
+            .items
+            .into_iter()
+            .filter(|item| !item.marker && changed.contains(&item.box_id))
+            .map(|item| item.text)
+            .collect::<Vec<_>>();
+        let result = render_load_node_result(&journal, &changed).unwrap();
+        assert_eq!(result, projected.join("\n\n"));
+        assert!(result.find("Node ID: active").unwrap() < result.find("retained fanout").unwrap());
+        assert!(result.contains("| summarized | stale]"));
+        assert!(!result.contains("new canonical fanout"));
+        assert!(!result.contains("\"updatedBoxIds\""));
+
+        let current = kweb_box_versions(&journal);
+        let unchanged = changed_kweb_box_ids(&journal, &current);
+        assert!(unchanged.is_empty());
+        assert_eq!(
+            render_load_node_result(&journal, &unchanged).unwrap(),
+            "LoadNode completed. The shared Kweb boxes were already current."
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ingress_always_keeps_kennedy_summaries_and_otherwise_hydrates_a_small_context() {
+        let (path, mut journal) = test_journal("small", 1_000);
+        journal
+            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
+            .unwrap();
+        let summarized = journal
+            .create_box(
+                "t2",
+                "web result",
+                BoxOwner::Controller,
+                BoxContent::text("x".repeat(600)),
+            )
+            .unwrap();
+        journal
+            .summarize_box("t3", summarized, "Kennedy's important points")
+            .unwrap();
+        let dehydrated = journal
+            .create_box(
+                "t4",
+                "code",
+                BoxOwner::Tool {
+                    tool_instance: "rust".into(),
+                    slot: "lib.rs".into(),
+                },
+                BoxContent::text("y".repeat(300)),
+            )
+            .unwrap();
+        journal.dehydrate_box("t5", dehydrated).unwrap();
+
+        let plan = history_ingress_representation_plan(journal.state()).unwrap();
+        assert_eq!(
+            plan[&summarized],
+            BoxRepresentation::Summarized("Kennedy's important points".into())
+        );
+        assert_eq!(plan[&dehydrated], BoxRepresentation::Hydrated);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ingress_reduces_largest_unprotected_box_before_protected_messages() {
+        let (path, mut journal) = test_journal("largest-first", 500);
+        journal
+            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
+            .unwrap();
+        let message = journal
+            .create_box(
+                "t2",
+                "User message",
+                BoxOwner::User,
+                BoxContent::text("m".repeat(300)),
+            )
+            .unwrap();
+        let large = journal
+            .create_box(
+                "t3",
+                "Kennedy tool result",
+                BoxOwner::Controller,
+                BoxContent::text("r".repeat(1_200)),
+            )
+            .unwrap();
+        let small = journal
+            .create_box(
+                "t4",
+                "small notice",
+                BoxOwner::Controller,
+                BoxContent::text("n".repeat(60)),
+            )
+            .unwrap();
+
+        let plan = history_ingress_representation_plan(journal.state()).unwrap();
+        assert_eq!(plan[&message], BoxRepresentation::Hydrated);
+        assert_eq!(plan[&large], BoxRepresentation::Dehydrated);
+        assert_eq!(plan[&small], BoxRepresentation::Hydrated);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn long_tool_invocations_are_programmatically_summarized_only_when_needed() {
+        let invocation = "i".repeat(1_284);
+        let (large_path, mut large_window) = test_journal("tool-large-window", 1_000);
+        large_window
+            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
+            .unwrap();
+        let large_id = large_window
+            .create_box(
+                "t2",
+                "Kennedy tool call: LoadNode",
+                BoxOwner::Kennedy,
+                BoxContent::text(&invocation),
+            )
+            .unwrap();
+        let large_plan = history_ingress_representation_plan(large_window.state()).unwrap();
+        assert_eq!(large_plan[&large_id], BoxRepresentation::Hydrated);
+
+        let (small_path, mut small_window) = test_journal("tool-small-window", 300);
+        small_window
+            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
+            .unwrap();
+        let small_id = small_window
+            .create_box(
+                "t2",
+                "Kennedy tool call: LoadNode",
+                BoxOwner::Kennedy,
+                BoxContent::text(invocation),
+            )
+            .unwrap();
+        let small_plan = history_ingress_representation_plan(small_window.state()).unwrap();
+        assert_eq!(
+            small_plan[&small_id],
+            BoxRepresentation::Summarized(
+                "Tool invocation: LoadNode {arguments dehydrated: 1,284 characters}.".into()
+            )
+        );
+        std::fs::remove_file(large_path).unwrap();
+        std::fs::remove_file(small_path).unwrap();
+    }
+
+    #[test]
+    fn a_large_unprotected_kennedy_summary_can_later_be_dehydrated() {
+        let (path, mut journal) = test_journal("large-summary", 300);
+        journal
+            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
+            .unwrap();
+        let summarized = journal
+            .create_box(
+                "t2",
+                "large fetched page",
+                BoxOwner::Controller,
+                BoxContent::text("canonical".repeat(300)),
+            )
+            .unwrap();
+        journal
+            .summarize_box("t3", summarized, "s".repeat(1_200))
+            .unwrap();
+
+        let plan = history_ingress_representation_plan(journal.state()).unwrap();
+        assert_eq!(plan[&summarized], BoxRepresentation::Dehydrated);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn attachment_payload_metadata_is_separate_and_not_a_transcript_turn() {
+        let metadata = json!({
+            "externalEventId":"event-1",
+            "attachments":[{
+                "fileName":"notes.txt",
+                "text":"derived contents",
+                "dataUrl":"data:text/plain;base64,ZA==",
+                "sizeBytes":1
+            }]
+        });
+        let sanitized = message_metadata_without_attachment_payloads(&metadata);
+        let attachment = &sanitized["attachments"][0];
+        assert!(attachment.get("text").is_none());
+        assert!(attachment.get("dataUrl").is_none());
+        assert_eq!(attachment["fileName"], "notes.txt");
+
+        let (path, mut journal) = test_journal("attachment-transcript", 1_000);
+        journal
+            .create_box(
+                "t1",
+                "User message",
+                BoxOwner::User,
+                BoxContent::text("please inspect the attachment"),
+            )
+            .unwrap();
+        journal
+            .create_box(
+                "t2",
+                "User attachment text: notes.txt",
+                BoxOwner::User,
+                BoxContent::text("derived contents"),
+            )
+            .unwrap();
+        let transcript = transcript_from_journal(&journal);
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0]["content"], "please inspect the attachment");
+        std::fs::remove_file(path).unwrap();
     }
 }

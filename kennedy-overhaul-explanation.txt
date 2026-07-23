@@ -243,9 +243,11 @@ PART IV: EVERYTHING YOU SEE IS A BOX
 The box model
 -------------
 
-Every provider-visible component is now a box. There is no model-visible
-message, system instruction, tool result, Kweb node, history inspection, or
-controller notice outside this model.
+Every durable provider-visible context component is now a box. There is no
+model-visible message, system instruction, Kweb node, history inspection, or
+controller notice outside this model. Native tool responses are transient
+inputs to the already-running provider turn; ordinary tool responses are also
+captured as result boxes, while LoadNode uses the Kweb boxes it updates.
 
 Examples include:
 
@@ -254,13 +256,15 @@ Examples include:
 - one box for each Kennedy message;
 - loaded Kweb nodes;
 - each individual tool call;
-- each individual tool result;
+- each ordinary tool result;
 - controller notices;
 - hydrated history events;
 - document and audio material presented to you.
 
-If you make several tool calls in one response, every call and every result is
-recorded independently in chronological order.
+If you make several tool calls in one response, every call and completion is
+recorded independently in chronological order. A manual LoadNode completion
+is a compact non-projected journal receipt rather than a duplicate JSON result
+box.
 
 Stable box identity
 -------------------
@@ -362,10 +366,12 @@ Who controls boxes
 You control ordinary box hydration, dehydration, and summarization. The user
 and frontend may inspect box state but cannot change it.
 
-The controller performs one deliberate bulk transformation: when a terminated
-source session is prepared for history ingress, it dehydrates the ordinary
-source boxes. It then explicitly hydrates the history-ingress system prompt,
-your root node, and the user's root node.
+The controller performs one deliberate context-fitting transformation when a
+terminated source session is prepared for history ingress. It always preserves
+your current summaries, tentatively hydrates the other boxes, and only reduces
+eligible boxes when the resulting context would exceed 75 percent of the
+ingress model's context window. Conversation messages, the system prompt, full
+direct/fixed/active Kweb nodes, and short tool invocations are protected.
 
 
 PART V: PROVIDER REQUESTS AND TOOLS
@@ -405,6 +411,13 @@ A native call looks like:
 Multiple calls may be issued before the next inference. A failed tool result
 means that call did not succeed.
 
+The JSON invocation is intentional. A successful LoadNode response is
+different from ordinary tool results: it contains the exact Kweb boxes created
+or revised by the call, rendered exactly as Chatend renders their current
+hydrated, summarized, or dehydrated representation. It contains no duplicate
+node JSON and creates no generic "Kennedy tool result" box. A failed load and
+an unchanged repeat load return short plain text.
+
 There is no ResetContext
 ------------------------
 
@@ -430,11 +443,12 @@ The remaining capacity is not wasted. It is reserved for the later
 history-ingress phase, which may need to hydrate source events, inspect Kweb
 state, reason about permanent memory, and call tools.
 
-History ingress: 100 percent
-----------------------------
+History ingress: 75 percent
+---------------------------
 
-History ingress may use the full effective context window. There is no
-additional reserved output margin.
+History ingress may use floor(75 percent) of the effective context window of
+the model being called. The ceiling therefore changes with the selected
+model; it is not a fixed byte or token constant.
 
 Capacity errors
 ---------------
@@ -455,12 +469,12 @@ force-ends the source phase and sends the same journal to history ingress.
 This is an emergency escape hatch, not an ordinary rollover target. Manage
 boxes before reaching it.
 
-If history ingress cannot progress at 100 percent
--------------------------------------------------
+If history ingress cannot progress at 75 percent
+------------------------------------------------
 
-If history ingress reaches its full limit and no further useful work fits, the
+If history ingress reaches its limit and no further useful work fits, the
 server completes with the useful staged work accumulated so far. There is no
-hidden reserve and no requirement to force one more model turn.
+requirement to force one more model turn.
 
 
 PART VII: KWEB IDENTITY AND NAVIGATION
@@ -515,8 +529,8 @@ mappings stored by canonical ID. They are not special responsibilities of the
 Kweb database.
 
 Both roots are loaded automatically at session startup through ordinary
-LoadNode behavior. They are explicitly hydrated again when history ingress
-begins.
+LoadNode behavior. All full directly loaded, fixed, and active node boxes are
+protected from automatic history-ingress dehydration.
 
 Loading nodes
 -------------
@@ -532,6 +546,16 @@ Chatend context budget is the practical limit.
 Repeating LoadNode refreshes the existing Kweb-owned boxes. It does not create
 duplicate node boxes. If the box is summarized or dehydrated and the node has
 changed, the representation remains compact and becomes stale.
+
+A manual load occurs while a provider turn is already running. Updating the
+journal cannot retroactively change that turn's input, so the native tool
+response returns the new or revised Kweb boxes in their persistent layout
+order. This is a delta, not a second storage format: each returned block is
+the exact text of the corresponding current Chatend projection item. The
+journal records only the identifier, changed box IDs and count, duration, and
+success or failure. That compact structured completion event is not projected
+unless Kennedy later explicitly inspects it with HydrateEvent during history
+ingress.
 
 The loaded-node display is globally ordered and deduplicated:
 
@@ -772,15 +796,18 @@ terminated.
 The controller:
 
 1. records source termination;
-2. dehydrates ordinary source boxes;
-3. hydrates the history-ingress system prompt;
-4. hydrates your root and the user's root;
-5. acquires the global write lane;
-6. revalidates previously loaded Kweb nodes;
-7. exposes a compact source-history skeleton.
+2. installs the history-ingress system prompt and the current model's context
+   window;
+3. acquires the global write lane;
+4. revalidates previously loaded Kweb nodes;
+5. retains every current Kennedy-authored summary;
+6. tentatively hydrates everything else;
+7. if the result would exceed 75 percent, reduces eligible boxes from largest
+   to smallest until it fits;
+8. exposes the source-history skeleton.
 
-The full source history has not been deleted. It is merely not all hydrated at
-once.
+The full source history has not been deleted. Dehydrated and programmatically
+summarized boxes retain canonical content and can be hydrated later.
 
 Inspecting source history
 -------------------------
@@ -1074,14 +1101,16 @@ Source phase:
 History-ingress phase:
 
 1. The same session journal enters ingress; no second conversation is created.
-2. Ordinary source boxes begin dehydrated.
-3. The ingress prompt and root nodes are hydrated.
-4. You inspect the relevant user event with HydrateEvent.
-5. You reload or inspect the deployment nodes.
-6. You stage UpdateNode or CreateNode calls.
-7. You attach pending:47 where appropriate.
-8. Every successful mutation updates the local read-your-writes view.
-9. You call EndSession.
+2. Your source summaries remain summarized.
+3. Other boxes remain hydrated unless largest-first fitting was required.
+4. The ingress prompt, conversation messages, and full direct/fixed/active
+   Kweb nodes are protected from automatic dehydration.
+5. You inspect any dehydrated material that is relevant.
+6. You reload or inspect the deployment nodes.
+7. You stage UpdateNode or CreateNode calls.
+8. You attach pending:47 where appropriate.
+9. Every successful mutation updates the local read-your-writes view.
+10. You call EndSession.
 
 Final commit:
 

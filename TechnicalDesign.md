@@ -132,15 +132,29 @@ The provider always receives one dynamic function, `call_ktool`. System prompt
 boxes explain tool names and contracts. Dehydrating those instructions does
 not unregister the function.
 
-Every Kennedy message, user message, tool call, tool result, loaded Kweb node,
-system prompt, controller notice, and history inspection is a box. Multiple
-tool calls in one model response each get independent call/result boxes.
+Every Kennedy message, user message, tool invocation, ordinary tool result,
+loaded Kweb node, system prompt, controller notice, and history inspection is
+a box. Multiple tool calls in one model response are recorded independently.
+`LoadNode` is the deliberate result exception: its invocation remains a box,
+but it updates the shared Kweb boxes and returns the exact newly created or
+revised box renderings directly to the in-flight provider turn. It does not
+create a second generic JSON result box.
 
 ## 7. Kweb context and writes
 
 `LoadNode` has no fixed call or node-count limit. Loaded nodes occupy stateful
 Kweb tool slots and can be represented compactly without unloading them.
 Repeated loads refresh canonical content.
+
+The provider request is already in flight when a manual load updates Chatend,
+so the current turn cannot see those journal mutations merely because they
+were persisted. The native tool response therefore contains the changed Kweb
+boxes in current Kweb layout order and in the same text format used by the
+next Chatend projection. This respects each box's current hydrated,
+summarized, or dehydrated representation. An unchanged repeat load returns a
+short plain-text acknowledgement. Load failures are also plain text. A compact
+structured completion receipt remains in the journal but is not projected as
+a box.
 
 The Kweb slots have an explicit persistent display layout. Directly loaded
 nodes appear first with complete node text, followed by unique fixed nodes and
@@ -166,22 +180,26 @@ diff is added.
 ## 8. Session lifecycle and context ceilings
 
 Ordinary source sessions have a hard working ceiling of floor(70% of the
-effective context window). History ingress has floor(100%). At the source
+effective context window). History ingress has floor(75%). At the source
 72% emergency boundary, the controller terminates the source and queues the
 same journal for history ingress.
 
 History ingress:
 
 1. records source termination;
-2. fully dehydrates ordinary source boxes;
-3. hydrates the current system prompt and Kennedy/user root nodes;
-4. revalidates loaded Kweb nodes;
-5. lets Kennedy selectively hydrate source material;
-6. stages all Kweb effects;
-7. commits one Kweb transaction and one session archive object.
+2. installs the current ingress prompt and model context-window metadata;
+3. revalidates loaded Kweb nodes;
+4. retains all current Kennedy-authored summaries and tentatively hydrates
+   everything else;
+5. if needed, fits context below 75% by reducing eligible boxes from largest
+   to smallest while protecting conversation messages, full direct/fixed/active
+   Kweb nodes, the system prompt, and short tool invocations;
+6. lets Kennedy selectively hydrate source material;
+7. stages all Kweb effects;
+8. commits one Kweb transaction and one session archive object.
 
-If ingress reaches 100% and cannot progress, it commits the work completed so
-far. There is no extra output reserve.
+If ingress reaches 75% and cannot progress, it commits the work completed so
+far. The remaining context window is the output and operating reserve.
 
 ## 9. Session History
 
