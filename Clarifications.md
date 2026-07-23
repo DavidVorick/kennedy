@@ -789,3 +789,52 @@ canonical documents; this file is not an append-only log.
   retry, failure, repair, and completion transition. The orchestration worker
   must consume audio payloads directly from MemoryIngress instead of fetching
   pieces from, or proxying lifecycle operations through, AudioIngress.
+
+## Kweb DB 1.0 Migration Direction
+
+- Kennedy will migrate from `kweb-db-core` to the transactional
+  `kcode-kweb-db`, but Kennedy's existing model-facing navigation and mutation
+  tools and their behavior remain a compatibility contract. The object store
+  adds capability rather than replacing an existing feature.
+- In `kcode-kweb-db` 1.0, `NodeData` is the complete authoritative node
+  revision and includes ordered `Vec<NodeId>` fields named exactly
+  `fixed_connections` and `recent_connections` alongside object references.
+  `create_node` and `update_node` set or replace the entire node state; there
+  is no separate connection mutation API.
+- The core preserves both connection vectors and requires uniqueness within
+  each, but imposes no Kweb-policy maximum count. Kennedy alone enforces its
+  three contiguous fixed positions; finite-memory protection comes from
+  checked decoding and general complete-record/transaction byte bounds rather
+  than a connection-count policy.
+- Kennedy alone interprets the first eight recent connections as active and
+  the remainder as fanout. The generic database preserves order without
+  assigning active, fanout, consolidation, root, user, or HTTP meaning.
+- `NodeId` and `ObjectId` remain six bytes but use exact eight-character
+  URL-safe unpadded Base64 canonical text and two/six-character sharded node
+  and object paths. Their generated raw domains must be disjoint so a node and
+  object cannot receive the same locator.
+- The append-only transaction log remains on disk for recovery and audit and
+  is never fully loaded, retained, or replayed by normal primary-library
+  startup. Complete current nodes and immutable objects are authoritative
+  sharded files; transaction/DAG metadata, history, pending activation, and
+  gossip work use bounded disk-backed indexes and queues.
+- A minimal internal WAL makes the transaction-log append, object installation,
+  complete affected-node replacements, history/index/head updates, and gossip
+  enqueue atomic. Startup rolls forward only prepared WAL work and resumes
+  queues; it does not rebuild or validate the complete database.
+- Gossip sends one newly committed or still-unacknowledged transaction package
+  at a time. It never reannounces the complete historical database on open.
+- Version 1.0 raises both the individual owned-buffer object payload limit and
+  the aggregate object payload limit for one transaction to exactly 32 GiB
+  (34,359,738,368 bytes). It supports 64-bit replicas only. Object bytes move
+  through build, commit, storage, and gossip without cloning; WAL and outbox
+  records reference staged/immutable files instead of copying payloads.
+  Streaming larger objects and 32-bit replica support are deliberately
+  deferred.
+- Database-wide inspection, listing, statistics, migration, backup, and
+  validation functionality belongs in separate Kennedy-owned tooling rather
+  than new primary-library APIs. Test changes will likewise be requested later
+  through separate narrowly scoped documents.
+- Complete the upstream readiness work in `kcode-kweb-db_updates.md`, publish
+  it as version `1.0.0`, and have Kennedy audit and exact-pin that published
+  release before executing the data migration.
