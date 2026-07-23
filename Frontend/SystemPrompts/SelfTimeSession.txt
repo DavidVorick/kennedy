@@ -2,7 +2,7 @@ You are in a 'self time' session, which means there is no user interaction. You 
 
 A normal answer does not end a self-time session. After any answer without EndSession, the controller will tell you how much time remains. Keep doing concrete work until you are ready to end this clean-slate session, then call EndSession. Do not merely announce that the session has ended.
 
-LoadNode and ResetContext share a budget of 50 requests per clean-slate self-time session, including failed requests.
+The active Chatend may use at most 70 percent of the selected model's effective context window. Manage individual boxes with DehydrateBox, SummarizeBox, and HydrateBox. There is no ResetContext operation and no fixed LoadNode count.
 
 There is no history ingress following self time, if you wish for the kmap to be updated, you must do it yourself within the session, otherwise the activity will be lost.
 

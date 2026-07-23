@@ -1,0 +1,146 @@
+HISTORICAL DRAFT: terminology and limits in this file are superseded by
+chatend-overhaul-clarifications.md and chatend-discussion-review.txt.
+
+```markdown
+# Context Assembly
+
+## Purpose
+
+Context assembly converts the durable event log and current box states into the request Kennedy receives for inference.
+
+The assembled context must:
+
+- preserve chronological meaning;
+- contain only each box’s current Kennedy-visible representation;
+- retain compact markers for superseded occurrences;
+- never force hidden material to rehydrate;
+- keep frequently changing material near the end;
+- report current context usage and available capacity.
+
+The durable event log remains authoritative. Context assembly is only a model-visible projection.
+
+## Assembly Inputs
+
+The controller assembles one fixed snapshot containing:
+
+- conversation and message boxes;
+- tool-owned boxes;
+- Kennedy-authored boxes and overrides;
+- compact historical continuation markers;
+- current dirty-box information;
+- current context-budget information.
+
+Each rendered box includes enough metadata to identify its `BoxId`, name, source type and relevant event or revision.
+
+## Chronological Occurrences
+
+A logical box may appear at several chronological points but retains one stable `BoxId`.
+
+Only its latest occurrence contains its current Kennedy-visible representation. Every superseded occurrence is replaced by a compact immutable marker such as:
+
+`Box 42 continued at Event 109.`
+
+When Box 42 changes again, its Event 109 occurrence becomes another continuation marker and its current representation appears at the new event position. Earlier markers are not rewritten to point directly to the newest event.
+
+This creates a chronological chain while allowing old portions of the prompt to stabilize for provider caching.
+
+Creation, canonical update, Kennedy override, summary, blanch and restore may all create a new current occurrence. Retirement ends the live occurrence and leaves only compact historical evidence.
+
+## Movement and Hydration
+
+Moving a box and hydrating it are independent operations.
+
+When an owner updates a fully hydrated box, the updated canonical contents may appear in its new occurrence.
+
+When an owner updates a summarized or blanched box:
+
+- the box moves to the update’s chronological position;
+- Kennedy’s existing compact representation remains;
+- the representation is marked dirty;
+- the new canonical contents remain hidden;
+- Kennedy decides whether to restore them.
+
+No owner action automatically expands a representation Kennedy chose to keep compact.
+
+Kennedy changes one box at a time. A summary, blanch or restore moves the box to that action’s chronological position and records a corresponding event.
+
+## Visible Representations
+
+An active occurrence renders one of:
+
+### Hydrated
+
+The complete selected canonical revision.
+
+### Summarized
+
+Kennedy-authored text with lineage to the canonical event it summarizes.
+
+### Blanched
+
+A minimal marker containing identity and state but no source contents.
+
+A Kennedy-authored representation must remain distinguishable from original user or tool text. Provider adapters preserve valid message and tool structure without presenting Kennedy’s derivative language as if the source owner wrote it.
+
+## Dirty-Box Footer
+
+The end of the assembled context contains a compact volatile footer listing boxes whose canonical state is newer than Kennedy’s visible representation.
+
+A typical entry is:
+
+`Box 42: visible from Event 71; canonical advanced through Event 109; hydrate ~3,200 tokens.`
+
+The footer does not contain the hidden update itself. It informs Kennedy that restoration is available and approximately how expensive it will be.
+
+When Kennedy restores or resummarizes the latest revision, the box leaves the dirty list.
+
+Keeping this information at the end prevents routine status changes from invalidating a larger cached prefix.
+
+## Ordering
+
+The general ordering is:
+
+1. provider-required control material;
+2. chronological box occurrences and immutable continuation markers;
+3. the current user turn and resulting tool activity;
+4. dirty-box status;
+
+5. context-budget status.
+
+Within the chronological region, events remain ordered by `EventId`. A box’s stable identity does not determine its position; its latest visible occurrence does.
+
+Retired boxes have no current active representation. Their prior occurrences remain represented only through compact historical markers.
+
+## Context Budget
+
+Each provider and model has an empirically chosen effective context limit `E`, which may be below its advertised maximum.
+
+Main Kennedy’s assembled context is limited to approximately `0.8E`. The remaining capacity is reserved so the complete dehydrated log can later enter history ingress with room for selective hydration and reasoning.
+
+The controller estimates current usage using:
+
+1. the latest actual provider-reported input-token count;
+2. subsequent textual additions and removals estimated conservatively at three characters per token.
+
+The terminal budget status reports:
+
+- estimated current tokens;
+- main-session limit;
+- estimated remaining tokens;
+- effective model limit.
+
+Kennedy should reduce context before approaching the boundary. Operations that only summarize, blanch or retire boxes remain available when expansion is no longer allowed.
+
+If compact continuation markers alone approach the main-session limit, the conversation must continue in a fresh session.
+
+## Invariants
+
+- At most one current occurrence exists for each active box.
+- Superseded occurrences become immutable compact markers.
+- Chronological ordering follows events, not box IDs.
+- Moving a box never forces hydration.
+- Kennedy-authored text never masquerades as source-authored text.
+- Hidden canonical updates appear only as dirty metadata.
+- The assembled request stays within the configured effective limit.
+- Durable history remains complete regardless of the active projection.
+```

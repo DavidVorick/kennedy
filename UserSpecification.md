@@ -1,828 +1,197 @@
-# Kweb Specification
+# Kennedy and Kweb Specification
 
-The general idea is that the kweb is a large web of knowledge composed of
-nodes. Each node is connected to a set of other nodes, allowing the web of
-knowledge to be easily traversed by an agent. Connections only go one
-direction; one node leading to another node does not imply that the other node
-leads back.
+## Product
 
-All of the knowledge is held in a simple SQLite database. Each core node create
-or update is atomic; backend workflows that update several nodes are
-deliberately sequential and may partially complete if a later call fails.
+Kennedy is a local-first assistant that uses a durable knowledge web, or Kweb,
+as long-term memory. The user talks to Kennedy through the browser or Telegram.
+Kennedy may inspect memory in parallel, but all writes are gathered into
+explicit transactional sessions.
 
-An agent named Kennedy is responsible for creating, maintaining, and navigating
-the kweb, using it to help the user solve problems.
+## Kweb
 
-## Hardcoded Numbers
+The Kweb is a directed graph of nodes. A node contains:
 
-This specification contains a bunch of hard-coded numbers, because the spec was
-written by a human and hard-coded numbers are easier to reason about. Hoewver,
-in the actual code they should all be parameters that can easily be updated.
-The live parameters in the codebase may be materially different.
+- short name;
+- short and long descriptions;
+- owner (`self`, `unowned`, or another node);
+- ordered fixed connections;
+- ordered recent connections;
+- immutable object references.
 
-## Vocabulary
-
-'Frontend' refers to the html/css/js application that is served. The frontend
-has no persistent or execution state, and relies on APIs to submit user intent
-and observe backend state.
-
-'Chatend' refers to Kennedy's model context and its transparent provider
-boundary. For current v3 archives, the Full inspector displays the exact UTF-8
-JSONL bytes the backend sent to Codex, including trailing newlines. It performs
-no parsing, reconstruction, pretty-printing, hiding, or human-friendly
-transformation. If Codex adds content that is visible to the client, that
-content must be included; if Codex does not expose an internal addition, Full
-view shows exactly what Kennedy sent and does not claim otherwise. The recovery
-archive and Main view remain separate representations. The human-readable
-application context includes one concise latency line per LLM/tool call and one final line with
-total and combined call time so Kennedy can reason about response latency
-without a repeated step list. Every application-context text item also ends with the terse line
-`context window usage: {used-or-unknown} / {advertised-effective-limit}`.
-It uses the most recent successful LLM call's reported occupancy, even after a
-reload or provider-thread reset, and uses `unknown` only before any successful
-LLM usage report exists. The value can lag behind subsequently appended
-messages, tool results, or loaded memory until the next LLM call.
-
-'Backend' refers to the Rust services plus the native orchestrator running
-inside `kennedy-server`. The frontend is only an observer/input client; the backend
-owns every live Kennedy session and all work coordination.
-
-Kennedy has five API domains: Kmap, intelligence, conversation history, a
-Telegram relay, and durable audio ingress. Kmap storage is a standalone Rust
-library imported by the main Rust server. The server exposes `/api/v1/kmap`,
-intelligence, conversation history, audio ingress, Telegram identity, and the
-frontend on one local listener while retaining separate storage. The published
-Telegram relay remains on its own loopback listener until its crate exposes a
-mergeable router.
-The main server also imports exact-pinned `kcode-rust-libs-v2` 1.1.0 and calls
-it directly from the backend-owned Kennedy tool loop; managed-library tools are
-not a browser API or an independent backend.
-
-## User Management
-
-Each whitelisted Telegram identity has a distinct root node in the shared Kmap.
-A separate SQLite user directory maps normalized Telegram handles and their
-TOFU-pinned stable numeric IDs to those roots; none of that mapping belongs in
-the Kweb database. `@taek42` is the only initial unresolved whitelist entry and
-the web UI uses its root. Once observed, its numeric ID becomes authoritative.
-That privileged identity may add trusted friends with `/adduser @handle`, which
-immediately reserves a blank root without a registration or onboarding flow.
-
-We explicitly do not want access controls inside the knowledge graph. This
-design is 'borg-like': every trusted user and Kennedy can traverse any node,
-including another user's root. There are no confidentiality warnings in the
-static system prompts; user/session behavior is learned and managed through
-the Kmap.
-
-## The Data Store
-
-The Kweb stores three logical data types in SQLite:
-
-+ A knowledge node
-+ A data provenance node
-+ A data history node
-
-Knowledge and history state is represented by those three types. Large
-provenance payloads and attached artifacts may live in the Kweb's sibling
-immutable artifact tree, referenced by provenance metadata in SQLite.
-
-### The Knowledge Node
-
-These are the fields for the knowledge node:
-
-+ Short Name (4-50 characters)
-+ Short Description (0-200 characters)
-+ Unique Identifier (20 randomly generated bytes)
-+ Long Description (Up to 1000 words)
-+ Latest modifying model and thinking mode
-+ Last-modified RFC 3339 timestamp
-+ Owner node identifier, or `unowned` for a legacy/unowned row
-+ Ordered list of unique identifiers as fixed connections
-+ Ordered list of unique identifiers as recent connections
-+ Unique Identifier of a data history node
-
-Storage assigns no active/fanout meaning to recent order. The backend session
-treats the first eight recent identifiers as active and the remainder as
-fanout; the frontend mirrors that projection for rendering. It
-also applies the three-slot fixed-connection UI policy.
-
-The unique identifier is the key for the data history node within the SQLite
-database that serves as the head of the linked list establishing the data
-history of this knowledge node.
-
-### The Data Provenance Node
-
-All knowledge within the kweb is initially ingested from somewhere. When a user
-first creates an 'account' with Kennedy, the only source of information is the
-conversations that the user has with Kennedy themselves. But, the user can work
-with Kennedy to construct data ingress pipelines, meaning that data is
-automatically sent to Kennedy over time from sources such as email, telegram,
-meeting recordings, etc.
-
-When knowledge is ingested, that session is immortalized as a 'data provenance
-node', an immutable object within the database which helps define the history
-of the knowledge nodes.
-
-A data provenance node needs several things:
-
-+ A durable identifier
-+ The data itself
-+ The specific data source
-+ A date indicating when the data was created
-+ Ordered metadata for any attached immutable artifacts
-
-The physical Kweb defaults to `data/kweb-db-core.sqlite3` beside
-`data/kweb-provenance-artifacts/`. Large provenance data and attached media live as
-files so node text, history, and lightweight provenance metadata remain easy
-to back up. SQLite records artifact relative paths, original filenames, media
-types, sizes, SHA-256 hashes, roles, and order. A stored file keeps its safe
-original basename and inserts 12 URL-safe Base64 characters before the final
-extension; the first two suffix characters select a shard directory. Loading a
-provenance node transparently loads its main external text, while attached
-media remains addressable through its metadata.
-
-This gives historians an ability to accurately identify changes in a knowledge
-node over time.
-
-### The Data History Node
-
-A data history node is effectively a node in a linked list. It points to the
-previous data history node, and it also points to a data provenance node. Every
-time that a knowledge node is updated with new data, a new data history node is
-appended to the linked list of that knowlege node, meaning that any LLM or
-human can go back in time through the history of a knowledge node and see the
-original first-hand sources that led to today's knowledge node. That makes
-cleaning up mistakes easier.
-
-It should be noted that each knowledge node has its own linked list of history,
-however a data provenance node can appear in the history of many different
-knowledge nodes, if it contains lots of information that is relavant to many
-different knowledge nodes.
-
-### In-Context Knowledge Node
-
-The model-readable projection is role-based to avoid repeating connection
-metadata:
-
-+ A directly loaded node includes its short identifier, short name, short and
-  long descriptions, latest modifying model/thinking mode and timestamp, and
-  identifier-only fixed, active, and fanout connection lists.
-+ Each full node pulled in through an active connection appears once in a later
-  section. It includes its short identifier, short name, long description, and
-  latest modifying model and thinking mode, but omits its short description.
-  Its fixed, active, and fanout connections are identifier-only.
-+ Fanout nodes directly connected to a loaded node appear once with identifier,
-  name, and short description, unless that node is already represented in full.
-+ Fanout nodes reached only from an active-connection node appear once with
-  identifier and name. Their short and long descriptions are omitted.
-
-The frontend may retain richer structured connection summaries for rendering
-and recovery; those repeated names and descriptions are not sent to the model.
-
-## The Context Glue
-
-Because we don't want the chatend to have to deal with complex details like
-large randomized identifiers, the backend session provides an abstraction where it
-gives short identifiers to the chatend, and then maintains a mapping from short
-identifier to unique identifier. This mapping is session-local and is preserved
-across ResetContext calls and session recovery. Once assigned, a short
-identifier continues to refer to the same node until the session ends.
-
-## The Primary Functions
-
-Several tools are provided to Kennedy for building context, navigating the
-kweb, researching the web, and working with managed Rust libraries:
-
-+ LoadNode
-+ CreateNode
-+ UpdateNode
-+ ResetContext
-+ ConnectNodes
-+ ConsolidateFanout
-+ SetFixedConnection
-+ WebSearch
-+ WebFetch
-+ kcode-rust-libs-v2/create
-+ kcode-rust-libs-v2/open
-+ kcode-rust-libs-v2/docs
-+ kcode-rust-libs-v2/write
-+ kcode-rust-libs-v2/check
-+ kcode-rust-libs-v2/publish
-
-Not every tool is available in every session, the session type determines which
-tools are available.
-
-### LoadNode
-
-LoadNode will fetch the provided knowledge node. It will load:
-
-+ The full in-context knowledge node for the selected node
-+ The full in-context knowledge node for all of the selected node's active connections
-
-The readable result uses the compact role-based projection above. Direct nodes
-refer to connections by short identifier, full active-connection nodes are
-listed once rather than nested under every direct node, and fanout references
-receive only the detail appropriate to their distance from a directly loaded
-node.
-
-Because the stored connection arrays contain durable identifiers rather than
-duplicated names, the Kmap HTTP read projection fetches each connection's short
-name and description from the database alongside the node. The backend uses
-that metadata for active and fanout rendering without loading the full node.
-
-The call signature is simply LoadNode(shortIdentifier)
-
-A 'loaded node' is a node that has had 'LoadNode' called on it, which means
-that all of its active connections are also in the context. A call to LoadNode
-will fail if there are already 10 directly loaded nodes. Every root declared by
-the current session is always directly loaded and shares this limit; web and
-private sessions declare the user and Kennedy roots, while a group session
-declares the invoking user, group, and Kennedy roots. Active-connection
-expansions do not count as direct loads. LoadNode and ResetContext share a
-budget of 20 calls per conversation turn; either tool consumes one call,
-including failed calls.
-
-### ResetContext
-
-ResetContext allows Kennedy to reset the context. The conversation history with
-the user will remain, along with any notes to self Kennedy supplied during prior
-resets, but non-root Kmap context will be fully unloaded. Kennedy may optionally
-supply a non-empty note to self of at most 400,000 characters to preserve ideas
-that would otherwise fall out of context. The latest note is added after prior
-conversation history and reset notes. Then, every session root is loaded
-automatically in its declared order, followed by every node Kennedy passed to
-ResetContext. Roots are not passed explicitly. At most eight other nodes may be
-retained in a two-root session and at most seven in a three-root group session.
-Each reset consumes one call from the shared 20-call
-LoadNode/ResetContext budget; the automatic node loads inside it consume no
-additional calls. The rebuilt Chatend contains a compact history of every
-successful reset, grouped by the names of requested nodes so that Kennedy can
-recognize repeated exploration. Existing short identifiers remain bound to the
-same nodes even when those nodes are not retained in the rebuilt context.
-
-The call signature is ResetContext(shortIdentifier[], optional selfMessage)
-
-### ConnectNodes
-
-During history ingress, Kennedy will call ConnectNodes when she identifies a
-subset of in-context nodes with a durable meaningful relationship. The
-backend prepends every peer to each node's recent list and sends one complete
-ordinary update per node.
-
-The call signature is ConnectNodes(shortIdentifier[])
-
-The first eight recent entries are active in Kennedy's context and all later
-entries are fanout. Prepending therefore promotes the connected peers and
-demotes older entries by position. Kmap storage imposes no active or fanout
+Connections are one-way. Fixed and recent connections remain distinct. The
+database stores complete arrays and does not impose an application-level count
 limit.
 
-Demotions are not bidirectional, one node demoting an active connection does
-not mean that the opposing node needs to implement a demotion.
+Node and object IDs are canonical eight-character URL-safe Base64 strings in
+disjoint domains. Kennedy and users see these real IDs. Session-local fake
+short node IDs do not exist.
 
-ConnectNodes is a Kmap mutation and is unavailable during live conversations.
+`kcode-kweb-db` 1.0 owns persistence. Current nodes, histories, objects,
+transaction packages, append-only log, state, and WAL use canonical,
+checksummed binary formats. The transaction log is not loaded wholesale into
+memory and the Kweb is not rebuilt at startup.
 
-### ConsolidateFanout
+## Roots and identities
 
-ConsolidateFanout is a command that Kennedy can use to consolidate a bunch of
-fanout nodes together into a single fanout node which then branches off to the
-other fanout nodes.
+Kennedy's root, the primary user's root, whitelisted Telegram user roots, and
+Telegram group roots are application data stored in the user directory by
+canonical node ID. They are not responsibilities of the Kweb library.
 
-The call signature is ConsolidateFanout(shortIdentifierParent, shortIdentiferAggregator, shortIdentifierFanoutConnections[])
+Trusted users share one Borg-like graph. Kweb contains no per-node access
+control system.
 
-shortIdentifierParent identifies which node is having its fanout consolidated.
-shortIdentifierAggregator identifies which node the fanout is being
-consolidated into. And shortIdnentifierFanoutConnections is an array of nodes
-that are currently part of the parent fanout which will be removed from the
-parent fanout and instead put into the aggregator node. The backend removes
-those IDs from the parent and appends them to the aggregator's recent list
-through two sequential ordinary updates. Whether an appended entry renders as
-active or fanout follows its final list position. Kmap storage has no
-consolidate operation.
+## Sessions
 
-ConsolidateFanout is available only during history ingress.
+A logical session contains the source activity and its later history ingress.
+Examples are:
 
-### CreateNode
+- browser conversation;
+- private or group Telegram conversation;
+- self time;
+- audio history ingress;
+- group background ingress.
 
-The call signature is CreateNode(parentShortIdentifier[], ownerIdentifier, shortName, shortDescription, longDescription)
+Every session produces exactly one immutable session archive object and, when
+it has write effects, exactly one Kweb transaction. Source conversation and
+history ingress are not separate permanent records.
 
-The backend creates the node with every parent in its recent list, then
-sequentially prepends the new node to every parent's recent list. The owner
-must be a fully available Kennedy, user, or group root.
-
-Note: this can only be called during a history ingress session, so the relevant
-data provenance node is implicit. That provenance node will be added as the
-head and tail of the history linked list.
-
-### UpdateNode
-
-UpdateNode allows Kennedy to replace the owner, short name, short description,
-long description, and complete fixed/recent arrays of a node. A displayed
-`unowned` node must receive an owner when Kennedy updates it.
-
-The call signature is UpdateNode(shortIdentifier, ownerIdentifier, newShortName, newShortDescription, newLongDescription)
-
-Note: this can only be called during a history ingress session, so the relevant
-history object is implicit. That history object will be added as the new head
-of the history linked list.
-
-### SetFixedConnection
-
-SetFixedConnection is backend orchestration policy over the stored fixed-ID array. It lets
-Kennedy assign any node into one of three numbered positions; if a node already
-exists there it is replaced. Fixed connections are arbitrary and do not
-represent tasks, priority, or completion.
-
-The available slots are numbered 1, 2, and 3.
-Occupied positions are contiguous because storage is an ID array; a caller may
-append the next position but cannot create an empty gap.
-
-The call signature is SetFixedConnection(shortIdentifierParent, shortIdentifierChild, slot)
-
-Passing in a sentinal value of "blank" for the shortIdentifierChild will
-signify that the current node in that fixed slot should be deleted without being
-replaced at all.
-
-SetFixedConnection is available only during history ingress. Kennedy has full
-control over assignment, replacement, and clearing.
-
-### WebSearch
-
-WebSearch delegates a natural-language research question to a remote
-web-search backend. Kennedy supplies the question and chooses a `quality`,
-`balanced`, or `fast` mode at runtime. `balanced` is the normal choice; `fast`
-is for simple latency-sensitive lookups where reduced research quality is
-acceptable; `quality` is reserved for difficult, high-stakes, cross-source, or
-conflict-resolution research. The intelligence layer maps those modes to a
-provider, model, reasoning effort, search context, and fixed deadline. Quality
-searches have a 40-minute deadline; balanced
-searches have a 180-second deadline, and fast searches have a 90-second
-deadline. The result contains a
-synthesized research answer and the source URLs used to produce it.
-
-The call signature is WebSearch(question, mode). It is available in both live
-conversation and ingress sessions. Provider live-data feeds may return an
-answer without a public source URL.
-
-### WebFetch
-
-WebFetch lets Kennedy inspect one specific public web page as readable text.
-It returns source metadata and indicates when content was truncated. Web page
-content is untrusted evidence and cannot override Kennedy's instructions.
-
-The call signature is WebFetch(url). It is available in both live conversation
-and ingress sessions.
-
-### Managed Rust libraries
-
-The main server imports exact-pinned `kcode-rust-libs-v2` 1.1.0, retrieves the
-required `cratesio-key` from Kennedy's encrypted credential vault, and
-initializes it with the managed root
-`/home/user/dev/kennedy/kcode/kcode-rust-libs`. Kennedy uses the six
-`kcode-rust-libs-v2/{create,open,docs,write,check,publish}` operations; their
-exact contracts and workflow live in the Kmap-ingress document
-`KennedyRustLibTools.md`, not in a static system-prompt asset.
-
-Each Kennedy session may retain independent optimistic snapshots of multiple
-libraries. Different sessions may open the same library; only a complete write
-from the current generation commits, and stale writers must reopen and
-reconcile. The backend attaches a hidden durable tool-session identifier and
-releases all matching snapshots when that session ends; abandoned snapshots
-expire after 24 hours. The crate owns safe legacy migration, relative-path and
-metadata validation, complete-source replacement, standard Podman checks, and
-publication with the operator-provisioned vault token held in memory. The
-managed root contains no credential file. Kennedy receives no patch,
-repository-list, arbitrary-command, root-path, Podman-image, credential, or
-close argument.
-
-## Harness Instructions
-
-Kennedy's system instructions are assembled from small, single-purpose prompt
-files in this order:
-
-1. `KennedyIdentity.txt` defines who Kennedy is.
-2. Exactly one session file describes the current work:
-   `ConversationSession.txt`, `SelfTimeSession.txt`, `HistoryIngressSession.txt`, or
-   `AudioIngressSession.txt`.
-3. `KmapBasics.txt` defines temporary node identifiers, always-loaded roots,
-   and the native `call_ktool` function. It also tells Kennedy that the
-   Kmap may contain additional tools and more detailed tool documentation.
-4. `ReadTools.txt` lists all shared read-only tools, including Kmap reads and
-   web research.
-5. Writable ingress and self-time sessions receive `WriteTools.txt`.
-6. The backend adds the current model, thinking mode, channel, or source
-   details that are known only at runtime.
-
-Each fact and tool contract has one prompt-file owner. The session files stay
-minimal, while strategy and expandable harness knowledge live in Kennedy's
-graph rooted at Kennedy's root node.
-
-The backend dynamically tells Kennedy the exact model and thinking mode for
-the current session. Whenever a model mutates the Kmap, the backend—not
-Kennedy—automatically records that combined identity on every affected node as
-its latest modifier. Node context and the memory explorer display this metadata;
-it is not part of any Kennedy tool signature.
-
-Kennedy receives one provider-native function named `call_ktool`. Each call
-contains one Ktool name and one arguments object. The model may issue several
-native function calls before its next inference; the runtime uses Codex's
-native ordering and may execute them sequentially. No fake startup tool call is
-inserted. In browser and Telegram conversations, the terminal assistant message
-ends the turn normally. History/audio ingress and self time remain active after
-a terminal message and receive a controller continuation until `EndSession`
-succeeds. Shared deadline and hard-stop enforcement may still terminate self
-time externally.
-
-## Conversation Persistence
-
-The conversation history backend durably stores active and completed
-conversation records separately from the kweb. The frontend first submits a
-durable message command. Before the backend sends that query to an LLM, it must
-save the query, pending-turn state, and a lossless
-versioned recovery archive of the whole Chatend: system prompts, structured
-messages, the backend's exact client-to-Codex JSONL for Full-view display, tool
-requests and results, loaded memory context, usage, and any serializable media
-content or attachment references. If that save fails, generation must not
-begin. This JSON archive is a durability format and is never itself sent to
-Kennedy. Complete tool rounds are checkpointed while a turn is running.
-
-When `kennedy-server` starts, its orchestrator retrieves every durable
-conversation. Every active conversation is restored where it left off; if a
-last user query has no answer, Kennedy can resume that turn from a fresh Codex
-thread. Failed generation and
-checkpoint attempts roll back transient Chatend, memory context, tool-log,
-usage, and continuation state to the last durable snapshot before retrying.
-Each browser Codex turn has a 30-minute complete-turn deadline, including its
-native tool work; other session families retain their dedicated deadlines.
-
-The user may keep multiple conversations live, switch freely among them, and
-create another at any time. Each live conversation keeps its own independent
-backend Kennedy turn and Kmap context; each browser may also keep an unsent
-local draft. The sidebar clearly distinguishes
-`Live · Continue` records from closed read-only records.
-
-Explicitly ending a conversation creates a durable history-ingress obligation.
-An active conversation also times out when it has had no user message for more
-than 24 hours and the user successfully sends a message in a different
-conversation. Viewing, switching, or typing alone does not trigger the timeout,
-and a conversation never times out while Kennedy owes a response. Closed
-records move through ingress-pending, ingress-in-progress, and complete states.
-An ingress session that reaches five total failed outer attempts instead moves
-to a terminal failed state. Every attempt keeps a concise durable diagnostic,
-and terminal failures are not selected for automatic retry.
-
-All Kmap-writing work is sequential for now: at most one conversation or
-Telegram history ingress, audio ingress piece, self-time run, or Telegram-root
-provisioning task mutates the Kmap at a time. Every ordinary web conversation
-and Telegram stream is read-only and runs concurrently without a global lock;
-one stream cannot block unrelated sessions. SQLite WAL permits their live Kmap
-reads while the backend writer commits memory changes. Closing the UI has no
-effect; server startup resumes the queue. A created
-provenance ID is reused by every mutation in its ingress session. Every Kmap
-mutation carries a fresh random 16-byte idempotency identifier, and an
-ambiguous network retry reuses the same identifier and request. Exact replays
-therefore do not duplicate provenance, node creation, updates, or history.
-Multi-node ingress workflows remain sequential and non-atomic.
-
-## Session Types
-
-Kennedy can be called using a few different session types:
-
-+ Conversation
-+ Telegram Conversation
-+ Telegram Group Invocation
-+ Self Time
-+ History Ingress
-+ Self-Action
-
-### Conversation
-
-The UI will need to establish which user is having a conversation with Kennedy.
-Then, the user's root and Kennedy's root are automatically loaded.
-
-The user provides Kennedy with some prompt, and Kennedy first determines
-whether she needs to call LoadNode, ResetContext, WebSearch, or WebFetch.
-Kennedy may call LoadNode up to 20 times per turn to find relevant context.
-
-The backend checkpoints the pending user query with the conversation history
-service before the first LLM request. Kennedy's answer and the completed-turn
-state are checkpointed again before another query is accepted.
-While Kennedy is responding, the live conversation exposes an explicit stop
-control. Stopping aborts the current model or web request, prevents any further
-tool-loop rounds, rolls the visible session back to its latest durable
-checkpoint, and leaves the unanswered user query available for deliberate
-retry. End Conversation is a separate always-available control for every live
-ordinary conversation. It cancels or abandons any unanswered turn and queues
-the preserved conversation for ingress without requiring the user to retry it
-first, including for conversations restored from before backend ownership.
-
-While the conversation session is ongoing, Kennedy may call LoadNode,
-ResetContext, WebSearch, WebFetch, and the six Kmap-documented Rust library
-tools. The coding tools are always available in every Kennedy execution mode,
-including private/group Telegram, self time, history ingress, and audio
-ingress. Conversation sessions cannot mutate the Kmap. When the
-conversation session ends, the complete recovery archive—not merely the clean
-dialog—is turned into a history provenance node. History Ingress then extracts
-readable source text from its structured application messages; the exact
-provider JSONL remains a transparency record and is not used as prose.
-
-Starting a new conversation does not end existing live conversations.
-Conversations end when the user deliberately ends them, or by the 24-hour idle
-rule during activity in another conversation.
-
-Note: calling ResetContext mid-conversation will preserve both the conversation
-history with the user, and also the LoadNode counter.
-
-### Telegram Conversation
-
-A Telegram conversation uses the same read-only tool set, roots, Chatend, and
-conversation manual as a UI conversation, but its dynamic system prompt
-explicitly labels it a `telegram session`. The Rust Telegram relay queues
-private and invoked-group text, voice, supported document, and `/reset` events
-and sends Kennedy's final
-conversational text; Kennedy's backend orchestrator remains responsible for
-prompt composition, short identifiers, tools, and the inspectable Chatend.
-
-The separate user directory initially whitelists `@taek42` without a numeric
-ID. The first matching observation pins that stable ID under TOFU, and future
-checks use the ID even if the handle changes. A different ID later presenting
-the pinned handle is refused. David may use `/adduser @handle`; that handle gets
-its reserved blank root immediately and pins on its first matching observation.
-Each allowed user has a separate durable private conversation visible under
-`TG Bot`. Private Telegram sessions do not expire after 24 hours. `/reset` ends
-the current private session and queues its complete archive for ordinary
-history ingress; the ingress session explicitly knows that its source was
-Telegram. Each newly crossed 100,000-token current-context band produces a
-separate delivery notice containing current and maximum context usage and
-recommending `/reset`. That operational notice is not part of Kennedy's
-Chatend. The backend continues polling and launches each relay queue head
-independently, so long model or tool work in one private or group-user stream
-does not delay newly arriving work in another stream. Ordering within one
-stream remains strict. Each event has a durable 30-minute response deadline.
-If Kennedy has not produced a complete response by then, the backend cancels
-that turn, the relay completes it as a timeout, sends a best-effort notice, and
-allows the next message in that stream to proceed. A stale event binding whose
-Conversation History record disappeared is safely rebound to a fresh record;
-its original voice note, transcription, or document is reused rather than
-discarded.
-
-UI recordings and Telegram voice notes preserve their original audio. The
-intelligence backend publishes model input modalities and uses paid OpenAI
-`gpt-4o-transcribe` only when the selected Kennedy transport lacks native audio.
-The configured `gpt-5.6-sol` transport is text/image-only, so its clearly
-labeled transcription is placed in the normal text Chatend.
-
-The browser composer and Telegram accept PDF, DOCX, spreadsheet, CSV, and text
-documents. Kennedy receives a bounded local text conversion together with the
-filename and format, and the original remains archived. Searchable PDFs are
-supported; scanned/image-only PDFs report that OCR is required.
-
-### Telegram Group Invocation
-
-Kennedy participates only in groups where she is an administrator, her member
-ledger is complete, and every current or departed historical member is a
-TOFU-valid whitelisted identity. An unknown member, incomplete ledger, or loss
-of administrator monitoring quarantines the group and causes Kennedy to discard
-message content without reading, downloading, or archiving it. The quarantine
-is fail-closed but reversible: once the complete historical ledger is
-whitelisted, Kennedy may participate again.
-Each observed group receives its own initially blank Kmap root. That assignment
-survives quarantine and Telegram chat-ID migration.
-
-Kennedy is invoked only by a direct bot-handle mention or a reply to one of her
-messages; a scoped group `/reset` also invokes her. A voice note invokes by
-replying to Kennedy, while a supported document may use a bot mention in its
-caption or a reply. Each `(group root, Telegram user)` pair retains its own
-`telegram-group` session until that user runs `/reset`. DMs and other groups
-remain separate. That person's root, the group's root, and Kennedy's root are
-automatically loaded in that order. The dynamic Chatend lists the group root and
-every current participant with a session-local root identifier, and includes
-up to the most recent 50 group messages at session start and unseen group
-messages on later invocations. Other participant roots remain unloaded
-references that Kennedy may load deliberately.
-
-Each newly crossed 100,000-token band produces a warning naming the relevant
-`@username` and stating that the context usage applies only to that user's
-session. Group queue ordering is also per group user, so one blocked session
-does not prevent other participants from being delivered.
-
-When more than 100 group messages accumulate without an invocation, the oldest
-80 not yet covered by an invocation or background batch are sent through the
-same durable, sequential History Ingress pipeline. Because no user invoked
-Kennedy, these batches load the group root followed by Kennedy's root and keep
-all participant roots as unloaded references. Twenty messages remain as a
-buffer.
-
-### Durable Vnote Ingress
-
-A separate loopback upload endpoint accepts WAV vnotes together with the exact
-RFC 3339 time at which recording began. Once the endpoint returns success, the
-uploader is finished: Kennedy durably owns the content-addressed original file
-and a restartable database job. SHA-256 is the idempotency identity, so a large
-historical repository can query or resubmit files without ingressing renamed or
-recopied audio twice.
-
-Kennedy passes the retained WAV bytes to the published
-`kcode-audio-transcribe` library. That dependency owns WAV validation,
-transcription, provider calls, and reconciliation into the canonical
-speaker-aware transcript. Kennedy persists pollable status snapshots for
-display, but the active transcription job and all working audio are
-in-memory. A process restart starts a new library job from the durable original
-and may repeat provider work; it does not resume individual windows.
-
-After the library returns the canonical transcript, Kennedy divides an
-oversized result at readable text boundaries so every memory-ingress piece is
-at or below the 50,000 estimated-token ceiling. Pieces are not forced to equal
-size.
-
-Kennedy ingresses those final pieces individually and chronologically under the
-same global serialization as conversation history. Every provenance node and
-model-facing piece carries the original recording timestamp, never merely the
-upload or ingress time. Kennedy uses that timestamp to distinguish historical,
-superseded, or then-current statements from knowledge independently marked as
-current. The audio-ingress prompt treats transcription and speaker identity as
-fallible, preserves important uncertainty or contradiction, and permits dated
-clarification notes or concrete follow-up tasks when context is materially
-missing. Preparation and Kmap mutation are server-side. Accepted originals,
-completed transcripts, prepared pieces, and Kmap-ingress checkpoints are
-restartable; only an active external transcription job is ephemeral. The raw
-content-addressed original and all persisted transcript, retry, and ingress
-metadata remain archived.
-
-### Self Time
-
-The browser's dedicated Self Time category tab requests a backend-owned
-autonomous run for 30 minutes by default. It accepts an optional custom prompt,
-which the backend stores in run metadata and gives to Kennedy in every
-clean-slate slice. The start
-control visibly enters `Starting…` and disables itself immediately; repeat
-clicks share that one start, and the history backend refuses a second active
-`free-time` record from another browser context. Self-time history titles use
-the custom prompt and session number so separate sessions are recognizable in
-the sidebar. The duration field accepts
-fractional minutes for short tests and up to seven days for long or overnight
-runs. The run stores one absolute deadline in Conversation History, so reload
-recovery and every clean-slate rollover use the same remaining allowance.
-
-Kennedy is told to have fun, follow her own interests, and not wait for user
-work. Self time receives LoadNode, ResetContext, WebSearch, WebFetch, and all
-Kmap write tools, plus the Kmap-documented Rust library tools. A run-level
-provenance record is supplied automatically for memory mutations.
-`EndSession({})`, or
-`EndSession({"message":"A message for the next self-time session."})`, is
-called through `call_ktool`. The optional self-time-only message is a non-empty string of at
-most 400,000 characters. The call closes and
-archives the current session without reducing the shared allowance; if at least
-five minutes remain, a fresh self-time Chatend opens immediately and receives
-the message. With less than five minutes left, the run ends and the message is
-not forwarded. Ordinary final text does not close or roll over the session.
-
-When less than three minutes remain, the harness injects one timer notification
-into the current Chatend. At the deadline substantive tools are blocked while
-`EndSession` remains available, and Kennedy receives one final
-wrap-up round. The active intelligence
-operation is cancelled at a hard stop two minutes later. Generation and search
-requests retain the intelligence provider's profile-specific allowance, so a
-quality search can run longer than 90 seconds, while the remaining hard-stop
-interval is always the upper bound. Conversation History prevents overlapping
-runs, and the backend's single Kmap-writer gate owns execution. Every completed clean-slate
-session is retained as read-only conversation history without ordinary history
-ingress, since self time has already performed its own Kmap memory work under
-the run provenance.
-
-### History Ingress
-
-In a history ingress session, a history provenance node is created as the first
-part of the context. Its provenance data is parsed as a recovery archive, and
-only the archive's canonical human-readable message text is placed under
-`Archived Chatend`; the JSON envelope, media data URLs, counters, diagnostics,
-and other recovery bookkeeping are excluded. Then the user's root and
-Kennedy's root are loaded. Kennedy can call LoadNode or ResetContext up to 50
-times in aggregate during the session.
-
-Kennedy will update as many nodes as she feels is appropriate during the
-history ingress session. Zero updates is also valid. A normal answer does not
-complete history ingress. When Kennedy has fully reviewed the source and every
-required mutation has succeeded, she must call `EndSession({})` through
-`call_ktool`. Any other final text receives a durable controller message directing her to continue or
-call the end tool. History ingress may use WebSearch and WebFetch when external evidence
-would help. It may use ConnectNodes, ConsolidateFanout, SetFixedConnection,
-CreateNode, and UpdateNode when justified.
-The entire logical history-ingress session is limited to 100 LLM rounds. This
-count survives checkpoints, retries, and ResetContext calls; ResetContext does
-not create a fresh allowance.
-The outer history-ingress worker permits five failed attempts total. It records
-the stage, error code/message, current round, and measured context usage when
-available. The fifth failure aborts the session, preserves the log for later
-inspection, and allows the queue to advance instead of retrying forever. Audio
-transcript pieces persist increasing delays between attempts so a temporary
-provider failure cannot exhaust the allowance immediately; a terminal audio
-piece can be manually returned to the queue while retaining its old
-diagnostics.
-
-### Self Action
-
-TBD, not currently implemented.
-
-## Context Flow
-
-To avoid needing to redo the context every turn, Kennedy keeps the same context
-and just keeps building upon it unless ResetContext is called. That means that
-if Kennedy calls 'LoadNode', a whole bunch of new data is pulled into the
-context window, rather than rewriting the context window.
-
-Conversation turns run through `kcode-codex-runtime-v2` and Codex app-server
-using JSON-RPC over the host's `codex-safe` launcher. Fresh threads register one
-dynamic function, `call_ktool`; native tool results are returned on the same
-Codex turn, after which Codex continues inference until its terminal assistant
-item. Continued conversation turns send only new application text on the same
-thread. ResetContext makes the next request start a fresh thread with rebuilt
-context. Built-in shell, web, MCP, environment, and remote-plugin capabilities
-are disabled for this path. The configured model is `gpt-5.6-sol` with `xhigh`
-reasoning.
-
-The unchanged v1 runtime remains in use for audio reconciliation and web
-research. Its sanitized catalog is derived from Codex's live model metadata. The catalog
-blanks provider prompt fields while preserving every advertised effective
-context limit. A prompt-input probe must show only the supplied Chatend item at
-the boundary Codex exposes; catalog or prompt-boundary failure aborts startup
-rather than falling back to hidden instructions.
-
-## UI
-
-The UI is a pure html/css/js webapp (no nodejs, no typescript, just pure js)
-that connects to five pure-Rust backend APIs hosted by one binary.
-
-The UI itself is a chat interface beween the user and Kennedy. On the left,
-there is the unpolluted conversation between the user and Kennedy. On the right
-is the full context window for Kennedy - that means any initial system prompts,
-any kweb nodes that have been loaded, any tool calls that Kennedy has made,
-etc, all appear on the right for the user to inspect.
-
-The UI also provides a memory explorer, where the user can open up their own
-node, see its contents, and then from there open up other nodes and explore the
-contents of the kweb.
-
-The top navigation has Conversation, TG Bot, Audio Ingress, and Memory views.
-TG Bot filters the conversation sidebar to Telegram users and reuses the
-transcript and full Chatend inspector, but has no browser composer. The
-ordinary conversation composer includes a microphone control and an editable
-paid transcription.
-
-Audio Ingress lists the complete durable recording history by recording-start
-time, newest first, regardless of when each vnote was uploaded or ingressed.
-Selecting a vnote shows its recording time and hash, external transcription-job
-progress, the reconciled final transcript, Kennedy-sized pieces, retry failures,
-and the saved Kennedy ingress Chatend for every piece. Legacy per-chunk
-transcripts remain visible when an older recording has them; new byte-only jobs
-do not create those records. The full transcript and other large artifacts
-begin collapsed. The large center display
-appends a conversation-style History Ingress section for every transcript
-piece, while the inspector's Full History orders those piece sessions and
-retains all pre-reset contexts. A terminal memory-ingress failure exposes an
-always-visible retry action above the collapsed transcript sections for the
-preserved piece.
-
-The conversation view includes a sidebar of durable active and completed
-conversations. Selecting an older entry loads its full saved transcript from
-the conversation history backend. Live entries remain continuable and closed
-entries are read-only. For an archive that predates persisted canonical text,
-the backend derives `chatendText` from the archived messages with the same
-formatter used for model requests before returning the record. The inspector
-passes that text through verbatim. Its complete history-ingress session is
-appended after the transcript as one continuous scrolling history.
-
-Below the sidebar history is a persistent activity log for sanitized
-user-visible operational failures. Entries are timestamped and repeated
-identical failures are collapsed. Errors from Telegram, audio ingress, startup,
-or background memory work never appear inside an unrelated conversation, and
-the log remains until the user clears it.
-
-Background progress never changes the user's reading position or reopens or
-closes a disclosure control. The center display, history sidebar, activity log,
-and inspector retain their scroll and disclosure state while showing the same
-record. A pane follows newly appended content only when the user was already
-scrolled completely to its bottom.
-
-Closed conversations do not show a message textarea or conversation controls;
-the composer exists only for a selected live conversation.
-While a live response is in flight, the composer shows Stop Kennedy. Activating
-it cancels the intelligence backend operation as well as the browser agent
-loop, then returns the conversation to Retry Saved Query without logging the
-user-requested stop as an operational failure.
-
-The live composer can be vertically resized up to most of the viewport from
-either a top-edge grip or the browser's lower-right corner. It also has a
-visible larger/compact toggle, so long messages can use a substantially larger
-editing area without permanently crowding the transcript.
-
-A conversation ends only when the user explicitly ends it or the 24-hour idle
-rule is triggered by successful activity in another conversation. Starting a
-new conversation leaves every existing live conversation open. Closing the UI
-abruptly does not lose the last durable checkpoint; reopening restores all live
-work and resumes required history ingress.
-
-## User Boostrap
-
-If there is no history yet, an initial node is created for David Vorick which
-contains minimal information. When David starts a conversation with Kennedy,
-memories will start to be created.
+## Boxes
+
+Every item Kennedy can see in context is a box:
+
+- system prompts;
+- user and Kennedy messages;
+- Kweb nodes;
+- tool calls and results;
+- controller notices;
+- document/audio material;
+- history-event inspections.
+
+A box has a stable ID equal to the event that created it. Later canonical
+updates or representation changes create new events without changing the box
+ID. Continuation markers explain this movement in the active context.
+
+A box is:
+
+- **hydrated** when canonical content is in context;
+- **dehydrated** when content is absent from context;
+- **summarized** when Kennedy's replacement text is in context;
+- **stale** when a dehydrated or summarized representation predates the latest
+  canonical revision.
+
+Kennedy alone decides when to dehydrate, summarize, or hydrate. The controller
+does not invent diffs for stale boxes. The only automatic bulk dehydration is
+preparation for history ingress.
+
+The retired terms “blanched” and “dirty” are not used.
+
+## Tools
+
+The provider always has the `call_ktool` bridge. Actual tool definitions and
+operating instructions are system-prompt boxes.
+
+Read tools include:
+
+- `LoadNode`;
+- box and history hydration/dehydration/summarization;
+- web search and fetch;
+- managed Rust library tools.
+
+Write tools stage:
+
+- node creation and complete node updates;
+- fixed/recent connection changes;
+- object attachment;
+- fanout consolidation and other Kweb graph operations.
+
+There is no ResetContext and no fixed LoadNode count. Dehydrating a Kweb node
+box does not unload the node's state.
+
+## Temporary IDs and staged objects
+
+The Chatend journal uses one monotonic temporary identity space. A pending node
+or object is named `pending:N`, where N is the allocation event. Box and
+pending IDs cannot overlap at the integer level.
+
+Original object bytes are staged in the append-only journal before provider or
+Kweb work is acknowledged. A later Kweb commit reads those bytes and obtains
+canonical object IDs. The final archive may retain pending IDs as its internal
+references; the commit result separately returns the canonical IDs needed by
+live application state.
+
+V1 permits up to 32 GiB for one object and 32 GiB aggregate object payload in a
+transaction. Larger streaming objects are future work.
+
+## Durability
+
+An in-progress session is one append-only, checksummed file. JSON is used for
+evolving Chatend state; object data is raw binary. A complete corrupt frame is
+an error. A partial final frame is discarded on recovery.
+
+Each accepted state change is fsynced. The staged Kweb plan is therefore
+recoverable after process failure.
+
+V1 deliberately accepts one narrow exception: the current Kweb library commits
+a locally built transaction inside `finalize`, so Kennedy cannot fsync the
+exact signed package before submitting it. A crash after Kweb commit but before
+the local completion event has an unknown outcome. A prepared-package API is
+deferred and this window must not be represented as exact-once behavior.
+
+## Context budgets
+
+A normal source session may use 70% of the model's effective context window.
+The remaining capacity is for history ingress. History ingress may use 100%.
+
+If a hydration or tool result would exceed capacity, Kennedy receives an
+error. If repeated failures push an ordinary source above 72%, the controller
+force-ends it and queues history ingress. If history ingress fills 100% and
+cannot continue, it commits the useful work completed so far.
+
+## History ingress
+
+History ingress begins from the same journal. The controller:
+
+- preserves the complete event history;
+- dehydrates ordinary source boxes;
+- rehydrates system prompt boxes;
+- loads Kennedy's and the user's root nodes;
+- revalidates nodes after obtaining the global writer lane;
+- posts compact update occurrences for changed nodes;
+- leaves stale representations compact until Kennedy hydrates them.
+
+Kennedy may inspect any event or box, then builds the final Kweb plan.
+
+## Session History
+
+In-progress sessions appear through Session History. Completed local history is
+only a text file of permanent session archive object IDs. Selecting one loads
+the complete immutable object from Kweb.
+
+There is no local completed-session metadata index, no purge control, and no
+legacy loader.
+
+## Concurrency
+
+Read-only sessions run in parallel. One global V1 writer lane serializes all
+Kweb-writing sessions. A conversation can begin read-only and later acquire
+the lane; it must revalidate loaded nodes at that point.
+
+Self time acquires the lane before loading. Kennedy may leave one message for
+the next self-time session. More advanced session handoff and swarm concurrency
+are future work.
+
+## Legacy cutover
+
+Legacy node IDs were already migrated independently and are not translated by
+Chatend. Legacy conversation records are not imported into the new session
+model.
+
+At cutover:
+
+- every unfinished legacy session is exported as one text file;
+- the complete legacy conversation database and its provenance are archived;
+- legacy conversation work is removed from the live mixed ingress queue only
+  after an archive copy exists;
+- no runtime compatibility store or loader remains.
+
+The archives can be moved off-machine and manually ingressed if desired.

@@ -1,0 +1,81 @@
+HISTORICAL DRAFT: terminology and limits in this file are superseded by
+chatend-overhaul-clarifications.md and chatend-discussion-review.txt.
+
+```markdown
+# Context Boxes: Overview
+
+## Purpose
+
+Kennedy’s model context is scarce, while conversation history, tool state and source material can be much larger. The context-box system separates the complete durable record from the compact representation Kennedy currently uses for inference.
+
+The system must:
+
+- preserve every message, tool result, box revision and Kennedy transformation;
+- let Kennedy remove irrelevant material without deleting history;
+- restore exact material without rerunning tools;
+- let stateful tools update existing context instead of duplicating it;
+- keep context usage visible and bounded;
+- support exact, selective history ingress.
+
+V1 supports text contents. Images, audio, video and other media can use the same model once suitable frontier models support them.
+
+## Core Model
+
+Every component of model-visible context is a named **box**. A logical box receives one stable `BoxId` when created. Every chronological action receives a unique, monotonically increasing `EventId`.
+
+A box has:
+
+- a name and stable identity;
+- an owner responsible for its canonical state;
+- canonical contents and revision history;
+- a current Kennedy-visible representation;
+- chronological creation, update, transformation and retirement events.
+
+The owner may create, update or retire its boxes. Kennedy may replace the visible representation of any box with arbitrary text, a summary or nothing. An empty representation is **blanched**. These changes affect only Kennedy’s active context; they never alter canonical contents or durable history.
+
+Kennedy changes one box at a time. She may restore a box to its latest canonical contents without rerunning its owner.
+
+## Updates and Ordering
+
+When a box changes, it retains its `BoxId` but receives a new chronological event. Its previous location becomes a compact immutable continuation marker, and its current occurrence moves to the position where the update happened. Earlier markers are never rewritten.
+
+Movement and hydration are independent. A tool update never forces a summarized or blanched box to rehydrate. Kennedy controls whether the new occurrence remains compact or reveals the updated canonical contents.
+
+Every Kennedy summary, blanch and restore is also a historical event. The log therefore records both the underlying source evolution and the exact representations Kennedy chose to use.
+
+Retirement removes a box from active context regardless of Kennedy’s current representation. Its identity, contents and events remain recoverable from history.
+
+## Tool Behavior
+
+A legacy stateless tool creates one ordinary result box and does not manage it afterward.
+
+A stateful tool owns an append-only sequence of box slots. It may create new slots, update existing slots or mark slots as retired. The controller maps those stable tool slots to global box IDs. Tools do not see Kennedy’s summaries or blanks; they operate only on their arguments and canonical tool state.
+
+A managed Rust library can use one box per source file. Reopening the same library refreshes those boxes instead of duplicating the source. Writes update existing file boxes, new files create boxes and deleted files retire boxes.
+
+KWeb is similarly stateful. Loading a node creates or refreshes its node and connection boxes. Loading it again refreshes the node, its current active connections and any newly discovered active connections. Blanching a node does not unload it. Restoring its retained box does not call KWeb.
+
+The fixed direct-node limit and `ResetContext` are unnecessary under this model. Kennedy may continue loading, summarizing, blanching and restoring material within the active-context budget.
+
+## Context Budget
+
+Each provider and model has an empirically chosen **effective context limit**, which may be lower than its advertised maximum.
+
+Main Kennedy may use up to approximately 80% of that effective limit. The controller displays estimated tokens used and remaining at the end of the active context. It begins with the latest actual provider input count and estimates subsequent changes conservatively at three characters per token.
+
+The remaining capacity ensures that a complete dehydrated history fits into a history-ingress session with room for selective hydration, reasoning and ingress-authored summaries. If the dehydrated event skeleton itself approaches the effective limit, the conversation must continue in a fresh session.
+
+## History and Ingress
+
+Durable history is an append-only event log, not repeated snapshots of every assembled prompt. Large payloads may be retained through exact object references.
+
+History ingress begins with the complete chronological log in a fully dehydrated form. Each event exposes compact identity, type, revision and estimated hydration cost. Ingress Kennedy may hydrate any historical event by `EventId`, recovering the exact box representation from that moment.
+
+She may inspect original contents, historical Kennedy summaries or later revisions; insert her own summaries as new events; and repeatedly hydrate and dehydrate material while working. Semantic judgment about what deserves durable integration remains Kennedy-directed rather than hardcoded.
+
+## Scope
+
+V1 defines text boxes, stateful tool ownership, active-view control, chronological events, exact restoration, retirement, context accounting and selective history ingress.
+
+Multimodal boxes, agent fleets and advanced automatic ingress prioritization are deferred. Canonical history always remains complete and recoverable regardless of what Kennedy chooses to keep visible.
+```

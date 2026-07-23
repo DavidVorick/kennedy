@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::{
     AgentMode, Api, Config, Manuals, RuntimeModel, Session,
-    http::{data_url, encode_path, stable_idempotency_id},
+    http::{data_url, encode_path},
     session::{SessionOptions, is_agent_loop_round_limit},
 };
 
@@ -289,7 +289,6 @@ impl Orchestrator {
                 .unwrap_or_else(|| json!({}));
             let abandoned_pending_turn = state
                 .get("pendingTurn")
-                .or_else(|| state.pointer("/archive/pendingTurn"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             state["orchestration"] = json!({
@@ -297,11 +296,7 @@ impl Orchestrator {
                 "status":"ending",
                 "abandonedPendingTurn":abandoned_pending_turn,
             });
-            if let Some(session_id) = state
-                .get("rustLibSessionId")
-                .or_else(|| state.pointer("/archive/rustLibSessionId"))
-                .and_then(Value::as_str)
-            {
+            if let Some(session_id) = state.get("rustLibSessionId").and_then(Value::as_str) {
                 self.api.release_rust_libs(session_id).await;
             }
             self.request_conversation_ingress(&record, Some(state))
@@ -391,6 +386,18 @@ impl Orchestrator {
                         }
                         return Err(error);
                     }
+                    if session.requires_history_ingress() {
+                        session.orchestration =
+                            json!({"owner":"backend","status":"ending","reason":"context-limit"});
+                        persist_record(&self.api, &record, session.snapshot()?, false).await?;
+                        self.request_conversation_ingress(&record, None).await?;
+                        self.complete_command(
+                            &command_id,
+                            json!({"status":"closed","reason":"context_limit"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
                 anyhow::ensure!(
                     session
@@ -454,6 +461,18 @@ impl Orchestrator {
                         }
                         return Err(error);
                     }
+                    if session.requires_history_ingress() {
+                        session.orchestration =
+                            json!({"owner":"backend","status":"ending","reason":"context-limit"});
+                        persist_record(&self.api, &record, session.snapshot()?, false).await?;
+                        self.request_conversation_ingress(&record, None).await?;
+                        self.complete_command(
+                            &command_id,
+                            json!({"status":"closed","reason":"context_limit"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
                 session.orchestration = json!({"owner":"backend","status":"idle"});
                 persist_record(&self.api, &record, session.snapshot()?, false).await?;
@@ -497,12 +516,7 @@ impl Orchestrator {
         let runtime = self.runtime()?.clone();
         let state = record.get("state").cloned().unwrap_or_else(|| json!({}));
         let session_type = session_type(record);
-        let archive = state.get("archive");
-        let roots = string_array(
-            state
-                .get("rootNodeIds")
-                .or_else(|| archive.and_then(|archive| archive.get("rootNodeIds"))),
-        );
+        let roots = string_array(state.get("rootNodeIds"));
         let roots = if roots.is_empty() {
             vec![
                 runtime.user_root_node_id.clone(),
@@ -512,29 +526,15 @@ impl Orchestrator {
             roots
         };
         let mut options = SessionOptions::conversation(session_type.clone(), roots);
-        options.reference_root_node_ids = string_array(
-            state
-                .get("referenceRootNodeIds")
-                .or_else(|| archive.and_then(|archive| archive.get("referenceRootNodeIds"))),
-        );
-        options.channel = state
-            .get("channel")
-            .or_else(|| archive.and_then(|archive| archive.get("channel")))
-            .cloned()
-            .unwrap_or(Value::Null);
-        options.free_time = state
-            .get("freeTime")
-            .or_else(|| archive.and_then(|archive| archive.get("freeTime")))
-            .cloned()
-            .unwrap_or(Value::Null);
+        options.reference_root_node_ids = string_array(state.get("referenceRootNodeIds"));
+        options.channel = state.get("channel").cloned().unwrap_or(Value::Null);
+        options.free_time = state.get("freeTime").cloned().unwrap_or(Value::Null);
         options.orchestration = state
             .get("orchestration")
-            .or_else(|| archive.and_then(|archive| archive.get("orchestration")))
             .cloned()
             .unwrap_or_else(|| json!({"owner":"backend","status":"idle"}));
         options.provenance_id = state
             .get("provenanceId")
-            .or_else(|| archive.and_then(|archive| archive.get("provenanceId")))
             .and_then(Value::as_str)
             .map(str::to_owned);
         options.mode = if session_type == "free-time" {
@@ -621,31 +621,20 @@ impl Orchestrator {
             .await;
             return Ok(());
         }
-        if let Some(record) = recoverable_self_time_slice(histories) {
-            self.launch_writer_job("self-time continuation", move |worker| async move {
-                let runtime = worker.runtime()?.clone();
+        if let Some(record) = histories
+            .iter()
+            .find(|record| {
+                matches!(
+                    record.get("phase").and_then(Value::as_str),
+                    Some("ingress_pending" | "ingress_in_progress")
+                )
+            })
+            .cloned()
+        {
+            self.launch_writer_job("session history ingress", move |worker| async move {
                 let id = required_string(&record, "id")?;
                 let record = worker.get_conversation(&id).await?;
-                let state = record.get("state").cloned().unwrap_or_else(|| json!({}));
-                let free_time = state
-                    .get("freeTime")
-                    .or_else(|| state.pointer("/archive/freeTime"))
-                    .cloned()
-                    .context("completed self-time slice has no continuation metadata")?;
-                let deadline = free_time
-                    .get("deadlineAt")
-                    .and_then(Value::as_str)
-                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                    .map(|value| value.with_timezone(&Utc))
-                    .context("completed self-time slice has an invalid deadline")?;
-                let provenance_id = state
-                    .get("provenanceId")
-                    .or_else(|| state.pointer("/archive/provenanceId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                worker
-                    .create_next_self_time_slice(&runtime, free_time, provenance_id, deadline)
-                    .await
+                worker.process_conversation_ingress(record).await
             })
             .await;
             return Ok(());
@@ -655,11 +644,10 @@ impl Orchestrator {
         };
         match job.source_kind {
             kennedy_memory_ingress::SourceKind::Conversation => {
-                let record = self.get_conversation(&job.source_id).await?;
-                self.launch_writer_job("conversation ingress", move |worker| async move {
-                    worker.process_conversation_ingress(record).await
-                })
-                .await;
+                anyhow::bail!(
+                    "legacy conversation memory-ingress job {} remained after the Session History cutover",
+                    job.source_id
+                );
             }
             kennedy_memory_ingress::SourceKind::Audio => {
                 let piece = self
@@ -706,40 +694,21 @@ impl Orchestrator {
         let mut stage = "prepare";
         let result = async {
             if record.get("phase").and_then(Value::as_str) == Some("ingress_pending") {
-                let archive = record
+                record
                     .get("state")
-                    .and_then(|state| state.get("archive"))
-                    .filter(|archive| archive.get("format").and_then(Value::as_str) == Some("kennedy-chatend"))
-                    .context("The queued conversation is missing its durable Chatend archive")?;
-                stage = "provenance";
-                let source = match archive.get("sessionType").and_then(Value::as_str) {
-                    Some("telegram-group") => "telegram-group",
-                    Some("telegram") => "telegram",
-                    Some("free-time") => "free-time",
-                    _ => "conversation",
-                };
-                let source_created_at = record
-                    .get("started_at")
+                    .and_then(|state| state.get("journalPath"))
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| Utc::now().to_rfc3339());
-                let provenance = self
-                    .api
-                    .create_provenance_archive(
-                        &stable_idempotency_id("conversation-ingress", &id),
-                        archive,
-                        source,
-                        &source_created_at,
-                    )
-                    .await?;
+                    .context("The queued session has no authoritative Chatend journal")?;
                 stage = "claim";
                 record = self
-                    .api.history_post(
-                        &format!(
-                            "/api/v1/conversations/{}/ingress-started",
-                            encode_path(&id)
-                        ),
-                        json!({"expected_version":version(&record)?,"provenance_id":required_string(&provenance,"id")?,"completion_protocol":"end-session-v2"}),
+                    .api
+                    .history_post(
+                        &format!("/api/v1/conversations/{}/ingress-started", encode_path(&id)),
+                        json!({
+                            "expected_version":version(&record)?,
+                            "provenance_id":format!("session:{id}"),
+                            "completion_protocol":"one-session-transaction-v1"
+                        }),
                     )
                     .await?;
             }
@@ -748,22 +717,19 @@ impl Orchestrator {
             }
             stage = "model_loop";
             let runtime = self.runtime()?.clone();
-            let provenance_id = required_string(&record, "provenance_id")?;
             let state = record.get("state").cloned().unwrap_or_else(|| json!({}));
-            let archive = state.get("archive").cloned().context("ingress source archive is missing")?;
-            let source_session_type = archive
+            let source_session_type = state
                 .get("sessionType")
                 .and_then(Value::as_str)
                 .unwrap_or("conversation")
                 .to_owned();
             let roots = {
-                let roots = string_array(
-                    state
-                        .get("rootNodeIds")
-                        .or_else(|| archive.get("rootNodeIds")),
-                );
+                let roots = string_array(state.get("rootNodeIds"));
                 if roots.is_empty() {
-                    vec![runtime.user_root_node_id.clone(), runtime.kennedy_root_node_id.clone()]
+                    vec![
+                        runtime.user_root_node_id.clone(),
+                        runtime.kennedy_root_node_id.clone(),
+                    ]
                 } else {
                     roots
                 }
@@ -771,15 +737,11 @@ impl Orchestrator {
             let options = SessionOptions {
                 session_type: "history-ingress".into(),
                 root_node_ids: roots,
-                reference_root_node_ids: string_array(
-                    state
-                        .get("referenceRootNodeIds")
-                        .or_else(|| archive.get("referenceRootNodeIds")),
-                ),
-                channel: Value::Null,
+                reference_root_node_ids: string_array(state.get("referenceRootNodeIds")),
+                channel: state.get("channel").cloned().unwrap_or(Value::Null),
                 free_time: Value::Null,
                 orchestration: Value::Null,
-                provenance_id: Some(provenance_id.clone()),
+                provenance_id: None,
                 mode: AgentMode::Ingress {
                     record_id: Some(id.clone()),
                 },
@@ -787,50 +749,39 @@ impl Orchestrator {
                 group_context: state
                     .get("channel")
                     .and_then(|channel| channel.get("groupContext"))
-                    .or_else(|| archive.get("channel").and_then(|channel| channel.get("groupContext")))
                     .cloned()
                     .unwrap_or(Value::Null),
                 rust_lib_session_id: Some(rust_session_id.clone()),
             };
-            let restored = state.get("historyIngress");
             let mut session = Session::new(
                 self.api.clone(),
                 runtime.manuals,
                 runtime.model,
                 options,
-                restored,
+                Some(&state),
             )
             .await?;
-            let provenance = self
-                .api.kmap_get(
-                    &format!("/api/v1/kmap/provenance/{}", encode_path(&provenance_id)),
-                )
-                .await?;
-            session.set_ingress_provenance_message(&provenance)?;
             session.pending_turn = true;
             let record = Arc::new(Mutex::new(record));
-            persist_ingress_record(&self.api, &record, session.archive()?).await?;
+            persist_ingress_record(&self.api, &record, session.snapshot()?).await?;
             let api = self.api.clone();
             let saved_record = record.clone();
             session
-                .run_pending_turn(Uuid::new_v4(), move |archive_state| {
+                .run_pending_turn(Uuid::new_v4(), move |session_state| {
                     let api = api.clone();
                     let record = saved_record.clone();
                     async move {
-                        let archive = archive_state
-                            .get("archive")
-                            .cloned()
-                            .unwrap_or(archive_state);
-                        persist_ingress_record(&api, &record, archive).await?;
+                        persist_ingress_record(&api, &record, session_state).await?;
                         Ok(())
                     }
                 })
                 .await?;
-            persist_ingress_record(&self.api, &record, session.archive()?).await?;
+            persist_ingress_record(&self.api, &record, session.snapshot()?).await?;
             stage = "completion";
             let mut locked = record.lock().await;
             let completed = self
-                .api.history_post(
+                .api
+                .history_post(
                     &format!(
                         "/api/v1/conversations/{}/ingress-completed",
                         encode_path(&id)
@@ -845,7 +796,8 @@ impl Orchestrator {
                 .and_then(|channel| channel.get("groupIngressBatchId"))
                 .and_then(Value::as_str)
             {
-                self.api.telegram_post(
+                self.api
+                    .telegram_post(
                         &format!("/api/v1/group-ingress/{}/complete", encode_path(batch)),
                         json!({}),
                     )
@@ -894,19 +846,6 @@ impl Orchestrator {
         let mut stage = "prepare";
         let result = async {
             if piece.get("phase").and_then(Value::as_str) == Some("ingress_pending") {
-                stage = "provenance";
-                let provenance = self
-                    .api
-                    .kmap_post(
-                        "/api/v1/kmap/provenance",
-                        json!({
-                            "idempotency_id":stable_idempotency_id("audio-ingress", &id),
-                            "data":format!("Vnote final transcript piece\n\nRecording began: {}\nRecording SHA-256: {}\nOriginal filename: {}\nTranscript piece: {} of {}\n\n{}",
-                                piece.get("source_created_at").and_then(Value::as_str).unwrap_or("unknown"),piece.get("sha256").and_then(Value::as_str).unwrap_or("unknown"),piece.get("original_filename").and_then(Value::as_str).unwrap_or("unknown"),piece.get("piece_index").and_then(Value::as_u64).unwrap_or_default()+1,piece.get("piece_count").and_then(Value::as_u64).unwrap_or_default(),piece.get("transcript_text").and_then(Value::as_str).unwrap_or("")),
-                            "source":"audio-vnote","source_created_at":piece.get("source_created_at").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(||Utc::now().to_rfc3339()),
-                        }),
-                    )
-                    .await?;
                 stage = "claim";
                 piece = self
                     .api.audio_post(
@@ -914,7 +853,11 @@ impl Orchestrator {
                             "/api/v1/audio-ingress/pieces/{}/ingress-started",
                             encode_path(&id)
                         ),
-                        json!({"expected_version":version(&piece)?,"provenance_id":required_string(&provenance,"id")?,"completion_protocol":"end-session-v2"}),
+                        json!({
+                            "expected_version":version(&piece)?,
+                            "provenance_id":format!("session:audio:{id}"),
+                            "completion_protocol":"one-session-transaction-v1"
+                        }),
                     )
                     .await?;
             }
@@ -923,21 +866,39 @@ impl Orchestrator {
             }
             stage = "model_loop";
             let runtime = self.runtime()?.clone();
-            let provenance_id = required_string(&piece, "provenance_id")?;
             let options = SessionOptions {
                 session_type: "history-ingress".into(),
                 root_node_ids: vec![runtime.user_root_node_id.clone(), runtime.kennedy_root_node_id.clone()],
                 reference_root_node_ids: Vec::new(), channel:Value::Null, free_time:Value::Null, orchestration:Value::Null,
-                provenance_id:Some(provenance_id.clone()),mode:AgentMode::Ingress{record_id:None},source_session_type:Some("audio".into()),group_context:Value::Null,rust_lib_session_id:Some(rust_session_id.clone()),
+                provenance_id:None,mode:AgentMode::Ingress{record_id:None},source_session_type:Some("audio".into()),group_context:Value::Null,rust_lib_session_id:Some(rust_session_id.clone()),
             };
             let state=piece.get("state").cloned().unwrap_or_else(||json!({}));
             let mut session=Session::new(self.api.clone(),runtime.manuals,runtime.model,options,state.get("historyIngress")).await?;
-            let provenance=self.api.kmap_get(&format!("/api/v1/kmap/provenance/{}",encode_path(&provenance_id))).await?;
-            session.set_ingress_provenance_message(&provenance)?;session.pending_turn=true;
-            let piece=Arc::new(Mutex::new(piece));persist_audio_ingress(&self.api,&piece,session.archive()?).await?;
+            session.stage_ingress_source(
+                &format!(
+                    "Vnote final transcript piece\n\nRecording began: {}\nRecording SHA-256: {}\nOriginal filename: {}\nTranscript piece: {} of {}\n\n{}",
+                    piece.get("source_created_at").and_then(Value::as_str).unwrap_or("unknown"),
+                    piece.get("sha256").and_then(Value::as_str).unwrap_or("unknown"),
+                    piece.get("original_filename").and_then(Value::as_str).unwrap_or("unknown"),
+                    piece.get("piece_index").and_then(Value::as_u64).unwrap_or_default()+1,
+                    piece.get("piece_count").and_then(Value::as_u64).unwrap_or_default(),
+                    piece.get("transcript_text").and_then(Value::as_str).unwrap_or("")
+                ),
+                &json!({"kind":"audio-transcript","audioPieceId":id}),
+            ).await?;
+            let piece=Arc::new(Mutex::new(piece));persist_audio_ingress(&self.api,&piece,session.snapshot()?).await?;
             let api=self.api.clone();let saved=piece.clone();
-            session.run_pending_turn(Uuid::new_v4(),move|archive_state|{let api=api.clone();let piece=saved.clone();async move{let archive=archive_state.get("archive").cloned().unwrap_or(archive_state);persist_audio_ingress(&api,&piece,archive).await?;Ok(())}}).await?;
-            persist_audio_ingress(&self.api,&piece,session.archive()?).await?;stage="completion";
+            session.run_pending_turn(Uuid::new_v4(),move|session_state|{let api=api.clone();let piece=saved.clone();async move{persist_audio_ingress(&api,&piece,session_state).await?;Ok(())}}).await?;
+            let completed_state = session.snapshot()?;
+            persist_audio_ingress(&self.api,&piece,completed_state.clone()).await?;
+            self.api.history_post(
+                "/api/v1/session-history",
+                json!({
+                    "session_object_id":completed_state.get("sessionObjectId").and_then(Value::as_str).context("audio ingress session has no permanent object ID")?,
+                    "journal_path":completed_state.get("journalPath"),
+                }),
+            ).await?;
+            stage="completion";
             let locked=piece.lock().await;
             self.api.audio_post(&format!("/api/v1/audio-ingress/pieces/{}/ingress-completed",encode_path(&id)),json!({"expected_version":version(&locked)?})).await?;
             Ok(())
@@ -983,9 +944,7 @@ impl Orchestrator {
             let requested_at = DateTime::parse_from_rfc3339(requested)?.with_timezone(&Utc);
             let deadline =
                 requested_at + ChronoDuration::milliseconds((duration * 60_000.0).round() as i64);
-            let provenance=self.api.kmap_post("/api/v1/kmap/provenance",json!({"idempotency_id":intent.get("provenanceIdempotencyId").and_then(Value::as_str).context("self-time provenance idempotency ID is missing")?,"data":serde_json::to_string_pretty(&json!({"kind":"free-time","runId":id,"runStartedAt":requested_at,"deadlineAt":deadline,"durationMinutes":duration,"customPrompt":intent.get("customPrompt").and_then(Value::as_str).unwrap_or("")}))?,"source":"free-time","source_created_at":requested_at.to_rfc3339()})).await?;
-            state["freeTime"] = json!({"runId":id,"runStartedAt":requested_at.to_rfc3339(),"deadlineAt":deadline.to_rfc3339(),"durationMinutes":duration,"customPrompt":intent.get("customPrompt").and_then(Value::as_str).unwrap_or(""),"sliceIndex":1,"provenanceId":required_string(&provenance,"id")?});
-            state["provenanceId"] = provenance.get("id").cloned().unwrap_or(Value::Null);
+            state["freeTime"] = json!({"runId":id,"runStartedAt":requested_at.to_rfc3339(),"deadlineAt":deadline.to_rfc3339(),"durationMinutes":duration,"customPrompt":intent.get("customPrompt").and_then(Value::as_str).unwrap_or(""),"sliceIndex":1});
             state["orchestration"] = json!({"owner":"backend","status":"running"});
         }
         let mut options = SessionOptions::conversation(
@@ -1061,6 +1020,7 @@ impl Orchestrator {
             }
         };
         session.finalize_free_time(&reason)?;
+        session.commit_current_write_session()?;
         persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
         session.release_rust_libs().await;
         let mut locked = record_arc.lock().await;
@@ -1170,12 +1130,14 @@ impl Orchestrator {
             let root = if is_web {
                 runtime.user_root_node_id.clone()
             } else {
-                required_string(user, "rootNodeId")?
-            };
-            if !is_web {
                 let _guard = self.writer.lock().await;
-                self.api.bootstrap_node(&root, None).await?;
-            }
+                let created = self.api.bootstrap_node(None).await?;
+                created
+                    .pointer("/node/id")
+                    .and_then(Value::as_str)
+                    .context("created user root omitted its node ID")?
+                    .to_owned()
+            };
             self.api
                 .directory_post(
                     &format!(
@@ -1193,9 +1155,13 @@ impl Orchestrator {
             .flatten()
         {
             let group_id = required_string(group, "groupId")?;
-            let root = required_string(group, "rootNodeId")?;
             let _guard = self.writer.lock().await;
-            self.api.bootstrap_node(&root, Some("Group Root")).await?;
+            let created = self.api.bootstrap_node(Some("Group Root")).await?;
+            let root = created
+                .pointer("/node/id")
+                .and_then(Value::as_str)
+                .context("created group root omitted its node ID")?
+                .to_owned();
             self.api
                 .directory_post(
                     &format!(
@@ -1222,9 +1188,12 @@ impl Orchestrator {
             ))
             .await?;
         if user.get("rootReady").and_then(Value::as_bool) != Some(true) {
-            let root = required_string(&user, "rootNodeId")?;
             let _guard = self.writer.lock().await;
-            self.api.bootstrap_node(&root, None).await?;
+            let created = self.api.bootstrap_node(None).await?;
+            let root = created
+                .pointer("/node/id")
+                .and_then(Value::as_str)
+                .context("created user root omitted its node ID")?;
             user = self
                 .api
                 .directory_post(
@@ -1247,9 +1216,12 @@ impl Orchestrator {
             ))
             .await?;
         if group.get("rootReady").and_then(Value::as_bool) != Some(true) {
-            let root = required_string(&group, "rootNodeId")?;
             let _guard = self.writer.lock().await;
-            self.api.bootstrap_node(&root, Some("Group Root")).await?;
+            let created = self.api.bootstrap_node(Some("Group Root")).await?;
+            let root = created
+                .pointer("/node/id")
+                .and_then(Value::as_str)
+                .context("created group root omitted its node ID")?;
             group = self
                 .api
                 .directory_post(
@@ -1580,6 +1552,21 @@ impl Orchestrator {
                 })
                 .await?;
             persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
+            if session.requires_history_ingress() {
+                session.orchestration =
+                    json!({"owner":"backend","status":"ending","reason":"context-limit"});
+                persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
+                self.request_conversation_ingress(&record_arc, None).await?;
+                self.api.telegram_post(
+                    &format!("/api/v1/events/{}/reply",encode_path(&id)),
+                    json!({
+                        "conversationId":conversation_id,
+                        "text":"This session reached its context limit and has been sent to history ingress.",
+                        "contextWarning":"session ended at the emergency context limit"
+                    }),
+                ).await?;
+                return Ok(());
+            }
         }
         let response = session
             .answer_for_external_event(&id)
@@ -1624,11 +1611,7 @@ impl Orchestrator {
                 json!({"expected_version":version(&record)?,"state":state}),
             )
             .await?;
-        if let Some(session_id) = state
-            .get("rustLibSessionId")
-            .or_else(|| state.pointer("/archive/rustLibSessionId"))
-            .and_then(Value::as_str)
-        {
+        if let Some(session_id) = state.get("rustLibSessionId").and_then(Value::as_str) {
             self.api.release_rust_libs(session_id).await;
         }
         Ok(())
@@ -1743,7 +1726,7 @@ impl Orchestrator {
             SessionOptions::conversation(if group { "telegram-group" } else { "telegram" }, roots);
         options.channel = channel;
         options.reference_root_node_ids = references;
-        let mut session = Session::new(
+        let session = Session::new(
             self.api.clone(),
             runtime.manuals,
             runtime.model,
@@ -1979,13 +1962,7 @@ impl Orchestrator {
         if let Some(existing) = self.list_history().await?.into_iter().find(|record| {
             record
                 .get("state")
-                .and_then(|state| {
-                    state.get("channel").or_else(|| {
-                        state
-                            .get("archive")
-                            .and_then(|archive| archive.get("channel"))
-                    })
-                })
+                .and_then(|state| state.get("channel"))
                 .and_then(|channel| channel.get("groupIngressBatchId"))
                 .and_then(Value::as_str)
                 == Some(&id)
@@ -2019,12 +1996,35 @@ impl Orchestrator {
             required_string(&group, "rootNodeId")?,
             runtime.kennedy_root_node_id,
         ];
-        let transcript=context.get("messages").and_then(Value::as_array).into_iter().flatten().map(|message|json!({"role":if message.get("sentByKennedy").and_then(Value::as_bool)==Some(true){"kennedy"}else{"user"},"content":message.get("text").and_then(Value::as_str).unwrap_or("")})).collect::<Vec<_>>();
-        let messages=transcript.iter().map(|message|json!({"role":if message.get("role").and_then(Value::as_str)==Some("kennedy"){"assistant"}else{"user"},"content":message.get("content").cloned().unwrap_or(Value::Null)})).collect::<Vec<_>>();
         let channel = json!({"kind":"telegram-group","chatId":batch.get("chatId").cloned().unwrap_or(Value::Null),"groupId":group_id,"groupRootNodeId":group.get("rootNodeId").cloned().unwrap_or(Value::Null),"groupIngressBatchId":id,"backgroundIngress":true,"groupContext":context});
-        let archive = json!({"format":"kennedy-chatend","version":2,"sessionType":"telegram-group","channel":channel,"rootNodeIds":roots,"referenceRootNodeIds":participant_references(&context,&roots),"startedAt":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"provider":runtime.model.provider,"model":runtime.model.model,"systemPrompt":"","retained":messages,"transcript":transcript,"messages":messages,"fullHistory":{"segments":[]},"context":{},"tools":{"loadCalls":0,"loadLimit":0,"log":[]},"usage":Value::Null,"media":[]});
-        let state = json!({"stateVersion":2,"sessionType":"telegram-group","channel":channel,"rootNodeIds":roots,"referenceRootNodeIds":participant_references(&context,&roots),"startedAt":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"transcript":transcript,"archive":archive});
-        let record=self.api.history_post("/api/v1/conversations",json!({"started_at":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"state":state})).await?;
+        let mut options = SessionOptions::conversation("telegram-group", roots.clone());
+        options.channel = channel;
+        options.reference_root_node_ids = participant_references(&context, &roots);
+        options.source_session_type = Some("telegram-group".into());
+        let mut session = Session::new(
+            self.api.clone(),
+            runtime.manuals,
+            runtime.model,
+            options,
+            None,
+        )
+        .await?;
+        for message in context
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            session.stage_source_message(
+                message.get("sentByKennedy").and_then(Value::as_bool) == Some(true),
+                message
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                message.clone(),
+            )?;
+        }
+        let record=self.api.history_post("/api/v1/conversations",json!({"started_at":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"state":session.snapshot()?})).await?;
         self.api.history_post(&format!("/api/v1/conversations/{}/request-ingress",encode_path(required_string(&record,"id")?)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
         Ok(())
     }
@@ -2140,71 +2140,10 @@ async fn persist_audio_ingress(
     Ok(())
 }
 
-fn recoverable_self_time_slice(histories: &[Value]) -> Option<Value> {
-    let mut latest_slice_by_run = HashMap::<String, u64>::new();
-    for record in histories {
-        if session_type(record) != "free-time" {
-            continue;
-        }
-        let Some(state) = record.get("state") else {
-            continue;
-        };
-        let Some(free_time) = state
-            .get("freeTime")
-            .or_else(|| state.pointer("/archive/freeTime"))
-        else {
-            continue;
-        };
-        let Some(run_id) = free_time.get("runId").and_then(Value::as_str) else {
-            continue;
-        };
-        let slice = free_time
-            .get("sliceIndex")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        latest_slice_by_run
-            .entry(run_id.to_owned())
-            .and_modify(|latest| *latest = (*latest).max(slice))
-            .or_insert(slice);
-    }
-    histories.iter().find_map(|record| {
-        if record.get("phase").and_then(Value::as_str) != Some("complete")
-            || session_type(record) != "free-time"
-        {
-            return None;
-        }
-        let state = record.get("state")?;
-        let free_time = state
-            .get("freeTime")
-            .or_else(|| state.pointer("/archive/freeTime"))?;
-        free_time.get("sliceEndedAt").and_then(Value::as_str)?;
-        let run_id = free_time.get("runId").and_then(Value::as_str)?;
-        let slice = free_time
-            .get("sliceIndex")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        if latest_slice_by_run.get(run_id).copied() != Some(slice) {
-            return None;
-        }
-        let deadline = free_time
-            .get("deadlineAt")
-            .and_then(Value::as_str)
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
-            .with_timezone(&Utc);
-        (deadline - Utc::now() >= ChronoDuration::minutes(5)).then(|| record.clone())
-    })
-}
-
 fn session_type(record: &Value) -> String {
     record
         .get("state")
-        .and_then(|state| {
-            state.get("sessionType").or_else(|| {
-                state
-                    .get("archive")
-                    .and_then(|archive| archive.get("sessionType"))
-            })
-        })
+        .and_then(|state| state.get("sessionType"))
         .and_then(Value::as_str)
         .unwrap_or("conversation")
         .into()
@@ -2213,13 +2152,7 @@ fn is_browser_conversation(record: &Value) -> bool {
     session_type(record) == "conversation"
 }
 fn record_channel(record: &Value) -> Option<&Value> {
-    record.get("state").and_then(|state| {
-        state.get("channel").or_else(|| {
-            state
-                .get("archive")
-                .and_then(|archive| archive.get("channel"))
-        })
-    })
+    record.get("state").and_then(|state| state.get("channel"))
 }
 fn record_group_id(record: &Value) -> Option<&str> {
     record_channel(record)
@@ -2308,30 +2241,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completed_self_time_continues_after_a_restart_only_for_the_latest_slice() {
-        let deadline = (Utc::now() + ChronoDuration::minutes(10)).to_rfc3339();
-        let first = json!({"id":"first","phase":"complete","state":{"sessionType":"free-time","freeTime":{"runId":"run","sliceIndex":1,"sliceEndedAt":Utc::now().to_rfc3339(),"deadlineAt":deadline}}});
-        assert_eq!(
-            recoverable_self_time_slice(std::slice::from_ref(&first))
-                .unwrap()
-                .get("id")
-                .and_then(Value::as_str),
-            Some("first")
-        );
-        let second = json!({"id":"second","phase":"active","state":{"sessionType":"free-time","freeTime":{"runId":"run","sliceIndex":2,"deadlineAt":deadline}}});
-        assert!(recoverable_self_time_slice(&[second, first]).is_none());
-    }
-
-    #[test]
-    fn legacy_frontend_conversations_are_adopted_but_telegram_sessions_are_not() {
-        let legacy = json!({
+    fn browser_and_telegram_sessions_are_classified_from_current_control_state() {
+        let browser = json!({
             "phase":"active",
             "state":{
                 "sessionType":"conversation",
-                "orchestration":{"owner":"frontend","status":"idle"}
+                "orchestration":{"owner":"backend","status":"idle"}
             }
         });
-        assert!(is_browser_conversation(&legacy));
+        assert!(is_browser_conversation(&browser));
         assert!(!is_browser_conversation(&json!({
             "phase":"active",
             "state":{"sessionType":"telegram"}

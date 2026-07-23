@@ -1,0 +1,148 @@
+HISTORICAL DRAFT: terminology and limits in this file are superseded by
+chatend-overhaul-clarifications.md and chatend-discussion-review.txt.
+
+```markdown
+# Tool Box Protocol
+
+## Purpose
+
+The tool-box protocol lets stateful tools maintain model-visible context without repeatedly appending complete snapshots.
+
+A tool controls only the canonical state of its own boxes. Kennedy independently controls how those boxes appear in her active context. Tools never observe Kennedy’s summaries, blanks or hydration choices.
+
+## Tool Classes
+
+### Legacy Stateless Tools
+
+A legacy tool receives arguments, performs one operation and returns ordinary text.
+
+Its complete response becomes one new immutable result box. The tool does not retain the box, update it or read it later. Kennedy may summarize, blanch or restore the result through the normal context interface.
+
+Repeated calls create separate result boxes.
+
+### Stateful Tools
+
+A stateful tool instance owns an append-only sequence of box slots. Each successful method call may change that sequence.
+
+The tool retains its own canonical state across calls. It receives:
+
+- the current method and arguments;
+- its private canonical tool state;
+- any resources explicitly supplied to it.
+
+It does not receive the full conversation or Kennedy’s active-view overrides.
+
+## Tool Instances
+
+The controller assigns each stateful tool instance a stable private identity. Calls routed to that instance address the same tool state and slot sequence.
+
+The controller retains the mapping:
+
+`(tool instance, slot position) -> BoxId`
+
+The tool does not need to know global box IDs or event IDs.
+
+Creating another tool instance creates another independent slot sequence, even if both instances use the same tool implementation.
+
+## Slot Sequence
+
+A stateful tool reports its complete current slot sequence after a successful call.
+
+Each slot is either:
+
+- **Active:** contains a stable name and current canonical text.
+- **Retired:** no longer contributes contents to active context.
+
+The sequence is append-only:
+
+- existing slots cannot be reordered;
+- new slots are appended;
+- active slots may update their contents;
+- active slots may become retired;
+- retired slots remain in their original positions;
+- retired slots cannot become active again.
+
+If a retired component later reappears, the tool appends a new slot. The controller assigns it a new `BoxId`.
+
+Slot names remain stable. Renaming a component is represented as retiring the old slot and appending a new one.
+
+## Applying a Tool Update
+
+After a successful stateful call, the controller compares the submitted sequence with the previously retained sequence.
+
+For each position:
+
+- a newly appended active slot creates a new box;
+- changed active contents create a canonical box revision;
+- unchanged active contents create no box revision;
+- an active slot newly marked retired retires its box;
+- an unchanged retired slot does nothing.
+
+The controller records the tool invocation and the resulting box events in chronological order.
+
+The complete slot transition is applied atomically. If the submitted sequence is malformed, reordered, truncated or otherwise invalid, none of its box changes are applied and the previous tool-box state remains current.
+
+A failed tool operation does not change its slot sequence. It may return a bounded error result associated with the invocation.
+
+## Context Effects
+
+A tool update changes canonical box state but does not control hydration.
+
+When a fully hydrated tool box updates, its new canonical contents may appear at its new chronological occurrence.
+
+When Kennedy has summarized or blanched the box:
+
+- the tool update advances the canonical revision;
+- Kennedy’s representation remains compact;
+- the box becomes dirty;
+- the tool cannot force it to rehydrate;
+- Kennedy may later restore or resummarize it.
+
+Retiring a slot removes its box from active context even if Kennedy had installed a summary. All prior contents and transformations remain available through history.
+
+A stateful invocation may also return compact status metadata, such as success, failure or a publication receipt. Canonical source contents should appear through owned slots rather than being duplicated in an ordinary result.
+
+## Managed Rust Example
+
+Opening a Rust library creates one active slot per source file.
+
+A later write:
+
+- updates slots for modified files;
+- leaves unchanged file slots untouched;
+- appends slots for new files;
+- retires slots for deleted files.
+
+Reopening the same library instance refreshes those existing slots instead of appending another complete source snapshot.
+
+A renamed file retires the old path’s slot and appends a new slot. Checks that do not change source leave all file slots unchanged and return only a compact result.
+
+## KWeb Example
+
+KWeb is one stateful tool instance with slots for rendered nodes and connection material.
+
+`LoadNode` may:
+
+- update an existing node slot;
+- refresh its current active-connection renderings;
+- append slots for newly encountered nodes or connections;
+- retire connection renderings no longer current.
+
+A node remains loaded in KWeb state when Kennedy blanches its box.
+
+Calling `LoadNode` again explicitly refreshes that node and its active closure. It reuses existing slots wherever their logical components are unchanged and appends slots only for genuinely new components.
+
+Restoring a retained KWeb box is a context operation, not a KWeb call.
+
+## Invariants
+
+- Only stateful tools manage tool-owned box slots.
+- A tool controls only its own canonical boxes.
+- Slot position and `BoxId` mappings remain stable.
+- Slots are never reordered, removed or reused.
+- Kennedy’s private representations are invisible to tools.
+- Tool updates never force hydration.
+- Repeated refreshes update boxes instead of duplicating snapshots.
+- Failed or invalid transitions preserve the previous complete state.
+- Retirement removes live context but never deletes history.
+```

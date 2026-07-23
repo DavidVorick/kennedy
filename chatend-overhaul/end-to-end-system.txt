@@ -1,0 +1,160 @@
+HISTORICAL DRAFT: terminology and limits in this file are superseded by
+chatend-overhaul-clarifications.md and chatend-discussion-review.txt.
+
+```markdown
+# End-to-End Context System
+
+## Purpose
+
+This document ties the context-box specifications into one complete system contract.
+
+The governing principle is:
+
+> Preserve everything exactly, while giving Kennedy complete control over what currently consumes her attention.
+
+The durable event log records reality. Canonical boxes represent current source state. Kennedy’s active view is a reversible projection. History ingress selectively revisits the exact record.
+
+When this document is less specific than a subject-focused document, the subject-focused document governs.
+
+## System Components
+
+The system consists of:
+
+1. **Event Log:** append-only chronological history.
+2. **Boxes:** stable logical containers with owner-controlled canonical state.
+3. **Active Context:** Kennedy-selected box representations assembled for inference.
+4. **Tool Protocol:** stateful tools update existing boxes through append-only slots.
+5. **Provider Adapter:** renders boxes into valid model-specific input.
+6. **History Ingress:** processes a fully dehydrated log through selective historical hydration.
+7. **Object Storage:** retains exact large payloads outside the prompt.
+
+These components share stable box, event, revision and object lineage.
+
+## Complete Turn Flow
+
+### 1. Receive Input
+
+A user message, edit or other authorized source becomes an event and creates or updates its canonical box.
+
+The original event remains preserved when edited.
+
+### 2. Assemble Context
+
+The controller replays current state into one ordered active projection containing:
+
+- chronological box occurrences;
+- compact continuation markers;
+- Kennedy-selected current representations;
+- dirty-box information;
+- context-budget information.
+
+The controller records an inference manifest identifying exactly which representations were assembled.
+
+### 3. Run Kennedy
+
+The provider receives only the active projection, not every hydrated source retained by the controller.
+
+Kennedy may:
+
+- respond;
+- call a tool;
+- replace one box with a summary;
+- blanch one box;
+- restore one box to its latest canonical revision.
+
+Every Kennedy transformation becomes an event.
+
+### 4. Run Tools
+
+A legacy tool returns one new immutable result box.
+
+A stateful tool returns its complete append-only slot state. The controller compares it with the preceding state and:
+
+- creates boxes for appended slots;
+- updates canonical revisions for changed slots;
+- leaves unchanged slots untouched;
+- retires boxes for newly retired slots.
+
+Tools never see Kennedy’s active-view overrides.
+
+### 5. Apply Updates
+
+An updated box retains its `BoxId` and moves to the update’s chronological position. Its preceding occurrence becomes an immutable continuation marker.
+
+Movement does not force hydration.
+
+If Kennedy had summarized or blanched the box, that representation remains compact and becomes dirty. Kennedy decides whether to inspect the new canonical revision.
+
+### 6. Continue or Finish
+
+The controller reassembles context after each tool or Kennedy action. The turn continues until Kennedy produces a terminal response.
+
+The user-facing conversation and durable audit history retain complete messages and operations even when Kennedy’s active view is compact.
+
+## Worked Example
+
+1. Event 10 creates KWeb Node Box 10.
+2. Event 15 records Kennedy summarizing Box 10.
+3. Event 24 records a later `LoadNode` refresh that updates Box 10.
+4. Box 10’s Event 15 occurrence becomes a continuation marker to Event 24.
+5. At Event 24, Kennedy’s summary remains visible and is marked dirty; the updated node does not automatically rehydrate.
+6. Event 29 records Kennedy restoring Box 10 to its Event 24 canonical revision.
+7. Event 36 records Kennedy blanching it after extracting what she needs.
+
+The same logical box remains Box 10 throughout.
+
+History ingress may later hydrate:
+
+- Event 10 to inspect the original node;
+- Event 15 to inspect Kennedy’s first summary;
+- Event 24 to inspect the refreshed state;
+
+- Event 29 to reconstruct the restored representation;
+- Event 36 to confirm that it was later blanched.
+
+No tool call must be repeated.
+
+## Context and Session Limits
+
+Each provider/model pair has an empirically selected effective context limit `E`.
+
+Main Kennedy operates within approximately `0.8E`. Usage is estimated from the latest provider-reported input count plus conservative text deltas at three characters per token.
+
+The remaining capacity lets history ingress begin with the complete dehydrated log and selectively hydrate source events while reasoning.
+
+Kennedy manages ordinary context pressure by summarizing, blanching and restoring boxes. `ResetContext`, `UnloadNode` and fixed direct-node limits are not part of the new design.
+
+When compact event markers alone approach the configured ceiling, the conversation continues in a fresh linked session.
+
+## History Ingress Flow
+
+After the source conversation:
+
+1. Ingress receives the complete chronological log, fully dehydrated.
+2. Each event exposes identity, type, lineage and estimated hydration cost.
+3. Ingress hydrates selected events by `EventId`.
+4. It may inspect canonical sources, Kennedy’s historical summaries or both.
+5. It inserts its own source-linked summaries as new events.
+6. It dehydrates completed material to recover working space.
+7. It integrates durable knowledge, current state, actions, corrections and reusable learning.
+8. Exact source history remains recoverable regardless of semantic selection.
+
+## Document Map
+
+- `00-Overview.md` defines purpose, vocabulary and scope.
+- `01-Box-Model.md` defines identity, ownership, representations and retirement.
+- `02-Context-Assembly.md` defines ordering, movement, rendering and budgets.
+- `03-Tool-Box-Protocol.md` defines legacy and stateful tool behavior.
+- `04-History-Event-Log.md` defines exact append-only history.
+- `05-History-Ingress.md` defines selective historical processing.
+- `06-Acceptance.md` defines required behavioral evidence.
+- `07-Controller-Lifecycle.md` defines operations, persistence and provider integration.
+
+## V1 Boundary
+
+V1 is complete when text boxes, tool updates, reversible active context, exact event history, selective ingress, restart recovery and budget enforcement pass acceptance together.
+
+Multimodal boxes, parallel Kennedy fleets and automatic semantic prioritization remain later extensions.
+
+At every stage, source truth remains exact, Kennedy’s attention remains curated, and every transformation remains reversible and attributable.
+```

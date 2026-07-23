@@ -19,7 +19,6 @@ use kcode_audio_transcribe::{
     AudioTranscriber, JobState, RECONCILIATION_MODEL, RECONCILIATION_REASONING, Step, StepState,
     TRANSCRIPTION_MODEL, TranscriptionJob, TranscriptionStatus,
 };
-use kennedy_chatend::hydrate_state_chatend_text;
 use kennedy_memory_ingress::{
     Failure as QueueFailure, Job as QueueJob, LegacySubmission, Queue, SourceKind, Submission,
 };
@@ -1367,10 +1366,9 @@ fn piece_select() -> &'static str {
 fn row_piece(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngressPieceRecord> {
     let state_json: String = row.get(11)?;
     let failures_json: String = row.get(14)?;
-    let mut piece_state = serde_json::from_str(&state_json).map_err(|error| {
+    let piece_state = serde_json::from_str(&state_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    hydrate_state_chatend_text(&mut piece_state);
     Ok(IngressPieceRecord {
         id: row.get(0)?,
         recording_id: row.get(1)?,
@@ -1818,10 +1816,7 @@ mod tests {
         );
         assert_eq!(history.pieces.len(), 1);
         assert_eq!(history.pieces[0].state["historyIngress"]["completed"], true);
-        assert_eq!(
-            history.pieces[0].state["historyIngress"]["chatendText"],
-            "David\n\nLegacy audio ingress"
-        );
+        assert!(history.pieces[0].state["historyIngress"]["chatendText"].is_null());
     }
 
     #[test]

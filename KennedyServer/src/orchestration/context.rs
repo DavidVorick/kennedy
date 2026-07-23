@@ -1,15 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context as _;
+use kcode_kweb_db::NodeId;
 use serde_json::{Value, json};
 
 use super::Api;
 
-pub(crate) const MAX_DIRECTLY_LOADED_NODES: usize = 10;
-
 struct LoadReceipt {
-    requested_identifier: u64,
-    active_identifiers: Vec<u64>,
+    requested_identifier: String,
+    active_identifiers: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -20,18 +19,15 @@ pub(crate) struct KmapContext {
     pub full_node_ids: HashSet<String>,
     pub nodes_by_id: HashMap<String, Value>,
     node_origins: HashMap<String, HashSet<String>>,
-    short_to_durable: HashMap<u64, String>,
-    durable_to_short: HashMap<String, u64>,
-    next_short_id: u64,
 }
 
 impl KmapContext {
     pub(crate) fn new(api: Api, root_node_ids: Vec<String>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !root_node_ids.is_empty()
-                && root_node_ids.iter().all(|id| !id.is_empty())
+                && root_node_ids.iter().all(|id| id.parse::<NodeId>().is_ok())
                 && root_node_ids.iter().collect::<HashSet<_>>().len() == root_node_ids.len(),
-            "Kmap root node identifiers must be distinct non-empty strings"
+            "Kmap root node identifiers must be distinct canonical node IDs"
         );
         Ok(Self {
             api,
@@ -40,22 +36,18 @@ impl KmapContext {
             full_node_ids: HashSet::new(),
             nodes_by_id: HashMap::new(),
             node_origins: HashMap::new(),
-            short_to_durable: HashMap::new(),
-            durable_to_short: HashMap::new(),
-            next_short_id: 1,
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn initialize(&mut self) -> anyhow::Result<()> {
-        self.clear(false);
+        self.clear();
         self.ensure_roots_loaded().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn ensure_roots_loaded(&mut self) -> anyhow::Result<()> {
         let roots = self.root_node_ids.clone();
-        for id in &roots {
-            self.short_id(id);
-        }
         let missing = roots
             .into_iter()
             .filter(|id| !self.loaded_node_ids.contains(id))
@@ -66,50 +58,19 @@ impl KmapContext {
         Ok(())
     }
 
-    fn clear(&mut self, preserve_identifiers: bool) {
+    #[cfg(test)]
+    fn clear(&mut self) {
         self.loaded_node_ids.clear();
         self.full_node_ids.clear();
         self.nodes_by_id.clear();
         self.node_origins.clear();
-        if !preserve_identifiers {
-            self.short_to_durable.clear();
-            self.durable_to_short.clear();
-            self.next_short_id = 1;
-        }
     }
 
-    pub(crate) fn short_id(&mut self, durable_id: &str) -> u64 {
-        if let Some(identifier) = self.durable_to_short.get(durable_id) {
-            return *identifier;
-        }
-        let identifier = self.next_short_id;
-        self.next_short_id += 1;
-        self.short_to_durable
-            .insert(identifier, durable_id.to_owned());
-        self.durable_to_short
-            .insert(durable_id.to_owned(), identifier);
-        identifier
-    }
-
-    pub(crate) fn register_reference(&mut self, durable_id: &str) -> anyhow::Result<u64> {
-        anyhow::ensure!(!durable_id.is_empty(), "a referenced Kmap node ID is empty");
-        Ok(self.short_id(durable_id))
-    }
-
-    pub(crate) fn resolve(&self, identifier: u64) -> anyhow::Result<String> {
-        self.short_to_durable
-            .get(&identifier)
-            .cloned()
-            .with_context(|| format!("Unknown memory identifier {identifier}."))
-    }
-
-    pub(crate) fn full_durable(&self, identifier: u64) -> anyhow::Result<String> {
-        let id = self.resolve(identifier)?;
-        anyhow::ensure!(
-            self.full_node_ids.contains(&id),
-            "Identifier {identifier} is only a connection summary; load it before using this tool."
-        );
-        Ok(id)
+    pub(crate) fn register_reference(&mut self, durable_id: &str) -> anyhow::Result<String> {
+        durable_id
+            .parse::<NodeId>()
+            .with_context(|| format!("invalid canonical Kmap node ID {durable_id:?}"))?;
+        Ok(durable_id.to_owned())
     }
 
     pub(crate) async fn load_durable(&mut self, durable_id: &str) -> anyhow::Result<Value> {
@@ -135,14 +96,6 @@ impl KmapContext {
     }
 
     async fn load_durable_one(&mut self, durable_id: &str) -> anyhow::Result<LoadReceipt> {
-        anyhow::ensure!(
-            !self.loaded_node_ids.iter().any(|id| id == durable_id),
-            "That node is already directly loaded."
-        );
-        anyhow::ensure!(
-            self.loaded_node_ids.len() < MAX_DIRECTLY_LOADED_NODES,
-            "Ten nodes are already directly loaded. Reset the context to continue."
-        );
         let previously_full = self.full_node_ids.clone();
         let payload = self.api.kmap_context(durable_id).await?;
         let requested = payload
@@ -159,43 +112,21 @@ impl KmapContext {
         for node in &active {
             self.ingest_node(node.clone(), true, "active")?;
         }
-        self.loaded_node_ids.push(durable_id.to_owned());
-        let requested_identifier = self.short_id(&requested_id);
+        if !self.loaded_node_ids.iter().any(|id| id == durable_id) {
+            self.loaded_node_ids.push(durable_id.to_owned());
+        }
+        let requested_identifier = requested_id;
         let mut active_identifiers = Vec::new();
         for node in &active {
             let id = string_field(node, "id")?;
             if !previously_full.contains(id) {
-                active_identifiers.push(self.short_id(id));
+                active_identifiers.push(id.to_owned());
             }
         }
         Ok(LoadReceipt {
             requested_identifier,
             active_identifiers,
         })
-    }
-
-    pub(crate) async fn reset(&mut self, durable_ids: &[String]) -> anyhow::Result<Value> {
-        anyhow::ensure!(
-            durable_ids
-                .iter()
-                .all(|id| !self.root_node_ids.contains(id)),
-            "Root nodes are loaded automatically and must not be listed."
-        );
-        anyhow::ensure!(
-            durable_ids.iter().collect::<HashSet<_>>().len() == durable_ids.len(),
-            "Reset identifiers must be distinct."
-        );
-        anyhow::ensure!(
-            durable_ids.len() + self.root_node_ids.len() <= MAX_DIRECTLY_LOADED_NODES,
-            "Reset would exceed the ten directly loaded node limit."
-        );
-        self.clear(true);
-        let mut loads = self.root_node_ids.clone();
-        for id in &loads {
-            self.short_id(id);
-        }
-        loads.extend_from_slice(durable_ids);
-        self.load_durable_batch(&loads).await
     }
 
     pub(crate) fn refresh(&mut self, nodes: Vec<Value>) -> anyhow::Result<()> {
@@ -205,16 +136,11 @@ impl KmapContext {
         Ok(())
     }
 
-    pub(crate) fn snapshot(&mut self) -> anyhow::Result<Value> {
+    pub(crate) fn snapshot(&self) -> anyhow::Result<Value> {
         let roots = self.root_node_ids.clone();
         let loaded = self.loaded_node_ids.clone();
         let mut full = self.full_node_ids.iter().cloned().collect::<Vec<_>>();
-        full.sort_by_key(|id| self.durable_to_short.get(id).copied().unwrap_or(u64::MAX));
-        let root_identifiers = roots.iter().map(|id| self.short_id(id)).collect::<Vec<_>>();
-        let directly_loaded_identifiers = loaded
-            .iter()
-            .map(|id| self.short_id(id))
-            .collect::<Vec<_>>();
+        full.sort();
         let mut nodes = Vec::new();
         for id in full {
             let node = self
@@ -232,104 +158,26 @@ impl KmapContext {
             nodes.push(projected);
         }
         Ok(json!({
-            "rootIdentifiers": root_identifiers,
-            "directlyLoadedIdentifiers": directly_loaded_identifiers,
+            "rootIdentifiers": roots,
+            "directlyLoadedIdentifiers": loaded,
             "nodes": nodes,
         }))
     }
 
-    pub(crate) fn archive(&self) -> Value {
-        let mut mappings = self
-            .short_to_durable
-            .iter()
-            .map(|(short, durable)| json!([short, durable]))
-            .collect::<Vec<_>>();
-        mappings.sort_by_key(|entry| entry[0].as_u64().unwrap_or_default());
-        json!({
-            "loadedNodeIds": self.loaded_node_ids,
-            "fullNodeIds": self.full_node_ids,
-            "nodesById": self.nodes_by_id.iter().map(|(id, node)| json!([id, node])).collect::<Vec<_>>(),
-            "nodeOrigins": self.node_origins.iter().map(|(id, origins)| json!([id, origins])).collect::<Vec<_>>(),
-            "shortToDurable": mappings,
-            "nextShortId": self.next_short_id,
-        })
-    }
-
-    pub(crate) fn diagnostics(&self) -> Value {
-        json!({
-            "loadedNodeIds": self.loaded_node_ids,
-            "fullNodeIds": self.full_node_ids,
-            "nodeOrigins": self.node_origins,
-            "shortToDurable": self.short_to_durable,
-            "nextShortId": self.next_short_id,
-        })
-    }
-
-    pub(crate) fn restore(&mut self, archive: &Value) -> anyhow::Result<()> {
-        let loaded = string_array(archive.get("loadedNodeIds"))?;
-        anyhow::ensure!(
-            loaded.len() <= MAX_DIRECTLY_LOADED_NODES
-                && loaded.iter().collect::<HashSet<_>>().len() == loaded.len(),
-            "The saved Kmap context exceeds the directly loaded node limit or contains duplicates."
-        );
-        self.loaded_node_ids = loaded;
-        self.full_node_ids = string_array(archive.get("fullNodeIds"))?
-            .into_iter()
-            .collect();
-        self.nodes_by_id = pairs(archive.get("nodesById"))?.into_iter().collect();
-        self.node_origins = pairs(archive.get("nodeOrigins"))?
-            .into_iter()
-            .map(|(key, value)| {
-                let values = string_array(Some(&value))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                (key, values)
-            })
-            .collect();
-        self.short_to_durable.clear();
-        for entry in archive
-            .get("shortToDurable")
-            .and_then(Value::as_array)
-            .context("saved Kmap context omitted shortToDurable")?
-        {
-            let pair = entry.as_array().context("invalid short ID mapping")?;
-            let short = pair
-                .first()
-                .and_then(Value::as_u64)
-                .context("invalid short ID")?;
-            let durable = pair
-                .get(1)
-                .and_then(Value::as_str)
-                .context("invalid durable ID")?;
-            self.short_to_durable.insert(short, durable.to_owned());
-        }
-        self.durable_to_short = self
-            .short_to_durable
-            .iter()
-            .map(|(short, durable)| (durable.clone(), *short))
-            .collect();
-        self.next_short_id = archive
-            .get("nextShortId")
-            .and_then(Value::as_u64)
-            .unwrap_or(self.short_to_durable.len() as u64 + 1);
-        Ok(())
-    }
-
-    pub(crate) fn context_node(&mut self, node: &Value) -> anyhow::Result<Value> {
+    pub(crate) fn context_node(&self, node: &Value) -> anyhow::Result<Value> {
         let id = string_field(node, "id")?;
         let owner = node
             .get("owner_root_node_id")
             .and_then(Value::as_str)
-            .map(|owner| self.short_id(owner));
+            .map(str::to_owned);
         Ok(json!({
-            "identifier": self.short_id(id),
+            "identifier": id,
             "shortName": node.get("short_name").and_then(Value::as_str).unwrap_or(""),
             "shortDescription": node.get("short_description").and_then(Value::as_str).unwrap_or(""),
             "longDescription": node.get("long_description").and_then(Value::as_str).unwrap_or(""),
             "lastModifiedBy": node.get("last_modified_by").and_then(Value::as_str).unwrap_or("legacy-unknown"),
             "lastModifiedAt": node.get("last_modified_at").cloned().unwrap_or(Value::Null),
-            "ownerIdentifier": owner.map(Value::from).unwrap_or_else(|| Value::String("unowned".into())),
+            "ownerIdentifier": owner.unwrap_or_else(|| "unowned".into()),
             "fixedConnections": self.connection_summaries(node.get("fixed_connections"), true),
             "activeConnections": self.connection_summaries(node.get("active_connections"), false),
             "fanoutConnections": self.connection_summaries(node.get("fanout_connections"), false),
@@ -345,26 +193,7 @@ impl KmapContext {
 
     fn ingest_node(&mut self, node: Value, full: bool, origin: &str) -> anyhow::Result<()> {
         let id = string_field(&node, "id")?.to_owned();
-        self.short_id(&id);
-        if let Some(owner) = node.get("owner_root_node_id").and_then(Value::as_str) {
-            self.short_id(owner);
-        }
-        for field in [
-            "fixed_connections",
-            "active_connections",
-            "fanout_connections",
-        ] {
-            for connection in node
-                .get(field)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(id) = connection.get("id").and_then(Value::as_str) {
-                    self.short_id(id);
-                }
-            }
-        }
+        self.register_reference(&id)?;
         if full {
             self.nodes_by_id.insert(id.clone(), node);
             self.full_node_ids.insert(id.clone());
@@ -378,7 +207,7 @@ impl KmapContext {
         Ok(())
     }
 
-    fn connection_summaries(&mut self, value: Option<&Value>, fixed: bool) -> Vec<Value> {
+    fn connection_summaries(&self, value: Option<&Value>, fixed: bool) -> Vec<Value> {
         value
             .and_then(Value::as_array)
             .into_iter()
@@ -398,9 +227,8 @@ impl KmapContext {
                     .and_then(|node| node.get("short_description"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let identifier = self.short_id(id);
                 let mut value = json!({
-                    "identifier": identifier,
+                    "identifier": id,
                     "shortName": connection.get("short_name").and_then(Value::as_str)
                         .or(full_name.as_deref())
                         .unwrap_or("Unloaded node"),
@@ -422,16 +250,18 @@ impl KmapContext {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn format_kmap_context(snapshot: &Value) -> String {
     format_projected_kmap_context(snapshot, &project_snapshot(snapshot))
 }
 
+#[cfg(test)]
 pub(crate) fn format_projected_kmap_context(snapshot: &Value, projection: &Value) -> String {
-    let roots = number_list(snapshot.get("rootIdentifiers"));
-    let loaded = number_list(snapshot.get("directlyLoadedIdentifiers"));
+    let roots = identifier_list(snapshot.get("rootIdentifiers"));
+    let loaded = identifier_list(snapshot.get("directlyLoadedIdentifiers"));
     let nodes = format_compact_memory_sections(projection);
     format!(
-        "Current Kmap context\n\nAlways-loaded root identifiers: {roots}\nDirectly loaded node limit: 10\nDirectly loaded memory identifiers: {loaded}\n\n{}",
+        "Current Kmap context\n\nAlways-loaded root identifiers: {roots}\nDirectly loaded memory identifiers: {loaded}\n\n{}",
         if nodes.is_empty() {
             "No memory nodes are currently loaded.".to_owned()
         } else {
@@ -443,8 +273,8 @@ pub(crate) fn format_projected_kmap_context(snapshot: &Value, projection: &Value
 pub(crate) fn project_load_batch(
     before: &Value,
     after: &Value,
-    requested_identifiers: &[u64],
-    active_identifiers: &[u64],
+    requested_identifiers: &[String],
+    active_identifiers: &[String],
 ) -> Value {
     let before_projection = project_snapshot(before);
     let before_roles = projection_roles(&before_projection);
@@ -454,7 +284,7 @@ pub(crate) fn project_load_batch(
     let mut direct_node_promotions = Vec::new();
     let mut seen_direct = HashSet::new();
     for identifier in requested_identifiers {
-        if !seen_direct.insert(*identifier) {
+        if !seen_direct.insert(identifier.clone()) {
             continue;
         }
         let previous_role = before_roles.get(identifier).copied().unwrap_or_default();
@@ -463,19 +293,19 @@ pub(crate) fn project_load_batch(
         {
             direct_nodes.push((*node).clone());
         } else if previous_role == 3 {
-            direct_node_promotions.push(*identifier);
+            direct_node_promotions.push(identifier.clone());
         }
     }
 
     let direct_identifiers = requested_identifiers
         .iter()
-        .copied()
+        .cloned()
         .collect::<HashSet<_>>();
     let mut active_nodes = Vec::new();
     let mut seen_active = HashSet::new();
     for identifier in active_identifiers {
         if !direct_identifiers.contains(identifier)
-            && seen_active.insert(*identifier)
+            && seen_active.insert(identifier.clone())
             && before_roles.get(identifier).copied().unwrap_or_default() < 3
             && let Some(node) = after_nodes.get(identifier)
         {
@@ -490,14 +320,14 @@ pub(crate) fn project_load_batch(
         .collect::<Vec<_>>();
     let batch_active = active_identifiers
         .iter()
-        .filter(|identifier| !direct_identifiers.contains(identifier))
+        .filter(|identifier| !direct_identifiers.contains(identifier.as_str()))
         .filter_map(|identifier| after_nodes.get(identifier).copied())
         .collect::<Vec<_>>();
     let direct_fanout_candidates =
         unique_connections(&batch_direct, "fanoutConnections", &full_identifiers);
     let direct_fanout_identifiers = direct_fanout_candidates
         .iter()
-        .filter_map(node_identifier)
+        .filter_map(|node| node_identifier(node).map(str::to_owned))
         .collect::<HashSet<_>>();
     let mut indirect_excluded = full_identifiers;
     indirect_excluded.extend(direct_fanout_identifiers);
@@ -507,7 +337,7 @@ pub(crate) fn project_load_batch(
         .into_iter()
         .filter(|node| {
             node_identifier(node).is_some_and(|identifier| {
-                before_roles.get(&identifier).copied().unwrap_or_default() < 2
+                before_roles.get(identifier).copied().unwrap_or_default() < 2
             })
         })
         .collect::<Vec<_>>();
@@ -515,7 +345,7 @@ pub(crate) fn project_load_batch(
         .into_iter()
         .filter(|node| {
             node_identifier(node).is_some_and(|identifier| {
-                before_roles.get(&identifier).copied().unwrap_or_default() < 1
+                before_roles.get(identifier).copied().unwrap_or_default() < 1
             })
         })
         .collect::<Vec<_>>();
@@ -529,6 +359,7 @@ pub(crate) fn project_load_batch(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn format_compact_memory_sections(projection: &Value) -> String {
     let direct_nodes = array(projection.get("directNodes"));
     let direct_promotions = projection
@@ -536,8 +367,8 @@ pub(crate) fn format_compact_memory_sections(projection: &Value) -> String {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(Value::as_u64)
-        .map(|identifier| identifier.to_string())
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     let active_nodes = array(projection.get("activeConnectionNodes"));
     let direct_fanout = array(projection.get("directFanoutNodes"));
@@ -577,8 +408,8 @@ pub(crate) fn format_compact_memory_sections(projection: &Value) -> String {
                 .map(|node| format!(
                     "{}: {}\n  Summary: {}",
                     node.get("identifier")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default(),
+                        .and_then(Value::as_str)
+                        .unwrap_or("invalid"),
                     text(node.get("shortName"), "(none)"),
                     text(node.get("shortDescription"), "(none)")
                 ))
@@ -594,8 +425,8 @@ pub(crate) fn format_compact_memory_sections(projection: &Value) -> String {
                 .map(|node| format!(
                     "{}: {}",
                     node.get("identifier")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default(),
+                        .and_then(Value::as_str)
+                        .unwrap_or("invalid"),
                     text(node.get("shortName"), "(none)")
                 ))
                 .collect::<Vec<_>>()
@@ -611,7 +442,8 @@ fn project_snapshot(snapshot: &Value) -> Value {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(Value::as_u64)
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
         .collect::<HashSet<_>>();
     let node_map = nodes_by_identifier(snapshot);
     let mut direct_nodes = Vec::new();
@@ -620,24 +452,26 @@ fn project_snapshot(snapshot: &Value) -> Value {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(Value::as_u64)
+        .filter_map(Value::as_str)
     {
-        if let Some(node) = node_map.get(&identifier) {
+        if let Some(node) = node_map.get(identifier) {
             direct_nodes.push((*node).clone());
         }
     }
     let active_nodes = array(snapshot.get("nodes"))
         .iter()
-        .filter(|node| {
-            node_identifier(node).is_some_and(|identifier| !direct.contains(&identifier))
-        })
+        .filter(|node| node_identifier(node).is_some_and(|identifier| !direct.contains(identifier)))
         .cloned()
         .collect::<Vec<_>>();
     let full = full_identifiers(snapshot);
     let direct_refs = direct_nodes.iter().collect::<Vec<_>>();
     let direct_fanout_nodes = unique_connections(&direct_refs, "fanoutConnections", &full);
     let mut indirect_excluded = full;
-    indirect_excluded.extend(direct_fanout_nodes.iter().filter_map(node_identifier));
+    indirect_excluded.extend(
+        direct_fanout_nodes
+            .iter()
+            .filter_map(|node| node_identifier(node).map(str::to_owned)),
+    );
     let active_refs = active_nodes.iter().collect::<Vec<_>>();
     let indirect_fanout_nodes =
         unique_connections(&active_refs, "fanoutConnections", &indirect_excluded);
@@ -650,21 +484,21 @@ fn project_snapshot(snapshot: &Value) -> Value {
     })
 }
 
-fn nodes_by_identifier(snapshot: &Value) -> HashMap<u64, &Value> {
+fn nodes_by_identifier(snapshot: &Value) -> HashMap<String, &Value> {
     array(snapshot.get("nodes"))
         .iter()
-        .filter_map(|node| Some((node_identifier(node)?, node)))
+        .filter_map(|node| Some((node_identifier(node)?.to_owned(), node)))
         .collect()
 }
 
-fn full_identifiers(snapshot: &Value) -> HashSet<u64> {
+fn full_identifiers(snapshot: &Value) -> HashSet<String> {
     array(snapshot.get("nodes"))
         .iter()
-        .filter_map(node_identifier)
+        .filter_map(|node| node_identifier(node).map(str::to_owned))
         .collect()
 }
 
-fn projection_roles(projection: &Value) -> HashMap<u64, u8> {
+fn projection_roles(projection: &Value) -> HashMap<String, u8> {
     let mut roles = HashMap::new();
     for (key, role) in [
         ("indirectFanoutNodes", 1),
@@ -674,14 +508,14 @@ fn projection_roles(projection: &Value) -> HashMap<u64, u8> {
     ] {
         for node in array(projection.get(key)) {
             if let Some(identifier) = node_identifier(node) {
-                roles.insert(identifier, role);
+                roles.insert(identifier.to_owned(), role);
             }
         }
     }
     roles
 }
 
-fn unique_connections(nodes: &[&Value], field: &str, excluded: &HashSet<u64>) -> Vec<Value> {
+fn unique_connections(nodes: &[&Value], field: &str, excluded: &HashSet<String>) -> Vec<Value> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for node in nodes {
@@ -689,7 +523,7 @@ fn unique_connections(nodes: &[&Value], field: &str, excluded: &HashSet<u64>) ->
             let Some(identifier) = node_identifier(connection) else {
                 continue;
             };
-            if !excluded.contains(&identifier) && seen.insert(identifier) {
+            if !excluded.contains(identifier) && seen.insert(identifier.to_owned()) {
                 result.push(connection.clone());
             }
         }
@@ -697,8 +531,8 @@ fn unique_connections(nodes: &[&Value], field: &str, excluded: &HashSet<u64>) ->
     result
 }
 
-fn node_identifier(node: &Value) -> Option<u64> {
-    node.get("identifier").and_then(Value::as_u64)
+fn node_identifier(node: &Value) -> Option<&str> {
+    node.get("identifier").and_then(Value::as_str)
 }
 
 fn array(value: Option<&Value>) -> &[Value] {
@@ -711,14 +545,15 @@ fn array(value: Option<&Value>) -> &[Value] {
 pub(crate) fn format_context_node(node: &Value, include_summary: bool) -> String {
     let owner = node
         .get("ownerIdentifier")
-        .and_then(Value::as_u64)
+        .and_then(Value::as_str)
+        .filter(|value| *value != "unowned")
         .map(|value| format!("Node {value}"))
         .unwrap_or_else(|| "unowned".into());
     let mut lines = vec![format!(
         "Node {}: {}",
         node.get("identifier")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
+            .and_then(Value::as_str)
+            .unwrap_or("invalid"),
         text(node.get("shortName"), "(none)")
     )];
     if include_summary {
@@ -789,51 +624,14 @@ fn string_field<'a>(value: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .with_context(|| format!("Kmap node is missing {key}"))
 }
 
-fn string_array(value: Option<&Value>) -> anyhow::Result<Vec<String>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    value
-        .as_array()
-        .context("expected an array")?
-        .iter()
-        .map(|entry| {
-            entry
-                .as_str()
-                .map(str::to_owned)
-                .context("expected string ID")
-        })
-        .collect()
-}
-
-fn pairs(value: Option<&Value>) -> anyhow::Result<Vec<(String, Value)>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    value
-        .as_array()
-        .context("expected saved key/value pairs")?
-        .iter()
-        .map(|entry| {
-            let pair = entry.as_array().context("invalid saved key/value pair")?;
-            Ok((
-                pair.first()
-                    .and_then(Value::as_str)
-                    .context("invalid saved key")?
-                    .to_owned(),
-                pair.get(1).cloned().context("missing saved value")?,
-            ))
-        })
-        .collect()
-}
-
-fn number_list(value: Option<&Value>) -> String {
+#[cfg(test)]
+fn identifier_list(value: Option<&Value>) -> String {
     let values = value
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(Value::as_u64)
-        .map(|value| value.to_string())
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     if values.is_empty() {
         "none".into()
@@ -848,7 +646,7 @@ fn connection_ids(value: Option<&Value>, fixed: bool) -> String {
         .into_iter()
         .flatten()
         .filter_map(|connection| {
-            let identifier = connection.get("identifier").and_then(Value::as_u64)?;
+            let identifier = connection.get("identifier").and_then(Value::as_str)?;
             Some(if fixed {
                 format!(
                     "slot {}: {identifier}",
@@ -858,7 +656,7 @@ fn connection_ids(value: Option<&Value>, fixed: bool) -> String {
                         .unwrap_or_default()
                 )
             } else {
-                identifier.to_string()
+                identifier.to_owned()
             })
         })
         .collect::<Vec<_>>();
@@ -900,9 +698,44 @@ mod tests {
         text.match_indices(needle).count()
     }
 
+    fn nid(value: u8) -> String {
+        NodeId::from_bytes([0, 0, 0, 0, 0, value])
+            .unwrap()
+            .to_string()
+    }
+
+    fn canonical_ids(mut value: Value) -> Value {
+        fn visit(value: &mut Value, key: Option<&str>) {
+            match value {
+                Value::Number(number) if matches!(key, Some("identifier" | "ownerIdentifier")) => {
+                    *value = json!(nid(number.as_u64().unwrap() as u8));
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        if matches!(key, Some("rootIdentifiers" | "directlyLoadedIdentifiers"))
+                            && value.is_number()
+                        {
+                            *value = json!(nid(value.as_u64().unwrap() as u8));
+                        } else {
+                            visit(value, key);
+                        }
+                    }
+                }
+                Value::Object(values) => {
+                    for (key, value) in values {
+                        visit(value, Some(key));
+                    }
+                }
+                _ => {}
+            }
+        }
+        visit(&mut value, None);
+        value
+    }
+
     #[test]
     fn compact_context_keeps_root_and_connection_identifiers() {
-        let rendered = format_kmap_context(&json!({
+        let rendered = format_kmap_context(&canonical_ids(json!({
             "rootIdentifiers": [1, 2],
             "directlyLoadedIdentifiers": [1],
             "nodes": [{
@@ -915,14 +748,14 @@ mod tests {
                 "fixedConnections": [],
                 "fanoutConnections": [],
             }],
-        }));
-        assert!(rendered.contains("Always-loaded root identifiers: 1, 2"));
-        assert!(rendered.contains("Active connection identifiers: 3"));
+        })));
+        assert!(rendered.contains("Always-loaded root identifiers: AAAAAAAB, AAAAAAAC"));
+        assert!(rendered.contains("Active connection identifiers: AAAAAAAD"));
     }
 
     #[test]
     fn complete_context_is_classified_globally_before_rendering() {
-        let rendered = format_kmap_context(&json!({
+        let rendered = format_kmap_context(&canonical_ids(json!({
             "rootIdentifiers": [1],
             "directlyLoadedIdentifiers": [1, 3],
             "nodes": [
@@ -964,7 +797,7 @@ mod tests {
                     "fanoutConnections": [{"identifier": 6, "shortName": "Direct Fanout Six", "shortDescription": "Six summary"}]
                 }
             ]
-        }));
+        })));
 
         let direct_heading = position(&rendered, "Directly loaded nodes");
         let active_heading = position(&rendered, "Full active-connection nodes");
@@ -977,16 +810,18 @@ mod tests {
         assert!(active_heading < direct_fanout_heading);
         assert!(direct_fanout_heading < indirect_heading);
         assert!(
-            position(&rendered, "Node 1: Direct One") < position(&rendered, "Node 3: Direct Three")
+            position(&rendered, "Node AAAAAAAB: Direct One")
+                < position(&rendered, "Node AAAAAAAD: Direct Three")
         );
         assert!(
-            position(&rendered, "Node 3: Direct Three") < position(&rendered, "Node 2: Active Two")
+            position(&rendered, "Node AAAAAAAD: Direct Three")
+                < position(&rendered, "Node AAAAAAAC: Active Two")
         );
-        assert_eq!(occurrences(&rendered, "2: Active Two"), 1);
-        assert_eq!(occurrences(&rendered, "3: Direct Three"), 1);
-        assert_eq!(occurrences(&rendered, "4: Direct Fanout Four"), 1);
-        assert!(rendered.contains("6: Direct Fanout Six\n  Summary: Six summary"));
-        assert!(rendered.contains("5: Indirect Fanout Five"));
+        assert_eq!(occurrences(&rendered, "AAAAAAAC: Active Two"), 1);
+        assert_eq!(occurrences(&rendered, "AAAAAAAD: Direct Three"), 1);
+        assert_eq!(occurrences(&rendered, "AAAAAAAE: Direct Fanout Four"), 1);
+        assert!(rendered.contains("AAAAAAAG: Direct Fanout Six\n  Summary: Six summary"));
+        assert!(rendered.contains("AAAAAAAF: Indirect Fanout Five"));
         assert!(!rendered.contains("ACTIVE SUMMARY MUST BE OMITTED"));
         assert!(!rendered.contains("INDIRECT SUMMARY MUST BE OMITTED"));
         assert!(!rendered.contains('{'));
@@ -994,7 +829,7 @@ mod tests {
 
     #[test]
     fn load_batch_upgrades_then_renders_each_final_role_once() {
-        let before = json!({
+        let before = canonical_ids(json!({
             "directlyLoadedIdentifiers": [1],
             "nodes": [
                 {
@@ -1008,8 +843,8 @@ mod tests {
                     "fanoutConnections": [{"identifier": 6, "shortName": "Previously Indirect", "shortDescription": "Previously hidden summary"}]
                 }
             ]
-        });
-        let after = json!({
+        }));
+        let after = canonical_ids(json!({
             "directlyLoadedIdentifiers": [1, 3, 2],
             "nodes": [
                 {
@@ -1039,97 +874,114 @@ mod tests {
                     ]
                 }
             ]
-        });
+        }));
 
-        let projection = project_load_batch(&before, &after, &[3, 2], &[2, 4, 3]);
+        let projection = project_load_batch(
+            &before,
+            &after,
+            &[nid(3), nid(2)],
+            &[nid(2), nid(4), nid(3)],
+        );
         let rendered = format_compact_memory_sections(&projection);
         assert_eq!(
             array(projection.get("directNodes"))
                 .iter()
                 .filter_map(node_identifier)
+                .map(str::to_owned)
                 .collect::<Vec<_>>(),
-            vec![3]
+            vec![nid(3)]
         );
-        assert_eq!(projection.get("directNodePromotions"), Some(&json!([2])));
+        assert_eq!(
+            projection.get("directNodePromotions"),
+            Some(&json!([nid(2)]))
+        );
         assert_eq!(
             array(projection.get("activeConnectionNodes"))
                 .iter()
                 .filter_map(node_identifier)
+                .map(str::to_owned)
                 .collect::<Vec<_>>(),
-            vec![4]
+            vec![nid(4)]
         );
         assert_eq!(
             array(projection.get("directFanoutNodes"))
                 .iter()
                 .filter_map(node_identifier)
+                .map(str::to_owned)
                 .collect::<Vec<_>>(),
-            vec![6, 8]
+            vec![nid(6), nid(8)]
         );
         assert_eq!(
             array(projection.get("indirectFanoutNodes"))
                 .iter()
                 .filter_map(node_identifier)
+                .map(str::to_owned)
                 .collect::<Vec<_>>(),
-            vec![9]
+            vec![nid(9)]
         );
         assert!(
-            position(&rendered, "Node 3: New Direct")
+            position(&rendered, "Node AAAAAAAD: New Direct")
                 < position(
                     &rendered,
-                    "Now directly loaded; full text already present: 2"
+                    "Now directly loaded; full text already present: AAAAAAAC"
                 )
         );
         assert!(
             position(
                 &rendered,
-                "Now directly loaded; full text already present: 2"
-            ) < position(&rendered, "Node 4: New Active")
+                "Now directly loaded; full text already present: AAAAAAAC"
+            ) < position(&rendered, "Node AAAAAAAE: New Active")
         );
         assert!(
-            position(&rendered, "Node 4: New Active")
-                < position(&rendered, "6: Previously Indirect")
+            position(&rendered, "Node AAAAAAAE: New Active")
+                < position(&rendered, "AAAAAAAG: Previously Indirect")
         );
         assert!(
-            position(&rendered, "6: Previously Indirect") < position(&rendered, "9: New Indirect")
+            position(&rendered, "AAAAAAAG: Previously Indirect")
+                < position(&rendered, "AAAAAAAJ: New Indirect")
         );
-        assert_eq!(occurrences(&rendered, "8: New Direct Fanout"), 1);
-        assert!(!rendered.contains("Node 2: Previously Active"));
+        assert_eq!(occurrences(&rendered, "AAAAAAAI: New Direct Fanout"), 1);
+        assert!(!rendered.contains("Node AAAAAAAC: Previously Active"));
         assert!(!rendered.contains("Previously active details"));
         assert!(!rendered.contains("Known Direct Fanout"));
         assert!(!rendered.contains("Nine summary omitted"));
     }
 
     #[tokio::test]
-    async fn reset_is_a_single_load_batch_for_roots_and_retained_nodes() {
+    async fn repeated_loads_refresh_nodes_without_reset_context() {
+        let root_id = nid(1);
+        let node_a_id = nid(2);
+        let node_c_id = nid(3);
+        let node_d_id = nid(4);
         let app = Router::new().route(
             "/api/v1/kmap/nodes/{id}",
             get(|Path(id): Path<String>| async move {
                 let (name, fixed, recent, summaries) = match id.as_str() {
-                    "root" => (
+                    "AAAAAAAB" => (
                         "Root",
-                        vec!["a", "c"],
+                        vec!["AAAAAAAC", "AAAAAAAD"],
                         Vec::new(),
                         vec![
-                            json!({"id":"a","short_name":"Node A","short_description":"A summary"}),
-                            json!({"id":"c","short_name":"Node C","short_description":"C summary"}),
+                            json!({"id":"AAAAAAAC","short_name":"Node A","short_description":"A summary"}),
+                            json!({"id":"AAAAAAAD","short_name":"Node C","short_description":"C summary"}),
                         ],
                     ),
-                    "a" => (
+                    "AAAAAAAC" => (
                         "Node A",
                         Vec::new(),
-                        vec!["c", "d"],
+                        vec!["AAAAAAAD", "AAAAAAAE"],
                         vec![
-                            json!({"id":"c","short_name":"Node C","short_description":"C summary"}),
-                            json!({"id":"d","short_name":"Node D","short_description":"D summary"}),
+                            json!({"id":"AAAAAAAD","short_name":"Node C","short_description":"C summary"}),
+                            json!({"id":"AAAAAAAE","short_name":"Node D","short_description":"D summary"}),
                         ],
                     ),
-                    "c" => ("Node C", Vec::new(), Vec::new(), Vec::new()),
-                    "d" => ("Node D", Vec::new(), Vec::new(), Vec::new()),
+                    "AAAAAAAD" => ("Node C", Vec::new(), Vec::new(), Vec::new()),
+                    "AAAAAAAE" => ("Node D", Vec::new(), Vec::new(), Vec::new()),
                     _ => ("Unknown", Vec::new(), Vec::new(), Vec::new()),
                 };
                 Json(json!({
                     "id":id,
-                    "owner_node_id":"root",
+                    "owner_node_id":"AAAAAAAB",
                     "short_name":name,
                     "short_description":format!("{name} summary"),
                     "long_description":format!("{name} details"),
@@ -1154,34 +1006,43 @@ mod tests {
             telegram_web_user_handle: "@test".into(),
         };
         let api = Api::new(&config).unwrap();
-        let mut context = KmapContext::new(api, vec!["root".into()]).unwrap();
+        let mut context = KmapContext::new(api, vec![root_id.clone()]).unwrap();
         context.initialize().await.unwrap();
 
-        let projection = context.reset(&["a".into()]).await.unwrap();
+        let projection = context.load_durable(&node_a_id).await.unwrap();
         assert_eq!(
             array(projection.get("directNodes"))
                 .iter()
                 .filter_map(node_identifier)
+                .map(str::to_owned)
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![node_a_id.clone()]
         );
         assert_eq!(
             array(projection.get("activeConnectionNodes"))
                 .iter()
                 .filter_map(node_identifier)
+                .map(str::to_owned)
                 .collect::<Vec<_>>(),
-            vec![3, 4]
+            vec![node_c_id.clone(), node_d_id.clone()]
         );
         assert!(projection.get("loads").is_none());
         assert!(projection.get("context").is_none());
 
         let snapshot = context.snapshot().unwrap();
-        assert_eq!(snapshot["directlyLoadedIdentifiers"], json!([1, 2]));
+        assert_eq!(
+            snapshot["directlyLoadedIdentifiers"],
+            json!([root_id, node_a_id])
+        );
         let rendered = format_projected_kmap_context(&snapshot, &projection);
-        assert!(position(&rendered, "Node 1: Root") < position(&rendered, "Node 2: Node A"));
-        assert!(position(&rendered, "Node 2: Node A") < position(&rendered, "Node 3: Node C"));
-        assert_eq!(occurrences(&rendered, "Node 2: Node A"), 1);
-        assert_eq!(occurrences(&rendered, "Node 3: Node C"), 1);
+        assert!(rendered.contains("Always-loaded root identifiers: AAAAAAAB"));
+        assert!(!rendered.contains("Node AAAAAAAB: Root"));
+        assert!(
+            position(&rendered, "Node AAAAAAAC: Node A")
+                < position(&rendered, "Node AAAAAAAD: Node C")
+        );
+        assert_eq!(occurrences(&rendered, "Node AAAAAAAC: Node A"), 1);
+        assert_eq!(occurrences(&rendered, "Node AAAAAAAD: Node C"), 1);
         server.abort();
     }
 
@@ -1208,11 +1069,11 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let snapshot = json!({
+        let snapshot = canonical_ids(json!({
             "rootIdentifiers": [1],
             "directlyLoadedIdentifiers": [1, 2, 3, 4, 5, 6, 7, 8],
             "nodes": nodes,
-        });
+        }));
         let rendered = format_kmap_context(&snapshot);
         let structured = snapshot.to_string();
         assert!(

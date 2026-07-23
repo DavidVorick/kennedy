@@ -1,5 +1,5 @@
-import { KwebAPI, IntelligenceAPI, ConversationHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260720.2";
-import { MemoryExplorer } from "./memory_explorer.js?v=20260721.1";
+import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260723.2";
+import { MemoryExplorer } from "./memory_explorer.js?v=20260723.1";
 import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260722.1";
 import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260720.2";
 
@@ -18,7 +18,7 @@ const ui = Object.fromEntries([
 const INSPECTOR_MODES = ["main", "full", "history"];
 const kweb = KwebAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
-const conversationHistory = ConversationHistoryAPI(CONFIG.conversationHistoryBase);
+const conversationHistory = SessionHistoryAPI(CONFIG.conversationHistoryBase);
 const telegramRelay = TelegramRelayAPI(CONFIG.telegramRelayBase);
 const audioIngress = AudioIngressAPI(CONFIG.audioIngressBase);
 
@@ -40,7 +40,6 @@ let audioDetailErrors = new Map();
 let retryingAudioPieces = new Set();
 let retryingAudioRecordings = new Set();
 let retryingConversationIds = new Set();
-let purgingConversationIds = new Set();
 let activeView = "conversation";
 let drafts = new Map();
 let conversationErrors = new Map();
@@ -136,6 +135,7 @@ function freshIngressState(state) {
 const EMPTY_MEMORY = { directlyLoadedIdentifiers: [], nodes: [] };
 
 function archivedDiagnostic(archive, mode, transcript = []) {
+  if (archive?.version === 1 && archive?.boxes) return boxDiagnostic(archive, mode);
   return {
     mode, provider, model,
     chatend: archive?.messages || transcript.map(item => ({ role: item.role === "kennedy" ? "assistant" : "user", content: item.content })),
@@ -150,8 +150,55 @@ function archivedDiagnostic(archive, mode, transcript = []) {
   };
 }
 
+function boxDiagnostic(source, mode) {
+  const boxes = Object.values(source?.boxes || {});
+  const messages = boxes
+    .filter(box => box?.active !== false)
+    .sort((left, right) => Number(left?.occurrenceEvents?.at(-1) || 0) - Number(right?.occurrenceEvents?.at(-1) || 0))
+    .map(box => {
+      const representation = box?.representation || {};
+      const stale = representation.kind !== "hydrated"
+        && Number(representation.based_on) !== Number(box?.canonical?.eventId);
+      let content = box?.canonical?.content?.text || "";
+      if (representation.kind === "dehydrated") content = `[Box ${box.id} is dehydrated.]`;
+      if (representation.kind === "summarized") content = representation.text || "";
+      if (stale) content = `[Stale representation]\n\n${content}`;
+      return {
+        role: box?.owner?.kind === "kennedy" ? "assistant"
+          : box?.owner?.kind === "system" ? "system" : "user",
+        display_role: `Box ${box.id} · ${box.name || "Context"}`,
+        content,
+      };
+    });
+  const context = source?.context || {};
+  const effective = Number(String(context.footer || "").match(/effective=(\d+)/)?.[1]) || 0;
+  return {
+    mode, provider, model,
+    chatend: messages,
+    chatendText: null,
+    context: {
+      boxCount: boxes.length,
+      eventCount: Array.isArray(source?.events) ? source.events.length : 0,
+      staleBoxes: context.staleBoxes || [],
+    },
+    loadCalls: 0,
+    loadLimit: 0,
+    toolLog: [],
+    usage: {
+      contextKnown: true,
+      contextTokens: context.estimatedTokens || 0,
+      contextWindowTokens: effective,
+    },
+    memory: EMPTY_MEMORY,
+    historySegments: [],
+    events: source?.events || [],
+    boxes,
+  };
+}
+
 function conversationDiagnostic(record) {
   if (!record) return null;
+  if (record.state?.boxes) return boxDiagnostic(record.state, "session Chatend");
   const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
   const archive = record.state?.archive?.format === "kennedy-chatend" ? record.state.archive : null;
   return archivedDiagnostic(archive, "saved conversation", transcript);
@@ -249,7 +296,7 @@ function audioRecordingDiagnostic() {
   const current = [...(detail?.pieces || [])].reverse()
     .map(audioPieceDiagnostic)
     .find(Boolean) || {
-      mode: "audio ingress", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 50,
+      mode: "audio ingress", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 0,
       toolLog: [], usage: null, memory: EMPTY_MEMORY, historySegments: [],
     };
   return { ...current, fullHistory: { phases } };
@@ -328,8 +375,6 @@ function update() {
     onSelect: id => selectConversation(id).catch(error => showError(ui.error_banner, error.message)),
     retryingIds: retryingConversationIds,
     onRetryIngress: retryConversationIngress,
-    purgingIds: purgingConversationIds,
-    onPurge: forcePurgeConversation,
     viewKey: `sidebar:${activeView}`,
   });
   const currentDiagnostic = diagnostic();
@@ -413,10 +458,23 @@ function upsertHistory(record) {
 
 async function hydrateHistoryRecord(recordOrId) {
   const id = typeof recordOrId === "string" ? recordOrId : recordOrId?.id;
-  if (!id) throw new Error("Conversation history record is missing an ID.");
+  if (!id) throw new Error("Session History record is missing an ID.");
   const cached = historyRecords.find(item => item.id === id);
   if (cached && !cached.summary) return cached;
-  const record = await conversationHistory.get(id);
+  let record = await conversationHistory.get(id);
+  const objectId = record?.state?.sessionObjectId;
+  if (record?.phase === "complete" && objectId) {
+    const archive = await kweb.sessionArchive(objectId);
+    record = {
+      ...record,
+      started_at: archive?.startedAt || archive?.session?.createdAt || record.started_at,
+      state: {
+        ...archive,
+        sessionType: archive?.sessionType || archive?.session?.kind || "conversation",
+        sessionObjectId: objectId,
+      },
+    };
+  }
   upsertHistory(record);
   return record;
 }
@@ -468,17 +526,7 @@ function finishComposerResize(event) {
   ui.message_resize_handle.classList.remove("resizing");
 }
 
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error("Could not archive the voice recording."));
-    reader.readAsDataURL(blob);
-  });
-}
-
-const MAX_ATTACHMENT_FILES = 5;
-const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024 * 1024;
 
 async function attachSelectedFiles() {
   const id = selectedConversationId;
@@ -486,18 +534,14 @@ async function attachSelectedFiles() {
   ui.attachment_input.value = "";
   if (!files.length || selectedRecord()?.phase !== "active" || activeView !== "conversation") return;
   const existing = attachmentDrafts.get(id) || [];
-  if (existing.length + files.length > MAX_ATTACHMENT_FILES) {
-    showError(ui.error_banner, `Attach at most ${MAX_ATTACHMENT_FILES} files to one message.`);
-    return;
-  }
   const oversized = files.find(file => !file.size || file.size > MAX_ATTACHMENT_BYTES);
   if (oversized) {
-    showError(ui.error_banner, `${oversized.name} must be between 1 byte and 20 MiB.`);
+    showError(ui.error_banner, `${oversized.name} must be between 1 byte and 32 GiB.`);
     return;
   }
   const totalBytes = [...existing, ...files].reduce((total, item) => total + (Number(item.sizeBytes ?? item.size) || 0), 0);
   if (totalBytes > MAX_ATTACHMENT_BYTES) {
-    showError(ui.error_banner, "Attachments for one message must total 20 MiB or less.");
+    showError(ui.error_banner, "Attachments for one session transaction must total 32 GiB or less.");
     return;
   }
   extractingAttachments.add(id);
@@ -508,13 +552,14 @@ async function attachSelectedFiles() {
     for (const file of files) {
       const started = performance.now();
       const result = await intelligence.extractDocument({ file, fileName: file.name });
+      const staged = await conversationHistory.stageObject(id, file, file.name);
       extracted.push({
         id: crypto.randomUUID(),
         kind: "document",
         fileName: result.file_name || file.name,
         mimeType: file.type || result.content_type || "application/octet-stream",
         sizeBytes: file.size,
-        dataUrl: await blobToDataUrl(file),
+        pendingId: staged.pendingId,
         format: result.format,
         text: result.text,
         characters: result.characters,
@@ -566,12 +611,12 @@ async function finishVoiceRecording() {
     const transcriptionStarted = performance.now();
     const result = await intelligence.transcribe({ provider, model, file: blob, fileName });
     const transcriptionDurationMs = Math.max(0, Math.round(performance.now() - transcriptionStarted));
-    const dataUrl = await blobToDataUrl(blob);
+    const staged = await conversationHistory.stageObject(id, blob, fileName);
     voiceDrafts.set(id, {
       inputKind: "voice",
       transcriptionModel: result.transcription_model,
       transcriptionDurationMs,
-      media: { id: crypto.randomUUID(), kind: "voice", mimeType, fileName, dataUrl, sizeBytes: blob.size },
+      media: { id: crypto.randomUUID(), kind: "voice", mimeType, fileName, pendingId: staged.pendingId, sizeBytes: blob.size },
     });
     ui.message_input.value = result.text;
     drafts.set(id, result.text);
@@ -623,6 +668,18 @@ async function refreshHistory() {
   const records = history.conversations || [];
   conversationCommandHeads = new Map((commands.commands || []).map(command => [command.conversationId, command]));
   reconcileHistory(records);
+  const completedSummaries = historyRecords.filter(
+    record => record.phase === "complete" && record.summary,
+  );
+  if (completedSummaries.length) {
+    const results = await Promise.allSettled(
+      completedSummaries.map(record => hydrateHistoryRecord(record)),
+    );
+    const failure = results.find(
+      result => result.status === "rejected" && result.reason?.code !== "not_found",
+    );
+    if (failure) throw failure.reason;
+  }
   const selected = historyRecords.find(record => record.id === selectedConversationId);
   if (selected?.summary) {
     try { await hydrateHistoryRecord(selected); } catch (error) {
@@ -740,88 +797,9 @@ async function retryConversationIngress(record) {
   }
 }
 
-function purgeWarning(record) {
-  const irreversible = "Its transcript and recovery checkpoints will be permanently deleted. This cannot be undone.";
-  if (record.phase === "ingress_in_progress") {
-    return `${irreversible}\n\nHistory ingress has already started. Kennedy will stop future work, but any Kmap changes already applied cannot be rolled back.`;
-  }
-  if (record.phase === "complete") {
-    return `${irreversible}\n\nHistory ingress already completed, so existing Kmap changes will not be rolled back.`;
-  }
-  return `${irreversible}\n\nThe conversation will not be sent through history ingress.`;
-}
-
-function removePurgedConversation(id) {
-  const purged = historyRecords.find(record => record.id === id);
-  historyRecords = historyRecords.filter(record => record.id !== id);
-  drafts.delete(id);
-  voiceDrafts.delete(id);
-  attachmentDrafts.delete(id);
-  extractingAttachments.delete(id);
-  conversationErrors.delete(id);
-  endingIds.delete(id);
-  retryingConversationIds.delete(id);
-  if (selectedConversationId === id) {
-    const replacement = recordsForView()[0]?.id || null;
-    selectedConversationId = replacement;
-    selectedByView[activeView] = replacement;
-    restoreDraft();
-  }
-}
-
-async function cancelConversationWork(id) {
-  await conversationHistory.stop(id).catch(() => null);
-}
-
-async function forcePurgeConversation(record) {
-  if (!record?.id || purgingConversationIds.has(record.id)) return;
-  if (!window.confirm(`Permanently purge this conversation?\n\n${purgeWarning(record)}`)) return;
-  const id = record.id;
-  purgingConversationIds.add(id);
-  update();
-  try {
-    await cancelConversationWork(id);
-
-    let deleted = false;
-    let lastError = null;
-    for (let attempt = 0; attempt < 3 && !deleted; attempt += 1) {
-      let latest;
-      try {
-        latest = await conversationHistory.get(id);
-      } catch (error) {
-        if (error.code === "not_found") {
-          deleted = true;
-          break;
-        }
-        throw error;
-      }
-      try {
-        await conversationHistory.purge(id, { expected_version: latest.version });
-        deleted = true;
-      } catch (error) {
-        if (error.code === "not_found") {
-          deleted = true;
-        } else if (error.code === "state_conflict") {
-          lastError = error;
-        } else {
-          throw error;
-        }
-      }
-    }
-    if (!deleted) throw lastError || new Error("The conversation kept changing while it was being purged.");
-    await cancelConversationWork(id);
-    removePurgedConversation(id);
-  } catch (error) {
-    showError(ui.error_banner, `Conversation could not be purged: ${error.message}`);
-  } finally {
-    purgingConversationIds.delete(id);
-    update();
-  }
-}
-
 async function createNewConversation() {
   if (creatingConversation) return;
-  if (!chatRuntimeReady()) throw new Error("A new conversation cannot start until conversation history is available.");
+  if (!chatRuntimeReady()) throw new Error("A new conversation cannot start until Session History is available.");
   creatingConversation = true;
   saveDraft();
   update();
@@ -864,7 +842,7 @@ async function startFreeTime() {
 async function startFreeTimeIntent() {
   await refreshHistory();
   if (activeFreeTimeRecord()) return null;
-  if (!freeTimeRuntimeReady()) throw new Error("Self time cannot start until conversation history is available.");
+  if (!freeTimeRuntimeReady()) throw new Error("Self time cannot start until Session History is available.");
   const durationMinutes = parseFreeTimeMinutes(ui.self_time_minutes.value || DEFAULT_FREE_TIME_MINUTES);
   const customPrompt = parseSelfTimePrompt(ui.self_time_prompt.value);
   const record = await conversationHistory.start({
@@ -1101,7 +1079,7 @@ async function initialize() {
     conversationCommandHeads = new Map((commands.commands || []).map(command => [command.conversationId, command]));
     conversationHistoryReady = true;
   } catch (error) {
-    showError(ui.error_banner, `Conversation history is unavailable: ${error.message}`);
+    showError(ui.error_banner, `Session History is unavailable: ${error.message}`);
   }
 
   try {

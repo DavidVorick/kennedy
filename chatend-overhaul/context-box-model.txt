@@ -1,0 +1,146 @@
+HISTORICAL DRAFT: terminology and limits in this file are superseded by
+chatend-overhaul-clarifications.md and chatend-discussion-review.txt.
+
+```markdown
+# Context Box Model
+
+## Purpose
+
+A context box is the stable logical container for one component of Kennedy’s context. Its canonical history is durable, while its currently visible representation may be hydrated, summarized, blanched or retired.
+
+Boxes separate three concerns:
+
+1. who controls the underlying source;
+2. what Kennedy currently sees;
+3. what the historical event log can reconstruct.
+
+## Identity
+
+The conversation has one monotonically increasing event sequence. Every event receives a unique `EventId`.
+
+A box’s `BoxId` is the `EventId` of its creation event. For example, Event 14 may create Box 14; Event 31 may later update Box 14. The box keeps ID 14 for its entire lifetime.
+
+IDs are never reused. A box may have many chronological occurrences and revisions, but they all refer to the same `BoxId`.
+
+Each box has:
+
+- a stable `BoxId`;
+- a stable name;
+- a canonical owner;
+- a creation event;
+- zero or more canonical revisions;
+- a current lifecycle state;
+- a current Kennedy-visible representation;
+- lineage linking every representation to its source event.
+
+The name and owner remain fixed. A component that changes identity is represented by retiring its old box and creating a new one.
+
+## Canonical Ownership
+
+A box’s owner controls its canonical state. Owners may include:
+
+- a user message source;
+- Kennedy;
+- a legacy tool invocation;
+- a stateful tool instance;
+- the conversation controller.
+
+The owner may create, update or retire the box. It cannot observe or react to Kennedy’s private summaries or blanks.
+
+Canonical contents may be retained inline or through an exact object reference. Every historical canonical revision must remain recoverable.
+
+Ownership of canonical contents is separate from Kennedy’s control over her active view.
+
+## Kennedy-Visible Representation
+
+For each active box, Kennedy sees one of three representations:
+
+### Hydrated
+
+The exact contents of a canonical revision are present in active context.
+
+### Overridden
+
+Kennedy has replaced the canonical contents with arbitrary Kennedy-authored text, usually a compact summary. The override records which canonical event it was based on.
+
+### Blanched
+
+Kennedy has replaced the visible contents with nothing. A compact structural marker may remain so the box’s identity and chronology are not lost.
+
+Kennedy changes one box at a time. Every override, summary, blanch and restore creates a historical event.
+
+These operations never mutate canonical contents.
+
+## Canonical Updates
+
+An owner update creates a new canonical revision while retaining the same `BoxId`.
+
+Movement and hydration are independent. If Kennedy is currently viewing a summary or blank, an owner update does not automatically reveal the new canonical contents. The visible representation remains under Kennedy’s control and is marked as based on an older revision.
+
+A box is **dirty** when its latest canonical revision is newer than the revision underlying Kennedy’s visible representation.
+
+Kennedy may explicitly restore the box, which hydrates its latest canonical revision. She may instead inspect the update and create a new summary.
+
+If a fully hydrated box updates, its new occurrence may display the new canonical revision because no Kennedy override is hiding it.
+
+## Stateful Tool Slots
+
+A stateful tool maintains an append-only sequence of box slots. The backend maps:
+
+`(tool instance, slot position) -> BoxId`
+
+The tool does not need to know global box IDs. It resubmits its current slot sequence, and the backend determines which boxes were created, updated, unchanged or retired.
+
+A slot is never removed from the sequence. It may be marked retired, but its position and historical mapping remain stable. New components append new slots.
+
+A retired slot is not reused. If equivalent content later reappears, it receives a new slot and a new `BoxId`.
+
+This supports tools such as:
+
+- Rust libraries with one slot per source file;
+- KWeb with slots for nodes and connection renderings;
+
+- stateful document or artifact viewers.
+
+## Retirement
+
+Only the canonical owner may retire its box.
+
+Retirement:
+
+- removes the box from active context;
+- overrides any Kennedy summary or blank associated with its active occurrence;
+- preserves all canonical revisions and Kennedy transformations;
+- leaves an immutable retirement event;
+- does not permit later reactivation of the same box.
+
+Historical ingress may still inspect any pre-retirement event. Reactivation in live context requires creating a new box.
+
+## Historical Representations
+
+Every event records enough lineage to reconstruct what existed and what Kennedy saw at that point.
+
+An event may contain:
+
+- a canonical creation or update;
+- a Kennedy summary or other override;
+- a blanch;
+- a restore;
+- a retirement;
+- the current representation resulting from that action.
+
+Historical ingress may hydrate an event by `EventId`. This restores the exact representation associated with that moment, including a historical Kennedy summary when the selected event is a summary event.
+
+Canonical source revisions remain separately recoverable even when Kennedy was using a derivative representation.
+
+## Invariants
+
+- Every box has exactly one stable ID and owner.
+- Every action has exactly one chronological event ID.
+- IDs and retired slots are never reused.
+- Canonical changes never depend on Kennedy’s private representation.
+- Kennedy transformations never alter canonical history.
+- Owner updates never force hidden contents to rehydrate.
+- Retirement removes live visibility but never destroys history.
+- Every visible or canonical state is reconstructible from the event log.
+```

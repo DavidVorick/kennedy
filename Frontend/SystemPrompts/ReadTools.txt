@@ -1,10 +1,26 @@
 LoadNode
-  Call: {"identifier":3}
-  Loads the identified node and all of its active-connection nodes. It consumes one request from the session's shared LoadNode and ResetContext budget, including when the request fails after argument validation. At most ten nodes may be directly loaded at once, including every always-loaded root. Loading an already directly loaded node fails.
+  Call: {"identifier":"AAECAwQF"}
+  Loads or refreshes the canonical node and its current recent-connection closure. There is no fixed direct-node count limit; the active Chatend context budget is the limit. Repeating LoadNode refreshes the existing Kweb-owned boxes instead of duplicating them. A summarized or dehydrated node box stays summarized or dehydrated after refresh and is marked stale if its canonical revision changed.
 
-ResetContext
-  Call: {"identifiers":[3,8],"selfMessage":"Ideas I need after this reset."}
-  Consumes one request from the shared context-loading budget. Clears all loaded kmap context except the session's always-loaded roots, then directly loads the listed known nodes in order. The list must contain distinct identifiers, must omit every root identifier, and must leave the total number of roots plus listed nodes at ten or fewer. selfMessage is optional; when present, it must be a non-empty string of at most 400,000 characters. It becomes an assistant-role note to yourself immediately before the rebuilt kmap context and survives later resets alongside retained session content and prior reset notes. The rebuild also includes a compact history of successful ResetContext calls. Existing short identifiers remain bound to the same nodes, including nodes omitted from the rebuilt context; newly encountered nodes receive new identifiers.
+DehydrateBox
+  Call: {"boxId":47}
+  Removes one box's substantive contents from active context while retaining its identity, lineage, revision, restoration metadata, and chronological continuation markers. This does not unload tool state or change canonical contents.
+
+SummarizeBox
+  Call: {"boxId":47,"summary":"Exact replacement text Kennedy wants to retain."}
+  Replaces one box's active representation with Kennedy-authored summary text. Canonical contents and lineage remain intact. If the owning tool later changes the canonical value, the summary remains visible and becomes stale.
+
+HydrateBox
+  Call: {"boxId":47}
+  Restores the latest canonical contents of one active box without rerunning its owner. Hydration is rejected if the projected provider context would exceed the session's applicable limit.
+
+HydrateEvent
+  Call: {"eventId":104}
+  History-ingress only. Hydrates an exact persisted source event into an ingress inspection box. The dehydrated history skeleton reports approximate hydration costs.
+
+DehydrateEvent
+  Call: {"eventId":104}
+  History-ingress only. Retires the active inspection box for a previously hydrated source event. It does not mutate source history.
 
 WebSearch
   Call: {"question":"A bounded research question.","mode":"balanced"}

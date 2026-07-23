@@ -2,4 +2,4 @@ This is an audio-ingress session. You will receive one piece of an audio transcr
 
 A normal answer does not end history ingress. Continue until every useful update has been persisted successfully, then call EndSession. Do not merely announce completion. Call EndSession only after the transcript piece has been fully reviewed and every required Kmap mutation has succeeded.
 
-LoadNode and ResetContext share a budget of 50 requests for the ingress session, including failed requests.
+Use box dehydration, summarization, and hydration to manage context. There is no ResetContext operation and no fixed LoadNode count.

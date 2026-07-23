@@ -64,6 +64,7 @@ export const KwebAPI = (base) => ({
   node: (id) => requestJSON(base, `/api/v1/kmap/nodes/${id}`),
   history: (id) => requestJSON(base, `/api/v1/kmap/nodes/${id}/history`),
   provenance: (id) => requestJSON(base, `/api/v1/kmap/provenance/${id}`),
+  sessionArchive: (id) => requestJSON(base, `/api/v1/session-history/${id}`),
 });
 
 export const IntelligenceAPI = (base) => ({
@@ -83,15 +84,19 @@ export const IntelligenceAPI = (base) => ({
   },
 });
 
-export const ConversationHistoryAPI = (base) => ({
+export const SessionHistoryAPI = (base) => ({
   health: () => requestJSON(base, "/api/v1/conversations/health"),
   list: () => requestJSON(base, "/api/v1/conversations/summaries"),
   start: (body) => requestJSON(base, "/api/v1/conversations/start", { method: "POST", body: JSON.stringify(body) }),
   commandHeads: () => requestJSON(base, "/api/v1/conversation-commands"),
   queueCommand: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/commands`, { method: "POST", body: JSON.stringify(body) }),
+  stageObject: (id, file, fileName = "object") => {
+    const form = new FormData();
+    form.append("file", file, fileName);
+    return requestFormJSON(base, `/api/v1/conversations/${id}/objects`, form);
+  },
   stop: (id) => requestJSON(base, `/api/v1/conversations/${id}/stop`, { method: "POST", body: "{}" }),
   get: (id) => requestJSON(base, `/api/v1/conversations/${id}`),
-  purge: (id, body) => requestJSON(base, `/api/v1/conversations/${id}`, { method: "DELETE", body: JSON.stringify(body) }),
   retryIngress: (id, body) => requestJSON(base, `/api/v1/conversations/${id}/retry-ingress`, { method: "POST", body: JSON.stringify(body) }),
 });
 

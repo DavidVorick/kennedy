@@ -1,0 +1,151 @@
+HISTORICAL DRAFT: terminology and limits in this file are superseded by
+chatend-overhaul-clarifications.md and chatend-discussion-review.txt.
+
+```markdown
+# History Ingress
+
+## Purpose
+
+History ingress converts a completed conversation’s exact event history into durable semantic knowledge, current state, actions, corrections and reusable learning.
+
+The controller preserves the source before ingress begins. Ingress therefore does not need to keep every source payload hydrated simultaneously or rewrite the original conversation.
+
+History ingress is an intelligent, iterative process. The controller supplies exact retrieval and accounting primitives; Kennedy decides what deserves inspection and integration.
+
+## Starting Context
+
+Ingress Kennedy begins with the complete source event log in a fully dehydrated form.
+
+The dehydrated log preserves chronological order and exposes, for every event:
+
+- `EventId`;
+- affected `BoxId`;
+- event type and source;
+- box name or content class;
+- canonical and representation lineage;
+- active, dirty or retired state;
+- approximate hydration cost.
+
+Large contents are absent from the starting view but remain exactly recoverable.
+
+Historical Kennedy summaries appear as events in the skeleton. Ingress can therefore choose between inspecting an earlier Kennedy interpretation, its canonical source or both.
+
+## Historical Hydration
+
+Ingress Kennedy may hydrate any historical occurrence by `EventId`.
+
+Hydration restores exactly what that event represented at that point in history. Depending on the event, this may be:
+
+- an original user message;
+- a Kennedy message;
+- canonical tool output;
+- a source revision;
+- a historical Kennedy summary;
+- a restored representation;
+- an empty blanched state.
+
+Every summary event retains lineage to the source event it summarized. Ingress may follow that lineage and hydrate the underlying source when exact wording, omitted context, provenance or reinterpretation matters.
+
+Hydrating an event changes only the current ingress working view. It does not modify the source event.
+
+Ingress may later dehydrate the event again, returning it to its compact skeleton representation.
+
+Each hydration operation targets one event. Kennedy may request several events while sufficient context remains.
+
+## Iterative Workflow
+
+A typical ingress pass is:
+
+1. Read the complete dehydrated chronology.
+2. Identify messages, decisions, evidence, corrections, actions or outcomes that may matter.
+3. Hydrate selected events.
+4. Compare them with related summaries, source revisions and later outcomes.
+5. Insert a compact ingress-authored summary or working note.
+6. Dehydrate source events that are no longer needed.
+7. Continue through the remaining chronology.
+8. Write or update the appropriate durable knowledge when evidence is sufficient.
+9. Finish only after reconciling the conversation’s meaningful state and unresolved work.
+
+Kennedy may revisit an earlier event whenever later material changes its interpretation.
+
+The workflow does not require one forward-only pass. Hydration and dehydration provide a movable working set over the complete history.
+
+## Ingress-Authored Summaries
+
+Ingress Kennedy may insert her own summaries into the working context.
+
+Each ingress summary is a new historical event containing:
+
+- Kennedy as its author;
+- exact summary text;
+- the events or ranges it covers;
+- relevant box and source lineage;
+- its place in the ingress chronology.
+
+An ingress summary never replaces its sources. It is a derivative that can itself be hydrated, summarized or dehydrated later.
+
+These summaries serve as working compression. Kennedy can preserve conclusions, uncertainties and completed coverage, then release the larger source events from active context.
+
+Ordinary ingress messages and tool results are also boxes and may be managed through the same context system.
+
+## Context Budget
+
+Each provider and model has an effective context limit `E`.
+
+Main Kennedy is limited to approximately `0.8E`. Because the main context contains the same chronological skeleton plus hydrated material, the fully dehydrated source log should fit within that bound when ingress begins.
+
+History ingress may use the remaining capacity for:
+
+- selected historical hydration;
+- reasoning;
+- Kmap context;
+- tool results;
+- ingress-authored summaries;
+- final semantic integration.
+
+The controller displays estimated tokens used and remaining at the end of the ingress context. It uses the latest actual provider input count plus conservative textual deltas estimated at three characters per token.
+
+Each dehydrated event reports its approximate hydration cost. Kennedy should dehydrate lower-value material before a requested hydration would exceed the effective limit.
+
+If the dehydrated skeleton itself no longer fits, the source conversation should have rolled into a fresh session earlier.
+
+## Semantic Responsibility
+
+The controller does not hardcode which events are important, which Kmap reads are redundant or which conclusions should become durable knowledge.
+
+Ingress Kennedy determines:
+
+- what to hydrate;
+- whether a historical summary is sufficient;
+- when exact source inspection is necessary;
+- which facts, interpretations and actions belong in durable memory;
+- which apparent commitments remain unresolved;
+- which material is merely repeated context;
+- what reusable lessons improve future Kennedy.
+
+Exact retention and semantic integration remain separate. Failing to integrate an event does not delete it.
+
+## Provenance and Completion
+
+Every durable conclusion derived during ingress should retain enough provenance to return to the relevant source events and objects.
+
+Ingress is complete when Kennedy has:
+
+- covered the conversation’s meaningful branches;
+- integrated new knowledge and current-state changes;
+- preserved corrections and uncertainty;
+- recovered actions and outcomes;
+- recorded useful method learning;
+- left exact source history recoverable.
+
+## Invariants
+
+- Ingress starts from the complete dehydrated event log.
+- Any historical occurrence can be restored by event ID.
+- Hydration never changes source history.
+- Historical and ingress-authored summaries remain distinguishable.
+- Every summary retains source lineage.
+- Working context remains bounded through selective dehydration.
+- Semantic omission never causes source deletion.
+- Exact history remains recoverable after ingress completes.
+```

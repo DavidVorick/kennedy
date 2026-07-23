@@ -25,7 +25,7 @@ struct DirectoryUser {
     telegram_user_id: Option<i64>,
     current_username: Option<String>,
     display_name: Option<String>,
-    root_node_id: String,
+    root_node_id: Option<String>,
     root_ready: bool,
     can_add_users: bool,
 }
@@ -34,7 +34,7 @@ struct DirectoryUser {
 #[serde(rename_all = "camelCase")]
 struct DirectoryGroup {
     group_id: String,
-    root_node_id: String,
+    root_node_id: Option<String>,
     root_ready: bool,
 }
 
@@ -108,13 +108,12 @@ impl Directory {
             "Telegram bootstrap handle must not be empty"
         );
         let database = self.lock()?;
-        let root_node_id = random_unassigned_node_id(&database)?;
         let now = Utc::now().to_rfc3339();
         database.execute(
-            "INSERT INTO whitelist_entries(handle,root_node_id,can_add_users,whitelisted_at,updated_at)
-             VALUES(?1,?2,1,?3,?3)
+            "INSERT INTO whitelist_entries(handle,can_add_users,whitelisted_at,updated_at)
+             VALUES(?1,1,?2,?2)
              ON CONFLICT(handle) DO UPDATE SET can_add_users=1,updated_at=excluded.updated_at",
-            params![handle, root_node_id, now],
+            params![handle, now],
         )?;
         Ok(())
     }
@@ -166,11 +165,10 @@ impl IdentitySink for Directory {
     fn observe_group(&self, group_id: &str) -> anyhow::Result<()> {
         let database = self.lock()?;
         let now = Utc::now().to_rfc3339();
-        let root_node_id = random_unassigned_node_id(&database)?;
         database.execute(
-            "INSERT INTO telegram_group_roots(group_id,root_node_id,created_at,updated_at)
-             VALUES(?1,?2,?3,?3) ON CONFLICT(group_id) DO NOTHING",
-            params![group_id, root_node_id, now],
+            "INSERT INTO telegram_group_roots(group_id,created_at,updated_at)
+             VALUES(?1,?2,?2) ON CONFLICT(group_id) DO NOTHING",
+            params![group_id, now],
         )?;
         Ok(())
     }
@@ -267,28 +265,6 @@ impl Directory {
 
 fn normalize_username(value: &str) -> String {
     value.trim().trim_start_matches('@').to_ascii_lowercase()
-}
-
-fn random_node_id() -> String {
-    hex::encode(rand::random::<[u8; 20]>())
-}
-
-fn random_unassigned_node_id(database: &Connection) -> anyhow::Result<String> {
-    loop {
-        let candidate = random_node_id();
-        let assigned = database.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM whitelist_entries WHERE root_node_id=?1
-                 UNION ALL SELECT 1 FROM telegram_group_roots WHERE root_node_id=?1
-                 UNION ALL SELECT 1 FROM kmap_system_roots WHERE root_node_id=?1
-             )",
-            [&candidate],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        if !assigned {
-            return Ok(candidate);
-        }
-    }
 }
 
 fn directory_user_by_clause(
@@ -421,19 +397,18 @@ fn whitelist_handle(
     let handle = normalize_username(handle.trim_matches(['\'', '"']));
     anyhow::ensure!(!handle.is_empty(), "the Telegram handle must not be empty");
     let now = Utc::now().to_rfc3339();
-    let root_node_id = random_unassigned_node_id(database)?;
     database.execute(
-        "INSERT INTO whitelist_entries(handle,current_username,root_node_id,added_by_telegram_user_id,whitelisted_at,updated_at)
-         VALUES(?1,?1,?2,?3,?4,?4) ON CONFLICT(handle) DO UPDATE SET updated_at=excluded.updated_at",
-        params![handle, root_node_id, added_by, now],
+        "INSERT INTO whitelist_entries(handle,current_username,added_by_telegram_user_id,whitelisted_at,updated_at)
+         VALUES(?1,?1,?2,?3,?3) ON CONFLICT(handle) DO UPDATE SET updated_at=excluded.updated_at",
+        params![handle, added_by, now],
     )?;
     directory_user_by_handle(database, &handle)?.context("reading whitelisted Telegram handle")
 }
 
 fn validate_root(root_node_id: &str) -> Result<(), ApiError> {
-    if root_node_id.len() != 40 || hex::decode(root_node_id).is_err() {
+    if root_node_id.parse::<kcode_kweb_db::NodeId>().is_err() {
         return Err(ApiError::bad(
-            "rootNodeId must be a 40-character hexadecimal Kmap identifier.",
+            "rootNodeId must be an eight-character canonical Kweb node identifier.",
         ));
     }
     Ok(())
@@ -487,7 +462,7 @@ async fn complete_user_root(
     let current = directory_user_by_id(&database, telegram_user_id)
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
-    if current.root_ready && current.root_node_id != input.root_node_id {
+    if current.root_ready && current.root_node_id.as_deref() != Some(&input.root_node_id) {
         return Err(ApiError::conflict(
             "This Telegram identity already has a different root node.",
         ));
@@ -521,7 +496,7 @@ async fn complete_handle_root(
     let current = directory_user_by_handle(&database, &handle)
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
-    if current.root_ready && current.root_node_id != input.root_node_id {
+    if current.root_ready && current.root_node_id.as_deref() != Some(&input.root_node_id) {
         return Err(ApiError::conflict(
             "This whitelisted handle already has a different root node.",
         ));
@@ -583,15 +558,15 @@ async fn complete_group_root(
     let current = directory_group_by_id(&database, &group_id)
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
-    if current.root_node_id != input.root_node_id {
+    if current.root_ready && current.root_node_id.as_deref() != Some(&input.root_node_id) {
         return Err(ApiError::conflict(
-            "This Telegram group has a different reserved root node.",
+            "This Telegram group already has a different root node.",
         ));
     }
     database
         .execute(
-            "UPDATE telegram_group_roots SET root_ready=1,updated_at=?1 WHERE group_id=?2",
-            params![Utc::now().to_rfc3339(), group_id],
+            "UPDATE telegram_group_roots SET root_node_id=?1,root_ready=1,updated_at=?2 WHERE group_id=?3",
+            params![input.root_node_id, Utc::now().to_rfc3339(), group_id],
         )
         .map_err(ApiError::internal)?;
     Ok(Json(
@@ -604,7 +579,9 @@ async fn complete_group_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kcode_kweb_db::{Config, NoopGossip, WriterId};
     use kcode_tg_kennedy_bot::IdentitySink;
+    use std::sync::Arc;
 
     fn directory() -> Directory {
         let database = Connection::open_in_memory().unwrap();
@@ -612,11 +589,11 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE kmap_system_roots(
                      role TEXT PRIMARY KEY CHECK(role IN ('user','kennedy')),
-                     root_node_id TEXT NOT NULL UNIQUE CHECK(length(root_node_id)=40),
+                     root_node_id TEXT NOT NULL UNIQUE CHECK(length(root_node_id)=8),
                      created_at TEXT NOT NULL
                  );
                  INSERT INTO kmap_system_roots VALUES(
-                     'user','1111111111111111111111111111111111111111','2026-01-01T00:00:00Z'
+                     'user','AAAAAAAB','2026-01-01T00:00:00Z'
                  );",
             )
             .unwrap();
@@ -636,9 +613,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let user_database = directory.join("users.sqlite3");
+        let signing_key = [7_u8; 32];
         let initialized = crate::kmap_http::initialize(
-            &directory.join("kmap.sqlite3"),
-            &directory.join("artifacts"),
+            &directory.join("kweb"),
+            Config {
+                signing_key,
+                writers_by_priority: vec![WriterId::from_signing_key(&signing_key)],
+                gossip: Arc::new(NoopGossip),
+            },
             &user_database,
         )
         .unwrap();
@@ -742,7 +724,7 @@ mod tests {
         let group = directory_group_by_id(&database, "opaque-group")
             .unwrap()
             .unwrap();
-        assert_eq!(group.root_node_id.len(), 40);
+        assert_eq!(group.root_node_id, None);
         assert!(!group.root_ready);
     }
 
@@ -758,7 +740,7 @@ mod tests {
             .unwrap();
         directory.observe_group("opaque-group").unwrap();
 
-        let user_root = "2222222222222222222222222222222222222222";
+        let user_root = "AAAAAAAC";
         let user = complete_user_root(
             State(directory.clone()),
             AxumPath(42),
@@ -769,35 +751,30 @@ mod tests {
         .await
         .unwrap();
         assert!(user.0.root_ready);
-        assert_eq!(user.0.root_node_id, user_root);
+        assert_eq!(user.0.root_node_id.as_deref(), Some(user_root));
 
-        let reserved_group_root = {
-            let database = directory.lock().unwrap();
-            directory_group_by_id(&database, "opaque-group")
-                .unwrap()
-                .unwrap()
-                .root_node_id
-        };
-        let mismatch = complete_group_root(
+        let group_root = "AAAAAAAD";
+        let group = complete_group_root(
             State(directory.clone()),
             AxumPath("opaque-group".into()),
             Json(CompleteRoot {
-                root_node_id: "3333333333333333333333333333333333333333".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(mismatch.code, "state_conflict");
-        let group = complete_group_root(
-            State(directory),
-            AxumPath("opaque-group".into()),
-            Json(CompleteRoot {
-                root_node_id: reserved_group_root.clone(),
+                root_node_id: group_root.into(),
             }),
         )
         .await
         .unwrap();
         assert!(group.0.root_ready);
-        assert_eq!(group.0.root_node_id, reserved_group_root);
+        assert_eq!(group.0.root_node_id.as_deref(), Some(group_root));
+
+        let mismatch = complete_group_root(
+            State(directory),
+            AxumPath("opaque-group".into()),
+            Json(CompleteRoot {
+                root_node_id: "AAAAAAAE".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch.code, "state_conflict");
     }
 }

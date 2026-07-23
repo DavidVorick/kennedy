@@ -1,4 +1,16 @@
-# Project Clarifications
+# Historical Project Clarifications (Partly Superseded)
+
+This file records pre-overhaul behavior and remains useful for unrelated
+provider, audio, Telegram, and deployment decisions. Its Conversation History,
+Chatend, ResetContext, context-budget, and Kweb-persistence statements are not
+current requirements.
+
+Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
+`Frontend/Specification.md`, `ConversationHistory/Specification.md`,
+`chatend-overhaul/chatend-overhaul-clarifications.md`, and
+`chatend-overhaul/chatend-discussion-review.txt`.
+
+# Original Project Clarifications
 
 These user-provided decisions supplement the repository specifications and
 technical design. They may be consolidated or removed once represented by the
@@ -34,8 +46,8 @@ canonical documents; this file is not an append-only log.
 - Do not add a `--data-dir` abstraction. Change the existing individual path
   defaults to locations under `./data/` while retaining those existing flags as
   overrides. Store live databases and their WAL/SHM companions directly in
-  `data/`, audio originals in `data/audio-ingress-media/`, Kweb artifacts in
-  `data/kweb-provenance-artifacts/`, the encrypted vault in `data/`, and backup
+  `data/`, audio originals in `data/audio-ingress-media/`, the transactional
+  Kweb root in `data/kweb/`, the encrypted vault in `data/`, and backup
   and manual recovery material in `data/backups/` and `data/recovery/`.
 
 ## Runtime Service Boundaries and Audio Retention
@@ -67,47 +79,38 @@ canonical documents; this file is not an append-only log.
 
 ## Kmap DB Core
 
-- The `kweb-db-core` crate is a standalone Rust library package that owns only
-  Kmap storage. `kennedy-server` imports its published release and exposes the HTTP adapter under
-  `/api/v1/kmap`; the Kennedy-owned application routers share that listener.
-- The core API is limited to opening/initializing a database path, creating
-  provenance, creating/updating nodes with an existing provenance ID, reading
-  nodes/provenance/full provenance history, and returning extensible stats.
-  Stats are typed in Rust with private fields and stable getters and serialize
-  to additive JSON whose unknown fields clients must ignore.
-- Nodes store a required `last_modified_at`, ordered `fixed_connections` ID arrays,
-  and ordered `recent_connections` ID arrays. The library assigns no active/fanout,
-  fixed-slot, root-role, system-prompt, user, or graph-operation meaning.
-- The backend session treats the first eight recent connections as active and
-  the remainder as fanout, maintains order, and implements connect,
-  consolidation, and fixed-connection workflows through sequential ordinary
-  updates. The frontend mirrors that projection for rendering. These
-  multi-call workflows are intentionally non-atomic.
-- Root-role/user mappings live outside the Kmap database. Creation may use a
-  self-owner sentinel; ordinary create/update is the only ownership mechanism.
-  Core operations are serialized by the caller and are not concurrency-friendly.
-- Every explicit mutation requires a caller-generated random 16-byte
-  `IdempotencyId`. A successful write stores a permanent receipt atomically;
-  an exact retry no-ops and succeeds, while reuse for a different operation or
-  normalized request conflicts. Node replays return current state and
-  provenance replays return the original provenance ID. Each call in a
-  multi-call workflow uses its own stable ID, which makes individual retries
-  safe without making the workflow atomic.
-- This storage is a Kweb (knowledge web), not a Kennedy-specific database. The
-  database path is caller-supplied; Kennedy defaults it to
-  `data/kweb-db-core.sqlite3` and supplies the sibling
-  `data/kweb-provenance-artifacts/` directory.
-- Provenance media and large provenance payloads live outside SQLite. Artifact
-  filenames preserve the original safe basename with exactly 12 random
-  URL-safe Base64 characters inserted before the final extension; the first
-  two suffix characters form a shard folder. The database retains relative
-  filenames, original names, content types, sizes, hashes, roles, and order.
+- Kennedy uses the published, exact-pinned `kcode-kweb-db` 1.0 crate. The
+  retired `kweb-db-core` SQLite database is not a runtime dependency.
+  `kennedy-server` owns the application adapter and root/user policy.
+- `NodeData` atomically replaces the complete node: text, owner, ordered fixed
+  connections, ordered recent connections, and object references. The core
+  assigns no active/fanout, slot, root-role, user, or policy meaning and imposes
+  no application-level connection-count limits.
+- The Kweb is a canonical binary on-disk store rooted at `data/kweb/`. Current
+  nodes and immutable objects use two-level sharded files. History, accepted
+  transactions, state, and the append-only transaction log are binary and
+  checksummed. Startup trusts current state and performs bounded WAL recovery;
+  it does not rebuild the graph from the transaction log.
+- Node IDs and object IDs are distinct type domains represented by canonical
+  eight-character URL-safe unpadded Base64 strings. Kennedy now receives these
+  real IDs directly; session-local numeric aliases no longer exist.
+- Native signed transaction IDs make reception of the exact same transaction
+  idempotent. Gossip transactions wait for all recursively referenced child
+  transactions; local submissions with missing children fail. Gossip protocol
+  integration remains later work.
+- Kennedy provenance envelopes are canonical binary application records stored
+  in immutable Kweb objects. Attached media are separate immutable objects.
+  JSON is used at application API boundaries, not as an internal checksummed
+  persistence encoding.
+- Root-role and user/group mappings remain in `kennedy-users.sqlite3`. Kennedy's
+  permanent writer private key lives only in the encrypted credential vault;
+  the Kweb state contains the ordered public writer list.
 
 ## Offline Backups
 
 - `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
-  all six SQLite databases, including the shared memory-ingress queue, the complete Kweb provenance-artifact and
-  audio-ingress media trees, and the
+  all five application SQLite databases, including the shared memory-ingress
+  queue, the complete transactional Kweb root and audio-ingress media tree, and the
   encrypted credential vault when present.
   Each archive is self-describing: its README starts with the creating commit
   hash and records the exact schemas and current data-format semantics.
@@ -119,10 +122,9 @@ canonical documents; this file is not an append-only log.
 - Backup creation verifies standalone SQLite snapshots and publishes the final
   archive atomically. The user is responsible for moving archives to durable
   off-machine storage.
-- `backup --lightweight-kweb` intentionally omits Kweb provenance artifact
-  bytes but retains the database and metadata. Full backups verify every
-  referenced copied artifact; lightweight backups cannot reconstruct
-  externally stored provenance without a separate artifact-tree backup.
+- `backup --lightweight-kweb` intentionally omits immutable Kweb object bytes
+  while retaining nodes and transaction metadata. Such an archive is not a
+  complete recovery source unless the omitted objects are restored separately.
 
 ## Kmap Size Estimate
 
@@ -380,8 +382,8 @@ canonical documents; this file is not an append-only log.
   call against the same 20-call conversation-turn or 50-call ingress-session
   budget as LoadNode. Keep a compact Chatend history of every successful reset,
   grouping duplicate retained-node name sets so Kennedy can recognize loops.
-  Preserve every short-ID assignment for the life of the session across resets
-  and recovery, even when its node is not retained in the rebuilt context.
+  Preserve canonical node references for the life of the session across resets
+  and recovery, even when a referenced node is not retained in rebuilt context.
 - Keep the 100-model-round history-ingress safety limit cumulative across
   checkpoints and retries. A reset starts a fresh provider thread but does not
   reset that session-wide guard.
@@ -516,7 +518,7 @@ canonical documents; this file is not an append-only log.
   prompt layers assembled in this order: Kennedy identity, one session type,
   Kmap basics, read-only tools, writable tools when allowed, and current
   runtime details.
-- Keep session-local identifier stability rules, always-loaded-root behavior,
+- Keep canonical identifier behavior, always-loaded-root behavior,
   and the native `call_ktool` contract in `KmapBasics.txt`. That layer must also tell Kennedy
   that additional tools and more detailed tool documentation may be available
   in the Kmap.
@@ -816,12 +818,54 @@ canonical documents; this file is not an append-only log.
 - The append-only transaction log remains on disk for recovery and audit and
   is never fully loaded, retained, or replayed by normal primary-library
   startup. Complete current nodes and immutable objects are authoritative
-  sharded files; transaction/DAG metadata, history, pending activation, and
-  gossip work use bounded disk-backed indexes and queues.
+  sharded files; transaction/DAG metadata, history, and gossip work use
+  disk-backed indexes and queues.
+- Every committed internal format is a canonical, hand-written binary encoding,
+  not JSON or Serde. Fixed-width fields, explicit tags and lengths, exact
+  decoding, and SHA-256 integrity checks ensure one encoding and checksum for
+  one logical record.
+- A transaction is not committed or projected until every transaction named in
+  its `heads` is already committed. This applies recursively. Missing-head
+  transactions received through the explicit source-aware gossip path retain
+  their canonical signed bytes in an in-memory dependency graph, stage
+  validated final object envelopes on disk, and ask the submitting peer for
+  the missing IDs. Ordinary non-gossip admission rejects missing heads as a
+  caller error without staging anything. Waiting transactions do not enter the
+  committed log, indexes, node/history state, object store, heads, or gossip
+  queue.
+- Local `start_transaction` snapshots every current database head, so Kennedy
+  and its frontend do not track or inject a single "latest transaction."
+- Waiting object envelopes are written only once. Admission stages the final
+  envelope under `incoming/`; WAL preparation and final installation use hard
+  links to the same inode, with checksum reads but no payload rewrite.
+- Kennedy's ordinary read/mutation boundary uses typed Rust values. Internal
+  database file encodings never cross it. Gossip deliberately carries opaque
+  canonical signed transaction bytes and raw object bytes so peers authenticate
+  exactly the bytes the writer signed.
+- Waiting state is intentionally not durable: restart clears the object spool
+  and the sender must resubmit. An exact duplicate of either a waiting or
+  committed transaction returns success as a no-op and never processes the
+  transaction twice.
+- The complete gossip protocol is deferred until after the local Kennedy
+  migration. Existing gossip admission, request, and outbox code is useful
+  scaffolding, but its final serving, retry, and transport APIs are not a
+  prerequisite for adopting the database locally and may be redesigned once
+  the peer protocol is specified.
+- IDs created by a local transaction belong to that mutation-locked,
+  uncommitted transaction until finalize; dropping it abandons them. A signed
+  gossip transaction instead arrives with canonical IDs already fixed.
+  Concurrent creation at the same canonical node ID is conflict input, while
+  an immutable object-ID collision is invalid, including collision with an
+  object created by an ancestor. Node and object raw type domains remain
+  disjoint.
 - A minimal internal WAL makes the transaction-log append, object installation,
   complete affected-node replacements, history/index/head updates, and gossip
   enqueue atomic. Startup rolls forward only prepared WAL work and resumes
   queues; it does not rebuild or validate the complete database.
+- The minimal WAL is sufficient for the initial migration. Generalized WAL
+  optimization and an exhaustive crash/fault-injection matrix are deferred;
+  separately operated offline recovery remains the fallback if an unusual
+  failure exceeds the online roll-forward path.
 - Gossip sends one newly committed or still-unacknowledged transaction package
   at a time. It never reannounces the complete historical database on open.
 - Version 1.0 raises both the individual owned-buffer object payload limit and
@@ -835,6 +879,89 @@ canonical documents; this file is not an append-only log.
   validation functionality belongs in separate Kennedy-owned tooling rather
   than new primary-library APIs. Test changes will likewise be requested later
   through separate narrowly scoped documents.
-- Complete the upstream readiness work in `kcode-kweb-db_updates.md`, publish
-  it as version `1.0.0`, and have Kennedy audit and exact-pin that published
-  release before executing the data migration.
+- Publish the reviewed library as version `1.0.0`, then have Kennedy audit and
+  exact-pin that release before executing the data migration.
+- The one-time live migration assigns every legacy node a fresh random
+  canonical ID and uses an in-memory old/new table only long enough to
+  translate owners, connections, application roots, and active-conversation
+  references. No compatibility table or permanent legacy-ID mapping survives.
+- Import the 1,000 current nodes in one signed migration transaction with
+  provenance fields set to `migration`. Legacy node revision history and
+  provenance are intentionally not imported; the old files are the archival
+  record.
+- Sign that import with an ephemeral migration key generated in memory. Retain
+  its public writer ID in Kweb state for verification and peer whitelisting,
+  but zeroize and discard the private key after import. The permanent Kennedy
+  writer is generated later by a local script, written only into the encrypted
+  vault, and added at first priority in the public writer list.
+- Active conversations retain translated root/reference IDs but discard their
+  cached Kmap context and directly loaded set so the next turn loads fresh
+  canonical data. The two terminally failed conversations and their two
+  mirrored MemoryIngress jobs are purged as explicitly authorized.
+- After successful import and application-reference rollover, move the live
+  legacy SQLite database, WAL/SHM files, and provenance artifact tree into a
+  timestamped directory under `data/archive/`. Kennedy must not read that
+  archive as runtime persistence.
+
+## Chatend Overhaul Planning Direction
+
+- Treat the material in `chatend-overhaul/` as a proposed large architectural
+  change that must be compared with the current implementation before coding.
+- The Chatend overhaul may rely on Kweb object storage, but its implementation
+  follows the in-progress Kweb storage release rather than inventing an
+  interim object store in Kennedy.
+- Design the overhaul around explicit modular boundaries so its generic event,
+  box, assembly, tool-state, and history-processing components can be separated
+  into publishable kcode Rust libraries. Resolve the major architectural
+  contracts and migration order before beginning the broad implementation.
+- Kweb participates in the Chatend as an ordinary tool implementation. The
+  generic controller must not contain Kweb-specific context behavior. Its only
+  session-opening conventions are tool definitions supplied through the system
+  prompt and automatic `LoadNode` calls for the user and Kennedy root nodes.
+- V1 may use straightforward whole-context provider requests and basic cache
+  optimization. More aggressive cache optimization is an important later
+  efficiency project, but must not complicate the first correct box-based
+  implementation.
+- Every session remains independent and is the unit processed by exactly one
+  history-ingress run. Do not introduce a conversation-segment layer. One
+  session contains its opening root-node tool calls, user and Kennedy activity,
+  Kennedy-managed boxes, and its eventual history ingress.
+- Every model-visible context item exists in a box. Each user message and each
+  Kennedy message creates exactly one ordinary box containing that message;
+  there is no separate message record that also creates another box.
+- Session operations are processed sequentially before the Chatend projection
+  is rebuilt. Do not expose an `EventBatch` as a domain concept merely to
+  describe that ordering.
+- Persist incomplete sessions and history-ingress checkpoints in
+  Kennedy-owned local disk storage; never use Kweb's permanent object store for
+  incomplete or transient session revisions.
+- After history ingress completes, map that one session to exactly one
+  `kcode_kweb_db::Transaction`. Bundle every Kweb node change produced by the
+  ingress, the complete immutable session archive, and all user-supplied file
+  objects into that transaction. Do not split one session across transactions
+  or combine sessions in one transaction.
+- Conversation History should retain only the small durable catalog needed for
+  session lifecycle, commands, ordering, retry state, and final Kweb
+  transaction/object identifiers, rather than a second permanent copy of
+  completed conversation contents.
+- Stage the pending Kweb transaction plan and its read-your-writes view in the
+  locally durable in-progress session. Do not hold the actual
+  `kcode_kweb_db::Transaction` open across model calls or restarts; construct
+  and finalize it only when history ingress completes successfully.
+- Set the live-session context budget to exactly 70% of the effective context
+  window. Context accounting should be as accurate as practical while
+  conservatively avoiding underestimation.
+- Kennedy permanently retains session events, source contents, transformations,
+  history-ingress activity, and archived Kweb objects. Purge and garbage
+  collection semantics must not imply that accepted session data is erased.
+- A session can receive and provide arbitrary objects. Represent either
+  direction as `Object provided: <ID>` inside the owning user or Kennedy
+  message box, never as model-visible content outside the box model.
+- Browser, Telegram, and future communication adapters own transport-specific
+  object ingress and egress, including supported types, limits, metadata, and
+  delivery mechanics. Kennedy must see the active session's capabilities.
+- The backend takes restart-safe local custody of newly accepted object bytes
+  until successful history ingress commits them in the session's sole Kweb
+  transaction. Kennedy may attach the resulting object reference to any number
+  of nodes, retrieve such references later, and ask a capable communication
+  adapter to deliver the object to the user.

@@ -1,0 +1,169 @@
+HISTORICAL DRAFT: terminology and limits in this file are superseded by
+chatend-overhaul-clarifications.md and chatend-discussion-review.txt.
+
+```markdown
+# Acceptance
+
+## Purpose
+
+This document defines the behavioral evidence required before the context-box system replaces the existing context and history controller.
+
+Passing unit tests is insufficient. Acceptance requires an end-to-end conversation, stateful tools, restart recovery and history ingress using the same persisted event log.
+
+## Identity and Events
+
+- Creating a box assigns a unique `BoxId` equal to its creation `EventId`.
+- Updating, summarizing, blanching, restoring or retiring it creates new event IDs without changing its box ID.
+- IDs are never reused.
+- Replaying events produces the same box identities, revisions and lifecycle states.
+- Concurrent or batched tool changes receive one deterministic chronological order.
+
+## Chronological Assembly
+
+Given a box created at Event 14 and updated at Events 31 and 47:
+
+- Box 14’s current occurrence appears at Event 47.
+- Event 31 renders as an immutable continuation marker to Event 47.
+- Event 14 renders as an immutable continuation marker to Event 31.
+- Updating again never rewrites the Event 14 marker.
+- At most one current occurrence of Box 14 is active.
+- Kennedy-authored representations remain distinguishable from source-authored text.
+
+The dirty-box and context-budget sections remain at the end of the assembled request.
+
+## Kennedy Context Control
+
+For hydrated, summarized and blanched boxes:
+
+- Kennedy can change one box without changing any other box.
+- A summary preserves exact text and source lineage.
+- Blanching removes substantive contents but preserves identity.
+- Restoring reveals the latest canonical revision without rerunning the owner.
+- Every transformation creates a historical event.
+- Canonical contents remain unchanged.
+
+When an owner updates a summarized or blanched box:
+
+- the canonical revision advances;
+- the box moves chronologically;
+- Kennedy’s compact representation remains;
+- the box becomes dirty;
+- no hidden contents automatically rehydrate.
+
+Explicit restoration clears the dirty state by revealing the selected canonical revision.
+
+## Legacy and Stateful Tools
+
+A legacy tool call creates one independent result box. Repeating the call creates another box.
+
+A stateful tool:
+
+- retains one append-only slot sequence;
+- updates existing slots without changing their box IDs;
+- appends boxes only for new slots;
+- retires deleted slots;
+- never reorders or reuses slots;
+- cannot observe Kennedy’s overrides.
+
+Submitting an unchanged state creates no canonical box revisions.
+
+A malformed, truncated or reordered slot sequence is rejected completely and preserves the preceding state. A failed tool operation creates no successful state transition.
+
+## Managed Rust Scenario
+
+Opening a library creates exactly one active box per source file.
+
+A subsequent write proves that:
+
+- modified files update their existing boxes;
+- unchanged files create no revisions;
+- new files append new boxes;
+- deleted files retire their boxes;
+- renamed files retire the old path and append the new path.
+
+Reopening the same library instance refreshes these boxes without duplicating the source tree. Kennedy summaries remain hidden from the Rust tool.
+
+## KWeb Scenario
+
+After `LoadNode`:
+
+- the requested node and its current active connections have boxes;
+- blanching those boxes does not unload KWeb state;
+- restoring one box does not invoke KWeb;
+- loading the node again refreshes its body and active closure;
+- existing logical components reuse their boxes;
+- new active connections append boxes;
+- obsolete connection renderings retire where appropriate;
+- summarized boxes do not rehydrate without Kennedy’s choice.
+
+No fixed direct-node count limits traversal; the effective context budget remains controlling.
+
+## Retirement
+
+Retiring a box:
+
+- removes its current occurrence from active context;
+- defeats any active Kennedy summary or blank;
+- preserves every prior canonical and Kennedy-authored event;
+- prevents reuse or reactivation of its slot;
+
+- permits exact historical hydration of pre-retirement events.
+
+Recreated equivalent content receives a new box ID.
+
+## Exact History
+
+The persisted log must reconstruct:
+
+- every user and Kennedy message;
+- exact tool arguments and outcomes;
+- all canonical box revisions;
+- every summary, blanch and restore;
+- every active representation used for inference;
+- all retirement and tool-slot state;
+- provider input-token receipts where available.
+
+Object-backed payloads must recover byte-identical contents. Context projections must not require duplicated full prompt snapshots.
+
+## History Ingress
+
+A completed source conversation enters ingress as one complete fully dehydrated chronology.
+
+Ingress Kennedy can:
+
+- hydrate any event by `EventId`;
+- recover exactly the representation at that event;
+- follow a summary to its canonical source;
+- inspect historical Kennedy summaries;
+- insert an ingress-authored summary with source lineage;
+- dehydrate inspected events and continue;
+- complete semantic integration without loading all payloads simultaneously.
+
+Hydration operations do not mutate the source history.
+
+## Budget and Rollover
+
+For effective model limit `E`:
+
+- main context reports provider-observed usage plus conservative deltas;
+- textual deltas use three characters per estimated token;
+- the main active view remains near or below `0.8E`;
+- each historical event reports approximate hydration cost;
+- summaries, blanks and retirements remain available near the limit;
+- the fully dehydrated skeleton fits history ingress;
+- a fresh session begins before the skeleton itself exceeds the configured ceiling.
+
+## Restart and Completion
+
+After controller restart, the system preserves:
+
+- event and box IDs;
+- tool-instance slot mappings;
+- canonical revisions;
+- active representations;
+- dirty and retired states;
+- continuation chains;
+- exact object references.
+
+The system is accepted only when all scenarios pass without duplicate source injection, forced hydration, silent history loss, provider clipping or unreconstructible state.
+```

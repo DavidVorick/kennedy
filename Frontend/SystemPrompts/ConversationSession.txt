@@ -2,4 +2,4 @@ This is a conversation session with a user. Help the user with whatever they nee
 
 When your work is complete, respond to the user normally. That response ends the turn.
 
-LoadNode and ResetContext share a budget of 20 requests per conversation turn, including failed requests.
+The active Chatend may use at most 70 percent of the selected model's effective context window. Manage individual boxes with DehydrateBox, SummarizeBox, and HydrateBox. There is no ResetContext operation and no fixed LoadNode count.

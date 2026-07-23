@@ -1,0 +1,730 @@
+KCODE KWEB ARCHITECTURE DISCUSSION
+=================================
+
+Purpose
+-------
+
+This document records the architecture discussion that led to
+kcode-kweb-db 1.0.0. It is intended as a handoff to Kennedy. It emphasizes the
+decisions that were reached, explains why they were reached, and calls out
+ideas that were considered but deliberately rejected.
+
+The implementation in kcode-kweb-db is the authoritative behavior. This
+document explains that behavior and the reasoning behind it.
+
+
+1. Migration context and compatibility boundary
+------------------------------------------------
+
+The old kennedy-server Kweb foundation is kweb-db-core. The replacement is
+kcode-kweb-db, a new transaction-oriented database rather than an incremental
+revision of the old storage model.
+
+DECISION:
+
+Kennedy will migrate its current database from kweb-db-core to
+kcode-kweb-db. The storage engine and transaction model change substantially,
+but Kennedy's existing model-facing Kweb navigation and mutation features are
+a compatibility contract. Existing Kennedy features are not supposed to
+disappear merely because the backend changes.
+
+The object store is an additive capability. It does not replace existing node,
+connection, navigation, ownership, history, or mutation behavior.
+
+It is useful to distinguish four boundaries:
+
+1. Kennedy's model-facing/application API.
+   This is the compatibility surface shown to Kennedy and its users. It should
+   remain conceptually stable through the migration.
+
+2. The typed Rust kcode-kweb-db API.
+   Kennedy-server uses typed values such as NodeData, Provenance, NodeId,
+   ObjectId, and Vec<u8>. It is not asked to understand database files.
+
+3. The private database storage format.
+   State, nodes, history, indexes, objects, the WAL, and queues use private,
+   versioned binary formats owned by kcode-kweb-db.
+
+4. The replication/gossip wire value.
+   Gossip transports opaque canonical signed transaction bytes and the raw
+   objects declared by those transactions. This is intentionally binary
+   because every peer must authenticate exactly the same bytes.
+
+The private disk encoding does not leak into Kennedy's ordinary read and
+mutation interface. Gossip is the deliberate exception: exact signed bytes
+must cross the replication boundary.
+
+
+2. Complete node revisions
+--------------------------
+
+NodeData is the complete authoritative content of one node revision:
+
+    short_name
+    short_description
+    long_description
+    owner
+    fixed_connections
+    recent_connections
+    objects
+
+DECISION:
+
+Transaction::create_node supplies the complete initial NodeData.
+Transaction::update_node replaces the complete NodeData. This includes fully
+replacing fixed_connections and recent_connections in the same transaction as
+all other node changes.
+
+There is no separate low-level connect, disconnect, or connection-patch
+operation in the database. Empty connection vectors clear those connections.
+Reordering a vector is meaningful and is preserved exactly.
+
+This gives Kennedy one atomic operation for changing all aspects of a node.
+It also avoids a proliferation of special mutation APIs whose independent
+updates could expose partial state.
+
+
+3. Fixed connections and recent connections
+--------------------------------------------
+
+The final storage names are exactly:
+
+    fixed_connections
+    recent_connections
+
+The older backend concepts described as active and fanout connections are
+represented together by recent_connections.
+
+DECISION:
+
+kcode-kweb-db preserves fixed_connections and recent_connections as two
+distinct, ordered vectors. The database does not interpret positions in those
+vectors.
+
+Kennedy, outside the generic database, owns the policy that:
+
+* fixed connections occupy its three fixed positions;
+* the first eight recent connections are active connections; and
+* remaining recent connections are fanout connections.
+
+The database enforces uniqueness within each vector and validates identifier
+domains. The same target may appear once in fixed_connections and once in
+recent_connections because the generic store assigns no policy meaning to
+that overlap.
+
+DECISION:
+
+There is no database-level maximum number of fixed or recent connections.
+Kennedy applies Kweb policy limits. The database uses checked lengths,
+canonical transaction-size limits, and allocation failure handling for
+finite-memory safety rather than imposing Kennedy-specific connection counts.
+
+
+4. Whole-node conflict and merge behavior
+-----------------------------------------
+
+Because a transaction stores a complete NodeData revision, concurrent changes
+to text, ownership, connections, and object references compete as whole-node
+revisions. Fields from two competing revisions are never silently combined.
+
+DECISION:
+
+The database owns causal projection, conflict-frontier maintenance, writer
+priority, and merge correctness.
+
+A causal descendant supersedes its ancestor. Incomparable revisions remain in
+the node's conflict frontier. The configured writer priority selects the
+visible candidate deterministically; transaction ID is the deterministic
+tie-breaker for the same writer.
+
+An explicit backend merge provides one new complete NodeData revision for an
+exact conflict pair. Conflict management is database behavior, not a
+Kennedy-facing model tool and not a reason to expose general transaction or
+database-inspection APIs.
+
+
+5. What remains outside the core library
+----------------------------------------
+
+Several initially discussed facilities were rejected as primary-library APIs.
+
+DECISION:
+
+The generic database does not expose database-wide enumeration, arbitrary
+transaction inspection, global statistics, migration, backup, whole-database
+validation, recovery orchestration, or Kennedy-specific conflict-management
+tools merely to support the migration.
+
+Migration and backup tools belong in separate Kennedy-owned code, including
+kennedy-server where appropriate. Offline validation and disaster-recovery
+tools may understand the versioned disk formats without expanding the live
+database API.
+
+The following also remain outside kcode-kweb-db:
+
+* users, groups, and system root roles;
+* mapping users to canonical root NodeIds;
+* Kennedy authorization beyond the configured database writer keys;
+* HTTP routes, Ktools, and frontend formats;
+* active/fanout position policy;
+* provenance filenames and media-type policy;
+* application queues and cross-database workflows; and
+* future streaming protocols for objects larger than the v1 limit.
+
+Kennedy's identity storage tracks root nodes by canonical NodeId. The Kweb
+database does not know which nodes are roots and does not bootstrap them.
+
+
+6. Identifier and path decisions
+--------------------------------
+
+NodeId and ObjectId remain compact six-byte locators. Their canonical text is
+exactly eight case-sensitive URL-safe unpadded Base64 characters.
+
+DECISION:
+
+The high-order type bit separates the raw NodeId and ObjectId domains. A node
+and an object therefore cannot receive the same valid locator.
+
+Current node and object files are sharded using the canonical text:
+
+    nodes/<first 2 characters>/<remaining 6 characters>.kwn
+    objects/<first 2 characters>/<remaining 6 characters>.kwo
+
+The canonical eight-character value is the identifier. The slash is only an
+on-disk sharding detail and is not part of the ID.
+
+TransactionId and WriterId remain cryptographic 32-byte values rendered as 64
+lowercase hexadecimal characters.
+
+IDs produced by a local Transaction are pending in the application sense:
+they belong to that mutation-locked, uncommitted transaction until finalize.
+Dropping the transaction abandons them. Because the mutation lock excludes
+other local and inbound mutation during that lifetime, they do not require a
+second concurrent local reservation mechanism.
+
+A signed gossip transaction is different. Its canonical IDs were fixed before
+arrival and are authenticated as part of its signed bytes. A concurrent create
+at an already selected NodeId is conflict input for whole-node convergence.
+An immutable ObjectId collision is invalid, including collision with an object
+created by one of the transaction's ancestors. NodeId and ObjectId raw domains
+are disjoint, so a valid canonical ID cannot silently change type.
+
+
+7. Disk-first authoritative storage
+-----------------------------------
+
+The earlier replay-and-cache design was rejected.
+
+DECISION:
+
+Current nodes are authoritative files beneath nodes/. Updating a node replaces
+only that node's file through the WAL. Objects are authoritative immutable
+files beneath objects/. Per-node history and transaction DAG metadata are
+disk-backed indexes.
+
+The append-only transaction log remains on disk for audit and offline recovery.
+Normal database startup never loads the complete log into memory, never
+replays it to reconstruct nodes, and never rebuilds the Kweb from historical
+transactions.
+
+Normal startup performs bounded work:
+
+* validate the root and acquire its exclusive process lock;
+* validate the format and small current state;
+* clear abandoned uncommitted incoming-object staging;
+* discard abandoned unprepared staging;
+* roll forward prepared WAL entries;
+* recover an interrupted gossip-outbox claim; and
+* return without scanning the complete node, object, history, transaction, or
+  append-only-log stores.
+
+The primary library assumes committed files are sound until they are accessed.
+An addressed file is locally checked for type, version, identity, canonical
+structure, length, and checksum. Corruption is reported rather than triggering
+an implicit whole-database rebuild.
+
+
+8. Canonical binary formats, not JSON or Serde
+----------------------------------------------
+
+Checksummed JSON was explicitly rejected. It is verbose, leaves too many
+representation choices, and makes the checksum depend on serialization
+details that do not belong in a storage contract.
+
+DECISION:
+
+All committed internal records use hand-written canonical binary encodings.
+There is exactly one valid encoding for one valid logical record.
+
+The common record envelope contains:
+
+* an eight-byte record-kind magic;
+* a big-endian u64 payload length;
+* the canonical binary payload; and
+* SHA-256 over the magic, length, and payload.
+
+Payload rules use fixed-width big-endian integers, one-byte tags, explicit
+lengths, exact UTF-8 bytes, fixed-width raw IDs, and seconds-plus-nanoseconds
+timestamps. Decoders reject invalid tags, invalid IDs, impossible lengths,
+trailing bytes, noncanonical collection state, and checksum mismatches.
+
+Object, signed-transaction, and append-only-log files use specialized binary
+envelopes suited to their streaming and integrity needs. They are still
+canonical, length-checked, and checksum-protected.
+
+There is no active Serde or serde_json use in the library. The appearance of
+an optional Serde package in a transitive crate's lockfile metadata would not
+mean that kcode-kweb-db uses it; the built feature graph contains no Serde.
+
+DECISION:
+
+These disk formats are private implementation formats. Kennedy does not encode
+or decode them across its ordinary application API.
+
+The canonical signed transaction is different: it is the authenticated gossip
+wire value. TransactionPackage contains those opaque signed bytes plus raw
+object buffers. Kennedy's transport should frame and forward the package, not
+reinterpret and reserialize the signed transaction.
+
+
+9. Efficient record layout
+---------------------------
+
+The binary conversion was accompanied by removal of redundant disk fields.
+
+DECISION:
+
+A current node file stores its visible transaction ID and conflict-frontier
+candidates. It derives the public visible node from the named candidate rather
+than storing the same visible NodeData twice.
+
+Transaction DAG metadata stores only what DAG lookup needs: format, transaction
+ID, parents, and DAG generation. It does not duplicate unused writer, time, or
+touched-node data already available elsewhere.
+
+History remains per node and per transaction so get_node_history does not scan
+the global log. Current node files do not contain the complete historical
+record.
+
+
+10. Object size and memory ownership
+------------------------------------
+
+The original 64 MiB object ceiling was rejected as far too small for Kennedy's
+machines and expected use.
+
+DECISION:
+
+For 1.0.0:
+
+    MAX_OBJECT_BYTES = 32 * 1024 * 1024 * 1024
+    MAX_TRANSACTION_OBJECT_BYTES = 32 * 1024 * 1024 * 1024
+
+Both the individual-object limit and aggregate new-object payload for one
+transaction are exactly 32 GiB (34,359,738,368 bytes).
+
+The release supports only 64-bit targets. A future streaming protocol may
+support larger objects without requiring one owned Vec<u8>.
+
+ObjectPayload and TransactionPackage deliberately do not implement Clone.
+Large buffers are moved or borrowed. Object envelopes are written directly
+from the caller's buffer. Local finalization releases its original object
+buffers before the durable gossip package is loaded from the object store.
+
+The transaction's canonical signed metadata has its own 64 MiB ceiling. That
+is separate from the 32 GiB object payload allowance.
+
+
+11. ACID transactions and the WAL
+---------------------------------
+
+The transaction log append, objects, current nodes, history, DAG metadata,
+current heads, state generation, and gossip enqueue must become durable as one
+logical transaction.
+
+DECISION:
+
+kcode-kweb-db uses a deliberately small internal write-ahead log. A generalized
+Sia-scale WAL was considered unnecessary for 1.0.0. Correctness comes first;
+performance can be optimized after measurement.
+
+The essential commit protocol is:
+
+1. Validate and project one transaction while holding the mutation lock.
+2. Write replacement and create-new files into a transaction-specific WAL
+   building directory.
+3. Write a canonical checksummed WAL intent containing expected generation and
+   log offset, staged-file identities and hashes, and the exact log-frame
+   operation.
+4. fsync staged files, the intent, and affected directories.
+5. Atomically rename the building WAL directory to its prepared name and sync
+   wal/. This publication is the durable commit decision.
+6. Apply every operation idempotently, including the exact append-only-log
+   frame at its expected offset.
+7. Apply state.kws last so readers never observe a partially applied logical
+   generation.
+8. fsync affected files and directories, then remove the prepared WAL entry.
+
+A crash before prepared-WAL publication commits nothing. A crash after it
+causes startup to roll the transaction forward before serving reads.
+
+The append-only log is never used as an ordinary startup replay mechanism.
+Its expected offset lives in the small current state. WAL recovery accepts only
+the exact already-present frame or an append at the exact expected end.
+
+
+12. Why staged objects use hard links instead of rename
+-------------------------------------------------------
+
+Objects attached to a gossip transaction whose dependencies are missing are
+written beneath:
+
+    incoming/<transaction ID>/<object ID>.kwo
+
+The file is already the final checksummed object envelope. The payload is
+written exactly once.
+
+When the transaction becomes ready, kcode-kweb-db creates a hard link from the
+incoming file into that transaction's WAL staging directory. WAL application
+then creates a hard link from the staged inode to the final objects/ path.
+After the transaction is committed, the extra incoming and WAL names are
+removed.
+
+DECISION:
+
+Use hard links for staged immutable objects rather than moving the only name
+with rename.
+
+Reasons:
+
+* A hard link is a metadata operation and does not copy or rewrite payload
+  bytes.
+* All relevant paths are created under one database root and are required to
+  reside on the same filesystem, which is also the requirement for an atomic
+  cross-directory rename. Mounting wal/, incoming/, or objects/ on separate
+  filesystems is therefore not a supported layout.
+* Before the WAL's prepared publication, the incoming name must remain valid.
+  If preparation fails, the in-memory waiting transaction can be retried using
+  the same staged object.
+* Renaming incoming/ into an unprepared WAL directory would remove the
+  waiter's only stable name. Dropping a failed WAL build could then delete the
+  object while the in-memory transaction still expects it, requiring a fragile
+  rollback rename.
+* After the durable commit decision, recovery needs a known-good WAL staging
+  name until application is complete. A hard link lets staging and the final
+  destination coexist while referring to the same immutable bytes.
+* If the process crashes after the final link appears but before state is
+  applied, WAL recovery can verify either name and finish idempotently.
+* Removing any one link does not remove the inode while another link remains.
+
+Rename is still used where ownership really should move atomically, especially
+when publishing the prepared WAL directory and replacing mutable state files.
+Hard links are specifically useful for immutable create-new files that need to
+exist safely at both the recovery source and destination during commit.
+
+Checksum reads still occur while staging and applying an object. Those reads
+verify integrity; they do not rewrite or duplicate the payload.
+
+
+13. Meaning of the incoming staging area
+----------------------------------------
+
+The term "ephemeral" previously caused confusion.
+
+DECISION:
+
+incoming/ is better understood as uncommitted object staging for
+memory-resident gossip waiters.
+
+The staged object file is physically written and fsynced. It is not
+authoritative database state because the corresponding signed transaction has
+not committed.
+
+The waiting transaction itself remains in memory. If the process exits before
+the transaction becomes ready, the transaction is lost and the next open
+clears its orphaned incoming files. The sender must resubmit.
+
+If the WAL was already durably prepared before a crash, its own hard link keeps
+the object inode alive even when startup clears incoming/. WAL recovery then
+installs the final object and completes the transaction.
+
+
+14. Transaction heads and the frontend
+--------------------------------------
+
+Terminology matters:
+
+* A transaction's heads are prior transactions.
+* Those heads are the new transaction's parents or dependencies.
+* The new transaction is the child of the transactions it names.
+
+DECISION:
+
+Kennedy's frontend does not remember one "latest transaction" and manually
+attach it.
+
+KwebDb::start_transaction reads and snapshots every current database head.
+Transaction::finalize includes all of those heads in the canonical signed
+transaction. There may be more than one current head after concurrent
+activity, so reducing this to one remembered latest ID would be incorrect.
+
+The transaction guard prevents another local builder or inbound transaction
+from changing the database while a local transaction is being built.
+
+
+15. Strict dependency admission
+-------------------------------
+
+No transaction may enter committed database state until every transaction in
+its heads has already committed. The same rule applies recursively to each
+dependency.
+
+DECISION:
+
+There are two explicit inbound admission behaviors:
+
+    accept_transaction(package)
+
+This is strict admission for a caller expected to be causally complete. If any
+head is absent, it returns InvalidTransaction immediately. It does not validate
+or stage large object payloads after discovering the missing head, does not
+write incoming state, and does not ask the gossip system for anything.
+
+    accept_gossip_transaction(package, source)
+
+This is source-aware peer admission. If heads are missing, the database may
+retain the signed transaction, stage its objects, and call the supplied
+TransactionSource with the missing transaction IDs. The exact peer/transport
+that supplied the transaction can then provide them.
+
+The old fallback design in which generic accept_transaction asked the
+configured outbound Gossip object for missing dependencies was rejected. A
+non-gossip caller with missing dependencies has most likely violated its own
+causal bookkeeping and should receive a direct error.
+
+The complete gossip protocol is intentionally deferred. These methods establish
+the desired causal distinction, but serving requested historical packages,
+retry scheduling, peer framing, authorization, and the final public shape of
+the gossip integration will be revisited together when Kennedy has a fully
+specified gossip protocol. Those later protocol APIs are not a blocker for the
+initial local database migration.
+
+
+16. Recursive gossip dependency resolution
+------------------------------------------
+
+When a gossip transaction has missing heads:
+
+* its signature, canonical structure, writer authorization, declarations, and
+  supplied object bytes are validated;
+* its canonical signed transaction bytes remain in an in-memory dependency
+  graph;
+* each final object envelope is written to incoming/ so the large Vec<u8> can
+  be released;
+* its object IDs are reserved against competing pending or local creation;
+* the source is asked for directly missing transaction IDs; and
+* nothing from the waiting transaction enters committed state.
+
+If a requested dependency arrives but itself has missing heads, the same rule
+is applied recursively and the source is asked for those dependencies.
+
+As dependencies commit, direct waiters are released. Newly ready transactions
+are processed one at a time in topological order through the ordinary WAL
+commit path.
+
+DECISION:
+
+Before all dependencies are committed, a waiting transaction does not appear
+in:
+
+* transactions.kwl;
+* the committed transaction index;
+* current heads or generation;
+* node or history projection;
+* the authoritative object store; or
+* the durable gossip outbox.
+
+
+17. Duplicate transaction behavior
+----------------------------------
+
+Gossip is naturally at-least-once, so the same transaction may arrive many
+times.
+
+DECISION:
+
+An exact duplicate of either:
+
+* an already committed transaction; or
+* an in-memory transaction currently waiting for dependencies
+
+is a successful no-op. The API returns Ok(false), where false means "nothing
+new was accepted." A newly accepted transaction returns Ok(true).
+
+A duplicate does not:
+
+* append another log frame;
+* project nodes or history again;
+* install objects again;
+* change heads or generation;
+* enqueue another gossip announcement;
+* rewrite staged state; or
+* issue another dependency request.
+
+If the retained transaction ID is somehow associated with different signed
+bytes, the database reports corruption rather than treating it as a duplicate.
+
+
+18. Gossip scope and durable delivery
+-------------------------------------
+
+DECISION:
+
+The gossip network sends transactions, not database snapshots.
+
+A transaction package contains:
+
+* exact canonical signed transaction bytes; and
+* only the objects created by that transaction.
+
+Gossip never sends projected node files, checkpoints, root mappings, all
+historical transactions, or the complete object store.
+
+Each committed transaction receives a durable gossip-outbox marker within the
+same WAL commit. Delivery claims one marker as INFLIGHT, loads one package, and
+invokes Gossip::announce without holding the database mutation lock.
+
+Successful handoff removes the claim. Failed handoff requeues it. Startup
+recovers an interrupted claim but never scans the transaction log to recreate
+or reannounce the historical database.
+
+
+19. Reference and visibility behavior
+-------------------------------------
+
+Local node, owner, connection, and object references must resolve according to
+the transaction's causal view. Nodes and objects created in the same
+transaction can be referenced by that transaction.
+
+For inbound replication, a reference is effective only when its creation is
+causally available. Invalid or unresolved operations do not cause fields from
+different competing revisions to be mixed.
+
+Objects are visible only after their creating transaction commits. Waiting
+objects under incoming/ are not returned by get_object.
+
+
+20. Version and migration policy
+--------------------------------
+
+DECISION:
+
+This architecture is released as kcode-kweb-db 1.0.0 because Kennedy is its
+first major consumer.
+
+Version 1 uses a new canonical transaction format and root-format 3. Earlier
+roots and earlier signed transaction formats are not silently reinterpreted.
+A nonempty old root produces OfflineUpgradeRequired.
+
+The kweb-db-core migration is a separate offline/application tool. The primary
+library does not gain migration, backup, enumeration, or global verification
+APIs merely to perform that one transition.
+
+Kennedy should audit the exact published source and pin exactly version 1.0.0
+before performing the live data migration.
+
+
+21. Testing and release posture
+-------------------------------
+
+The implementation was tested in focused pieces rather than presenting a large
+undifferentiated failure list.
+
+The dependency test covers a three-transaction chain delivered in reverse
+order. It verifies:
+
+* strict non-gossip rejection writes no staging state;
+* gossip asks for the direct missing dependency;
+* each supplied dependency recursively asks for its own missing dependency;
+* no transaction log entry, node, or object becomes visible early;
+* the chain commits parent-first in topological order;
+* the staged object becomes visible only at final commit;
+* a duplicate waiting transaction is a no-op; and
+* a duplicate committed transaction does not change log length.
+
+The binary codec test verifies deterministic byte-for-byte encoding,
+round-trip decoding, and checksum failure on corruption.
+
+At the time of this handoff:
+
+* all 13 Rust tests pass;
+* cargo fmt passes;
+* Clippy passes with warnings denied;
+* rustdoc passes with warnings denied; and
+* cargo package successfully builds and verifies the 1.0.0 crate.
+
+The current minimal WAL and its existing tests are accepted for the initial
+migration. A generalized high-performance WAL and an exhaustive crash
+fault-injection matrix are deliberately deferred. If an unusual failure cannot
+be handled by the bounded prepared-WAL roll-forward path, separately operated
+offline recovery is the fallback. This is a conscious scope decision rather
+than a claim that every possible crash boundary has already been simulated.
+
+
+22. Condensed final decisions
+-----------------------------
+
+For quick reference, the final decisions are:
+
+* Keep Kennedy's existing model-facing Kweb capabilities.
+* Replace kweb-db-core with the transactional kcode-kweb-db backend.
+* Make NodeData a complete revision.
+* Name the connection vectors fixed_connections and recent_connections.
+* Preserve both vectors and their order.
+* Keep active/fanout and fixed-position policy in Kennedy, not the database.
+* Impose no database-specific connection-count limit.
+* Resolve conflicts as complete node revisions.
+* Keep migration, backup, enumeration, and global validation outside the core.
+* Use disjoint six-byte NodeId and ObjectId domains with eight-character
+  Base64 text and two/six path sharding.
+* Store authoritative current nodes and immutable objects on disk.
+* Never rebuild the Kweb from the transaction log at ordinary startup.
+* Use canonical checksummed binary storage with no JSON or Serde.
+* Keep private disk formats behind the typed Rust API.
+* Carry exact opaque signed binary transactions only across gossip.
+* Use a small WAL with prepared publication as the durable commit decision.
+* Set both individual and per-transaction object payload limits to 32 GiB.
+* Do not clone object-sized buffers.
+* Write waiting object envelopes once to incoming/.
+* Promote staged objects with hard links, not payload rewrites.
+* Let local builders snapshot all current heads automatically.
+* Reject missing heads from strict non-gossip admission.
+* Let source-aware gossip wait and recursively request missing dependencies.
+* Commit dependencies before their descendants.
+* Treat exact waiting and committed duplicates as successful no-ops.
+* Gossip only transactions and the objects those transactions create.
+* Publish and pin the reviewed crate as kcode-kweb-db 1.0.0.
+
+
+23. Readiness boundary for the Kennedy migration
+------------------------------------------------
+
+DECISION:
+
+The library is ready to serve as the local backend for the kennedy-server
+codebase migration.
+
+Completing the peer-to-peer gossip protocol is a later project. In particular,
+the exact historical-package serving API, outbox retry trigger, peer lifecycle,
+and transport framing should be designed as one coherent protocol rather than
+freezing provisional APIs now.
+
+The initial migration may rely on the existing minimal WAL and offline recovery
+posture. Additional recovery fault injection and WAL performance work can be
+introduced incrementally after the application has moved to the new backend.
+
+This readiness decision does not change the committed storage invariants:
+canonical binary records, dependency-before-descendant admission, duplicate
+no-op behavior, complete-node transactions, immutable objects, and
+authoritative disk state remain final 1.0 decisions.

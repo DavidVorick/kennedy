@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::{ffi::OsStr, fs, path::Path, str::FromStr};
 
 use anyhow::Context;
+use kcode_kweb_db::{Config, KwebDb, NodeId};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct KmapSize {
@@ -13,20 +14,77 @@ pub(crate) struct KmapSize {
     pub long_description_tokens: u64,
 }
 
-pub(crate) fn measure(path: &Path, artifact_directory: &Path) -> anyhow::Result<KmapSize> {
-    let kmap = kweb_db_core::Kmap::open_with_artifacts(path, artifact_directory)
+pub(crate) fn measure(path: &Path, config: Config) -> anyhow::Result<KmapSize> {
+    let database = KwebDb::open(path, config)
         .map_err(anyhow::Error::new)
-        .with_context(|| format!("opening Kmap database {}", path.display()))?;
-    let stats = kmap.stats().map_err(anyhow::Error::new)?;
-    Ok(KmapSize {
-        node_count: stats.node_count(),
-        full_node_characters: stats.full_node_characters(),
-        full_node_words: stats.full_node_words(),
-        full_node_tokens: stats.estimated_full_node_tokens(),
-        long_description_characters: stats.long_description_characters(),
-        long_description_words: stats.long_description_words(),
-        long_description_tokens: stats.estimated_long_description_tokens(),
-    })
+        .with_context(|| format!("opening Kweb database {}", path.display()))?;
+    let mut size = KmapSize {
+        node_count: 0,
+        full_node_characters: 0,
+        full_node_words: 0,
+        full_node_tokens: 0,
+        long_description_characters: 0,
+        long_description_words: 0,
+        long_description_tokens: 0,
+    };
+    for id in node_ids(path)? {
+        let node = database.get_node(id).map_err(anyhow::Error::new)?;
+        let full = format!(
+            "{}{}{}",
+            node.data.short_name, node.data.short_description, node.data.long_description
+        );
+        size.node_count += 1;
+        size.full_node_characters += count_characters(&full);
+        size.full_node_words += count_words(&full);
+        size.long_description_characters += count_characters(&node.data.long_description);
+        size.long_description_words += count_words(&node.data.long_description);
+    }
+    size.full_node_tokens = size.full_node_characters.div_ceil(4);
+    size.long_description_tokens = size.long_description_characters.div_ceil(4);
+    Ok(size)
+}
+
+fn node_ids(root: &Path) -> anyhow::Result<Vec<NodeId>> {
+    let directory = root.join("nodes");
+    let mut ids = Vec::new();
+    for shard in
+        fs::read_dir(&directory).with_context(|| format!("reading {}", directory.display()))?
+    {
+        let shard = shard?;
+        if !shard.file_type()?.is_dir() {
+            continue;
+        }
+        let prefix = shard.file_name();
+        let prefix = prefix.to_str().context("Kweb node shard is not UTF-8")?;
+        for entry in fs::read_dir(shard.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("kwn"))
+            {
+                continue;
+            }
+            let stem = entry
+                .path()
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .context("Kweb node filename is not UTF-8")?
+                .to_owned();
+            ids.push(
+                NodeId::from_str(&format!("{prefix}{stem}"))
+                    .map_err(anyhow::Error::new)
+                    .context("decoding a Kweb node filename")?,
+            );
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+fn count_characters(value: &str) -> u64 {
+    u64::try_from(value.chars().count()).unwrap_or(u64::MAX)
+}
+
+fn count_words(value: &str) -> u64 {
+    u64::try_from(value.split_whitespace().count()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn render(size: &KmapSize) -> String {

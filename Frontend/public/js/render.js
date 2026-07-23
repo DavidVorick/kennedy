@@ -209,8 +209,6 @@ export function renderConversationHistory(container, records, {
   onSelect = () => {},
   retryingIds = new Set(),
   onRetryIngress = () => {},
-  purgingIds = new Set(),
-  onPurge = () => {},
   viewKey = "conversation-history",
 } = {}) {
   const viewState = captureViewState(container, viewKey);
@@ -251,15 +249,6 @@ export function renderConversationHistory(container, records, {
       retry.setAttribute("aria-label", `Retry history ingress for ${conversationTitle(record, 100)}`);
       retry.addEventListener("click", () => onRetryIngress(record));
       actions.append(retry);
-    }
-    if (record.id === selectedId) {
-      const purging = purgingIds.has(record.id);
-      const purge = element("button", "quiet history-item-purge", purging ? "Purging…" : "Purge");
-      purge.type = "button";
-      purge.disabled = purging;
-      purge.setAttribute("aria-label", `Permanently purge ${conversationTitle(record, 100)}`);
-      purge.addEventListener("click", () => onPurge(record));
-      actions.append(purge);
     }
     if (actions.childNodes.length) row.append(actions);
     container.append(row);
@@ -1178,7 +1167,7 @@ function renderFullHistory(container, diagnostic) {
     for (const [contextIndex, context] of contexts.entries()) {
       history.append(renderHistoryContext(context, `history:${phaseIndex}:Context ${contextIndex + 1}`, openKeys));
       if (contextIndex < contexts.length - 1) {
-        history.append(historyBarrier(`${context.reason || "ResetContext"} · context reset`));
+        history.append(historyBarrier(`${context.reason || "Context transition"}`));
       }
     }
   }
@@ -1203,7 +1192,7 @@ function fullHistoryText(diagnostic) {
           ? context.chatendText
           : "",
       );
-      if (contextIndex < contexts.length - 1) output.push(`════════ ${context.reason || "ResetContext"} · context reset ════════`);
+      if (contextIndex < contexts.length - 1) output.push(`════════ ${context.reason || "Context transition"} ════════`);
     }
   }
   return output.join("\n\n");

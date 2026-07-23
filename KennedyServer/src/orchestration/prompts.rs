@@ -25,7 +25,6 @@ pub(crate) struct RuntimeModel {
     pub model: String,
     pub reasoning_effort: String,
     pub context_window_tokens: u64,
-    pub max_input_tokens: u64,
 }
 
 impl RuntimeModel {
@@ -68,7 +67,6 @@ impl RuntimeModel {
             model,
             reasoning_effort,
             context_window_tokens,
-            max_input_tokens,
         })
     }
 

@@ -18,7 +18,7 @@ export class MemoryExplorer {
     this.content.replaceChildren(element("p", "", "Loading memory…"));
     try {
       const [node, history] = await Promise.all([this.api.node(id), this.api.history(id)]);
-      this.renderNode(node, history.provenance_ids || []);
+      this.renderNode(node, history.entries || []);
     } catch (error) { this.content.replaceChildren(element("p", "error-banner", error.message)); }
   }
 
@@ -46,11 +46,11 @@ export class MemoryExplorer {
     root.append(grid);
     const historySection = element("section", "history"); historySection.append(element("h3", "", "Source history"));
     if (!history.length) historySection.append(element("p", "", "No history entries."));
-    history.forEach((provenanceId, index) => {
+    history.forEach((entry, index) => {
       const row = element("div", "history-entry");
-      row.append(element("span", "", `Revision ${history.length - index}`));
+      row.append(element("span", "", `Revision ${index + 1} · ${entry.committed_at || "unknown time"}`));
       const button = element("button", "quiet", "View source"); button.type = "button";
-      button.addEventListener("click", () => this.showSource(provenanceId, row)); row.append(button); historySection.append(row);
+      button.addEventListener("click", () => this.showSource(entry, row)); row.append(button); historySection.append(row);
     });
     root.append(historySection); this.content.replaceChildren(root);
   }
@@ -68,13 +68,10 @@ export class MemoryExplorer {
     return section;
   }
 
-  async showSource(provenanceId, row) {
+  showSource(source, row) {
     const existing = row.nextElementSibling;
     if (existing?.classList.contains("source-detail")) { existing.remove(); return; }
-    try {
-      const source = await this.api.provenance(provenanceId);
-      const detail = element("div", "source-detail", `${source.source} · ${source.source_created_at}\n\n${source.data}`);
-      row.insertAdjacentElement("afterend", detail);
-    } catch (error) { row.insertAdjacentElement("afterend", element("div", "source-detail", error.message)); }
+    const detail = element("div", "source-detail", `${source.source || source.author || "unknown"} · ${source.source_created_at || source.committed_at || "unknown time"}\n\n${source.data || "No source detail."}`);
+    row.insertAdjacentElement("afterend", detail);
   }
 }

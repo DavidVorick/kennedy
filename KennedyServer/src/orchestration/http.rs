@@ -8,6 +8,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::multipart;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -27,6 +28,7 @@ pub(crate) struct LocalServices {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ApiError {
+    #[allow(dead_code)] // Retained for transport diagnostics and the test HTTP backend.
     pub status: Option<StatusCode>,
     pub code: String,
     pub message: String,
@@ -111,15 +113,24 @@ impl Api {
             .map(normalize_kmap_mutation_response)
     }
 
-    pub async fn kmap_put(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Kmap, Method::PUT, path, Some(body))
-            .await
-            .map(normalize_kmap_mutation_response)
-    }
-
     pub async fn kmap_get(&self, path: &str) -> Result<Value, ApiError> {
         self.service_request(ServiceKind::Kmap, Method::GET, path, None)
             .await
+    }
+
+    pub(crate) fn commit_kweb_session(
+        &self,
+        input: crate::kmap_http::SessionCommit,
+    ) -> Result<crate::kmap_http::SessionCommitResult, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local.kmap.commit_session(input).map_err(kmap_error),
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "Session commits require the in-process Kweb service.".into(),
+            }),
+        }
     }
 
     pub async fn intelligence_get(&self, path: &str) -> Result<Value, ApiError> {
@@ -419,10 +430,7 @@ impl Api {
         let requested = self
             .kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
             .await?;
-        let active_ids = recent_connection_ids(&requested)
-            .into_iter()
-            .take(8)
-            .collect::<Vec<_>>();
+        let active_ids = recent_connection_ids(&requested);
         let mut active = Vec::with_capacity(active_ids.len());
         for id in active_ids {
             active.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
@@ -433,19 +441,7 @@ impl Api {
         }))
     }
 
-    pub async fn bootstrap_node(
-        &self,
-        node_id: &str,
-        short_name: Option<&str>,
-    ) -> Result<Value, ApiError> {
-        match self
-            .kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
-            .await
-        {
-            Ok(node) => return Ok(node),
-            Err(error) if error.status == Some(StatusCode::NOT_FOUND) => {}
-            Err(error) => return Err(error),
-        }
+    pub async fn bootstrap_node(&self, short_name: Option<&str>) -> Result<Value, ApiError> {
         let provenance = self
             .kmap_post(
                 "/api/v1/kmap/provenance",
@@ -461,7 +457,6 @@ impl Api {
             "/api/v1/kmap/nodes",
             json!({
                 "idempotency_id": idempotency_id(),
-                "node_id": node_id,
                 "provenance_id": string_at(&provenance, "id")?,
                 "owner_node_id": "self",
                 "model_attribution": "system-bootstrap",
@@ -473,97 +468,6 @@ impl Api {
             }),
         )
         .await
-    }
-
-    pub async fn create_provenance_archive(
-        &self,
-        idempotency: &str,
-        archive: &Value,
-        source: &str,
-        source_created_at: &str,
-    ) -> Result<Value, ApiError> {
-        let mut stored = archive.clone();
-        let mut artifacts = Vec::new();
-        if let Some(media) = stored.get_mut("media").and_then(Value::as_array_mut) {
-            for item in media {
-                let Some(data_url) = item.get("dataUrl").and_then(Value::as_str) else {
-                    continue;
-                };
-                let (mime, bytes) = decode_data_url(data_url)?;
-                let filename = item
-                    .get("fileName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provenance-media")
-                    .to_owned();
-                let index = artifacts.len();
-                artifacts.push((filename, mime, bytes));
-                if let Some(object) = item.as_object_mut() {
-                    object.remove("dataUrl");
-                    object.insert("provenanceArtifactIndex".into(), json!(index));
-                }
-            }
-        }
-        let safe_source = source
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        match &self.services {
-            ServiceBackend::Local(local) => local
-                .kmap
-                .create_provenance_archive(
-                    idempotency,
-                    serde_json::to_string_pretty(&stored).map_err(local_api_error)?,
-                    source,
-                    source_created_at,
-                    format!("{safe_source}-archive.json"),
-                    artifacts
-                        .into_iter()
-                        .map(|(original_filename, media_type, data)| {
-                            crate::kmap_http::ArtifactInput {
-                                original_filename,
-                                media_type,
-                                data,
-                            }
-                        })
-                        .collect(),
-                )
-                .map_err(kmap_error),
-            #[cfg(test)]
-            ServiceBackend::Http(bases) => {
-                let mut form = multipart::Form::new()
-                    .text("idempotency_id", idempotency.to_owned())
-                    .text("source", source.to_owned())
-                    .text("source_created_at", source_created_at.to_owned())
-                    .text("data_filename", format!("{safe_source}-archive.json"));
-                for (filename, mime, bytes) in artifacts {
-                    let part = multipart::Part::bytes(bytes)
-                        .file_name(filename)
-                        .mime_str(&mime)
-                        .map_err(|error| ApiError {
-                            status: None,
-                            code: "invalid_media".into(),
-                            message: error.to_string(),
-                        })?;
-                    form = form.part("artifact", part);
-                }
-                form = form.text(
-                    "data",
-                    serde_json::to_string_pretty(&stored).map_err(|error| ApiError {
-                        status: None,
-                        code: "invalid_archive".into(),
-                        message: error.to_string(),
-                    })?,
-                );
-                self.multipart(&bases.kweb, "/api/v1/kmap/provenance-with-artifacts", form)
-                    .await
-            }
-        }
     }
 
     pub async fn transcribe(
@@ -822,6 +726,7 @@ fn trim_base(value: &str) -> String {
     value.trim_end_matches('/').to_owned()
 }
 
+#[cfg(test)]
 fn local_api_error(error: impl std::fmt::Display) -> ApiError {
     ApiError {
         status: None,
@@ -873,6 +778,7 @@ pub(crate) fn idempotency_id() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+#[cfg(test)]
 pub(crate) fn stable_idempotency_id(namespace: &str, value: &str) -> String {
     let digest = Sha256::digest(format!("{namespace}\0{value}").as_bytes());
     hex::encode(&digest[..16])
@@ -895,25 +801,6 @@ pub(crate) fn string_at<'a>(value: &'a Value, key: &str) -> Result<&'a str, ApiE
 
 pub(crate) fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", BASE64.encode(bytes))
-}
-
-fn decode_data_url(value: &str) -> Result<(String, Vec<u8>), ApiError> {
-    let (header, encoded) = value.split_once(',').ok_or_else(|| ApiError {
-        status: None,
-        code: "invalid_media".into(),
-        message: "An archived media data URL is invalid.".into(),
-    })?;
-    let mime = header
-        .strip_prefix("data:")
-        .and_then(|value| value.strip_suffix(";base64"))
-        .unwrap_or("application/octet-stream")
-        .to_owned();
-    let bytes = BASE64.decode(encoded).map_err(|error| ApiError {
-        status: None,
-        code: "invalid_media".into(),
-        message: format!("An archived media data URL is invalid: {error}"),
-    })?;
-    Ok((mime, bytes))
 }
 
 fn recent_connection_ids(node: &Value) -> Vec<String> {

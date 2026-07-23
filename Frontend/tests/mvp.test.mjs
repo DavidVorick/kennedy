@@ -4,9 +4,9 @@ import { readFile } from "node:fs/promises";
 
 import {
   AudioIngressAPI,
-  ConversationHistoryAPI,
   IntelligenceAPI,
   KwebAPI,
+  SessionHistoryAPI,
   TelegramRelayAPI,
   newIdempotencyId,
 } from "../public/js/api.js";
@@ -58,7 +58,7 @@ test("browser API clients expose only browser-owned reads and commands", async (
     calls.push({ url: String(url), method: options.method || "GET", body: options.body });
     return jsonResponse({ ok: true });
   }, async () => {
-    const history = ConversationHistoryAPI("http://kennedy");
+    const history = SessionHistoryAPI("http://kennedy");
     await history.health();
     await history.start({ idempotency_id: "start", session_type: "conversation", started_at: "now" });
     await history.queueCommand("conversation", { idempotency_id: "command", kind: "send" });
@@ -100,7 +100,7 @@ test("conversation and audio titles use durable source data", () => {
   assert.equal(audioRecordingTitle({ original_filename: "2026-07-20-vnote.wav" }), "2026-07-20-vnote.wav");
 });
 
-test("conversation history groups phases without mutating backend results", () => {
+test("session history groups phases without mutating backend results", () => {
   const records = [
     { id: "complete", phase: "complete", updated_at: "2026-07-20T12:00:00Z" },
     { id: "pending", phase: "ingress_pending", updated_at: "2026-07-20T10:00:00Z" },
@@ -114,7 +114,7 @@ test("conversation history groups phases without mutating backend results", () =
   assert.equal(records[0].id, "complete");
 });
 
-test("conversation history reconciliation never regresses a hydrated record", () => {
+test("session history reconciliation never regresses a hydrated record", () => {
   const hydrated = [{
     id: "active", version: 5, phase: "active",
     state: { transcript: [{ role: "user", content: "Complete history" }] },

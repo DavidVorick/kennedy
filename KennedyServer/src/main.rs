@@ -3,6 +3,8 @@ mod credentials;
 mod intelligence;
 mod kmap_http;
 mod kmap_size;
+mod kweb_migration;
+mod legacy_session_archive;
 mod orchestration;
 mod rust_lib_tools;
 mod telegram_identity;
@@ -10,6 +12,8 @@ mod telegram_identity;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
 };
 
 use age::secrecy::{ExposeSecret, SecretString};
@@ -17,12 +21,15 @@ use anyhow::Context;
 use backup::BackupOptions;
 use clap::{Parser, Subcommand};
 use credentials::CredentialVault;
-use zeroize::Zeroize;
+use kcode_kweb_db::{Config as KwebConfig, NoopGossip, WriterId};
+use zeroize::{Zeroize, Zeroizing};
 
 const OPENAI_API_KEY_SECRET: &str = "openai-api-key";
 const GEMINI_API_KEY_SECRET: &str = "gemini-api-key";
 const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
 const CRATES_IO_KEY_SECRET: &str = "cratesio-key";
+const KWEB_WRITER_SIGNING_KEY_SECRET: &str = "kweb-writer-signing-key";
+const KWEB_WRITERS_SECRET: &str = "kweb-writers-by-priority";
 const RUST_LIBS_ROOT: &str = "/home/user/dev/kennedy/kcode/kcode-rust-libs";
 #[derive(Parser, Debug)]
 struct Args {
@@ -36,20 +43,18 @@ struct Args {
     telegram_bind: String,
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     frontend_origin: String,
-    #[arg(long, global = true, default_value = "./data/kweb-db-core.sqlite3")]
-    kweb_database: PathBuf,
-    #[arg(
-        long,
-        global = true,
-        default_value = "./data/kweb-provenance-artifacts"
-    )]
-    kweb_provenance_artifacts: PathBuf,
+    #[arg(long, global = true, default_value = "./data/kweb")]
+    kweb_root: PathBuf,
     #[arg(
         long,
         global = true,
         default_value = "./data/kennedy-conversations.sqlite3"
     )]
     conversation_history_database: PathBuf,
+    #[arg(long, global = true, default_value = "./data/sessions/in-progress")]
+    session_directory: PathBuf,
+    #[arg(long, global = true, default_value = "./data/session-history.txt")]
+    session_history_file: PathBuf,
     #[arg(long, global = true, default_value = "./data/kennedy-telegram.sqlite3")]
     telegram_database: PathBuf,
     #[arg(long, global = true, default_value = "./data/kennedy-users.sqlite3")]
@@ -88,12 +93,28 @@ enum Command {
         /// Directory in which to create the timestamped .tar.gz archive.
         #[arg(long, default_value = "./data/backups")]
         backup_dir: PathBuf,
-        /// Omit large Kweb provenance artifacts while retaining the Kweb database and artifact metadata.
+        /// Omit immutable Kweb objects while retaining nodes and transaction metadata.
         #[arg(long)]
         lightweight_kweb: bool,
     },
     /// Estimate the token footprint of all current Kmap node text.
     KmapSize,
+    /// Migrate the stopped live kweb-db-core database into kcode-kweb-db 1.0.
+    MigrateKweb {
+        #[arg(long, default_value = "./data/kweb-db-core.sqlite3")]
+        legacy_database: PathBuf,
+        #[arg(long, default_value = "./data/kweb-provenance-artifacts")]
+        legacy_artifacts: PathBuf,
+        #[arg(long)]
+        archive_directory: Option<PathBuf>,
+    },
+    /// Archive the stopped legacy Conversation History store for the Chatend cutover.
+    ArchiveLegacySessions {
+        #[arg(long)]
+        archive_directory: Option<PathBuf>,
+    },
+    /// Generate Kennedy's permanent Kweb key inside the encrypted vault.
+    ProvisionKwebWriter,
 }
 
 #[derive(Subcommand, Debug)]
@@ -113,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "kennedy_server=info,kweb_db_core=info,kcode_codex_runtime=info,kennedy_conversation_history=info,kcode_tg_kennedy_bot=info,tower_http=info".into()
+                "kennedy_server=info,kcode_kweb_db=info,kcode_codex_runtime=info,kennedy_conversation_history=info,kcode_tg_kennedy_bot=info,tower_http=info".into()
             }),
         )
         .init();
@@ -141,10 +162,11 @@ async fn main() -> anyhow::Result<()> {
             let path = backup::run(BackupOptions {
                 bind: args.kweb_bind,
                 backup_dir,
-                kmap_database: args.kweb_database,
-                kmap_artifact_directory: args.kweb_provenance_artifacts,
-                include_kmap_artifacts: !lightweight_kweb,
+                kweb_root: args.kweb_root,
+                include_kweb_objects: !lightweight_kweb,
                 conversation_database: args.conversation_history_database,
+                session_directory: args.session_directory,
+                session_history_file: args.session_history_file,
                 telegram_database: args.telegram_database,
                 user_database: args.user_database,
                 audio_database: args.audio_ingress_database,
@@ -157,9 +179,77 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::KmapSize) => {
-            let size = kmap_size::measure(&args.kweb_database, &args.kweb_provenance_artifacts)?;
+            let _maintenance_guard =
+                maintenance_guard(&args.kweb_bind, "measuring the Kweb").await?;
+            let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
+            let vault = CredentialVault::unlock(&vault_path, passphrase)?;
+            let size = kmap_size::measure(&args.kweb_root, kweb_config(&vault)?)?;
             println!("{}", kmap_size::render(&size));
             Ok(())
+        }
+        Some(Command::MigrateKweb {
+            legacy_database,
+            legacy_artifacts,
+            archive_directory,
+        }) => {
+            let _maintenance_guard =
+                maintenance_guard(&args.kweb_bind, "migrating the Kweb").await?;
+            let archive_directory = archive_directory.unwrap_or_else(|| {
+                PathBuf::from("./data/archive").join(format!(
+                    "kweb-db-core-{}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ")
+                ))
+            });
+            let result = kweb_migration::run(&kweb_migration::MigrationOptions {
+                target_root: args.kweb_root,
+                legacy_database,
+                legacy_artifacts,
+                identity_database: args.user_database,
+                conversation_database: args.conversation_history_database,
+                memory_ingress_database: args.memory_ingress_database,
+                archive_directory,
+            })?;
+            println!(
+                "Migrated {} nodes with migration writer {}. Purged {} terminal conversations and {} mirrored memory jobs. Archived legacy storage at {}.",
+                result.nodes,
+                result.migration_writer,
+                result.purged_conversations,
+                result.purged_memory_jobs,
+                result.archive.display()
+            );
+            println!(
+                "Kennedy remains intentionally unable to open the new Kweb until you run scripts/provision-kweb-writer.sh."
+            );
+            Ok(())
+        }
+        Some(Command::ArchiveLegacySessions { archive_directory }) => {
+            let _maintenance_guard =
+                maintenance_guard(&args.kweb_bind, "archiving legacy sessions").await?;
+            let archive_directory = archive_directory.unwrap_or_else(|| {
+                PathBuf::from("./data/archive").join(format!(
+                    "legacy-sessions-{}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ")
+                ))
+            });
+            let result = legacy_session_archive::run(&legacy_session_archive::ArchiveOptions {
+                conversation_database: args.conversation_history_database,
+                memory_ingress_database: args.memory_ingress_database,
+                archive_directory,
+                session_directory: args.session_directory,
+                session_history_file: args.session_history_file,
+            })?;
+            println!(
+                "Archived {} unfinished sessions and {} legacy conversation ingress jobs at {}.",
+                result.unfinished_sessions,
+                result.memory_jobs,
+                result.archive_directory.display()
+            );
+            Ok(())
+        }
+        Some(Command::ProvisionKwebWriter) => {
+            let _maintenance_guard =
+                maintenance_guard(&args.kweb_bind, "provisioning the Kweb writer").await?;
+            provision_kweb_writer(&args.kweb_root, &vault_path)
         }
         None => run_server(args, vault_path).await,
     }
@@ -199,14 +289,12 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             .transpose()?;
     let crates_io_key =
         resolve_required_secret(&vault, CRATES_IO_KEY_SECRET, "Rust library publication")?;
+    let kweb_config = kweb_config(&vault)?;
     let codex_catalog_cache =
         kcode_codex_runtime::CatalogCache::new(kcode_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
-    let (kmap, system_roots) = kmap_http::initialize(
-        &args.kweb_database,
-        &args.kweb_provenance_artifacts,
-        &args.user_database,
-    )?;
-    let kmap_service = kmap_http::Service::new(kmap, system_roots);
+    let (kmap, system_roots) =
+        kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
+    let kmap_service = kmap_http::Service::new(kmap, system_roots, &args.user_database)?;
     let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT, crates_io_key)
         .with_context(|| format!("opening managed Rust libraries root {RUST_LIBS_ROOT}"))?;
     let memory_ingress = kennedy_memory_ingress::Queue::open(&args.memory_ingress_database)
@@ -215,13 +303,12 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.user_database,
         &args.telegram_bootstrap_username,
     )?);
-    let history_service = kennedy_conversation_history::open(
-        kennedy_conversation_history::Config {
-            database: args.conversation_history_database,
-            max_request_bytes: 128 * 1024 * 1024,
-        },
-        memory_ingress.clone(),
-    )?;
+    let history_service =
+        kennedy_conversation_history::open(kennedy_conversation_history::Config {
+            directory: args.session_directory,
+            completed_list: args.session_history_file,
+            max_request_bytes: 32 * 1024 * 1024 * 1024,
+        })?;
     let history_router = kennedy_conversation_history::router(history_service.clone());
     let intelligence_service = intelligence::open(
         transcription_api_key,
@@ -305,9 +392,10 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
 fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::Result<()> {
     for path in [
         vault_path,
-        &args.kweb_database,
-        &args.kweb_provenance_artifacts,
+        &args.kweb_root,
         &args.conversation_history_database,
+        &args.session_directory,
+        &args.session_history_file,
         &args.telegram_database,
         &args.user_database,
         &args.audio_ingress_database,
@@ -348,6 +436,83 @@ fn telegram_relay_http_base(bind: &str) -> String {
         IpAddr::V4(ip) => format!("http://{ip}:{}", address.port()),
         IpAddr::V6(ip) => format!("http://[{ip}]:{}", address.port()),
     }
+}
+
+async fn maintenance_guard(bind: &str, purpose: &str) -> anyhow::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(bind).await.with_context(|| {
+        format!("binding maintenance lock {bind}; stop the running Kennedy server before {purpose}")
+    })
+}
+
+fn kweb_config(vault: &CredentialVault) -> anyhow::Result<KwebConfig> {
+    let encoded_key = resolve_required_secret(
+        vault,
+        KWEB_WRITER_SIGNING_KEY_SECRET,
+        "Kweb mutation signing",
+    )?;
+    let mut signing_key = Zeroizing::new([0_u8; 32]);
+    let decoded = hex::decode(encoded_key.trim())
+        .context("Kweb writer signing key must be 64 lowercase hexadecimal characters")?;
+    *signing_key = decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Kweb writer signing key must decode to exactly 32 bytes"))?;
+    let encoded_writers =
+        resolve_required_secret(vault, KWEB_WRITERS_SECRET, "Kweb writer authorization")?;
+    let writers_by_priority = encoded_writers
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(WriterId::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::new)
+        .context("decoding the ordered Kweb writer whitelist")?;
+    anyhow::ensure!(
+        !writers_by_priority.is_empty(),
+        "the Kweb writer whitelist is empty"
+    );
+    Ok(KwebConfig {
+        signing_key: *signing_key,
+        writers_by_priority,
+        gossip: Arc::new(NoopGossip),
+    })
+}
+
+fn provision_kweb_writer(kweb_root: &Path, vault_path: &Path) -> anyhow::Result<()> {
+    let (mut vault, passphrase) = unlock_for_edit(vault_path)?;
+    let mut signing_key = if let Some(existing) = vault.secret(KWEB_WRITER_SIGNING_KEY_SECRET)? {
+        let decoded = hex::decode(existing.expose_secret().trim())
+            .context("decoding the existing Kweb writer signing key")?;
+        Zeroizing::new(
+            decoded
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("the existing Kweb signing key is not 32 bytes"))?,
+        )
+    } else {
+        let generated = Zeroizing::new(rand::random::<[u8; 32]>());
+        vault.set(KWEB_WRITER_SIGNING_KEY_SECRET, hex::encode(*generated))?;
+        vault.save(vault_path, &passphrase)?;
+        generated
+    };
+    let permanent_writer = WriterId::from_signing_key(&signing_key);
+    let writers = if kweb_root.exists() {
+        kweb_migration::install_permanent_writer(kweb_root, permanent_writer)?
+    } else {
+        vec![permanent_writer]
+    };
+    vault.set(
+        KWEB_WRITERS_SECRET,
+        writers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    )?;
+    vault.save(vault_path, &passphrase)?;
+    signing_key.zeroize();
+    println!(
+        "Provisioned Kennedy Kweb writer {permanent_writer}. The private key was written only to the encrypted vault."
+    );
+    Ok(())
 }
 
 fn resolve_optional_secret(
@@ -494,6 +659,8 @@ mod tests {
         assert_eq!(GEMINI_API_KEY_SECRET, "gemini-api-key");
         assert_eq!(TELEGRAM_BOT_TOKEN_SECRET, "telegram-bot-token");
         assert_eq!(CRATES_IO_KEY_SECRET, "cratesio-key");
+        assert_eq!(KWEB_WRITER_SIGNING_KEY_SECRET, "kweb-writer-signing-key");
+        assert_eq!(KWEB_WRITERS_SECRET, "kweb-writers-by-priority");
         assert_eq!(
             RUST_LIBS_ROOT,
             "/home/user/dev/kennedy/kcode/kcode-rust-libs"
@@ -552,7 +719,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         let vault = directory.join("vault.age");
-        let kmap = directory.join("kmap.sqlite3");
+        let kmap = directory.join("kweb");
         let conversations = directory.join("conversations.sqlite3");
         let telegram = directory.join("telegram.sqlite3");
         let users = directory.join("users.sqlite3");
@@ -565,9 +732,10 @@ mod tests {
             kweb_bind: bind,
             telegram_bind: "127.0.0.1:0".to_owned(),
             frontend_origin: "http://127.0.0.1:4321".to_owned(),
-            kweb_database: kmap.clone(),
-            kweb_provenance_artifacts: directory.join("kweb-provenance-artifacts"),
+            kweb_root: kmap.clone(),
             conversation_history_database: conversations.clone(),
+            session_directory: directory.join("sessions"),
+            session_history_file: directory.join("session-history.txt"),
             telegram_database: telegram.clone(),
             user_database: users.clone(),
             audio_ingress_database: audio.clone(),
