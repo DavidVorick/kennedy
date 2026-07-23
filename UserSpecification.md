@@ -116,7 +116,12 @@ fanout lists. Per-loaded-node fanout boxes and the three second-layer aggregate
 boxes add summaries or names only for nodes not already represented earlier.
 
 A manual `LoadNode` invocation remains visible in its normal JSON call box.
-The successful result is not copied into a generic JSON result box. Instead,
+Every Ktool result is raw text. Ordinary result boxes contain that text
+directly, without a JSON envelope or pretty-printing. Managed Rust library
+tools are ordinary tools; opening a library returns its complete textual
+snapshot in one result box rather than creating one box per file.
+
+The successful `LoadNode` result is not copied into a generic result box. Instead,
 the native tool response contains exactly the Kweb boxes that the load created
 or revised, using their current Chatend-rendered representation and Kweb
 layout order. This lets the already-running provider turn see the state it

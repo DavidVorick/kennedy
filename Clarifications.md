@@ -754,8 +754,12 @@ canonical documents; this file is not an append-only log.
   not required; sequential delivery and execution are valid because outputs
   from calls in one model response cannot feed sibling calls.
 - Return every Ktool result through the matching native tool-call response and
-  let Codex continue inference on the same provider turn. Do not add generic
-  mutation idempotency; mutating Ktools retain their own protections.
+  let Codex continue inference on the same provider turn. A Ktool returns raw
+  text; place that text directly in its ordinary result box and native
+  response without a JSON envelope, Serde rendering, or pretty-printing.
+  Managed Rust library tools use the same ordinary one-box result path. Do not
+  add generic mutation idempotency; mutating Ktools retain their own
+  protections.
 - A terminal assistant response normally completes a browser or Telegram turn.
 - Use `EndSession` for history ingress, audio ingress, and self time. Terminal
   prose without it receives a minimal controller continuation. `EndSession`

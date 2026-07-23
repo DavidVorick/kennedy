@@ -263,7 +263,7 @@ Examples include:
 
 If you make several tool calls in one response, every call and completion is
 recorded independently in chronological order. A manual LoadNode completion
-is a compact non-projected journal receipt rather than a duplicate JSON result
+is a compact non-projected journal receipt rather than a duplicate result
 box.
 
 Stable box identity
@@ -411,12 +411,18 @@ A native call looks like:
 Multiple calls may be issued before the next inference. A failed tool result
 means that call did not succeed.
 
-The JSON invocation is intentional. A successful LoadNode response is
-different from ordinary tool results: it contains the exact Kweb boxes created
-or revised by the call, rendered exactly as Chatend renders their current
-hydrated, summarized, or dehydrated representation. It contains no duplicate
-node JSON and creates no generic "Kennedy tool result" box. A failed load and
-an unchanged repeat load return short plain text.
+The JSON invocation is intentional. Ktool results, however, are raw text:
+there is no result JSON envelope, Serde rendering, or pretty-printing. An
+ordinary result is retained as one box containing the same raw text. Managed
+Rust library tools follow this ordinary path, so opening a library returns one
+box containing its complete textual snapshot.
+
+A successful LoadNode response is different from ordinary tool results: it
+contains the exact Kweb boxes created or revised by the call, rendered exactly
+as Chatend renders their current hydrated, summarized, or dehydrated
+representation. It contains no duplicate node data and creates no generic
+"Kennedy tool result" box. A failed load and an unchanged repeat load return
+short plain text.
 
 There is no ResetContext
 ------------------------

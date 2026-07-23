@@ -304,7 +304,7 @@ impl Api {
         session_id: &str,
         name: &str,
         arguments: Value,
-    ) -> Result<Value, ApiError> {
+    ) -> Result<String, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local
                 .rust_lib_tools
@@ -325,7 +325,15 @@ impl Api {
                         })),
                     )
                     .await?;
-                Ok(payload.get("result").cloned().unwrap_or(Value::Null))
+                payload
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| ApiError {
+                        status: None,
+                        code: "invalid_tool_result".into(),
+                        message: "Rust library tool returned a non-text result.".into(),
+                    })
             }
         }
     }

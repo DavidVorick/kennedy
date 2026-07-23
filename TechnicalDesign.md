@@ -134,11 +134,17 @@ not unregister the function.
 
 Every Kennedy message, user message, tool invocation, ordinary tool result,
 loaded Kweb node, system prompt, controller notice, and history inspection is
-a box. Multiple tool calls in one model response are recorded independently.
-`LoadNode` is the deliberate result exception: its invocation remains a box,
-but it updates the shared Kweb boxes and returns the exact newly created or
-revised box renderings directly to the in-flight provider turn. It does not
-create a second generic JSON result box.
+a box. Every Ktool returns raw text, and the native response forwards that
+string unchanged. An ordinary result box stores the same text directly,
+without a JSON envelope, Serde rendering, diagnostic wrapper, or
+pretty-printing. Its normal Chatend header is added only when Chatend projects
+the retained box in a later context. Multiple tool calls in one model response
+are recorded independently. Managed Rust library results use the same path as
+every other ordinary result, so an opened library and all of its files occupy
+one result box. `LoadNode` is the deliberate result exception: its invocation
+remains a box, but it updates the shared Kweb boxes and returns the exact newly
+created or revised box renderings directly to the in-flight provider turn. It
+does not create a second generic result box.
 
 ## 7. Kweb context and writes
 

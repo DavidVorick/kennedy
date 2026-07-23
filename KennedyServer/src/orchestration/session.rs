@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     future::Future,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -22,9 +22,7 @@ use crate::{
     kmap_http::{
         SessionCommit, SessionNodeCreate, SessionNodeData, SessionNodeUpdate, SessionObject,
     },
-    rust_lib_tools::{
-        CREATE_RUST_LIB_TOOL, OPEN_RUST_LIB_TOOL, RUST_LIB_TOOLS, WRITE_RUST_LIB_TOOL,
-    },
+    rust_lib_tools::RUST_LIB_TOOLS,
 };
 
 use super::{
@@ -287,15 +285,71 @@ fn render_load_node_result(
         .map(|boxes| boxes.join("\n\n"))
 }
 
-fn render_box_result(journal: &SessionJournal, box_id: BoxId) -> anyhow::Result<String> {
-    journal
-        .state()
-        .projection()
-        .items
-        .into_iter()
-        .find(|item| !item.marker && item.box_id == box_id)
-        .map(|item| item.text)
-        .with_context(|| format!("tool-result box {box_id} is absent from the projection"))
+fn render_web_search_result(result: &Value) -> anyhow::Result<String> {
+    let answer = result
+        .get("answer")
+        .and_then(Value::as_str)
+        .context("web search response has no answer text")?;
+    let mut text = answer.to_owned();
+    let sources = result
+        .get("sources")
+        .and_then(Value::as_array)
+        .context("web search response has no sources")?;
+    if !sources.is_empty() {
+        text.push_str("\n\nSources:");
+        for source in sources {
+            let url = source
+                .get("url")
+                .and_then(Value::as_str)
+                .context("web search source has no URL")?;
+            let title = source
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(url);
+            text.push_str("\n- ");
+            text.push_str(title);
+            if title != url {
+                text.push_str(": ");
+                text.push_str(url);
+            }
+        }
+    }
+    Ok(text)
+}
+
+fn render_web_fetch_result(result: &Value) -> anyhow::Result<String> {
+    let url = result
+        .get("url")
+        .and_then(Value::as_str)
+        .context("web fetch response has no URL")?;
+    let content = result
+        .get("content")
+        .and_then(Value::as_str)
+        .context("web fetch response has no page text")?;
+    let mut text = format!("Source URL: {url}");
+    if let Some(title) = result
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+    {
+        text.push_str("\nTitle: ");
+        text.push_str(title);
+    }
+    if let Some(content_type) = result.get("content_type").and_then(Value::as_str) {
+        text.push_str("\nContent type: ");
+        text.push_str(content_type);
+    }
+    if result
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        text.push_str("\nThe returned page text was truncated.");
+    }
+    text.push_str("\n\n");
+    text.push_str(content);
+    Ok(text)
 }
 
 fn history_ingress_representation_plan(
@@ -485,14 +539,9 @@ struct ToolCall {
     arguments: Value,
 }
 
-enum ToolPresentation {
-    JsonResultBox,
-    DirectText(String),
-}
-
 struct ToolOutcome {
-    result: Value,
-    presentation: ToolPresentation,
+    text: String,
+    store_result: bool,
     ok: bool,
     end_session: bool,
 }
@@ -1187,40 +1236,33 @@ impl Session {
                                 match self.execute_tool(&call, operation_id).await {
                                     Ok(outcome) => outcome,
                                     Err(error) => ToolOutcome {
-                                        result: json!({"error":{"code":"tool_failed","message":error.to_string()}}),
-                                        presentation: if call.name == "LoadNode" {
-                                            ToolPresentation::DirectText(format!(
-                                                "LoadNode failed: {error}"
-                                            ))
-                                        } else {
-                                            ToolPresentation::JsonResultBox
-                                        },
+                                        text: format!("{} failed: {error}", call.name),
+                                        store_result: call.name != "LoadNode",
                                         ok: false,
                                         end_session: false,
                                     },
                                 }
                             }
                             Err(error) => ToolOutcome {
-                                result: json!({"error":{"code":"invalid_call_ktool","message":error.to_string()}}),
-                                presentation: ToolPresentation::JsonResultBox,
+                                text: format!("Invalid Ktool call: {error}"),
+                                store_result: true,
                                 ok: false,
                                 end_session: false,
                             },
                         };
-                        let result = json!({"ok":outcome.ok,"result":outcome.result});
-                        let provider_result = match outcome.presentation {
-                            ToolPresentation::JsonResultBox => {
-                                let box_id = self.journal.create_box(
-                                    now(),
-                                    "Kennedy tool result",
-                                    BoxOwner::Controller,
-                                    BoxContent::text(serde_json::to_string_pretty(&result)?),
-                                )?;
-                                render_box_result(&self.journal, box_id)?
-                            }
-                            ToolPresentation::DirectText(text) => text,
-                        };
-                        self.record_tool_completion("call_ktool", result.clone())?;
+                        if outcome.store_result {
+                            self.journal.create_box(
+                                now(),
+                                "Kennedy tool result",
+                                BoxOwner::Controller,
+                                BoxContent::text(&outcome.text),
+                            )?;
+                        }
+                        let provider_result = outcome.text.clone();
+                        self.record_tool_completion(
+                            "call_ktool",
+                            json!({"ok":outcome.ok,"result":outcome.text}),
+                        )?;
                         end_session |= outcome.ok && outcome.end_session;
                         checkpoint(self.snapshot()?).await?;
                         turn.respond(
@@ -1297,10 +1339,9 @@ impl Session {
         operation_id: Uuid,
     ) -> anyhow::Result<ToolOutcome> {
         self.assert_tool_allowed(&call.name)?;
-        let started = Instant::now();
         let mut end_session = false;
-        let mut presentation = ToolPresentation::JsonResultBox;
-        let result = match call.name.as_str() {
+        let mut store_result = true;
+        let text = match call.name.as_str() {
             "EndSession" => {
                 validate_arguments(&call.arguments, &[], &["message"])?;
                 anyhow::ensure!(
@@ -1317,27 +1358,27 @@ impl Session {
                 {
                     self.free_time["nextSessionMessage"] = json!(message);
                 }
-                json!({"sessionEnding":true})
+                "Session ending.".into()
             }
             "DehydrateBox" => {
                 validate_arguments(&call.arguments, &["boxId"], &[])?;
                 let id = box_id(&call.arguments, "boxId")?;
                 self.journal.dehydrate_box(now(), id)?;
-                json!({"boxId":id.0,"representation":"dehydrated"})
+                format!("Dehydrated box {id}.")
             }
             "SummarizeBox" => {
                 validate_arguments(&call.arguments, &["boxId", "summary"], &[])?;
                 let id = box_id(&call.arguments, "boxId")?;
                 let summary = nonempty_string(&call.arguments, "summary", 1_000_000)?;
                 self.journal.summarize_box(now(), id, summary)?;
-                json!({"boxId":id.0,"representation":"summarized"})
+                format!("Summarized box {id}.")
             }
             "HydrateBox" => {
                 validate_arguments(&call.arguments, &["boxId"], &[])?;
                 let id = box_id(&call.arguments, "boxId")?;
                 self.preflight_hydration(id)?;
                 self.journal.rehydrate_box(now(), id)?;
-                json!({"boxId":id.0,"representation":"hydrated"})
+                format!("Hydrated box {id}.")
             }
             "HydrateEvent" => {
                 anyhow::ensure!(
@@ -1360,7 +1401,7 @@ impl Session {
                         source_event: event_id,
                     },
                 )?;
-                json!({"eventId":event_id.0,"hydrated":true})
+                format!("Hydrated history event {event_id}.")
             }
             "DehydrateEvent" => {
                 anyhow::ensure!(
@@ -1383,21 +1424,15 @@ impl Session {
                         source_event: event_id,
                     },
                 )?;
-                json!({"eventId":event_id.0,"hydrated":false})
+                format!("Released history event {event_id} from the active context.")
             }
             "LoadNode" => {
                 validate_arguments(&call.arguments, &["identifier"], &[])?;
                 let id = canonical_node_id(&call.arguments, "identifier")?;
                 self.context.load_durable(&id).await?;
                 let changed = self.sync_kweb_boxes()?;
-                let updated_box_count = changed.len();
-                presentation =
-                    ToolPresentation::DirectText(render_load_node_result(&self.journal, &changed)?);
-                json!({
-                    "identifier":id,
-                    "updatedBoxCount":updated_box_count,
-                    "updatedBoxIds":changed,
-                })
+                store_result = false;
+                render_load_node_result(&self.journal, &changed)?
             }
             "WebSearch" => {
                 validate_arguments(&call.arguments, &["question", "mode"], &[])?;
@@ -1406,7 +1441,8 @@ impl Session {
                     matches!(mode.as_str(), "quality" | "balanced" | "fast"),
                     "mode must be quality, balanced, or fast"
                 );
-                self.api
+                let result = self
+                    .api
                     .intelligence_post(
                         "/api/v1/web/search",
                         json!({
@@ -1417,11 +1453,13 @@ impl Session {
                             "parent_operation_id":operation_id,
                         }),
                     )
-                    .await?
+                    .await?;
+                render_web_search_result(&result)?
             }
             "WebFetch" => {
                 validate_arguments(&call.arguments, &["url"], &[])?;
-                self.api
+                let result = self
+                    .api
                     .intelligence_post(
                         "/api/v1/web/fetch",
                         json!({
@@ -1429,7 +1467,8 @@ impl Session {
                             "parent_operation_id":operation_id,
                         }),
                     )
-                    .await?
+                    .await?;
+                render_web_fetch_result(&result)?
             }
             "ConnectNodes" => self.connect_nodes(&call.arguments)?,
             "ConsolidateFanout" => self.consolidate_fanout(&call.arguments)?,
@@ -1437,19 +1476,15 @@ impl Session {
             "CreateNode" => self.create_node(&call.arguments)?,
             "UpdateNode" => self.update_node(&call.arguments)?,
             name if RUST_LIB_TOOLS.contains(&name) => {
-                let result = self
-                    .api
+                self.api
                     .rust_lib_execute(&self.rust_lib_session_id, name, call.arguments.clone())
-                    .await?;
-                self.sync_rust_tool(name, &call.arguments, &result)?;
-                result
+                    .await?
             }
             _ => anyhow::bail!("Tool {} is not available", call.name),
         };
-        let duration = started.elapsed().as_millis() as u64;
         Ok(ToolOutcome {
-            result: json!({"value":result,"durationMs":duration}),
-            presentation,
+            text,
+            store_result,
             ok: true,
             end_session,
         })
@@ -1802,82 +1837,11 @@ impl Session {
         })
     }
 
-    fn sync_rust_tool(
-        &mut self,
-        name: &str,
-        arguments: &Value,
-        result: &Value,
-    ) -> anyhow::Result<()> {
-        if !matches!(
-            name,
-            CREATE_RUST_LIB_TOOL | OPEN_RUST_LIB_TOOL | WRITE_RUST_LIB_TOOL
-        ) {
-            return Ok(());
-        }
-        let library = arguments
-            .get("name")
-            .and_then(Value::as_str)
-            .context("Rust tool library name is missing")?;
-        let instance = format!("rust:{library}");
-        let files = result
-            .get("files")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let current = self
-            .journal
-            .state()
-            .tools
-            .get(&instance)
-            .cloned()
-            .unwrap_or_default();
-        let by_path = files
-            .iter()
-            .filter_map(|file| {
-                Some((
-                    file.get("path")?.as_str()?.to_owned(),
-                    file.get("contents")?.as_str()?.to_owned(),
-                ))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut slots = Vec::new();
-        let mut seen = HashSet::new();
-        for slot in current.slots {
-            let existing = self
-                .journal
-                .state()
-                .box_state(slot.box_id)
-                .context("Rust tool box is missing")?;
-            slots.push(ToolSlotInput {
-                slot: slot.slot.clone(),
-                name: existing.name.clone(),
-                content: by_path
-                    .get(&slot.slot)
-                    .map(|contents| BoxContent::text(contents.clone()))
-                    .unwrap_or_else(|| existing.canonical.content.clone()),
-                retired: slot.retired || !by_path.contains_key(&slot.slot),
-            });
-            seen.insert(slot.slot);
-        }
-        for (path, contents) in by_path {
-            if seen.insert(path.clone()) {
-                slots.push(ToolSlotInput {
-                    slot: path.clone(),
-                    name: format!("{library}/{path}"),
-                    content: BoxContent::text(contents),
-                    retired: false,
-                });
-            }
-        }
-        self.journal.apply_tool_slots(now(), instance, slots)?;
-        Ok(())
-    }
-
     fn record_tool_invocation(&mut self, name: &str, arguments: Value) -> anyhow::Result<EventId> {
         self.journal.record(
             now(),
             EventKind::ToolInvoked {
-                tool_instance: tool_instance(name, &arguments),
+                tool_instance: tool_instance(name),
                 tool_name: name.into(),
                 arguments,
             },
@@ -1927,7 +1891,7 @@ impl Session {
         Ok(())
     }
 
-    fn connect_nodes(&mut self, args: &Value) -> anyhow::Result<Value> {
+    fn connect_nodes(&mut self, args: &Value) -> anyhow::Result<String> {
         validate_arguments(args, &["identifiers"], &[])?;
         let ids = resource_id_array(args, "identifiers", 2)?;
         for id in &ids {
@@ -1949,10 +1913,13 @@ impl Session {
             self.put_node_data(id, data)?;
         }
         self.stage_plan()?;
-        Ok(json!({"identifiers":ids,"staged":true}))
+        Ok(format!(
+            "Staged connections among nodes {}.",
+            ids.join(", ")
+        ))
     }
 
-    fn consolidate_fanout(&mut self, args: &Value) -> anyhow::Result<Value> {
+    fn consolidate_fanout(&mut self, args: &Value) -> anyhow::Result<String> {
         validate_arguments(
             args,
             &[
@@ -1987,10 +1954,12 @@ impl Session {
         self.put_node_data(&parent, parent_data)?;
         self.put_node_data(&aggregator, aggregator_data)?;
         self.stage_plan()?;
-        Ok(json!({"parentIdentifier":parent,"aggregatorIdentifier":aggregator,"staged":true}))
+        Ok(format!(
+            "Staged fanout consolidation from node {parent} into node {aggregator}."
+        ))
     }
 
-    fn set_fixed_connection(&mut self, args: &Value) -> anyhow::Result<Value> {
+    fn set_fixed_connection(&mut self, args: &Value) -> anyhow::Result<String> {
         validate_arguments(args, &["parentIdentifier", "childIdentifier", "slot"], &[])?;
         let parent = resource_id(args, "parentIdentifier")?;
         self.ensure_known_node(&parent)?;
@@ -2022,10 +1991,15 @@ impl Session {
         }
         self.put_node_data(&parent, data)?;
         self.stage_plan()?;
-        Ok(json!({"parentIdentifier":parent,"slot":slot,"cleared":child.is_none(),"staged":true}))
+        Ok(match child {
+            Some(child) => {
+                format!("Staged node {child} in fixed slot {slot} of node {parent}.")
+            }
+            None => format!("Cleared fixed slot {slot} of node {parent} in the staged plan."),
+        })
     }
 
-    fn create_node(&mut self, args: &Value) -> anyhow::Result<Value> {
+    fn create_node(&mut self, args: &Value) -> anyhow::Result<String> {
         validate_arguments(
             args,
             &[
@@ -2065,10 +2039,10 @@ impl Session {
             self.put_node_data(&parent, data)?;
         }
         self.stage_plan()?;
-        Ok(json!({"identifier":pending,"staged":true}))
+        Ok(format!("Created staged node {pending}."))
     }
 
-    fn update_node(&mut self, args: &Value) -> anyhow::Result<Value> {
+    fn update_node(&mut self, args: &Value) -> anyhow::Result<String> {
         validate_arguments(
             args,
             &[
@@ -2094,7 +2068,7 @@ impl Session {
         data.include_session_object = true;
         self.put_node_data(&id, data)?;
         self.stage_plan()?;
-        Ok(json!({"identifier":id,"staged":true}))
+        Ok(format!("Staged the update to node {id}."))
     }
 
     fn ensure_known_node(&self, id: &str) -> anyhow::Result<()> {
@@ -2440,18 +2414,9 @@ fn session_kind(session_type: &str, mode: &AgentMode) -> SessionKind {
     }
 }
 
-fn tool_instance(name: &str, arguments: &Value) -> String {
+fn tool_instance(name: &str) -> String {
     if name == "LoadNode" {
         return KWEB_TOOL_INSTANCE.into();
-    }
-    if RUST_LIB_TOOLS.contains(&name) {
-        return format!(
-            "rust:{}",
-            arguments
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-        );
     }
     format!("{name}:{}", Uuid::new_v4())
 }
@@ -2867,24 +2832,64 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_tool_results_expose_their_box_id_in_same_turn_format() {
+    fn ordinary_tool_result_boxes_store_raw_text_without_escaping() {
         let (path, mut journal) = test_journal("tool-result", 1_000);
+        let raw = "File: src/lib.rs\npub fn quote() -> &'static str { \"raw\\\\text\" }\n";
         let box_id = journal
             .create_box(
                 "t1",
                 "Kennedy tool result",
                 BoxOwner::Controller,
-                BoxContent::text("{\"ok\":true}"),
+                BoxContent::text(raw),
             )
             .unwrap();
 
         assert_eq!(
-            render_box_result(&journal, box_id).unwrap(),
-            format!(
-                "[box {box_id} | Kennedy tool result | owner=controller | hydrated]\n{{\"ok\":true}}"
-            )
+            journal
+                .state()
+                .box_state(box_id)
+                .unwrap()
+                .canonical
+                .content
+                .text,
+            raw
         );
+        let projected = journal.state().projection().items[0].text.clone();
+        assert!(projected.contains("\"raw\\\\text\""));
+        assert!(!projected.contains("\\\"raw"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn web_tool_results_are_plain_text() {
+        let search = render_web_search_result(&json!({
+            "answer":"The answer uses \"quotes\" and a backslash: \\",
+            "sources":[
+                {"title":"Primary source","url":"https://example.test/source"},
+                {"title":"","url":"https://example.test/untitled"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            search,
+            "The answer uses \"quotes\" and a backslash: \\\n\nSources:\n- Primary source: https://example.test/source\n- https://example.test/untitled"
+        );
+        assert!(!search.contains("\\\"quotes\\\""));
+
+        let fetched = render_web_fetch_result(&json!({
+            "url":"https://example.test/page",
+            "title":"A page",
+            "content_type":"text/plain",
+            "content":"fn main() {\n    println!(\"raw\");\n}\n",
+            "truncated":true
+        }))
+        .unwrap();
+        assert_eq!(
+            fetched,
+            "Source URL: https://example.test/page\nTitle: A page\nContent type: text/plain\nThe returned page text was truncated.\n\nfn main() {\n    println!(\"raw\");\n}\n"
+        );
+        assert!(!fetched.contains("\\n"));
+        assert!(!fetched.contains("\\\"raw\\\""));
     }
 
     #[test]
