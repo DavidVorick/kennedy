@@ -936,6 +936,10 @@ canonical documents; this file is not an append-only log.
 - Session operations are processed sequentially before the Chatend projection
   is rebuilt. Do not expose an `EventBatch` as a domain concept merely to
   describe that ordering.
+- Native results for ordinary tools that create result boxes include those
+  boxes in normal Chatend text format, including BoxId. Kennedy can therefore
+  summarize, dehydrate, or hydrate a just-created result later in the same
+  provider turn without guessing an event or box identity.
 - Persist incomplete sessions and history-ingress checkpoints in
   Kennedy-owned local disk storage; never use Kweb's permanent object store for
   incomplete or transient session revisions.
@@ -955,6 +959,15 @@ canonical documents; this file is not an append-only log.
 - Set the live-session context budget to exactly 70% of the effective context
   window. Context accounting should be as accurate as practical while
   conservatively avoiding underestimation.
+- Treat 75% of the ingress model's effective context window as the
+  history-ingress *initial fitting target*, not its runtime ceiling. Before the
+  first ingress inference, reduce eligible boxes largest-first until the
+  projection is below that target. Once ingress is running, Kennedy may use
+  the remaining headroom, including through hydration and tool calls, up to
+  100% of the effective context window; only the full-window boundary
+  force-ends ingress. Compaction performed during an already submitted
+  provider turn affects the next rendered request rather than retroactively
+  shrinking that turn's input.
 - Kennedy permanently retains session events, source contents, transformations,
   history-ingress activity, and archived Kweb objects. Purge and garbage
   collection semantics must not imply that accepted session data is erased.

@@ -1416,6 +1416,26 @@ impl SessionJournal {
         recorded_at: impl Into<String>,
         kind: EventKind,
     ) -> anyhow::Result<EventId> {
+        let box_id = event_box_id(&kind).context("box operation has no box identity")?;
+        let state = self
+            .chatend
+            .box_state(box_id)
+            .with_context(|| format!("box {box_id} does not exist"))?;
+        ensure!(state.active, "box {box_id} is retired");
+        if let EventKind::BoxSummarized { text, .. } = &kind {
+            ensure!(!text.trim().is_empty(), "a box summary cannot be empty");
+        }
+        if matches!(kind, EventKind::BoxRetired { .. })
+            && let BoxOwner::Tool { tool_instance, .. } = &state.owner
+        {
+            ensure!(
+                self.chatend
+                    .tools
+                    .get(tool_instance)
+                    .is_some_and(|tool| tool.slots.iter().any(|slot| slot.box_id == box_id)),
+                "tool box {box_id} is missing from {tool_instance}"
+            );
+        }
         let id = EventId(self.chatend.next_id);
         let recorded_at = recorded_at.into();
         self.commit_events(
@@ -1934,6 +1954,44 @@ mod tests {
             .create_box("t2", "next", BoxOwner::Kennedy, BoxContent::text("resumed"))
             .unwrap();
         assert_eq!(id, BoxId(2));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_box_operations_do_not_poison_the_append_only_journal() {
+        let path = path("invalid-box-operation");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        let box_id = journal
+            .create_box(
+                "t1",
+                "valid",
+                BoxOwner::Controller,
+                BoxContent::text("canonical"),
+            )
+            .unwrap();
+        let valid_length = std::fs::metadata(&path).unwrap().len();
+
+        for result in [
+            journal.dehydrate_box("t2", BoxId(97)),
+            journal.summarize_box("t3", BoxId(97), "summary"),
+            journal.rehydrate_box("t4", BoxId(97)),
+            journal.retire_box("t5", BoxId(97)),
+        ] {
+            assert_eq!(result.unwrap_err().to_string(), "box 97 does not exist");
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_length);
+        }
+
+        drop(journal);
+        let reopened = SessionJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .state()
+                .box_state(box_id)
+                .unwrap()
+                .canonical
+                .content,
+            BoxContent::text("canonical")
+        );
         std::fs::remove_file(path).unwrap();
     }
 

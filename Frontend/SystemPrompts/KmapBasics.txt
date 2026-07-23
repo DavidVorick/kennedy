@@ -6,7 +6,7 @@ Every full Kmap node declares its Kennedy, user, or group root owner. A node wit
 
 The tools documented below are the baseline tools for this session. Additional tools and their documentation may be available in the kmap; use the kmap to learn about those capabilities rather than expecting every instruction to be repeated in the system prompt.
 
-Use the native call_ktool function to invoke one Ktool, for example {"name":"LoadNode","arguments":{"identifier":"AAECAwQF"}}. You may issue multiple function calls before the next inference. Results are returned as native tool results. LoadNode returns the Kweb boxes it created or revised in their ordinary Chatend text format, not as node JSON. A failed result means the operation did not succeed.
+Use the native call_ktool function to invoke one Ktool, for example {"name":"LoadNode","arguments":{"identifier":"AAECAwQF"}}. You may issue multiple function calls before the next inference. Results are returned as native tool results. An ordinary result that creates a box includes that box's normal Chatend header, so its BoxId is immediately available for same-turn context calls. LoadNode returns the Kweb boxes it created or revised in their ordinary Chatend text format, not as node JSON. A failed result means the operation did not succeed.
 
 EndSession
   Call through call_ktool with {} or, during self time only, {"message":"A message for the next self-time session."}

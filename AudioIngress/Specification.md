@@ -86,8 +86,10 @@ clients. It runs the normal mutation tool loop with the additional
 audio-ingress prompt policy under the backend's serialized Kmap-writer gate.
 Completing the final piece atomically marks the recording complete and removes
 any legacy local WAV shards.
-The completion endpoint independently requires a successful
-`EndSession` entry in the persisted history-ingress tool log. Historical
+The completion endpoint independently requires the persisted Chatend snapshot
+to show both a completed session and its final Kweb session-object ID.
+Legacy checkpoints with a successful `EndSession` tool-log entry remain
+accepted for migration compatibility. Historical
 pieces identified as prematurely completed remain terminal with
 `historyIngressRepairRequired: true` until the corrected backend worker invokes
 repair release through the in-process adapter; release removes the old ingress

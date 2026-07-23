@@ -333,9 +333,9 @@ impl Queue {
         if existing.phase == "complete" {
             return Ok(existing);
         }
-        if !was_explicitly_ended(&existing.state) {
+        if !has_successful_final_commit(&existing.state) {
             return Err(Error::conflict(
-                "Memory ingress cannot complete without a successful EndSession tool call.",
+                "Memory ingress cannot complete without a successful final Chatend/Kweb commit.",
             ));
         }
         let changed = db.execute(
@@ -555,8 +555,15 @@ fn fetch_by_source(db: &Connection, kind: SourceKind, source_id: &str) -> Result
     optional_by_source(db, kind, source_id)?.ok_or_else(Error::not_found)
 }
 
-fn was_explicitly_ended(state: &Value) -> bool {
-    state
+fn has_successful_final_commit(state: &Value) -> bool {
+    let current_snapshot = state.get("historyIngress").is_some_and(|history| {
+        history.get("completed").and_then(Value::as_bool) == Some(true)
+            && history
+                .get("sessionObjectId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+    });
+    let legacy_end_session = state
         .pointer("/historyIngress/tools/log")
         .and_then(Value::as_array)
         .is_some_and(|entries| {
@@ -564,7 +571,8 @@ fn was_explicitly_ended(state: &Value) -> bool {
                 entry.get("name").and_then(Value::as_str) == Some("EndSession")
                     && entry.get("ok").and_then(Value::as_bool) == Some(true)
             })
-        })
+        });
+    current_snapshot || legacy_end_session
 }
 
 fn concise(value: &str, limit: usize, fallback: &str) -> String {
@@ -646,6 +654,41 @@ mod tests {
     }
 
     #[test]
+    fn claims_require_the_current_completion_protocol() {
+        let queue = Queue::in_memory().unwrap();
+        queue
+            .submit(submission(
+                SourceKind::Audio,
+                "piece",
+                "2026-01-01T00:00:00Z",
+                0,
+            ))
+            .unwrap();
+
+        let error = queue
+            .start(
+                SourceKind::Audio,
+                "piece",
+                2,
+                "provenance",
+                Some("one-session-transaction-v1"),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Conflict);
+
+        let active = queue
+            .start(
+                SourceKind::Audio,
+                "piece",
+                2,
+                "provenance",
+                Some(COMPLETION_PROTOCOL),
+            )
+            .unwrap();
+        assert_eq!(active.phase, "ingress_in_progress");
+    }
+
+    #[test]
     fn checkpoint_failure_retry_and_completion_are_one_state_machine() {
         let queue = Queue::in_memory().unwrap();
         queue
@@ -711,7 +754,7 @@ mod tests {
                 SourceKind::Conversation,
                 "c",
                 active.version,
-                &json!({"historyIngress":{"tools":{"log":[{"name":"EndSession","ok":true}]}}}),
+                &json!({"historyIngress":{"completed":true,"sessionObjectId":"AAECAwQF"}}),
             )
             .unwrap();
         assert_eq!(
@@ -722,6 +765,22 @@ mod tests {
             "complete"
         );
         assert!(queue.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn completion_evidence_supports_current_and_legacy_checkpoints() {
+        assert!(has_successful_final_commit(
+            &json!({"historyIngress":{"completed":true,"sessionObjectId":"AAECAwQF"}})
+        ));
+        assert!(!has_successful_final_commit(
+            &json!({"historyIngress":{"completed":true,"sessionObjectId":null}})
+        ));
+        assert!(!has_successful_final_commit(
+            &json!({"historyIngress":{"completed":false,"sessionObjectId":"AAECAwQF"}})
+        ));
+        assert!(has_successful_final_commit(
+            &json!({"historyIngress":{"tools":{"log":[{"name":"EndSession","ok":true}]}}})
+        ));
     }
 
     #[test]

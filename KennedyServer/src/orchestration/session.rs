@@ -287,6 +287,17 @@ fn render_load_node_result(
         .map(|boxes| boxes.join("\n\n"))
 }
 
+fn render_box_result(journal: &SessionJournal, box_id: BoxId) -> anyhow::Result<String> {
+    journal
+        .state()
+        .projection()
+        .items
+        .into_iter()
+        .find(|item| !item.marker && item.box_id == box_id)
+        .map(|item| item.text)
+        .with_context(|| format!("tool-result box {box_id} is absent from the projection"))
+}
+
 fn history_ingress_representation_plan(
     state: &kennedy_chatend::Chatend,
 ) -> anyhow::Result<BTreeMap<BoxId, BoxRepresentation>> {
@@ -1199,13 +1210,13 @@ impl Session {
                         let result = json!({"ok":outcome.ok,"result":outcome.result});
                         let provider_result = match outcome.presentation {
                             ToolPresentation::JsonResultBox => {
-                                self.journal.create_box(
+                                let box_id = self.journal.create_box(
                                     now(),
                                     "Kennedy tool result",
                                     BoxOwner::Controller,
                                     BoxContent::text(serde_json::to_string_pretty(&result)?),
                                 )?;
-                                serde_json::to_string(&result)?
+                                render_box_result(&self.journal, box_id)?
                             }
                             ToolPresentation::DirectText(text) => text,
                         };
@@ -2851,6 +2862,27 @@ mod tests {
         assert_eq!(
             render_load_node_result(&journal, &unchanged).unwrap(),
             "LoadNode completed. The shared Kweb boxes were already current."
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ordinary_tool_results_expose_their_box_id_in_same_turn_format() {
+        let (path, mut journal) = test_journal("tool-result", 1_000);
+        let box_id = journal
+            .create_box(
+                "t1",
+                "Kennedy tool result",
+                BoxOwner::Controller,
+                BoxContent::text("{\"ok\":true}"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            render_box_result(&journal, box_id).unwrap(),
+            format!(
+                "[box {box_id} | Kennedy tool result | owner=controller | hydrated]\n{{\"ok\":true}}"
+            )
         );
         std::fs::remove_file(path).unwrap();
     }

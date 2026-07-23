@@ -856,7 +856,7 @@ impl Orchestrator {
                         json!({
                             "expected_version":version(&piece)?,
                             "provenance_id":format!("session:audio:{id}"),
-                            "completion_protocol":"one-session-transaction-v1"
+                            "completion_protocol":kennedy_memory_ingress::COMPLETION_PROTOCOL
                         }),
                     )
                     .await?;
