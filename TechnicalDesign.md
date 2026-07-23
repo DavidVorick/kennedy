@@ -59,9 +59,10 @@ The local transaction builder currently allocates random object/node IDs and
 sets its signed commit timestamp during `finalize`. Because V1 deliberately
 deferred a prepared `TransactionPackage`, there is a small crash window after
 Kweb commit and before the Chatend journal records the result. The journal and
-full semantic plan are fsynced first, but reconstructing after this particular
-crash does not guarantee the same signed transaction. This limitation is
-accepted and explicitly not described as exact-once recovery.
+full semantic plan have already been appended, but they are not explicitly
+fsynced. Reconstructing after this particular crash does not guarantee the same
+signed transaction. This limitation is accepted and explicitly not described
+as exact-once recovery.
 
 ## 4. Chatend journal
 
@@ -80,9 +81,18 @@ The file begins with `KCHAT01\n`. Each frame contains:
 
 Transition and sideband frames contain JSON because the Chatend model is
 expected to evolve rapidly. Staged object frames contain a short JSON metadata
-prefix followed by raw bytes. The journal is append-only and fsynced before an
-operation is acknowledged. On open, an incomplete final frame is truncated;
-checksum or structural failure in a complete frame is fatal.
+prefix followed by raw bytes. The journal is append-only. Each ordinary update
+is one frame. Operations that naturally produce several events build them in
+memory and append one transition frame whose checksum covers the complete
+batch. There is no transaction candidate, rollback copy, group-commit worker,
+or explicit `fsync`.
+
+On open, frames are checked and applied directly to the materialized state in
+order. The first incomplete or checksum-invalid frame is treated as the end of
+the usable log: that frame and the complete suffix after it are truncated.
+Checksum-valid structural, schema, or semantic errors remain fatal because
+they indicate incompatible code or an invalid locally generated event rather
+than an interrupted append.
 
 The process maintains only the replayed current state, current transaction
 plan, provider work, and staged object metadata in memory. Raw staged bytes are
@@ -131,6 +141,17 @@ tool calls in one model response each get independent call/result boxes.
 `LoadNode` has no fixed call or node-count limit. Loaded nodes occupy stateful
 Kweb tool slots and can be represented compactly without unloading them.
 Repeated loads refresh canonical content.
+
+The Kweb slots have an explicit persistent display layout. Directly loaded
+nodes appear first with complete node text, followed by unique fixed nodes and
+then unique active nodes (the first eight recent connections). Complete node
+text contains the ID, name, summary, long description, and identifier-only
+fixed/active/fanout lists. Each directly loaded node then has one fanout box
+containing only previously unseen fanout IDs and summaries. Three final boxes
+contain, with one global deduplication pass, fixed/active neighbor summaries of
+fixed nodes, fixed/active neighbor summaries of active nodes, and remaining
+fanout IDs/names of all fixed and active nodes. Tool layout events preserve
+this order independently of box creation chronology and across restart.
 
 Kweb write tools mutate only a durable `KwebPlan` in the journal. Staged
 creates and updates immediately update Kweb boxes, providing read-your-writes

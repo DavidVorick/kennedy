@@ -710,7 +710,7 @@ export function mainViewEntries(diagnostic) {
   for (const message of [...instructions, ...fallbackInstructions]) {
     entries.push({ kind: "context", label: "System prompt", content: readableMessageContent(message.content) });
   }
-  entries.push({ kind: "memory", memory });
+  if ((memory.nodes || []).length) entries.push({ kind: "memory", memory });
 
   const pendingCalls = [];
   let pendingToolTiming = [];

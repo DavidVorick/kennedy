@@ -15,6 +15,8 @@ use uuid::Uuid;
 #[cfg(test)]
 use super::Config;
 
+const ACTIVE_CONNECTION_LIMIT: usize = 8;
+
 #[derive(Clone)]
 pub(crate) struct LocalServices {
     pub kmap: crate::kmap_http::Service,
@@ -116,6 +118,12 @@ impl Api {
     pub async fn kmap_get(&self, path: &str) -> Result<Value, ApiError> {
         self.service_request(ServiceKind::Kmap, Method::GET, path, None)
             .await
+    }
+
+    pub async fn kmap_node(&self, node_id: &str) -> Result<Value, ApiError> {
+        self.kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
+            .await
+            .map(normalize_node)
     }
 
     pub(crate) fn commit_kweb_session(
@@ -430,13 +438,24 @@ impl Api {
         let requested = self
             .kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
             .await?;
-        let active_ids = recent_connection_ids(&requested);
+        let fixed_ids = fixed_connection_ids(&requested);
+        let active_ids = active_connection_ids(&requested);
+        let mut seen = std::collections::HashSet::from([node_id.to_owned()]);
+        let mut fixed = Vec::with_capacity(fixed_ids.len());
+        for id in fixed_ids {
+            if seen.insert(id.clone()) {
+                fixed.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
+            }
+        }
         let mut active = Vec::with_capacity(active_ids.len());
         for id in active_ids {
-            active.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
+            if seen.insert(id.clone()) {
+                active.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
+            }
         }
         Ok(json!({
             "requested_node": normalize_node(requested),
+            "fixed_connection_nodes": fixed.into_iter().map(normalize_node).collect::<Vec<_>>(),
             "active_connection_nodes": active.into_iter().map(normalize_node).collect::<Vec<_>>(),
         }))
     }
@@ -803,8 +822,23 @@ pub(crate) fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", BASE64.encode(bytes))
 }
 
-fn recent_connection_ids(node: &Value) -> Vec<String> {
+fn active_connection_ids(node: &Value) -> Vec<String> {
     node.get("recent_connections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(ACTIVE_CONNECTION_LIMIT)
+        .filter_map(|entry| {
+            entry
+                .as_str()
+                .or_else(|| entry.get("id").and_then(Value::as_str))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn fixed_connection_ids(node: &Value) -> Vec<String> {
+    node.get("fixed_connections")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -934,5 +968,18 @@ mod tests {
         assert_eq!(node["active_connections"].as_array().unwrap().len(), 8);
         assert_eq!(node["fanout_connections"].as_array().unwrap().len(), 1);
         assert_eq!(node["fanout_connections"][0]["short_name"], "Recent 8");
+    }
+
+    #[test]
+    fn context_fetch_expands_only_the_first_eight_recent_connections() {
+        let recent = (0..12)
+            .map(|index| json!({"id":format!("recent-{index}")}))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active_connection_ids(&json!({"recent_connections":recent})),
+            (0..8)
+                .map(|index| format!("recent-{index}"))
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -215,23 +215,26 @@ will likely gain fields frequently. Raw object bytes are stored as raw bytes,
 not expanded into Base64 JSON.
 
 Frames have a stable binary envelope containing a frame type, a canonical
-little-endian length, and a SHA-256 checksum. A completed corrupt frame is a
-hard error. An incomplete final frame caused by a crash is discarded, after
-which appending may resume.
+little-endian length, and a SHA-256 checksum. Replay accepts frames until it
+finds an incomplete or checksum-invalid frame, then truncates that frame and
+everything after it. Checksum-valid structural or semantic failures are
+programming or compatibility errors.
 
 Durability rule
 ---------------
 
-An accepted transition is flushed and fsynced before the server acknowledges
-it. This means a process or machine restart can replay the journal and recover
-the in-progress session, including pending resources and staged writes.
+An accepted update is appended as one checksummed frame. A naturally batched
+operation is one frame containing all of its ordered events. The server uses
+ordinary append I/O without an explicit flush or fsync. Data already accepted
+by the kernel remains available after ordinary process termination; sudden
+power loss may remove a suffix, which replay detects and discards.
 
 The journal remains authoritative until the session's Kweb transaction has
 committed and local completion has been recorded.
 
-This is why you should treat a successful tool result as durable even when the
-result is only staged. The plan is not yet globally committed, but it is not
-merely held in volatile model context.
+A successful tool result is therefore staged in the local session log rather
+than existing only in model context, but it does not carry a separate
+power-loss durability guarantee.
 
 
 PART IV: EVERYTHING YOU SEE IS A BOX
@@ -529,6 +532,25 @@ Chatend context budget is the practical limit.
 Repeating LoadNode refreshes the existing Kweb-owned boxes. It does not create
 duplicate node boxes. If the box is summarized or dehydrated and the node has
 changed, the representation remains compact and becomes stale.
+
+The loaded-node display is globally ordered and deduplicated:
+
+1. Every directly loaded node has one full box.
+2. Every unique fixed connection of those nodes has one full box.
+3. Every unique active connection (the first eight recent connections) has one
+   full box.
+4. Each directly loaded node has one fanout box containing the ID and summary
+   of each fanout node not represented earlier.
+5. One box contains the previously unseen fixed and active neighbors of all
+   fixed nodes, using ID, name, and summary.
+6. One box does the same for all active nodes.
+7. One final box contains the ID and name of every still-unseen fanout
+   connection of the fixed and active nodes.
+
+A full node box contains exactly its ID, name, summary, long description, and
+identifier-only fixed, active, and fanout lists. If a node qualifies for
+several roles, the earliest role above wins and its descriptive text is not
+emitted again.
 
 Connections
 -----------
@@ -909,7 +931,7 @@ PART XIV: CRASHES, RETRIES, AND EXACTLY-ONCE LIMITS
 What is recoverable
 -------------------
 
-Before final Kweb commit, the Chatend journal durably contains:
+Before final Kweb commit, the Chatend journal's appended valid prefix contains:
 
 - accepted messages and objects;
 - box state;
@@ -932,9 +954,10 @@ transactions.
 The accepted V1 crash window
 ----------------------------
 
-KennedyServer does not yet have an API for preparing and fsyncing the exact
-signed TransactionPackage before submission. It fsyncs the Chatend journal and
-semantic plan, then constructs and finalizes the Kweb transaction.
+KennedyServer does not yet have an API for preparing the exact signed
+TransactionPackage before submission. It appends the Chatend journal and
+semantic plan, then constructs and finalizes the Kweb transaction without
+explicitly fsyncing the journal.
 
 There is therefore a narrow window:
 

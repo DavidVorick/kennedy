@@ -259,6 +259,10 @@ canonical documents; this file is not an append-only log.
 
 ## Frontend Behavior
 
+- Do not expose per-action Chatend persistence state such as “saving” or
+  “saved.” Accepted updates are appended directly to the session journal; no
+  separate frontend state is shown for kernel writeback or power-loss
+  durability.
 - History-ingress activity is appended after its conversation transcript in
   the same scroll container, as a natural continuation rather than an overlay
   or independently scrolling panel. Its header and usage row are ordinary

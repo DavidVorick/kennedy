@@ -107,6 +107,13 @@ Write tools stage:
 There is no ResetContext and no fixed LoadNode count. Dehydrating a Kweb node
 box does not unload the node's state.
 
+Loaded Kweb boxes use one globally deduplicated layout. Full directly loaded
+nodes come first, full fixed connections second, and full active connections
+third. Active means the first eight recent connections. A full node shows its
+ID, name, summary, long description, and identifier-only fixed, active, and
+fanout lists. Per-loaded-node fanout boxes and the three second-layer aggregate
+boxes add summaries or names only for nodes not already represented earlier.
+
 ## Temporary IDs and staged objects
 
 The Chatend journal uses one monotonic temporary identity space. A pending node
@@ -125,17 +132,22 @@ transaction. Larger streaming objects are future work.
 ## Durability
 
 An in-progress session is one append-only, checksummed file. JSON is used for
-evolving Chatend state; object data is raw binary. A complete corrupt frame is
-an error. A partial final frame is discarded on recovery.
+evolving Chatend state; object data is raw binary. Each update is appended as
+one checksummed frame. Related events may share one transition frame and
+checksum. Recovery replays the valid prefix in place and discards the first
+incomplete or checksum-invalid frame together with everything after it.
 
-Each accepted state change is fsynced. The staged Kweb plan is therefore
-recoverable after process failure.
+Journal writes use ordinary append I/O without explicit flush or `fsync`.
+Process termination does not discard data already accepted by the kernel, but
+the journal makes no stronger power-loss durability claim. Checksum-valid
+structural or semantic failures remain errors.
 
 V1 deliberately accepts one narrow exception: the current Kweb library commits
-a locally built transaction inside `finalize`, so Kennedy cannot fsync the
-exact signed package before submitting it. A crash after Kweb commit but before
-the local completion event has an unknown outcome. A prepared-package API is
-deferred and this window must not be represented as exact-once behavior.
+a locally built transaction inside `finalize`, so Kennedy cannot prepare and
+persist the exact signed package before submitting it. A crash after Kweb
+commit but before the local completion event has an unknown outcome. A
+prepared-package API is deferred and this window must not be represented as
+exact-once behavior.
 
 ## Context budgets
 

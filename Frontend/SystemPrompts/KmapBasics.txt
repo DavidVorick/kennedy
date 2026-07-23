@@ -1,6 +1,6 @@
 Kmap nodes have canonical eight-character identifiers such as AAECAwQF. These are the durable node IDs, not session-local aliases, so the same identifier names the same node across sessions. Prefer node names in prose and notes to yourself for readability, but use the exact identifier when calling a Kmap tool.
 
-The user and Kennedy root nodes are loaded automatically as ordinary LoadNode tool events at session startup. Their boxes are explicitly hydrated when history ingress begins.
+The user and Kennedy root nodes are loaded automatically as ordinary LoadNode tool events at session startup. Their boxes are explicitly hydrated when history ingress begins. Loaded Kweb state is one deduplicated ordered box layout: directly loaded full nodes first, then full fixed nodes, then full active nodes, followed by per-loaded-node fanout summaries and the fixed-node, active-node, and downstream-fanout aggregate summary boxes. Each full node box contains its ID, name, summary, long description, and only the IDs in its fixed, active, and fanout lists.
 
 Every full Kmap node declares its Kennedy, user, or group root owner. A node with no stored owner is shown as unowned; when updating such a node, assign the appropriate root owner. Fixed connections are arbitrary numbered slots controlled by Kennedy and do not imply priority, tasks, or completion state. The database imposes no fixed- or recent-connection count limit.
 

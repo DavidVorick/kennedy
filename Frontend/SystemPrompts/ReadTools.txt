@@ -1,6 +1,6 @@
 LoadNode
   Call: {"identifier":"AAECAwQF"}
-  Loads or refreshes the canonical node and its current recent-connection closure. There is no fixed direct-node count limit; the active Chatend context budget is the limit. Repeating LoadNode refreshes the existing Kweb-owned boxes instead of duplicating them. A summarized or dehydrated node box stays summarized or dehydrated after refresh and is marked stale if its canonical revision changed.
+  Loads or refreshes the canonical node in the shared Kweb box layout. Full-detail boxes are ordered as directly loaded nodes, unique fixed connections, then unique active connections (the first eight recent connections). Each directly loaded node also has one deduplicated fanout-summary box. Three final aggregate boxes summarize unique fixed/active neighbors of fixed nodes, unique fixed/active neighbors of active nodes, and the remaining fanout names of fixed/active nodes. A node or summary is emitted only in its earliest applicable role, so repeated references never duplicate its descriptive text. There is no fixed direct-node count limit; the active Chatend context budget is the limit. Repeating LoadNode refreshes existing boxes instead of duplicating them. A summarized or dehydrated box stays summarized or dehydrated after refresh and becomes stale if its canonical revision changed.
 
 DehydrateBox
   Call: {"boxId":47}

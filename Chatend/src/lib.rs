@@ -236,6 +236,10 @@ pub enum EventKind {
         box_id: BoxId,
         content: BoxContent,
     },
+    BoxRenamed {
+        box_id: BoxId,
+        name: String,
+    },
     BoxDehydrated {
         box_id: BoxId,
     },
@@ -262,6 +266,10 @@ pub enum EventKind {
         tool_instance: String,
         tool_name: String,
         outcome: Value,
+    },
+    ToolLayoutChanged {
+        tool_instance: String,
+        box_ids: Vec<BoxId>,
     },
     InferenceSubmitted {
         manifest_hash: String,
@@ -397,6 +405,8 @@ pub struct Chatend {
     pub boxes: BTreeMap<BoxId, BoxState>,
     pub pending: BTreeMap<PendingId, PendingKind>,
     pub tools: BTreeMap<String, ToolState>,
+    #[serde(default)]
+    pub tool_layouts: BTreeMap<String, Vec<BoxId>>,
     pub source_terminated: bool,
     pub history_ingress_started: bool,
     pub completed_session_object: Option<String>,
@@ -411,6 +421,7 @@ impl Chatend {
             boxes: BTreeMap::new(),
             pending: BTreeMap::new(),
             tools: BTreeMap::new(),
+            tool_layouts: BTreeMap::new(),
             source_terminated: false,
             history_ingress_started: false,
             completed_session_object: None,
@@ -505,6 +516,9 @@ impl Chatend {
             .filter(|state| state.stale())
             .map(|state| state.id)
             .collect::<Vec<_>>();
+        for box_ids in self.tool_layouts.values() {
+            arrange_tool_projection(&mut items, box_ids);
+        }
         let body_tokens = items
             .iter()
             .map(|item| item.approximate_tokens)
@@ -632,11 +646,9 @@ impl Chatend {
             !transition.events.is_empty(),
             "a transition cannot be empty"
         );
-        let mut candidate = self.clone();
         for event in &transition.events {
-            candidate.apply_event(event)?;
+            self.apply_event(event)?;
         }
-        *self = candidate;
         Ok(())
     }
 
@@ -693,6 +705,21 @@ impl Chatend {
                         active: true,
                     },
                 );
+                if let BoxOwner::Tool {
+                    tool_instance,
+                    slot,
+                } = owner
+                {
+                    self.tools
+                        .entry(tool_instance.clone())
+                        .or_default()
+                        .slots
+                        .push(ToolSlot {
+                            slot: slot.clone(),
+                            box_id: *box_id,
+                            retired: false,
+                        });
+                }
             }
             EventKind::CanonicalUpdated { box_id, content } => {
                 let state = active_box_mut(&mut self.boxes, *box_id)?;
@@ -705,6 +732,12 @@ impl Chatend {
                         canonical_event: event.id,
                     };
                 }
+                state.occurrence_events.push(event.id);
+            }
+            EventKind::BoxRenamed { box_id, name } => {
+                ensure!(!name.trim().is_empty(), "a box name cannot be empty");
+                let state = active_box_mut(&mut self.boxes, *box_id)?;
+                state.name = name.clone();
                 state.occurrence_events.push(event.id);
             }
             EventKind::BoxDehydrated { box_id } => {
@@ -731,9 +764,54 @@ impl Chatend {
                 state.occurrence_events.push(event.id);
             }
             EventKind::BoxRetired { box_id } => {
+                let tool_instance = self.boxes.get(box_id).and_then(|state| {
+                    let BoxOwner::Tool { tool_instance, .. } = &state.owner else {
+                        return None;
+                    };
+                    Some(tool_instance.clone())
+                });
                 let state = active_box_mut(&mut self.boxes, *box_id)?;
                 state.active = false;
                 state.occurrence_events.push(event.id);
+                if let Some(tool_instance) = tool_instance {
+                    let slot = self
+                        .tools
+                        .get_mut(&tool_instance)
+                        .and_then(|tool| tool.slots.iter_mut().find(|slot| slot.box_id == *box_id))
+                        .with_context(|| {
+                            format!("tool box {box_id} is missing from {tool_instance}")
+                        })?;
+                    slot.retired = true;
+                }
+            }
+            EventKind::ToolLayoutChanged {
+                tool_instance,
+                box_ids,
+            } => {
+                let mut unique = std::collections::HashSet::new();
+                for box_id in box_ids {
+                    ensure!(
+                        unique.insert(*box_id),
+                        "tool layout contains duplicate box {box_id}"
+                    );
+                    let state = self
+                        .boxes
+                        .get(box_id)
+                        .with_context(|| format!("tool layout references missing box {box_id}"))?;
+                    ensure!(state.active, "tool layout references retired box {box_id}");
+                    ensure!(
+                        matches!(
+                            &state.owner,
+                            BoxOwner::Tool {
+                                tool_instance: owner,
+                                ..
+                            } if owner == tool_instance
+                        ),
+                        "tool layout box {box_id} belongs to another tool"
+                    );
+                }
+                self.tool_layouts
+                    .insert(tool_instance.clone(), box_ids.clone());
             }
             EventKind::PendingAllocated {
                 pending_id,
@@ -789,10 +867,41 @@ fn active_box_mut(
     Ok(state)
 }
 
+fn arrange_tool_projection(items: &mut Vec<ProjectionItem>, box_ids: &[BoxId]) {
+    if box_ids.is_empty() {
+        return;
+    }
+    let ranks = box_ids
+        .iter()
+        .enumerate()
+        .map(|(rank, box_id)| (*box_id, rank))
+        .collect::<HashMap<_, _>>();
+    let insertion = items
+        .iter()
+        .position(|item| !item.marker && ranks.contains_key(&item.box_id));
+    let Some(insertion) = insertion else {
+        return;
+    };
+    let mut arranged = Vec::with_capacity(box_ids.len());
+    let mut retained = Vec::with_capacity(items.len());
+    for item in std::mem::take(items) {
+        if !item.marker && ranks.contains_key(&item.box_id) {
+            arranged.push(item);
+        } else {
+            retained.push(item);
+        }
+    }
+    arranged.sort_by_key(|item| ranks[&item.box_id]);
+    let insertion = insertion.min(retained.len());
+    retained.splice(insertion..insertion, arranged);
+    *items = retained;
+}
+
 fn event_box_id(kind: &EventKind) -> Option<BoxId> {
     match kind {
         EventKind::BoxCreated { box_id, .. }
         | EventKind::CanonicalUpdated { box_id, .. }
+        | EventKind::BoxRenamed { box_id, .. }
         | EventKind::BoxDehydrated { box_id }
         | EventKind::BoxSummarized { box_id, .. }
         | EventKind::BoxRehydrated { box_id }
@@ -806,6 +915,7 @@ fn event_kind_label(kind: &EventKind) -> &'static str {
         EventKind::SessionConfigured { .. } => "session configured",
         EventKind::BoxCreated { .. } => "box created",
         EventKind::CanonicalUpdated { .. } => "canonical box update",
+        EventKind::BoxRenamed { .. } => "box renamed",
         EventKind::BoxDehydrated { .. } => "box dehydrated",
         EventKind::BoxSummarized { .. } => "box summarized",
         EventKind::BoxRehydrated { .. } => "box rehydrated",
@@ -813,6 +923,7 @@ fn event_kind_label(kind: &EventKind) -> &'static str {
         EventKind::PendingAllocated { .. } => "pending identity allocated",
         EventKind::ToolInvoked { .. } => "tool invoked",
         EventKind::ToolCompleted { .. } => "tool completed",
+        EventKind::ToolLayoutChanged { .. } => "tool layout changed",
         EventKind::InferenceSubmitted { .. } => "inference submitted",
         EventKind::ProviderReceipt { .. } => "provider receipt",
         EventKind::CapacityError { .. } => "context capacity error",
@@ -900,7 +1011,7 @@ impl SessionJournal {
         let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
-            .write(true)
+            .append(true)
             .open(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         file.write_all(MAGIC)?;
@@ -909,8 +1020,6 @@ impl SessionJournal {
             metadata: metadata.clone(),
         };
         append_frame(&mut file, JSON_FRAME, &serde_json::to_vec(&opened)?)?;
-        file.sync_all()?;
-        sync_parent_directory(&path)?;
         drop(_append_guard);
         Ok(Self {
             path,
@@ -930,7 +1039,7 @@ impl SessionJournal {
             .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
         let mut file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .append(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         let mut magic = [0; MAGIC.len()];
@@ -972,10 +1081,10 @@ impl SessionJournal {
                     let mut payload = vec![0; payload_len_usize];
                     file.read_exact(&mut payload)?;
                     let checksum = Sha256::digest(&payload);
-                    ensure!(
-                        checksum.as_slice() == &header[9..],
-                        "checksum mismatch in complete frame at byte {cursor}"
-                    );
+                    if checksum.as_slice() != &header[9..] {
+                        file.set_len(cursor)?;
+                        break;
+                    }
                     let record: JsonRecord = serde_json::from_slice(&payload)
                         .with_context(|| format!("decoding JSON frame at byte {cursor}"))?;
                     match record {
@@ -1006,10 +1115,25 @@ impl SessionJournal {
                     }
                 }
                 OBJECT_FRAME => {
+                    let payload_start = cursor + FRAME_HEADER_BYTES;
+                    let mut hasher = Sha256::new();
+                    let mut remaining = payload_len;
+                    let mut buffer = vec![0_u8; 1024 * 1024];
+                    while remaining > 0 {
+                        let take = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+                        file.read_exact(&mut buffer[..take])?;
+                        hasher.update(&buffer[..take]);
+                        remaining -= take as u64;
+                    }
+                    if hasher.finalize().as_slice() != &header[9..] {
+                        file.set_len(cursor)?;
+                        break;
+                    }
                     ensure!(
                         payload_len >= OBJECT_PREFIX_BYTES as u64,
                         "raw object frame is shorter than its prefix"
                     );
+                    file.seek(SeekFrom::Start(payload_start))?;
                     let mut prefix = [0_u8; OBJECT_PREFIX_BYTES];
                     file.read_exact(&mut prefix)?;
                     let event_id = EventId(u64::from_le_bytes(prefix[..8].try_into().unwrap()));
@@ -1037,23 +1161,7 @@ impl SessionJournal {
                         .checked_sub(body_start as u64)
                         .context("invalid raw object frame length")?;
                     ensure!(body_len <= MAX_OBJECT_BYTES, "staged object exceeds 32 GiB");
-                    let payload_offset = cursor + FRAME_HEADER_BYTES + body_start as u64;
-                    let mut hasher = Sha256::new();
-                    hasher.update(prefix);
-                    hasher.update(&metadata_bytes);
-                    let mut remaining = body_len;
-                    let mut buffer = vec![0_u8; 1024 * 1024];
-                    while remaining > 0 {
-                        let take = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
-                        file.read_exact(&mut buffer[..take])?;
-                        hasher.update(&buffer[..take]);
-                        remaining -= take as u64;
-                    }
-                    let checksum = hasher.finalize();
-                    ensure!(
-                        checksum.as_slice() == &header[9..],
-                        "checksum mismatch in complete frame at byte {cursor}"
-                    );
+                    let payload_offset = payload_start + body_start as u64;
                     let state = chatend.as_mut().context("object precedes session header")?;
                     let allocation = Event {
                         id: metadata.event_id,
@@ -1084,8 +1192,7 @@ impl SessionJournal {
             }
             cursor = frame_end;
         }
-        let mut chatend = chatend.context("journal has no session header")?;
-        chatend.tools = derive_tool_states(&chatend);
+        let chatend = chatend.context("journal has no session header")?;
         file.seek(SeekFrom::End(0))?;
         drop(_append_guard);
         Ok(Self {
@@ -1120,20 +1227,24 @@ impl SessionJournal {
         recorded_at: impl Into<String>,
         value: Value,
     ) -> anyhow::Result<()> {
-        let kind = kind.into();
-        let recorded_at = recorded_at.into();
         let record = JsonRecord::Sideband {
-            kind: kind.clone(),
-            recorded_at: recorded_at.clone(),
-            value: value.clone(),
+            kind: kind.into(),
+            recorded_at: recorded_at.into(),
+            value,
         };
         let append_lock = self.append_lock.clone();
         let _append_guard = append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
         append_frame(&mut self.file, JSON_FRAME, &serde_json::to_vec(&record)?)?;
-        self.file.flush()?;
-        self.file.sync_data()?;
+        let JsonRecord::Sideband {
+            kind,
+            recorded_at,
+            value,
+        } = record
+        else {
+            unreachable!()
+        };
         self.sidebands.push(SidebandRecord {
             kind,
             recorded_at,
@@ -1330,8 +1441,6 @@ impl SessionJournal {
         self.file.write_all(&metadata_len.to_le_bytes())?;
         self.file.write_all(&metadata_bytes)?;
         self.file.write_all(bytes)?;
-        self.file.flush()?;
-        self.file.sync_data()?;
         let allocation = Event {
             id: event_id,
             recorded_at: metadata.recorded_at.clone(),
@@ -1400,20 +1509,20 @@ impl SessionJournal {
             recorded_at: recorded_at.into(),
             events,
         };
-        let mut candidate = self.chatend.clone();
-        candidate.apply_transition(&transition)?;
-        candidate.tools = derive_tool_states(&candidate);
-        let record = JsonRecord::Transition {
-            transition: transition.clone(),
-        };
+        ensure!(
+            !transition.events.is_empty(),
+            "a transition cannot be empty"
+        );
+        let record = JsonRecord::Transition { transition };
         let append_lock = self.append_lock.clone();
         let _append_guard = append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
         append_frame(&mut self.file, JSON_FRAME, &serde_json::to_vec(&record)?)?;
-        self.file.flush()?;
-        self.file.sync_data()?;
-        self.chatend = candidate;
+        let JsonRecord::Transition { transition } = record else {
+            unreachable!()
+        };
+        self.chatend.apply_transition(&transition)?;
         Ok(())
     }
 
@@ -1422,6 +1531,26 @@ impl SessionJournal {
         recorded_at: impl Into<String>,
         tool_instance: impl Into<String>,
         slots: Vec<ToolSlotInput>,
+    ) -> anyhow::Result<Vec<EventId>> {
+        self.apply_tool_slots_inner(recorded_at, tool_instance, slots, None)
+    }
+
+    pub fn apply_tool_slots_with_layout(
+        &mut self,
+        recorded_at: impl Into<String>,
+        tool_instance: impl Into<String>,
+        slots: Vec<ToolSlotInput>,
+        layout_slots: &[String],
+    ) -> anyhow::Result<Vec<EventId>> {
+        self.apply_tool_slots_inner(recorded_at, tool_instance, slots, Some(layout_slots))
+    }
+
+    fn apply_tool_slots_inner(
+        &mut self,
+        recorded_at: impl Into<String>,
+        tool_instance: impl Into<String>,
+        slots: Vec<ToolSlotInput>,
+        layout_slots: Option<&[String]>,
     ) -> anyhow::Result<Vec<EventId>> {
         let recorded_at = recorded_at.into();
         let tool_instance = tool_instance.into();
@@ -1467,17 +1596,31 @@ impl SessionJournal {
                         },
                     });
                     next_state.slots[index].retired = true;
-                } else if !input.retired && state.canonical.content != input.content {
-                    let id = EventId(next);
-                    next += 1;
-                    events.push(Event {
-                        id,
-                        recorded_at: recorded_at.clone(),
-                        kind: EventKind::CanonicalUpdated {
-                            box_id: existing.box_id,
-                            content: input.content.clone(),
-                        },
-                    });
+                } else if !input.retired {
+                    if state.name != input.name {
+                        let id = EventId(next);
+                        next += 1;
+                        events.push(Event {
+                            id,
+                            recorded_at: recorded_at.clone(),
+                            kind: EventKind::BoxRenamed {
+                                box_id: existing.box_id,
+                                name: input.name.clone(),
+                            },
+                        });
+                    }
+                    if state.canonical.content != input.content {
+                        let id = EventId(next);
+                        next += 1;
+                        events.push(Event {
+                            id,
+                            recorded_at: recorded_at.clone(),
+                            kind: EventKind::CanonicalUpdated {
+                                box_id: existing.box_id,
+                                content: input.content.clone(),
+                            },
+                        });
+                    }
                 }
             } else {
                 ensure!(
@@ -1507,19 +1650,47 @@ impl SessionJournal {
                 });
             }
         }
+        if let Some(layout_slots) = layout_slots {
+            let mut unique = std::collections::HashSet::new();
+            let box_ids = layout_slots
+                .iter()
+                .map(|slot_name| {
+                    ensure!(
+                        unique.insert(slot_name),
+                        "tool layout contains duplicate slot {slot_name}"
+                    );
+                    let slot = next_state
+                        .slots
+                        .iter()
+                        .find(|slot| &slot.slot == slot_name)
+                        .with_context(|| {
+                            format!("tool layout references missing slot {slot_name}")
+                        })?;
+                    ensure!(
+                        !slot.retired,
+                        "tool layout references retired slot {slot_name}"
+                    );
+                    Ok(slot.box_id)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if self.chatend.tool_layouts.get(&tool_instance) != Some(&box_ids) {
+                let id = EventId(next);
+                events.push(Event {
+                    id,
+                    recorded_at: recorded_at.clone(),
+                    kind: EventKind::ToolLayoutChanged {
+                        tool_instance: tool_instance.clone(),
+                        box_ids,
+                    },
+                });
+            }
+        }
         if events.is_empty() {
             return Ok(Vec::new());
         }
         let ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
         self.commit_events(recorded_at, events)?;
-        self.chatend.tools.insert(tool_instance, next_state);
-        // Tool slot mappings are derived from box-owner events on replay.
-        self.rebuild_tools();
         Ok(ids)
-    }
-
-    fn rebuild_tools(&mut self) {
-        self.chatend.tools = derive_tool_states(&self.chatend);
     }
 
     pub fn fully_dehydrate_for_ingress(
@@ -1550,10 +1721,6 @@ impl SessionJournal {
         self.commit_events(recorded_at, events)?;
         Ok(ids)
     }
-
-    pub fn sync_all(&mut self) -> anyhow::Result<()> {
-        self.file.sync_all().context("syncing Chatend journal")
-    }
 }
 
 fn journal_lock(path: &Path) -> Arc<Mutex<()>> {
@@ -1569,48 +1736,18 @@ fn journal_lock(path: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
-fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .with_context(|| format!("opening journal directory {} for sync", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing journal directory {}", parent.display()))
-}
-
-fn derive_tool_states(chatend: &Chatend) -> BTreeMap<String, ToolState> {
-    let mut output = BTreeMap::<String, ToolState>::new();
-    let mut boxes = chatend.boxes.values().collect::<Vec<_>>();
-    boxes.sort_by_key(|state| state.created_at);
-    for state in boxes {
-        let BoxOwner::Tool {
-            tool_instance,
-            slot,
-        } = &state.owner
-        else {
-            continue;
-        };
-        output
-            .entry(tool_instance.clone())
-            .or_default()
-            .slots
-            .push(ToolSlot {
-                slot: slot.clone(),
-                box_id: state.id,
-                retired: !state.active,
-            });
-    }
-    output
-}
-
 fn append_frame(file: &mut File, kind: u8, payload: &[u8]) -> anyhow::Result<()> {
     file.seek(SeekFrom::End(0))?;
-    file.write_all(&[kind])?;
-    file.write_all(&(payload.len() as u64).to_le_bytes())?;
-    file.write_all(&Sha256::digest(payload))?;
-    file.write_all(payload)?;
+    let capacity = FRAME_HEADER_BYTES
+        .checked_add(payload.len() as u64)
+        .and_then(|length| usize::try_from(length).ok())
+        .context("journal frame does not fit address space")?;
+    let mut frame = Vec::with_capacity(capacity);
+    frame.push(kind);
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&Sha256::digest(payload));
+    frame.extend_from_slice(payload);
+    file.write_all(&frame)?;
     Ok(())
 }
 
@@ -1645,6 +1782,18 @@ mod tests {
             effective_context_tokens: 1_000,
             channel: json!({"kind":"test"}),
         }
+    }
+
+    fn frame_starts(bytes: &[u8]) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut cursor = MAGIC.len();
+        while cursor < bytes.len() {
+            starts.push(cursor);
+            let payload_len =
+                u64::from_le_bytes(bytes[cursor + 1..cursor + 9].try_into().unwrap()) as usize;
+            cursor += FRAME_HEADER_BYTES as usize + payload_len;
+        }
+        starts
     }
 
     #[test]
@@ -1725,7 +1874,6 @@ mod tests {
         file.write_all(&[JSON_FRAME]).unwrap();
         file.write_all(&500_u64.to_le_bytes()).unwrap();
         file.write_all(&[0; 7]).unwrap();
-        file.sync_all().unwrap();
         drop(file);
         let mut recovered = SessionJournal::open(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
@@ -1733,6 +1881,113 @@ mod tests {
             .create_box("t2", "next", BoxOwner::Kennedy, BoxContent::text("resumed"))
             .unwrap();
         assert_eq!(id, BoxId(2));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn checksum_mismatch_discards_the_frame_and_every_later_frame() {
+        let path = path("checksum-tail");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        let first = journal
+            .create_box("t1", "first", BoxOwner::User, BoxContent::text("safe"))
+            .unwrap();
+        let second = journal
+            .create_box(
+                "t2",
+                "second",
+                BoxOwner::Kennedy,
+                BoxContent::text("discard"),
+            )
+            .unwrap();
+        journal
+            .create_box(
+                "t3",
+                "third",
+                BoxOwner::Kennedy,
+                BoxContent::text("also discard"),
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let starts = frame_starts(&bytes);
+        let corrupted_start = starts[2];
+        bytes[corrupted_start + 9] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut recovered = SessionJournal::open(&path).unwrap();
+        assert!(recovered.state().box_state(first).is_some());
+        assert!(recovered.state().box_state(second).is_none());
+        assert_eq!(recovered.state().next_id, 2);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            corrupted_start as u64
+        );
+        let resumed = recovered
+            .create_box("t4", "resumed", BoxOwner::Kennedy, BoxContent::text("new"))
+            .unwrap();
+        assert_eq!(resumed, BoxId(2));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn checksum_mismatch_discards_a_whole_multi_event_transition() {
+        let path = path("checksum-batch");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        let first = journal
+            .create_box("t1", "first", BoxOwner::User, BoxContent::text("one"))
+            .unwrap();
+        let second = journal
+            .create_box("t2", "second", BoxOwner::Kennedy, BoxContent::text("two"))
+            .unwrap();
+        journal.fully_dehydrate_for_ingress("t3", &[]).unwrap();
+        drop(journal);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let batch_start = *frame_starts(&bytes).last().unwrap();
+        bytes[batch_start + 9] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let recovered = SessionJournal::open(&path).unwrap();
+        assert!(matches!(
+            recovered.state().box_state(first).unwrap().representation,
+            Representation::Hydrated { .. }
+        ));
+        assert!(matches!(
+            recovered.state().box_state(second).unwrap().representation,
+            Representation::Hydrated { .. }
+        ));
+        assert_eq!(recovered.state().next_id, 3);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn object_checksum_mismatch_discards_the_object_and_later_frames() {
+        let path = path("object-checksum-tail");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        let object = journal
+            .stage_object(
+                "t1",
+                "application/octet-stream",
+                Some("object.bin".into()),
+                Value::Null,
+                b"object payload",
+            )
+            .unwrap();
+        journal
+            .create_box("t2", "later", BoxOwner::User, BoxContent::text("discard"))
+            .unwrap();
+        drop(journal);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let object_start = frame_starts(&bytes)[1];
+        bytes[object_start + 9] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let recovered = SessionJournal::open(&path).unwrap();
+        assert!(!recovered.objects().contains_key(&object));
+        assert!(recovered.state().events.is_empty());
+        assert_eq!(recovered.state().next_id, 1);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1786,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn stateful_tool_slots_are_atomic_append_only_and_do_not_see_summaries() {
+    fn stateful_tool_slots_are_batched_append_only_and_do_not_see_summaries() {
         let path = path("slots");
         let mut journal = SessionJournal::create(&path, metadata()).unwrap();
         journal
@@ -1863,6 +2118,46 @@ mod tests {
         let reopened = SessionJournal::open(&path).unwrap();
         assert_eq!(reopened.state().tools["rust-1"].slots.len(), 3);
         assert!(reopened.state().tools["rust-1"].slots[1].retired);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tool_layout_orders_current_boxes_without_changing_their_identities() {
+        let path = path("tool-layout");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        journal
+            .apply_tool_slots_with_layout(
+                "t1",
+                "kweb",
+                vec![
+                    ToolSlotInput {
+                        slot: "active".into(),
+                        name: "Active node".into(),
+                        content: BoxContent::text("ACTIVE NODE"),
+                        retired: false,
+                    },
+                    ToolSlotInput {
+                        slot: "direct".into(),
+                        name: "Direct node".into(),
+                        content: BoxContent::text("DIRECT NODE"),
+                        retired: false,
+                    },
+                ],
+                &["direct".into(), "active".into()],
+            )
+            .unwrap();
+        let tool = &journal.state().tools["kweb"];
+        let active_id = tool.slots[0].box_id;
+        let direct_id = tool.slots[1].box_id;
+        let rendered = journal.state().render();
+        assert!(rendered.find("DIRECT NODE") < rendered.find("ACTIVE NODE"));
+        assert_eq!(
+            journal.state().tool_layouts["kweb"],
+            vec![direct_id, active_id]
+        );
+        drop(journal);
+        let reopened = SessionJournal::open(&path).unwrap();
+        assert_eq!(reopened.state().render(), rendered);
         std::fs::remove_file(path).unwrap();
     }
 

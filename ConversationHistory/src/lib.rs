@@ -6,11 +6,11 @@
 //! ID; their details are loaded from Kweb on demand.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path as FilePath, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use anyhow::Context as _;
@@ -40,7 +40,8 @@ pub struct Config {
 #[derive(Clone)]
 struct AppState {
     config: Config,
-    mutation: Arc<Mutex<()>>,
+    catalog_mutation: Arc<Mutex<()>>,
+    session_mutations: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -270,7 +271,8 @@ pub fn open(config: Config) -> anyhow::Result<Service> {
     }
     let state = AppState {
         config: config.clone(),
-        mutation: Arc::new(Mutex::new(())),
+        catalog_mutation: Arc::new(Mutex::new(())),
+        session_mutations: Arc::new(Mutex::new(HashMap::new())),
     };
     Ok(Service {
         state,
@@ -476,7 +478,18 @@ async fn record_completed_session(
     State(state): State<AppState>,
     Json(input): Json<RecordCompletedSession>,
 ) -> Result<Json<Value>, ApiError> {
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = input
+        .journal_path
+        .as_ref()
+        .and_then(|path| path.file_stem())
+        .and_then(|value| value.to_str())
+        .map(|id| session_mutation(&state, id))
+        .transpose()?;
+    let _session_guard = session_guard
+        .as_ref()
+        .map(|guard| guard.lock().map_err(ApiError::internal))
+        .transpose()?;
+    let _catalog_guard = state.catalog_mutation.lock().map_err(ApiError::internal)?;
     append_completed_id(&state.config.completed_list, &input.session_object_id)
         .map_err(ApiError::internal)?;
     if let Some(path) = input.journal_path {
@@ -485,7 +498,6 @@ async fn record_completed_session(
             std::fs::remove_file(&path)
                 .with_context(|| format!("removing committed journal {}", path.display()))
                 .map_err(ApiError::internal)?;
-            sync_directory(&state.config.directory).map_err(ApiError::internal)?;
         }
     }
     Ok(Json(json!({
@@ -531,8 +543,12 @@ async fn create_session(
             ApiError::bad("A session created by the backend must provide its journalPath.")
         })?;
     ensure_inside(&path, &state.config.directory)?;
-    let mut journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
+    let journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
     let id = journal.state().metadata.session_id.clone();
+    drop(journal);
+    let session_guard = session_mutation(&state, &id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
+    let mut journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
     if latest_lifecycle(&journal).is_some() {
         return Err(ApiError::conflict("Session is already registered."));
     }
@@ -561,7 +577,7 @@ async fn start_managed_session(
 ) -> Result<(StatusCode, Json<SessionRecord>), ApiError> {
     validate_started_at(&input.started_at)?;
     validate_idempotency(&input.idempotency_id)?;
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let _catalog_guard = state.catalog_mutation.lock().map_err(ApiError::internal)?;
     for path in journal_paths(&state.config.directory)? {
         let journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
         if let Some(record) = latest_lifecycle(&journal)
@@ -696,7 +712,8 @@ async fn queue_session_command(
     Json(input): Json<QueueSessionCommand>,
 ) -> Result<(StatusCode, Json<SessionCommand>), ApiError> {
     validate_idempotency(&input.idempotency_id)?;
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = session_mutation(&state, &id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, &id)?;
     let record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     if record.phase != "active" {
@@ -761,7 +778,8 @@ async fn stage_session_object(
     }
     let (file_name, media_type, bytes) =
         body.ok_or_else(|| ApiError::bad("Multipart upload omitted the file field."))?;
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = session_mutation(&state, &id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, &id)?;
     let record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     if record.phase != "active" {
@@ -850,17 +868,24 @@ fn mutate_command(
     command_id: &str,
     mutation: impl FnOnce(&mut SessionCommand) -> Result<(), ApiError>,
 ) -> Result<SessionCommand, ApiError> {
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let mut target = None;
     for path in journal_paths(&state.config.directory)? {
-        let mut journal = SessionJournal::open(path).map_err(ApiError::internal)?;
-        let Some(mut command) = commands(&journal).remove(command_id) else {
-            continue;
-        };
-        mutation(&mut command)?;
-        append_command(&mut journal, &command)?;
-        return Ok(command);
+        let journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
+        if let Some(command) = commands(&journal).remove(command_id) {
+            target = Some((path, command.conversation_id));
+            break;
+        }
     }
-    Err(ApiError::not_found())
+    let (path, conversation_id) = target.ok_or_else(ApiError::not_found)?;
+    let session_guard = session_mutation(state, &conversation_id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
+    let mut journal = SessionJournal::open(path).map_err(ApiError::internal)?;
+    let mut command = commands(&journal)
+        .remove(command_id)
+        .ok_or_else(ApiError::not_found)?;
+    mutation(&mut command)?;
+    append_command(&mut journal, &command)?;
+    Ok(command)
 }
 
 async fn request_session_stop(
@@ -882,7 +907,8 @@ async fn checkpoint(
     new_state: Value,
     user_activity: bool,
 ) -> Result<Json<SessionRecord>, ApiError> {
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = session_mutation(&state, id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
     let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     require_version(&record, expected_version)?;
@@ -902,7 +928,8 @@ async fn transition_with_checkpoint(
     input: CheckpointSession,
     phase: &str,
 ) -> Result<Json<SessionRecord>, ApiError> {
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = session_mutation(&state, id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
     let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     require_version(&record, input.expected_version)?;
@@ -921,7 +948,8 @@ async fn transition(
     phase: &str,
     provenance_id: Option<String>,
 ) -> Result<Json<SessionRecord>, ApiError> {
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = session_mutation(&state, id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
     let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     require_version(&record, expected_version)?;
@@ -938,7 +966,8 @@ async fn record_ingress_failure(
     id: &str,
     input: RecordIngressFailure,
 ) -> Result<Json<SessionRecord>, ApiError> {
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = session_mutation(&state, id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
     let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     require_version(&record, input.expected_version)?;
@@ -988,7 +1017,8 @@ async fn complete_session(
     expected_version: i64,
     new_state: Value,
 ) -> Result<Json<SessionRecord>, ApiError> {
-    let _guard = state.mutation.lock().map_err(ApiError::internal)?;
+    let session_guard = session_mutation(&state, id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let path = state.config.directory.join(format!("{id}.chatend"));
     let journal = open_by_id(&state, id)?;
     let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
@@ -1003,6 +1033,7 @@ async fn complete_session(
             ApiError::conflict("completed session has no permanent Kweb session object")
         })?
         .to_owned();
+    let _catalog_guard = state.catalog_mutation.lock().map_err(ApiError::internal)?;
     append_completed_id(&state.config.completed_list, &object_id).map_err(ApiError::internal)?;
     record.phase = "complete".into();
     record.version += 1;
@@ -1014,7 +1045,6 @@ async fn complete_session(
     std::fs::remove_file(&path)
         .with_context(|| format!("removing committed journal {}", path.display()))
         .map_err(ApiError::internal)?;
-    sync_directory(&state.config.directory).map_err(ApiError::internal)?;
     Ok(Json(output))
 }
 
@@ -1043,6 +1073,17 @@ async fn purge_session(
 fn fetch_active(state: &AppState, id: &str) -> Result<SessionRecord, ApiError> {
     let journal = open_by_id(state, id)?;
     latest_lifecycle(&journal).ok_or_else(ApiError::not_found)
+}
+
+fn session_mutation(state: &AppState, id: &str) -> Result<Arc<Mutex<()>>, ApiError> {
+    let mut sessions = state.session_mutations.lock().map_err(ApiError::internal)?;
+    sessions.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = sessions.get(id).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    sessions.insert(id.to_owned(), Arc::downgrade(&lock));
+    Ok(lock)
 }
 
 fn open_by_id(state: &AppState, id: &str) -> Result<SessionJournal, ApiError> {
@@ -1126,6 +1167,7 @@ fn materialize(mut record: SessionRecord, journal: &SessionJournal) -> SessionRe
     record.state["events"] = serde_json::to_value(&journal.state().events).unwrap_or(Value::Null);
     record.state["context"] =
         serde_json::to_value(journal.state().projection()).unwrap_or(Value::Null);
+    record.state["chatendText"] = json!(journal.state().render());
     record.state["sessionObjectId"] = journal
         .state()
         .completed_session_object
@@ -1361,6 +1403,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(command["status"], "pending");
+        let materialized = service
+            .get_json(&format!("/api/v1/conversations/{id}"))
+            .await
+            .unwrap();
+        assert!(
+            materialized["state"]["chatendText"]
+                .as_str()
+                .is_some_and(|text| text.contains("[context budget"))
+        );
         let listed = service
             .get_json("/api/v1/conversation-commands")
             .await

@@ -1,6 +1,6 @@
 import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260723.2";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260723.1";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260722.1";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260723.4";
 import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260720.2";
 
 const CONFIG = {
@@ -151,10 +151,28 @@ function archivedDiagnostic(archive, mode, transcript = []) {
 }
 
 function boxDiagnostic(source, mode) {
+  const context = source?.context || {};
+  const projectedText = Array.isArray(context.items)
+    ? [...context.items.map(item => item?.text).filter(text => typeof text === "string"), context.footer]
+        .filter(text => typeof text === "string" && text.length)
+        .join("\n\n")
+    : null;
+  const projectedOrder = new Map(
+    (context.items || [])
+      .filter(item => item?.marker !== true)
+      .map((item, index) => [Number(item.boxId), index]),
+  );
   const boxes = Object.values(source?.boxes || {});
   const messages = boxes
     .filter(box => box?.active !== false)
-    .sort((left, right) => Number(left?.occurrenceEvents?.at(-1) || 0) - Number(right?.occurrenceEvents?.at(-1) || 0))
+    .sort((left, right) => {
+      const leftProjected = projectedOrder.get(Number(left?.id));
+      const rightProjected = projectedOrder.get(Number(right?.id));
+      if (leftProjected !== undefined || rightProjected !== undefined) {
+        return (leftProjected ?? Number.MAX_SAFE_INTEGER) - (rightProjected ?? Number.MAX_SAFE_INTEGER);
+      }
+      return Number(left?.occurrenceEvents?.at(-1) || 0) - Number(right?.occurrenceEvents?.at(-1) || 0);
+    })
     .map(box => {
       const representation = box?.representation || {};
       const stale = representation.kind !== "hydrated"
@@ -163,19 +181,24 @@ function boxDiagnostic(source, mode) {
       if (representation.kind === "dehydrated") content = `[Box ${box.id} is dehydrated.]`;
       if (representation.kind === "summarized") content = representation.text || "";
       if (stale) content = `[Stale representation]\n\n${content}`;
+      const owner = box?.owner || {};
+      const kweb = owner.kind === "tool" && owner.tool_instance === "kweb";
       return {
-        role: box?.owner?.kind === "kennedy" ? "assistant"
-          : box?.owner?.kind === "system" ? "system" : "user",
+        role: owner.kind === "kennedy" ? "assistant"
+          : owner.kind === "user" ? "user" : "system",
+        context_kind: kweb ? "kweb-box"
+          : owner.kind === "system" ? "instructions"
+          : owner.kind === "user" || (owner.kind === "kennedy" && box.name === "Kennedy message") ? null
+          : "box",
         display_role: `Box ${box.id} · ${box.name || "Context"}`,
         content,
       };
     });
-  const context = source?.context || {};
   const effective = Number(String(context.footer || "").match(/effective=(\d+)/)?.[1]) || 0;
   return {
     mode, provider, model,
     chatend: messages,
-    chatendText: null,
+    chatendText: typeof source?.chatendText === "string" ? source.chatendText : projectedText,
     context: {
       boxCount: boxes.length,
       eventCount: Array.isArray(source?.events) ? source.events.length : 0,

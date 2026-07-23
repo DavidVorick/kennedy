@@ -138,10 +138,13 @@ transaction.
 ### Chatend
 
 An active session is one `.chatend` file. Frames have a kind, canonical
-little-endian length, SHA-256 checksum, and payload. Evolving event/control state is JSON; staged
-objects are raw bytes with a compact metadata prefix. Appends are fsynced
-before acknowledgement. A partial final frame is discarded; corruption in a
-complete frame is fatal.
+little-endian length, SHA-256 checksum, and payload. Evolving event/control
+state is JSON; staged objects are raw bytes with a compact metadata prefix.
+Updates are appended immediately without explicit flush or `fsync`. A
+transition that needs several events is encoded as one frame under one
+checksum. On replay, the first incomplete or checksum-invalid frame and
+everything after it are discarded. Checksum-valid structural or schema errors
+remain fatal.
 
 The browser uploads original objects as multipart data and receives a shared
 temporary ID such as `pending:47`. At commit, Kennedy reads the staged bytes
@@ -205,8 +208,9 @@ stopped.
 
 ## Deliberate V1 limits
 
-- The exact signed Kweb transaction package cannot yet be fsynced before local
-  `finalize`; a narrow post-commit/pre-journal crash window is accepted.
+- The exact signed Kweb transaction package cannot yet be prepared and
+  persisted before local `finalize`; a narrow post-commit/pre-journal crash
+  window is accepted.
 - Zero-copy object handoff and streaming objects are deferred.
 - The writer lane is global rather than fine-grained.
 - Gossip protocol integration is deferred.
