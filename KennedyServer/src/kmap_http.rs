@@ -151,9 +151,9 @@ impl Service {
     }
 
     /// Commit all permanent effects of one completed Chatend session in one
-    /// Kweb transaction. Pending object IDs are allocated first; pending node
-    /// creates are then resolved in dependency order; canonical node updates
-    /// are applied last.
+    /// Kweb transaction. Pending object and node IDs are allocated first;
+    /// pending node creates are then resolved and materialized; canonical node
+    /// updates are applied last.
     pub(crate) fn commit_session(
         &self,
         input: SessionCommit,
@@ -172,33 +172,13 @@ impl Service {
         let session_object_id = transaction.create_object(input.archive)?;
 
         let mut node_ids = BTreeMap::<String, NodeId>::new();
-        let mut creates = input.creates;
-        while !creates.is_empty() {
-            let before = creates.len();
-            let mut deferred = Vec::new();
-            for create in creates {
-                if node_dependencies(&create.data)
-                    .iter()
-                    .any(|id| is_pending(id) && !node_ids.contains_key(*id))
-                {
-                    deferred.push(create);
-                    continue;
-                }
-                let data = resolve_session_node_data(
-                    &create.data,
-                    &node_ids,
-                    &object_ids,
-                    session_object_id,
-                )?;
-                let id = transaction.create_node(data)?;
-                node_ids.insert(create.pending_id, id);
-            }
-            if deferred.len() == before {
-                return Err(ApiError::invalid(
-                    "pending node creates contain a forward-reference cycle; create dependent nodes in dependency order",
-                ));
-            }
-            creates = deferred;
+        for create in &input.creates {
+            node_ids.insert(create.pending_id.clone(), transaction.reserve_node_id()?);
+        }
+        for create in input.creates {
+            let data =
+                resolve_session_node_data(&create.data, &node_ids, &object_ids, session_object_id)?;
+            transaction.create_reserved_node(node_ids[&create.pending_id], data)?;
         }
         for update in input.updates {
             let id = parse_node_id(&update.node_id)?;
@@ -350,21 +330,6 @@ pub(crate) struct SessionCommitResult {
 
 fn is_pending(value: &str) -> bool {
     value.starts_with("pending:")
-}
-
-fn node_dependencies(data: &SessionNodeData) -> Vec<&str> {
-    let mut dependencies = Vec::new();
-    if is_pending(&data.owner) {
-        dependencies.push(data.owner.as_str());
-    }
-    dependencies.extend(
-        data.fixed_connections
-            .iter()
-            .chain(&data.recent_connections)
-            .filter(|id| is_pending(id))
-            .map(String::as_str),
-    );
-    dependencies
 }
 
 fn resolve_session_node_data(
@@ -1355,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn one_session_commit_contains_archive_objects_creates_and_updates() {
+    fn one_session_commit_supports_circular_creates_with_archive_objects_and_updates() {
         let directory =
             std::env::temp_dir().join(format!("kennedy-session-commit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -1364,6 +1329,7 @@ mod tests {
         let service = Service::new(database, roots, &identity).unwrap();
         let root = service.database.get_node(roots.user).unwrap();
         let pending_node = "pending:7".to_owned();
+        let circular_node = "pending:9".to_owned();
         let pending_object = "pending:8".to_owned();
         let result = service
             .commit_session(SessionCommit {
@@ -1377,19 +1343,34 @@ mod tests {
                     pending_id: pending_object.clone(),
                     bytes: b"attachment".to_vec(),
                 }],
-                creates: vec![SessionNodeCreate {
-                    pending_id: pending_node.clone(),
-                    data: SessionNodeData {
-                        short_name: "Created Memory".into(),
-                        short_description: String::new(),
-                        long_description: "Created in one session transaction.".into(),
-                        owner: roots.user.to_string(),
-                        fixed_connections: Vec::new(),
-                        recent_connections: vec![roots.user.to_string()],
-                        objects: vec![pending_object.clone()],
-                        include_session_object: true,
+                creates: vec![
+                    SessionNodeCreate {
+                        pending_id: pending_node.clone(),
+                        data: SessionNodeData {
+                            short_name: "Created Memory".into(),
+                            short_description: String::new(),
+                            long_description: "Created in one session transaction.".into(),
+                            owner: roots.user.to_string(),
+                            fixed_connections: Vec::new(),
+                            recent_connections: vec![roots.user.to_string(), circular_node.clone()],
+                            objects: vec![pending_object.clone()],
+                            include_session_object: true,
+                        },
                     },
-                }],
+                    SessionNodeCreate {
+                        pending_id: circular_node.clone(),
+                        data: SessionNodeData {
+                            short_name: "Circular Memory".into(),
+                            short_description: String::new(),
+                            long_description: "References the other created node.".into(),
+                            owner: roots.user.to_string(),
+                            fixed_connections: Vec::new(),
+                            recent_connections: vec![pending_node.clone()],
+                            objects: Vec::new(),
+                            include_session_object: false,
+                        },
+                    },
+                ],
                 updates: vec![SessionNodeUpdate {
                     node_id: roots.user.to_string(),
                     data: SessionNodeData {
@@ -1411,9 +1392,15 @@ mod tests {
             })
             .unwrap();
         let created_id = result.node_ids[&pending_node].parse::<NodeId>().unwrap();
+        let circular_id = result.node_ids[&circular_node].parse::<NodeId>().unwrap();
         let created = service.database.get_node(created_id).unwrap();
+        let circular = service.database.get_node(circular_id).unwrap();
         let updated_root = service.database.get_node(roots.user).unwrap();
-        assert_eq!(created.data.recent_connections, vec![roots.user]);
+        assert_eq!(
+            created.data.recent_connections,
+            vec![roots.user, circular_id]
+        );
+        assert_eq!(circular.data.recent_connections, vec![created_id]);
         assert_eq!(updated_root.data.recent_connections, vec![created_id]);
         assert!(
             created

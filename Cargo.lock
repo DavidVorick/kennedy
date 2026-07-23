@@ -2035,9 +2035,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-kweb-db"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1461fe22d2032450a65dabc8cab0fc79ae412fd76d004e3e513f3ef8ac64f8"
+checksum = "00641b1c6962c36fbdf60e0568f16b17698df2dd1c45d263d4f3b331990b749c"
 dependencies = [
  "base64",
  "chrono",
