@@ -32,6 +32,15 @@ struct Runtime {
     kennedy_root_node_id: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum MissingGroupSessionRecovery {
+    CompleteSilentReset,
+    DetachCurrent {
+        group_id: String,
+        telegram_user_id: i64,
+    },
+}
+
 pub(crate) struct Orchestrator {
     config: Config,
     api: Api,
@@ -842,7 +851,7 @@ impl Orchestrator {
                         json!({
                             "expected_version":version(&piece)?,
                             "provenance_id":format!("session:audio:{id}"),
-                            "completion_protocol":kennedy_audio_ingress::COMPLETION_PROTOCOL
+                            "completion_protocol":crate::audio_ingress::COMPLETION_PROTOCOL
                         }),
                     )
                     .await?;
@@ -1879,7 +1888,18 @@ impl Orchestrator {
         let id = required_string(&update, "conversationId")?;
         let lock = self.conversation_lock(&id).await;
         let _guard = lock.lock().await;
-        let record = self.get_conversation(&id).await?;
+        let record = match self.get_conversation(&id).await {
+            Ok(record) => record,
+            Err(error)
+                if error
+                    .downcast_ref::<super::ApiError>()
+                    .is_some_and(|error| error.code == "not_found") =>
+            {
+                self.reconcile_missing_group_session(&update, &id).await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if record.get("phase").and_then(Value::as_str) != Some("active") {
             if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
                 self.api
@@ -1922,6 +1942,68 @@ impl Orchestrator {
                 .await?;
         } else {
             self.api.telegram_post(&format!("/api/v1/group-sessions/{}/context-ack",encode_path(&id)),json!({"throughMessageId":update.get("throughMessageId").cloned().unwrap_or(json!(0))})).await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_missing_group_session(
+        &self,
+        update: &Value,
+        conversation_id: &str,
+    ) -> anyhow::Result<()> {
+        match missing_group_session_recovery(update)? {
+            MissingGroupSessionRecovery::CompleteSilentReset => {
+                self.api
+                    .telegram_post(
+                        &format!(
+                            "/api/v1/group-sessions/{}/silent-reset-completed",
+                            encode_path(conversation_id)
+                        ),
+                        json!({}),
+                    )
+                    .await?;
+                tracing::info!(
+                    %conversation_id,
+                    "Completed orphaned Telegram group reset"
+                );
+            }
+            MissingGroupSessionRecovery::DetachCurrent {
+                group_id,
+                telegram_user_id,
+            } => {
+                let result = self
+                    .api
+                    .telegram_post(
+                        &format!(
+                            "/api/v1/group-sessions/{}/detach-if-current",
+                            encode_path(conversation_id)
+                        ),
+                        json!({
+                            "groupId":group_id,
+                            "telegramUserId":telegram_user_id,
+                        }),
+                    )
+                    .await;
+                match result {
+                    Ok(_) => {
+                        tracing::info!(
+                            %conversation_id,
+                            %group_id,
+                            telegram_user_id,
+                            "Detached orphaned Telegram group session"
+                        );
+                    }
+                    Err(error) if error.code == "state_conflict" => {
+                        tracing::info!(
+                            %conversation_id,
+                            %group_id,
+                            telegram_user_id,
+                            "Telegram group session was already detached or rebound"
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
         Ok(())
     }
@@ -2190,6 +2272,18 @@ fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
         .map(str::to_owned)
         .with_context(|| format!("backend response omitted {key}"))
 }
+fn missing_group_session_recovery(update: &Value) -> anyhow::Result<MissingGroupSessionRecovery> {
+    if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
+        return Ok(MissingGroupSessionRecovery::CompleteSilentReset);
+    }
+    Ok(MissingGroupSessionRecovery::DetachCurrent {
+        group_id: required_string(update, "groupId")?,
+        telegram_user_id: update
+            .get("telegramUserId")
+            .and_then(Value::as_i64)
+            .context("backend response omitted telegramUserId")?,
+    })
+}
 fn version(value: &Value) -> anyhow::Result<i64> {
     value
         .get("version")
@@ -2276,6 +2370,29 @@ mod tests {
         assert_eq!(
             ingress_restore_state(&json!({"sessionType":"conversation"}))["sessionType"],
             "conversation"
+        );
+    }
+
+    #[test]
+    fn missing_group_sessions_choose_the_transport_recovery_for_the_update_kind() {
+        assert_eq!(
+            missing_group_session_recovery(&json!({
+                "groupId":"group-1",
+                "telegramUserId":42,
+                "resetRequired":false,
+            }))
+            .unwrap(),
+            MissingGroupSessionRecovery::DetachCurrent {
+                group_id: "group-1".into(),
+                telegram_user_id: 42,
+            }
+        );
+        assert_eq!(
+            missing_group_session_recovery(&json!({
+                "resetRequired":true,
+            }))
+            .unwrap(),
+            MissingGroupSessionRecovery::CompleteSilentReset
         );
     }
 

@@ -312,11 +312,12 @@ export function renderAudioHistory(container, records, {
     button.append(element("span", "history-item-title", audioRecordingTitle(record)), meta);
     button.addEventListener("click", () => onSelect(record.id));
     row.append(button);
-    if (record.status === "ingress_failed") {
+    if (record.status === "failed" || record.status === "ingress_failed") {
       const retry = element("button", "quiet history-item-retry", retryingIds.has(record.id) ? "Retrying…" : "Retry");
       retry.type = "button";
       retry.disabled = retryingIds.has(record.id);
-      retry.setAttribute("aria-label", `Retry failed memory ingress for ${audioRecordingTitle(record, 100)}`);
+      const action = record.status === "failed" ? "processing" : "memory ingress";
+      retry.setAttribute("aria-label", `Retry failed ${action} for ${audioRecordingTitle(record, 100)}`);
       retry.addEventListener("click", () => onRetryIngress(record));
       row.append(retry);
     }

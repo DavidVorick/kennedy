@@ -794,6 +794,10 @@ async function retryAudioIngressRecording(record) {
   update();
   const scheduled = [];
   try {
+    if (record.status === "failed") {
+      await audioIngress.retry(record.id);
+      return;
+    }
     const detail = await audioIngress.history(record.id);
     const failedPieces = (detail.pieces || []).filter(piece =>
       piece.phase === "ingress_failed" && !retryingAudioPieces.has(piece.id)
@@ -809,7 +813,8 @@ async function retryAudioIngressRecording(record) {
       state: freshIngressState(piece.state),
     })));
   } catch (error) {
-    showError(ui.error_banner, `Audio memory ingress could not be retried: ${error.message}`);
+    const operation = record.status === "failed" ? "Audio processing" : "Audio memory ingress";
+    showError(ui.error_banner, `${operation} could not be retried: ${error.message}`);
   } finally {
     retryingAudioRecordings.delete(record.id);
     for (const pieceId of scheduled) retryingAudioPieces.delete(pieceId);

@@ -56,8 +56,8 @@ canonical documents; this file is not an append-only log.
   work.
 - `kcode-audio-transcribe` owns transcription only. It has no Kennedy HTTP,
   Chatend, Kmap, provenance, or memory-ingress behavior. AudioIngress persists
-  the final transcript and ordered queue pieces; KennedyServer builds and
-  checkpoints the audio-ingress Chatend.
+  the final transcript; KennedyServer splits it and owns the complete
+  audio-memory-ingress lifecycle.
 
 ## Repository-Local Runtime Data
 
@@ -93,7 +93,7 @@ canonical documents; this file is not an append-only log.
   the published Telegram relay remains the sole temporary loopback exception
   until its crate exposes an in-process service API.
 - Keep prepared audio transcript pieces and their complete claim, provenance,
-  checkpoint, retry, failure, and completion lifecycle in the AudioIngress
+  checkpoint, retry, failure, and completion lifecycle in a KennedyServer-owned
   database. Conversation history ingress remains in its source session log.
   KennedyServer's one writer lane, rather than a shared persistence queue,
   serializes both sources.
@@ -139,12 +139,11 @@ canonical documents; this file is not an append-only log.
 ## Offline Backups
 
 - `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
-  the application SQLite databases, including the AudioIngress database and
-  its queue, the complete transactional Kweb root and audio-ingress media tree,
-  and the encrypted credential vault when present.
-  If the retired standalone queue file still exists, include it as an optional
-  offline archive so retained pre-unification checkpoints are not silently
-  dropped from the backup set.
+  the application SQLite databases, including the complete AudioIngress
+  persistence root and KennedyServer-owned audio-memory-ingress queue, the
+  complete transactional Kweb root, and the encrypted credential vault when
+  present. Include the pre-library AudioIngress database when it still exists
+  as optional migration evidence.
   Each archive is self-describing: its README starts with the creating commit
   hash and records the exact schemas and current data-format semantics.
 - Backups are deliberately offline. Before reading persistent data, the backup
@@ -632,9 +631,9 @@ canonical documents; this file is not an append-only log.
   without generating a Kennedy response, then immediately queues the complete
   Chatend for history ingress.
 - Keep memory-ingress lifecycle orchestration outside the frontend.
-  AudioIngress owns audio queue selection, claims, checkpoints, retries,
-  failures, and completion; Session History owns conversation ingress state.
-  KennedyServer serializes their Kweb writes.
+  KennedyServer owns audio queue selection, claims, checkpoints, downstream
+  retries, failures, and completion; Session History owns conversation ingress
+  state. KennedyServer serializes their Kweb writes.
 
 ## Autonomous Self Time
 
@@ -684,6 +683,11 @@ canonical documents; this file is not an append-only log.
   missing by compare-and-swap rebinding it from the exact stale conversation
   ID to a fresh record. Preserve any stored media and transcription so the
   original query completes instead of requiring a replacement chat group.
+- Recover a retained Telegram group pointer whose Conversation History record
+  is missing by compare-and-swap detaching only the exact
+  `(group ID, Telegram user ID, conversation ID)` match. Complete an orphaned
+  silent-reset item instead, so neither kind of missing downstream session can
+  remain in the retry queue.
 - Give every Telegram event a durable 30-minute processing deadline. If no
   complete response is ready by then, cancel Kennedy's active turn, atomically
   complete that event as a timeout, clear only its matching session pointer,
@@ -828,13 +832,15 @@ canonical documents; this file is not an append-only log.
 
 ## Unified AudioIngress Boundary
 
-- `kennedy-audio-ingress` owns durable audio intake, delegation to the external
-  transcriber, the final transcript, immutable ordered transcript pieces, and
-  every later audio claim, checkpoint, retry, failure, repair, and completion
-  transition in one SQLite database.
-- KennedyServer consumes complete audio pieces directly from AudioIngress and
-  owns the model loop, kcode-session-log/Kweb commit, and global writer lane.
-  Conversation and self-time ingress never use the audio queue.
+- This older unified-database decision is superseded by the later standalone
+  library boundary below.
+- `kcode-audio-ingress` owns durable audio intake, delegation to the external
+  transcriber, and the final transcript. KennedyServer owns immutable ordered
+  transcript pieces and every later audio claim, checkpoint, retry, failure,
+  repair, and completion transition in its own SQLite database.
+- KennedyServer consumes completed transcripts through AudioIngress status and
+  owns splitting, the model loop, kcode-session-log/Kweb commit, and the global
+  writer lane. Conversation and self-time ingress never use the audio queue.
 
 ## Kweb DB 1.0 Migration Direction
 
@@ -1031,3 +1037,33 @@ canonical documents; this file is not an append-only log.
   adapter to deliver the object to the user.
 - When `write-file-freeform` captures model output without a final newline,
   append one automatically before previewing and writing the file.
+
+## Standalone AudioIngress Library Boundary
+
+- The published package is named exactly `kcode-audio-ingress`.
+  KennedyServer consumes its crates.io release; the crate is not vendored or a
+  member of this repository's Cargo workspace.
+- Maintain it as a conforming `kcode-rust-libs-v2` library: its manifest is
+  standalone with literal package metadata and explicit dependencies, root
+  `Documentation.md` is the complete agent-facing API reference, generated
+  Cargo state is not package source, and the standard README, specification,
+  dependency audit, and license accompany publication.
+- AudioIngress is a Rust library used by KennedyServer, not an HTTP component.
+  It has no Axum, multipart, route, HTTP-status, or frontend-response API;
+  KennedyServer owns those adapters.
+- Give AudioIngress one persistence-root path. It owns and derives every
+  database and media location beneath that root.
+- Submit one owned audio byte vector with its minimal source metadata. The
+  library performs no streaming and imposes no input-size limit; callers own
+  transport and admission limits.
+- Processing runs automatically after durable submission. Retry retryable
+  processing failures at most five times, then remain failed until an explicit
+  manual retry grants a fresh attempt budget. This policy is fixed rather than
+  configurable.
+- Keep the public surface minimal: open, submit, one status operation, and
+  manual retry. Do not expose individual processing steps or require callers to
+  drive the worker.
+- AudioIngress ends at a durably completed transcript. KennedyServer owns
+  transcript-piece memory ingress, Chatend/Kweb checkpoints, downstream
+  failures, completion, and idempotency; those concepts do not appear in the
+  standalone library API.

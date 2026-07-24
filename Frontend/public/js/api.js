@@ -104,6 +104,7 @@ export const AudioIngressAPI = (base) => ({
   health: () => requestJSON(base, "/api/v1/audio-ingress/health"),
   list: (limit = 100) => requestJSON(base, `/api/v1/audio-ingress?limit=${encodeURIComponent(limit)}`),
   history: (id) => requestJSON(base, `/api/v1/audio-ingress/${id}/history`),
+  retry: (id) => requestJSON(base, `/api/v1/audio-ingress/${id}/retry`, { method: "POST", body: "{}" }),
   retryIngress: (id, body) => requestJSON(base, `/api/v1/audio-ingress/pieces/${id}/retry-ingress`, { method: "POST", body: JSON.stringify(body) }),
 });
 

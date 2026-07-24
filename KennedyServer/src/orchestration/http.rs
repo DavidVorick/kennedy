@@ -22,7 +22,7 @@ pub(crate) struct LocalServices {
     pub kmap: crate::kmap_http::Service,
     pub intelligence: crate::intelligence::Service,
     pub history: kennedy_conversation_history::Service,
-    pub audio: kennedy_audio_ingress::Service,
+    pub audio: crate::audio_ingress::Service,
     pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
     pub rust_lib_tools: crate::rust_lib_tools::RustLibToolService,
 }
@@ -652,7 +652,7 @@ impl Api {
                         Method::GET => services.audio.get_json(path).await,
                         Method::POST => services.audio.post_json(path, body).await,
                         Method::PUT => services.audio.put_json(path, body).await,
-                        _ => Err(kennedy_audio_ingress::ServiceError {
+                        _ => Err(crate::audio_ingress::ServiceError {
                             status: StatusCode::METHOD_NOT_ALLOWED.as_u16(),
                             code: "method_not_allowed",
                             message: "Unsupported direct audio operation.".into(),
@@ -764,7 +764,7 @@ fn history_error(error: kennedy_conversation_history::ServiceError) -> ApiError 
     }
 }
 
-fn audio_error(error: kennedy_audio_ingress::ServiceError) -> ApiError {
+fn audio_error(error: crate::audio_ingress::ServiceError) -> ApiError {
     ApiError {
         status: StatusCode::from_u16(error.status).ok(),
         code: error.code.into(),

@@ -1,3 +1,4 @@
+mod audio_ingress;
 mod backup;
 mod credentials;
 mod intelligence;
@@ -58,17 +59,29 @@ struct Args {
     telegram_database: PathBuf,
     #[arg(long, global = true, default_value = "./data/kennedy-users.sqlite3")]
     user_database: PathBuf,
-    #[arg(long, global = true, default_value = "./data/kennedy-audio.sqlite3")]
-    audio_ingress_database: PathBuf,
+    #[arg(
+        long,
+        alias = "audio-ingress-database",
+        global = true,
+        default_value = "./data/kennedy-audio.sqlite3",
+        help = "Optional pre-library AudioIngress database used only for one-time migration"
+    )]
+    legacy_audio_ingress_database: PathBuf,
     #[arg(
         long = "memory-ingress-database",
         global = true,
         default_value = "./data/kennedy-memory-ingress.sqlite3",
-        help = "Optional retired queue database retained in offline backups when present"
+        help = "Kennedy-owned audio transcript memory-ingress queue"
     )]
-    legacy_memory_ingress_database: PathBuf,
-    #[arg(long, global = true, default_value = "./data/audio-ingress-media")]
-    audio_ingress_media: PathBuf,
+    audio_memory_ingress_database: PathBuf,
+    #[arg(
+        long,
+        alias = "audio-ingress-media",
+        global = true,
+        default_value = "./data/audio-ingress-media",
+        help = "AudioIngress-owned persistence root (database and original audio)"
+    )]
+    audio_ingress_directory: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
     frontend_dir: PathBuf,
     #[arg(long, default_value = "./Frontend/SystemPrompts")]
@@ -155,9 +168,9 @@ async fn main() -> anyhow::Result<()> {
                 session_history_file: args.session_history_file,
                 telegram_database: args.telegram_database,
                 user_database: args.user_database,
-                audio_database: args.audio_ingress_database,
-                legacy_memory_ingress_database: Some(args.legacy_memory_ingress_database),
-                audio_media_directory: args.audio_ingress_media,
+                legacy_audio_database: Some(args.legacy_audio_ingress_database),
+                audio_memory_ingress_database: args.audio_memory_ingress_database,
+                audio_ingress_directory: args.audio_ingress_directory,
                 vault: vault_path,
             })
             .await?;
@@ -250,27 +263,28 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         identity_sink: telegram_identity.clone(),
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
-    let audio_transcriber = if let Some(gemini) = gemini {
-        let mut config =
-            kcode_codex_runtime::CodexConfig::new(kcode_audio_transcribe::RECONCILIATION_MODEL);
-        config.validation_reasoning_effort = kcode_codex_runtime::ReasoningEffort::XHigh;
-        let codex = kcode_codex_runtime::Codex::open(config, codex_catalog_cache)
-            .await
-            .context("opening Codex audio-reconciliation runtime")?;
-        Some(kcode_audio_transcribe::AudioTranscriber::new(gemini, codex))
-    } else {
-        None
-    };
-    let audio_service = kennedy_audio_ingress::open(
-        kennedy_audio_ingress::Config {
-            database: args.audio_ingress_database,
-            media_directory: args.audio_ingress_media,
-            max_upload_bytes: args.audio_ingress_max_upload_bytes,
-        },
-        audio_transcriber,
-    )
-    .await?;
-    let audio_ingress_router = kennedy_audio_ingress::router(audio_service.clone());
+    let gemini = gemini.context(
+        "AudioIngress requires the gemini-api-key credential; configure it before starting Kennedy",
+    )?;
+    let mut config =
+        kcode_codex_runtime::CodexConfig::new(kcode_audio_transcribe::RECONCILIATION_MODEL);
+    config.validation_reasoning_effort = kcode_codex_runtime::ReasoningEffort::XHigh;
+    let codex = kcode_codex_runtime::Codex::open(config, codex_catalog_cache)
+        .await
+        .context("opening Codex audio-reconciliation runtime")?;
+    let audio_transcriber = kcode_audio_transcribe::AudioTranscriber::new(gemini, codex);
+    let audio_state_database = args.audio_ingress_directory.join("state.sqlite3");
+    migrate_audio_ingress_database(&args.legacy_audio_ingress_database, &audio_state_database)?;
+    let audio =
+        kcode_audio_ingress::AudioIngress::open(&args.audio_ingress_directory, audio_transcriber)
+            .await?;
+    let audio_service = audio_ingress::Service::open(
+        audio,
+        &args.audio_memory_ingress_database,
+        Some(&audio_state_database),
+        args.audio_ingress_max_upload_bytes,
+    )?;
+    let audio_ingress_router = audio_ingress::router(audio_service.clone());
     let orchestration = orchestration::Config {
         system_prompts_directory: args.system_prompts_dir.clone(),
         telegram_relay_base: orchestration_telegram_base,
@@ -321,8 +335,9 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.session_history_file,
         &args.telegram_database,
         &args.user_database,
-        &args.audio_ingress_database,
-        &args.audio_ingress_media,
+        &args.legacy_audio_ingress_database,
+        &args.audio_memory_ingress_database,
+        &args.audio_ingress_directory,
     ] {
         let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) else {
             continue;
@@ -341,6 +356,35 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
             .create(parent)
             .with_context(|| format!("creating runtime data directory {}", parent.display()))?;
     }
+    Ok(())
+}
+
+fn migrate_audio_ingress_database(legacy: &Path, current: &Path) -> anyhow::Result<()> {
+    if current.exists() || !legacy.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = current.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating AudioIngress root {}", parent.display()))?;
+    }
+    let source = rusqlite::Connection::open(legacy)
+        .with_context(|| format!("opening legacy AudioIngress database {}", legacy.display()))?;
+    source
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .context("checkpointing legacy AudioIngress database")?;
+    source
+        .backup(rusqlite::MAIN_DB, current, None)
+        .context("copying legacy AudioIngress database into its persistence root")?;
+    let destination = rusqlite::Connection::open(current)
+        .with_context(|| format!("opening AudioIngress database {}", current.display()))?;
+    destination
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .context("syncing migrated AudioIngress database")?;
+    tracing::info!(
+        source = %legacy.display(),
+        destination = %current.display(),
+        "Migrated AudioIngress database into its owned persistence root"
+    );
     Ok(())
 }
 
@@ -633,6 +677,44 @@ mod tests {
         assert_eq!(telegram_relay_http_base("[::1]:9876"), "http://[::1]:9876");
     }
 
+    #[test]
+    fn legacy_audio_database_is_copied_once_into_the_persistence_root() {
+        let directory = std::env::temp_dir().join(format!(
+            "kennedy-audio-migration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let legacy = directory.join("legacy.sqlite3");
+        let current = directory.join("audio-ingress/state.sqlite3");
+        let source = rusqlite::Connection::open(&legacy).unwrap();
+        source
+            .execute_batch("CREATE TABLE marker(value TEXT NOT NULL);")
+            .unwrap();
+        source
+            .execute("INSERT INTO marker(value) VALUES('legacy')", [])
+            .unwrap();
+        drop(source);
+
+        migrate_audio_ingress_database(&legacy, &current).unwrap();
+        let migrated = rusqlite::Connection::open(&current).unwrap();
+        let value: String = migrated
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "legacy");
+        migrated
+            .execute("UPDATE marker SET value='current'", [])
+            .unwrap();
+        drop(migrated);
+
+        migrate_audio_ingress_database(&legacy, &current).unwrap();
+        let value: String = rusqlite::Connection::open(&current)
+            .unwrap()
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "current");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn occupied_kweb_address_prevents_server_from_opening_persistent_state() {
         let directory =
@@ -660,9 +742,9 @@ mod tests {
             session_history_file: directory.join("session-history.txt"),
             telegram_database: telegram.clone(),
             user_database: users.clone(),
-            audio_ingress_database: audio.clone(),
-            legacy_memory_ingress_database: memory_ingress.clone(),
-            audio_ingress_media: audio_media.clone(),
+            legacy_audio_ingress_database: audio.clone(),
+            audio_memory_ingress_database: memory_ingress.clone(),
+            audio_ingress_directory: audio_media.clone(),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
             telegram_bootstrap_username: "@test".to_owned(),

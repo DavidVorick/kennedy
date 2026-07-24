@@ -17,9 +17,10 @@ orchestrator; the browser does not run Kennedy.
   orchestration, Ktools, Kweb graph policy, credential handling, the global
   Kweb writer lane, HTTP adapters, and static frontend serving.
 - `Frontend/public` is a browser-native observer and command client.
-- `AudioIngress` owns durable audio intake, transcription state, prepared
-  transcript pieces, and the audio memory-ingress queue. The Telegram crate
-  owns its durable intake stream.
+- `kcode-audio-ingress` is a standalone library that owns durable audio intake,
+  automatic transcription state, and completed transcripts. `KennedyServer`
+  owns its Axum adapter and the separate audio memory-ingress queue. The
+  Telegram crate owns its durable intake stream.
 
 Every provider-visible item is a Chatend box. Boxes can be hydrated,
 dehydrated, summarized, or stale. Kennedy controls their representation. There
@@ -116,8 +117,10 @@ Defaults:
 - Kweb root: `data/kweb`;
 - in-progress journals: `data/sessions/in-progress`;
 - completed Session History ID list: `data/session-history.txt`;
-- audio, Telegram, user-directory, and mixed audio-ingress SQLite files under
-  `data/`;
+- AudioIngress persistence root: `data/audio-ingress-media` (including its
+  derived `state.sqlite3` and `originals/`);
+- Kennedy's audio memory-ingress queue and the Telegram and user-directory
+  SQLite files under `data/`;
 - frontend assets: `Frontend/public`;
 - system-prompt boxes: `Frontend/SystemPrompts`.
 

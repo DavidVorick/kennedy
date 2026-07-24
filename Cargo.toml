@@ -1,5 +1,5 @@
 [workspace]
-members = ["AudioIngress", "ConversationHistory", "KennedyServer"]
+members = ["ConversationHistory", "KennedyServer"]
 resolver = "2"
 
 [workspace.package]
@@ -22,6 +22,7 @@ kcode-codex-runtime-v2 = "0.1.1"
 kcode-doc-extraction = "0.1.0"
 kcode-gemini-api = "=0.1.1"
 kcode-kweb-db = "1.0"
+kcode-audio-ingress = "0.1.0"
 kcode-audio-transcribe = "0.1.0"
 kcode-openai-api = "=0.1.0"
 kcode-rust-libs-v2 = "=1.1.0"
