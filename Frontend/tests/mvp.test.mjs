@@ -139,6 +139,16 @@ test("ingress activity is scoped to the selected record", () => {
   };
   const saved = conversationIngressActivity({ record, liveRecordId: "other", liveDiagnostic: { round: 9 } });
   assert.equal(saved.diagnostic.chatend.messages[0].content, "Saved ingress");
+  const reconstructed = conversationIngressActivity({
+    record,
+    savedDiagnostic: {
+      chatend: [{ role: "assistant", content: "Reconstructed ingress" }],
+      usage: { contextTokens: 12 },
+      toolLog: [{ name: "EndSession", ok: true }],
+    },
+  });
+  assert.equal(reconstructed.diagnostic.chatend.messages[0].content, "Reconstructed ingress");
+  assert.equal(reconstructed.diagnostic.usage.snapshot().contextTokens, 12);
   const live = conversationIngressActivity({ record, liveRecordId: "selected", liveDiagnostic: { round: 3 } });
   assert.equal(live.diagnostic.round, 3);
   assert.equal(conversationIngressActivity({ record, dismissedId: "selected" }), null);

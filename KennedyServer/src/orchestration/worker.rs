@@ -698,7 +698,7 @@ impl Orchestrator {
                     .get("state")
                     .and_then(|state| state.get("journalPath"))
                     .and_then(Value::as_str)
-                    .context("The queued session has no authoritative Chatend journal")?;
+                    .context("The queued session has no authoritative session log")?;
                 stage = "claim";
                 record = self
                     .api
@@ -753,29 +753,32 @@ impl Orchestrator {
                     .unwrap_or(Value::Null),
                 rust_lib_session_id: Some(rust_session_id.clone()),
             };
+            let restored = ingress_restore_state(&state);
             let mut session = Session::new(
                 self.api.clone(),
                 runtime.manuals,
                 runtime.model,
                 options,
-                Some(&state),
+                Some(restored),
             )
             .await?;
-            session.pending_turn = true;
             let record = Arc::new(Mutex::new(record));
             persist_ingress_record(&self.api, &record, session.snapshot()?).await?;
-            let api = self.api.clone();
-            let saved_record = record.clone();
-            session
-                .run_pending_turn(Uuid::new_v4(), move |session_state| {
-                    let api = api.clone();
-                    let record = saved_record.clone();
-                    async move {
-                        persist_ingress_record(&api, &record, session_state).await?;
-                        Ok(())
-                    }
-                })
-                .await?;
+            if !session.completed {
+                session.pending_turn = true;
+                let api = self.api.clone();
+                let saved_record = record.clone();
+                session
+                    .run_pending_turn(Uuid::new_v4(), move |session_state| {
+                        let api = api.clone();
+                        let record = saved_record.clone();
+                        async move {
+                            persist_ingress_record(&api, &record, session_state).await?;
+                            Ok(())
+                        }
+                    })
+                    .await?;
+            }
             persist_ingress_record(&self.api, &record, session.snapshot()?).await?;
             stage = "completion";
             let mut locked = record.lock().await;
@@ -895,6 +898,10 @@ impl Orchestrator {
                 "/api/v1/session-history",
                 json!({
                     "session_object_id":completed_state.get("sessionObjectId").and_then(Value::as_str).context("audio ingress session has no permanent object ID")?,
+                    "commit_receipt":completed_state.get("commitReceipt"),
+                    "session_id":completed_state.get("sessionId"),
+                    "session_type":completed_state.get("sessionType"),
+                    "created_at":completed_state.get("startedAt"),
                     "journal_path":completed_state.get("journalPath"),
                 }),
             ).await?;
@@ -1557,12 +1564,19 @@ impl Orchestrator {
                     json!({"owner":"backend","status":"ending","reason":"context-limit"});
                 persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
                 self.request_conversation_ingress(&record_arc, None).await?;
+                let notice = session
+                    .answer_for_external_event(&id)
+                    .and_then(|entry| entry.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(
+                        "This session reached its context limit and has been sent to history ingress.",
+                    );
                 self.api.telegram_post(
                     &format!("/api/v1/events/{}/reply",encode_path(&id)),
                     json!({
                         "conversationId":conversation_id,
-                        "text":"This session reached its context limit and has been sent to history ingress.",
-                        "contextWarning":"session ended at the emergency context limit"
+                        "text":notice,
+                        "contextWarning":"session ended after crossing the 75% forced-ingress threshold"
                     }),
                 ).await?;
                 return Ok(());
@@ -2208,6 +2222,9 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+fn ingress_restore_state(state: &Value) -> &Value {
+    state.get("historyIngress").unwrap_or(state)
+}
 fn value_string(value: &Value) -> String {
     value
         .as_str()
@@ -2254,6 +2271,29 @@ mod tests {
             "phase":"active",
             "state":{"sessionType":"telegram"}
         })));
+    }
+
+    #[test]
+    fn history_ingress_restart_prefers_its_own_checkpoint() {
+        let source = json!({
+            "sessionType":"conversation",
+            "kwebPlan":{"creates":[]},
+            "historyIngress":{
+                "sessionType":"history-ingress",
+                "completed":true,
+                "commitReceipt":{"sessionObjectId":"A1234567"},
+                "kwebPlan":{"creates":[{"pendingId":"pending:1"}]}
+            }
+        });
+        let restored = ingress_restore_state(&source);
+        assert_eq!(restored["sessionType"], "history-ingress");
+        assert_eq!(restored["completed"], true);
+        assert_eq!(restored["commitReceipt"]["sessionObjectId"], "A1234567");
+        assert_eq!(restored["kwebPlan"]["creates"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            ingress_restore_state(&json!({"sessionType":"conversation"}))["sessionType"],
+            "conversation"
+        );
     }
 
     #[tokio::test]

@@ -1,19 +1,19 @@
 //! Session lifecycle and local Session History.
 //!
-//! In-progress lifecycle and command records are sideband frames in the same
-//! append-only Chatend journal as the session itself. Successfully committed
-//! sessions leave only one local line containing their immutable Kweb object
-//! ID; their details are loaded from Kweb on demand.
+//! In-progress transcript entries live in `session-log`. Session lifecycle and
+//! command records live in a separate Session History control journal.
+//! Successfully committed sessions leave only one local line containing their
+//! immutable Kweb object ID; their details are loaded from Kweb on demand.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path as FilePath, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
 
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -22,13 +22,185 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use kennedy_chatend::{BoxOwner, SessionJournal, SessionKind, SessionMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use session_log::{Role, Session as DurableSession, SessionLog, SessionStore};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const LIFECYCLE_SIDEBAND: &str = "session_lifecycle";
 const COMMAND_SIDEBAND: &str = "session_command";
+const CONTROL_EXTENSION: &str = "session-control";
+const LEGACY_MAGIC: &[u8] = b"KCHAT01\n";
+const LEGACY_FRAME_HEADER_BYTES: usize = 1 + 8 + 32;
+const LEGACY_JSON_FRAME: u8 = 1;
+const LEGACY_OBJECT_FRAME: u8 = 2;
+const LEGACY_OBJECT_PREFIX_BYTES: usize = 8 + 4;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlRecord {
+    kind: String,
+    recorded_at: String,
+    value: Value,
+}
+
+struct ControlJournal {
+    path: PathBuf,
+    records: Vec<ControlRecord>,
+}
+
+impl ControlJournal {
+    fn create(path: PathBuf) -> anyhow::Result<Self> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        file.sync_all()?;
+        sync_directory(path.parent().unwrap_or_else(|| FilePath::new(".")))?;
+        Ok(Self {
+            path,
+            records: Vec::new(),
+        })
+    }
+
+    fn open(path: PathBuf) -> anyhow::Result<Self> {
+        if !path.exists() {
+            return Self::create(path);
+        }
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let mut records = Vec::new();
+        let mut cursor = 0_usize;
+        while cursor < bytes.len() {
+            let Some(relative_end) = bytes[cursor..].iter().position(|byte| *byte == b'\n') else {
+                file.set_len(cursor as u64)?;
+                file.sync_all()?;
+                break;
+            };
+            let end = cursor + relative_end;
+            let line = &bytes[cursor..end];
+            let separator = line
+                .iter()
+                .position(|byte| *byte == b' ')
+                .context("session-control record has no checksum separator")?;
+            let expected = std::str::from_utf8(&line[..separator])?;
+            let payload = &line[separator + 1..];
+            ensure!(
+                hex_sha256(payload) == expected,
+                "session-control record checksum mismatch"
+            );
+            records.push(serde_json::from_slice(payload)?);
+            cursor = end + 1;
+        }
+        Ok(Self { path, records })
+    }
+
+    fn records(&self) -> &[ControlRecord] {
+        &self.records
+    }
+
+    fn append(
+        &mut self,
+        kind: impl Into<String>,
+        recorded_at: impl Into<String>,
+        value: Value,
+    ) -> anyhow::Result<()> {
+        let record = ControlRecord {
+            kind: kind.into(),
+            recorded_at: recorded_at.into(),
+            value,
+        };
+        let payload = serde_json::to_vec(&record)?;
+        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        writeln!(
+            file,
+            "{} {}",
+            hex_sha256(&payload),
+            String::from_utf8(payload)?
+        )?;
+        file.sync_all()?;
+        self.records.push(record);
+        Ok(())
+    }
+}
+
+struct SessionJournal {
+    log: DurableSession,
+    control: ControlJournal,
+}
+
+impl SessionJournal {
+    fn create(directory: &FilePath, id: &str, created_at: &str) -> anyhow::Result<Self> {
+        let log = SessionStore::new(directory).create_session(id, created_at)?;
+        let control = ControlJournal::create(control_path(directory, id))?;
+        Ok(Self { log, control })
+    }
+
+    fn open(path: impl AsRef<FilePath>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        ensure!(
+            path.extension().and_then(|value| value.to_str()) == Some("session-log"),
+            "{} is not a session-log path",
+            path.display()
+        );
+        let directory = path.parent().unwrap_or_else(|| FilePath::new("."));
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("session-log filename is not valid UTF-8")?;
+        Ok(Self {
+            log: SessionStore::new(directory).open_session(id)?,
+            control: ControlJournal::open(control_path(directory, id))?,
+        })
+    }
+
+    fn path(&self) -> &FilePath {
+        self.log.path()
+    }
+
+    fn list(&self) -> SessionLog {
+        self.log.list()
+    }
+
+    fn records(&self) -> &[ControlRecord] {
+        self.control.records()
+    }
+
+    fn append_control(
+        &mut self,
+        kind: impl Into<String>,
+        recorded_at: impl Into<String>,
+        value: Value,
+    ) -> anyhow::Result<()> {
+        self.control.append(kind, recorded_at, value)
+    }
+
+    fn stage_object(
+        &mut self,
+        media_type: String,
+        file_name: Option<String>,
+        bytes: &[u8],
+    ) -> anyhow::Result<String> {
+        let file_name = file_name.unwrap_or_else(|| "uploaded-object".into());
+        let position =
+            self.log
+                .add_pending_object(file_name.clone(), file_name, media_type, bytes)?;
+        Ok(format!("pending:{}", position.index() + 1))
+    }
+}
+
+fn control_path(directory: &FilePath, id: &str) -> PathBuf {
+    directory.join(format!("{id}.{CONTROL_EXTENSION}"))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -242,11 +414,336 @@ struct RecordIngressFailure {
 struct RecordCompletedSession {
     session_object_id: String,
     #[serde(default)]
+    commit_receipt: Option<CompletionReceipt>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    session_type: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
     journal_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletionReceipt {
+    #[serde(default)]
+    transaction_id: Option<String>,
+    session_object_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    session_type: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    committed_at: Option<String>,
+    #[serde(default)]
+    node_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    object_ids: BTreeMap<String, String>,
+}
+
+fn migrate_legacy_journals(directory: &FilePath) -> anyhow::Result<()> {
+    let mut paths = std::fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("chatend"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        migrate_legacy_journal(directory, &path)?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_journal(directory: &FilePath, path: &FilePath) -> anyhow::Result<()> {
+    let session_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("legacy Chatend filename is not valid UTF-8")?;
+    remove_partial_session_log_migration(directory, session_id)?;
+
+    let mut file = File::open(path)?;
+    let mut magic = vec![0_u8; LEGACY_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    ensure!(
+        magic == LEGACY_MAGIC,
+        "{} is not a legacy Chatend",
+        path.display()
+    );
+    let file_len = file.metadata()?.len();
+    let mut cursor = LEGACY_MAGIC.len() as u64;
+    let mut journal = None;
+    let mut expected_event_id = 1_u64;
+    while cursor < file_len {
+        if file_len - cursor < LEGACY_FRAME_HEADER_BYTES as u64 {
+            break;
+        }
+        file.seek(SeekFrom::Start(cursor))?;
+        let mut header = [0_u8; LEGACY_FRAME_HEADER_BYTES];
+        file.read_exact(&mut header)?;
+        let kind = header[0];
+        let payload_len = u64::from_le_bytes(header[1..9].try_into().unwrap());
+        let frame_end = cursor
+            .checked_add(LEGACY_FRAME_HEADER_BYTES as u64)
+            .and_then(|value| value.checked_add(payload_len))
+            .context("legacy frame length overflow")?;
+        if frame_end > file_len {
+            break;
+        }
+        let payload_len_usize =
+            usize::try_from(payload_len).context("legacy frame does not fit memory")?;
+        let mut payload = vec![0_u8; payload_len_usize];
+        file.read_exact(&mut payload)?;
+        if Sha256::digest(&payload).as_slice() != &header[9..] {
+            break;
+        }
+        match kind {
+            LEGACY_JSON_FRAME => {
+                let record: Value = serde_json::from_slice(&payload)?;
+                match record.get("record").and_then(Value::as_str) {
+                    Some("session_opened") => {
+                        ensure!(journal.is_none(), "duplicate legacy session header");
+                        let metadata = record
+                            .get("metadata")
+                            .context("legacy session header has no metadata")?;
+                        let id = metadata
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .context("legacy session header has no session ID")?;
+                        ensure!(id == session_id, "legacy filename and session ID differ");
+                        let created_at = metadata
+                            .get("createdAt")
+                            .and_then(Value::as_str)
+                            .context("legacy session header has no creation time")?;
+                        journal = Some(SessionJournal::create(directory, id, created_at)?);
+                    }
+                    Some("transition") => {
+                        let journal = journal
+                            .as_mut()
+                            .context("legacy transition precedes session header")?;
+                        let events = record
+                            .get("transition")
+                            .and_then(|value| value.get("events"))
+                            .and_then(Value::as_array)
+                            .context("legacy transition has no event array")?;
+                        for event in events {
+                            let old_id = event
+                                .get("id")
+                                .and_then(Value::as_u64)
+                                .context("legacy event has no ID")?;
+                            ensure!(
+                                old_id == expected_event_id,
+                                "legacy event identity is not contiguous"
+                            );
+                            let recorded_at = event
+                                .get("recordedAt")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let context_kind = event
+                                .get("kind")
+                                .cloned()
+                                .context("legacy event has no kind")?;
+                            let text = serde_json::to_string(&json!({
+                                "contextEventVersion":1,
+                                "recordedAt":recorded_at,
+                                "kind":context_kind,
+                            }))?;
+                            let position = journal
+                                .log
+                                .add_event(legacy_event_role(&context_kind), text)?;
+                            ensure!(
+                                position.index() + 1 == old_id,
+                                "migrated event position differs from legacy identity"
+                            );
+                            expected_event_id += 1;
+                        }
+                    }
+                    Some("sideband") => {
+                        let journal = journal
+                            .as_mut()
+                            .context("legacy sideband precedes session header")?;
+                        journal.append_control(
+                            record
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .context("legacy sideband has no kind")?,
+                            record
+                                .get("recordedAt")
+                                .or_else(|| record.get("recorded_at"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            record.get("value").cloned().unwrap_or(Value::Null),
+                        )?;
+                    }
+                    other => anyhow::bail!("unknown legacy JSON record {other:?}"),
+                }
+            }
+            LEGACY_OBJECT_FRAME => {
+                let journal = journal
+                    .as_mut()
+                    .context("legacy object precedes session header")?;
+                ensure!(
+                    payload.len() >= LEGACY_OBJECT_PREFIX_BYTES,
+                    "legacy object frame is shorter than its prefix"
+                );
+                let event_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                ensure!(
+                    event_id == expected_event_id,
+                    "legacy object identity is not contiguous"
+                );
+                let metadata_len = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+                let metadata_end = LEGACY_OBJECT_PREFIX_BYTES
+                    .checked_add(metadata_len)
+                    .context("legacy object metadata length overflow")?;
+                ensure!(
+                    metadata_end <= payload.len(),
+                    "legacy object metadata is truncated"
+                );
+                let metadata: Value =
+                    serde_json::from_slice(&payload[LEGACY_OBJECT_PREFIX_BYTES..metadata_end])?;
+                let recorded_at = metadata
+                    .get("recordedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let pending_id = format!("pending:{event_id}");
+                let text = serde_json::to_string(&json!({
+                    "contextEventVersion":1,
+                    "recordedAt":recorded_at,
+                    "kind":{
+                        "type":"pending_allocated",
+                        "pending_id":pending_id,
+                        "resource":"object",
+                    },
+                }))?;
+                let file_name = metadata
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("uploaded-object");
+                let media_type = metadata
+                    .get("mediaType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream");
+                let position = journal.log.add_pending_object(
+                    text,
+                    file_name,
+                    media_type,
+                    &payload[metadata_end..],
+                )?;
+                ensure!(
+                    position.index() + 1 == event_id,
+                    "migrated object position differs from legacy identity"
+                );
+                expected_event_id += 1;
+            }
+            other => anyhow::bail!("unknown legacy Chatend frame kind {other}"),
+        }
+        cursor = frame_end;
+    }
+    let journal = journal.context("legacy Chatend has no session header")?;
+    let migrated = SessionJournal::open(journal.path())?;
+    ensure!(
+        migrated.list().events.len() as u64 + 1 == expected_event_id,
+        "migrated session event count differs"
+    );
+    drop(migrated);
+    drop(journal);
+
+    let backup_directory = directory
+        .parent()
+        .unwrap_or_else(|| FilePath::new("."))
+        .join("legacy-chatend-migration");
+    create_private_directory(&backup_directory)?;
+    let backup = backup_directory.join(
+        path.file_name()
+            .context("legacy Chatend path has no filename")?,
+    );
+    ensure!(
+        !backup.exists(),
+        "legacy Chatend migration backup already exists at {}",
+        backup.display()
+    );
+    std::fs::rename(path, &backup)?;
+    sync_directory(directory)?;
+    sync_directory(&backup_directory)?;
+    Ok(())
+}
+
+fn legacy_event_role(kind: &Value) -> Role {
+    match kind.get("type").and_then(Value::as_str) {
+        Some("box_created") => match kind
+            .get("owner")
+            .and_then(|owner| owner.get("kind"))
+            .and_then(Value::as_str)
+        {
+            Some("user") => Role::UserMessage,
+            Some("kennedy") => Role::KennedyMessage,
+            Some("tool") => Role::ToolResult,
+            _ if kind
+                .get("content")
+                .and_then(|content| content.get("metadata"))
+                .and_then(|metadata| metadata.get("capacityError"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+            {
+                Role::SystemError
+            }
+            _ => Role::SystemMessage,
+        },
+        Some("tool_invoked") => Role::KennedyToolCall,
+        Some("tool_completed")
+            if kind
+                .get("outcome")
+                .and_then(|outcome| outcome.get("ok"))
+                .and_then(Value::as_bool)
+                == Some(false) =>
+        {
+            Role::ToolError
+        }
+        Some("tool_completed") => Role::ToolResult,
+        Some("capacity_error") => Role::SystemError,
+        Some("box_dehydrated" | "box_summarized" | "box_rehydrated" | "box_retired") => {
+            Role::KennedyToolCall
+        }
+        _ => Role::SystemMessage,
+    }
+}
+
+fn remove_partial_session_log_migration(
+    directory: &FilePath,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let exact_log = name == format!("{session_id}.session-log");
+        let exact_control = name == format!("{session_id}.{CONTROL_EXTENSION}");
+        let object = name
+            .strip_prefix(&format!("{session_id}-"))
+            .and_then(|tail| {
+                tail.strip_suffix(".pending-object")
+                    .or_else(|| tail.strip_suffix(".pending-object.tmp"))
+            })
+            .is_some_and(|number| {
+                !number.is_empty()
+                    && (!number.starts_with('0') || number == "0")
+                    && number.parse::<u64>().is_ok()
+            });
+        if exact_log || exact_control || object {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 pub fn open(config: Config) -> anyhow::Result<Service> {
     create_private_directory(&config.directory)?;
+    migrate_legacy_journals(&config.directory)?;
     if let Some(parent) = config
         .completed_list
         .parent()
@@ -490,14 +987,47 @@ async fn record_completed_session(
         .map(|guard| guard.lock().map_err(ApiError::internal))
         .transpose()?;
     let _catalog_guard = state.catalog_mutation.lock().map_err(ApiError::internal)?;
-    append_completed_id(&state.config.completed_list, &input.session_object_id)
+    let mut receipt = input.commit_receipt.unwrap_or(CompletionReceipt {
+        transaction_id: None,
+        session_object_id: input.session_object_id.clone(),
+        session_id: None,
+        session_type: None,
+        created_at: None,
+        committed_at: None,
+        node_ids: BTreeMap::new(),
+        object_ids: BTreeMap::new(),
+    });
+    if receipt.session_object_id != input.session_object_id {
+        return Err(ApiError::conflict(
+            "completion receipt and requested session object differ",
+        ));
+    }
+    receipt.session_id = receipt.session_id.or(input.session_id);
+    receipt.session_type = receipt.session_type.or(input.session_type);
+    receipt.created_at = receipt.created_at.or(input.created_at);
+    receipt.committed_at.get_or_insert_with(now);
+    append_completion_receipt(&state.config.completed_list, &receipt)
         .map_err(ApiError::internal)?;
     if let Some(path) = input.journal_path {
         ensure_inside(&path, &state.config.directory)?;
         if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("removing committed journal {}", path.display()))
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("session-log filename is not valid UTF-8")
                 .map_err(ApiError::internal)?;
+            SessionJournal::open(&path)
+                .map_err(ApiError::internal)?
+                .log
+                .delete_committed()
+                .map_err(ApiError::internal)?;
+            let control = control_path(&state.config.directory, id);
+            if control.exists() {
+                std::fs::remove_file(&control)
+                    .with_context(|| format!("removing {}", control.display()))
+                    .map_err(ApiError::internal)?;
+                sync_directory(&state.config.directory).map_err(ApiError::internal)?;
+            }
         }
     }
     Ok(Json(json!({
@@ -544,7 +1074,7 @@ async fn create_session(
         })?;
     ensure_inside(&path, &state.config.directory)?;
     let journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
-    let id = journal.state().metadata.session_id.clone();
+    let id = journal.list().header.session_id;
     drop(journal);
     let session_guard = session_mutation(&state, &id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
@@ -591,26 +1121,9 @@ async fn start_managed_session(
         }
     }
     let id = Uuid::new_v4().to_string();
-    let path = state.config.directory.join(format!("{id}.chatend"));
-    let kind = match input.session_type.as_str() {
-        "free-time" => SessionKind::SelfTime,
-        "telegram" => SessionKind::Telegram,
-        "telegram-group" => SessionKind::TelegramGroup,
-        other => SessionKind::Other(other.into()),
-    };
-    let mut journal = SessionJournal::create(
-        &path,
-        SessionMetadata {
-            session_id: id.clone(),
-            kind,
-            created_at: input.started_at.clone(),
-            // The orchestration runtime records the exact selected-model
-            // value before it creates the first box.
-            effective_context_tokens: 1,
-            channel: Value::Null,
-        },
-    )
-    .map_err(ApiError::internal)?;
+    let mut journal = SessionJournal::create(&state.config.directory, &id, &input.started_at)
+        .map_err(ApiError::internal)?;
+    let path = journal.path().to_path_buf();
     let mut session_state = json!({
         "stateVersion":3,
         "sessionId":id,
@@ -656,13 +1169,20 @@ async fn list_session_summaries(State(state): State<AppState>) -> Result<Json<Va
             sessions.push(record);
         }
     }
-    for object_id in read_completed_ids(&state.config.completed_list).map_err(ApiError::internal)? {
+    for receipt in
+        read_completion_receipts(&state.config.completed_list).map_err(ApiError::internal)?
+    {
+        let object_id = receipt.session_object_id;
         sessions.push(SessionRecord {
             id: object_id.clone(),
             phase: "complete".into(),
-            started_at: String::new(),
-            updated_at: String::new(),
-            state: json!({"sessionObjectId":object_id}),
+            started_at: receipt.created_at.clone().unwrap_or_default(),
+            updated_at: receipt.committed_at.unwrap_or_default(),
+            state: json!({
+                "sessionObjectId":object_id,
+                "sessionId":receipt.session_id,
+                "sessionType":receipt.session_type,
+            }),
             provenance_id: None,
             version: 1,
             last_user_message_at: None,
@@ -681,16 +1201,21 @@ async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionRecord>, ApiError> {
-    if read_completed_ids(&state.config.completed_list)
+    if let Some(receipt) = read_completion_receipts(&state.config.completed_list)
         .map_err(ApiError::internal)?
-        .contains(&id)
+        .into_iter()
+        .find(|receipt| receipt.session_object_id == id)
     {
         return Ok(Json(SessionRecord {
             id: id.clone(),
             phase: "complete".into(),
-            started_at: String::new(),
-            updated_at: String::new(),
-            state: json!({"sessionObjectId":id}),
+            started_at: receipt.created_at.clone().unwrap_or_default(),
+            updated_at: receipt.committed_at.unwrap_or_default(),
+            state: json!({
+                "sessionObjectId":id,
+                "sessionId":receipt.session_id,
+                "sessionType":receipt.session_type,
+            }),
             provenance_id: None,
             version: 1,
             last_user_message_at: None,
@@ -796,13 +1321,7 @@ async fn stage_session_object(
         ));
     }
     let pending_id = journal
-        .stage_object(
-            now(),
-            media_type,
-            file_name,
-            json!({"adapter":"browser"}),
-            &bytes,
-        )
+        .stage_object(media_type, file_name, &bytes)
         .map_err(|error| ApiError::bad(error.to_string()))?;
     Ok((
         StatusCode::CREATED,
@@ -1019,32 +1538,74 @@ async fn complete_session(
 ) -> Result<Json<SessionRecord>, ApiError> {
     let session_guard = session_mutation(&state, id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
-    let path = state.config.directory.join(format!("{id}.chatend"));
     let journal = open_by_id(&state, id)?;
     let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     require_version(&record, expected_version)?;
+    let completion_state = new_state
+        .get("historyIngress")
+        .filter(|state| state.get("sessionObjectId").is_some_and(Value::is_string))
+        .cloned()
+        .unwrap_or_else(|| new_state.clone());
     record.state = control_state(&new_state);
-    let object_id = record
-        .state
+    let object_id = completion_state
         .get("sessionObjectId")
         .and_then(Value::as_str)
-        .or_else(|| journal.state().completed_session_object.as_deref())
         .ok_or_else(|| {
             ApiError::conflict("completed session has no permanent Kweb session object")
         })?
         .to_owned();
     let _catalog_guard = state.catalog_mutation.lock().map_err(ApiError::internal)?;
-    append_completed_id(&state.config.completed_list, &object_id).map_err(ApiError::internal)?;
+    let mut receipt = completion_state
+        .get("commitReceipt")
+        .filter(|receipt| !receipt.is_null())
+        .cloned()
+        .map(serde_json::from_value::<CompletionReceipt>)
+        .transpose()
+        .map_err(|error| ApiError::conflict(format!("invalid session commit receipt: {error}")))?
+        .unwrap_or(CompletionReceipt {
+            transaction_id: None,
+            session_object_id: object_id.clone(),
+            session_id: None,
+            session_type: None,
+            created_at: None,
+            committed_at: None,
+            node_ids: BTreeMap::new(),
+            object_ids: BTreeMap::new(),
+        });
+    if receipt.session_object_id != object_id {
+        return Err(ApiError::conflict(
+            "session commit receipt names a different archive object",
+        ));
+    }
+    let completed_at = now();
+    receipt.session_id = Some(record.id.clone());
+    receipt.session_type = record
+        .state
+        .get("sessionType")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    receipt.created_at = Some(record.started_at.clone());
+    receipt.committed_at = Some(completed_at.clone());
+    append_completion_receipt(&state.config.completed_list, &receipt)
+        .map_err(ApiError::internal)?;
     record.phase = "complete".into();
     record.version += 1;
-    record.updated_at = now();
+    record.updated_at = completed_at;
     record.ended_at = Some(record.updated_at.clone());
     record.state["sessionObjectId"] = json!(object_id);
+    record.state["commitReceipt"] = completion_state
+        .get("commitReceipt")
+        .cloned()
+        .unwrap_or(Value::Null);
     let output = materialize(record, &journal);
-    drop(journal);
-    std::fs::remove_file(&path)
-        .with_context(|| format!("removing committed journal {}", path.display()))
-        .map_err(ApiError::internal)?;
+    let control_path = control_path(&state.config.directory, id);
+    journal.log.delete_committed().map_err(ApiError::internal)?;
+    if control_path.exists() {
+        std::fs::remove_file(&control_path)
+            .with_context(|| format!("removing {}", control_path.display()))
+            .map_err(ApiError::internal)?;
+        sync_directory(&state.config.directory).map_err(ApiError::internal)?;
+    }
     Ok(Json(output))
 }
 
@@ -1088,7 +1649,7 @@ fn session_mutation(state: &AppState, id: &str) -> Result<Arc<Mutex<()>>, ApiErr
 
 fn open_by_id(state: &AppState, id: &str) -> Result<SessionJournal, ApiError> {
     validate_session_id(id)?;
-    let path = state.config.directory.join(format!("{id}.chatend"));
+    let path = state.config.directory.join(format!("{id}.session-log"));
     SessionJournal::open(&path).map_err(|error| {
         if !path.exists() {
             ApiError::not_found()
@@ -1100,7 +1661,7 @@ fn open_by_id(state: &AppState, id: &str) -> Result<SessionJournal, ApiError> {
 
 fn latest_lifecycle(journal: &SessionJournal) -> Option<SessionRecord> {
     journal
-        .sidebands()
+        .records()
         .iter()
         .rev()
         .find(|record| record.kind == LIFECYCLE_SIDEBAND)
@@ -1109,7 +1670,7 @@ fn latest_lifecycle(journal: &SessionJournal) -> Option<SessionRecord> {
 
 fn append_lifecycle(journal: &mut SessionJournal, record: &SessionRecord) -> Result<(), ApiError> {
     journal
-        .append_sideband(
+        .append_control(
             LIFECYCLE_SIDEBAND,
             now(),
             serde_json::to_value(record).map_err(ApiError::internal)?,
@@ -1120,7 +1681,7 @@ fn append_lifecycle(journal: &mut SessionJournal, record: &SessionRecord) -> Res
 fn commands(journal: &SessionJournal) -> BTreeMap<String, SessionCommand> {
     let mut commands = BTreeMap::new();
     for record in journal
-        .sidebands()
+        .records()
         .iter()
         .filter(|record| record.kind == COMMAND_SIDEBAND)
     {
@@ -1133,7 +1694,7 @@ fn commands(journal: &SessionJournal) -> BTreeMap<String, SessionCommand> {
 
 fn append_command(journal: &mut SessionJournal, command: &SessionCommand) -> Result<(), ApiError> {
     journal
-        .append_sideband(
+        .append_control(
             COMMAND_SIDEBAND,
             now(),
             serde_json::to_value(command).map_err(ApiError::internal)?,
@@ -1142,55 +1703,45 @@ fn append_command(journal: &mut SessionJournal, command: &SessionCommand) -> Res
 }
 
 fn materialize(mut record: SessionRecord, journal: &SessionJournal) -> SessionRecord {
-    record.state["sessionId"] = json!(journal.state().metadata.session_id);
+    let log = journal.list();
+    record.state["sessionId"] = json!(log.header.session_id);
     record.state["journalPath"] = json!(journal.path());
-    record.state["transcript"] = Value::Array(
-        journal
-            .state()
-            .boxes
-            .values()
-            .filter_map(|state| {
-                let role = match state.owner {
-                    BoxOwner::User => "user",
-                    BoxOwner::Kennedy if state.name == "Kennedy message" => "kennedy",
-                    _ => return None,
-                };
-                Some(json!({
-                    "role":role,
-                    "content":state.canonical.content.text,
-                    "boxId":state.id.0,
-                }))
-            })
-            .collect(),
-    );
-    record.state["boxes"] = serde_json::to_value(&journal.state().boxes).unwrap_or(Value::Null);
-    record.state["events"] = serde_json::to_value(&journal.state().events).unwrap_or(Value::Null);
-    record.state["context"] =
-        serde_json::to_value(journal.state().projection()).unwrap_or(Value::Null);
-    record.state["chatendText"] = json!(journal.state().render());
-    record.state["sessionObjectId"] = journal
-        .state()
-        .completed_session_object
-        .as_ref()
-        .map_or(Value::Null, |id| json!(id));
+    if !record.state.get("transcript").is_some_and(Value::is_array) {
+        record.state["transcript"] = Value::Array(
+            log.events
+                .iter()
+                .enumerate()
+                .filter_map(|(position, event)| transcript_entry(position, event))
+                .collect(),
+        );
+    }
+    if !record.state.get("events").is_some_and(Value::is_array) {
+        record.state["events"] = serde_json::to_value(&log.events).unwrap_or(Value::Null);
+    }
+    if !record
+        .state
+        .get("chatendText")
+        .is_some_and(Value::is_string)
+    {
+        record.state["chatendText"] = json!(
+            log.events
+                .iter()
+                .map(|event| format!("[{}]\n{}", role_name(event.role), display_text(event)))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+    }
     record
 }
 
 fn summary_state(control: &Value, journal: &SessionJournal) -> Value {
-    let first_user = journal
-        .state()
-        .boxes
-        .values()
-        .find(|state| matches!(state.owner, BoxOwner::User))
-        .map(|state| {
-            state
-                .canonical
-                .content
-                .text
-                .chars()
-                .take(512)
-                .collect::<String>()
-        });
+    let log = journal.list();
+    let first_user = log
+        .events
+        .iter()
+        .find(|event| event.role == Role::UserMessage)
+        .map(display_text)
+        .map(|text| text.chars().take(512).collect::<String>());
     json!({
         "sessionType":control.get("sessionType"),
         "channel":control.get("channel"),
@@ -1198,14 +1749,76 @@ fn summary_state(control: &Value, journal: &SessionJournal) -> Value {
         "orchestration":control.get("orchestration"),
         "journalPath":journal.path(),
         "firstUserMessage":first_user,
-        "boxCount":journal.state().boxes.len(),
-        "eventCount":journal.state().events.len(),
+        "boxCount":log.events.len(),
+        "eventCount":log.events.len(),
         "pendingTurn":control.get("pendingTurn").cloned().unwrap_or(Value::Bool(false)),
     })
 }
 
+fn persisted_context_kind(event: &session_log::SessionEvent) -> Option<Value> {
+    serde_json::from_str::<Value>(&event.text)
+        .ok()?
+        .get("kind")
+        .cloned()
+}
+
+fn display_text(event: &session_log::SessionEvent) -> String {
+    persisted_context_kind(event)
+        .and_then(|kind| {
+            (kind.get("type").and_then(Value::as_str) == Some("box_created"))
+                .then(|| {
+                    kind.get("content")
+                        .and_then(|content| content.get("text"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .unwrap_or_else(|| event.text.clone())
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::SystemMessage => "system-message",
+        Role::SystemError => "system-error",
+        Role::UserMessage => "user-message",
+        Role::KennedyMessage => "kennedy-message",
+        Role::KennedyToolCall => "kennedy-tool-call",
+        Role::ToolResult => "tool-result",
+        Role::ToolError => "tool-error",
+        Role::Object => "object",
+        Role::PendingObject => "pending-object",
+    }
+}
+
+fn transcript_entry(position: usize, event: &session_log::SessionEvent) -> Option<Value> {
+    let role = match event.role {
+        Role::UserMessage => "user",
+        Role::KennedyMessage => "kennedy",
+        Role::SystemError => "system",
+        Role::SystemMessage => {
+            let kind = persisted_context_kind(event)?;
+            let content = kind.get("content")?;
+            (content
+                .get("metadata")
+                .and_then(|metadata| metadata.get("transcriptRole"))
+                .and_then(Value::as_str)
+                == Some("system"))
+            .then_some("system")?
+        }
+        _ => return None,
+    };
+    Some(json!({
+        "role":role,
+        "content":display_text(event),
+        "boxId":position + 1,
+    }))
+}
+
 fn control_state(value: &Value) -> Value {
     const KEYS: &[&str] = &[
+        "format",
+        "version",
         "stateVersion",
         "sessionId",
         "journalPath",
@@ -1220,16 +1833,33 @@ fn control_state(value: &Value) -> Value {
         "rootNodeIds",
         "referenceRootNodeIds",
         "startedAt",
+        "transcript",
         "pendingTurn",
         "pendingExternalEventId",
         "roundsUsed",
         "completed",
         "sessionObjectId",
+        "commitReceipt",
+        "commitAuthor",
+        "kwebPlan",
         "startIdempotencyId",
+        "boxCount",
+        "eventCount",
+        "boxes",
+        "events",
+        "context",
+        "chatendText",
+        "historyIngress",
     ];
     let mut output = Map::new();
     for key in KEYS {
         if let Some(item) = value.get(*key) {
+            if *key == "boxes" && !item.is_object() {
+                continue;
+            }
+            if *key == "commitReceipt" && item.is_null() {
+                continue;
+            }
             output.insert((*key).into(), item.clone());
         }
     }
@@ -1241,35 +1871,77 @@ fn journal_paths(directory: &FilePath) -> Result<Vec<PathBuf>, ApiError> {
         .map_err(ApiError::internal)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("chatend"))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("session-log"))
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
 }
 
 fn read_completed_ids(path: &FilePath) -> anyhow::Result<Vec<String>> {
+    Ok(read_completion_receipts(path)?
+        .into_iter()
+        .map(|receipt| receipt.session_object_id)
+        .collect())
+}
+
+fn read_completion_receipts(path: &FilePath) -> anyhow::Result<Vec<CompletionReceipt>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut ids = Vec::new();
+    let mut receipts = Vec::new();
     let mut seen = HashSet::new();
     for line in BufReader::new(file).lines() {
         let line = line?;
-        let id = line.trim();
-        if !id.is_empty() && seen.insert(id.to_owned()) {
-            ids.push(id.to_owned());
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let receipt = if line.starts_with('{') {
+            serde_json::from_str::<CompletionReceipt>(line)
+                .context("decoding Session History completion receipt")?
+        } else {
+            CompletionReceipt {
+                transaction_id: None,
+                session_object_id: line.to_owned(),
+                session_id: None,
+                session_type: None,
+                created_at: None,
+                committed_at: None,
+                node_ids: BTreeMap::new(),
+                object_ids: BTreeMap::new(),
+            }
+        };
+        if seen.insert(receipt.session_object_id.clone()) {
+            receipts.push(receipt);
         }
     }
-    Ok(ids)
+    Ok(receipts)
 }
 
+#[cfg(test)]
 fn append_completed_id(path: &FilePath, id: &str) -> anyhow::Result<()> {
+    append_completion_receipt(
+        path,
+        &CompletionReceipt {
+            transaction_id: None,
+            session_object_id: id.into(),
+            session_id: None,
+            session_type: None,
+            created_at: None,
+            committed_at: None,
+            node_ids: BTreeMap::new(),
+            object_ids: BTreeMap::new(),
+        },
+    )
+}
+
+fn append_completion_receipt(path: &FilePath, receipt: &CompletionReceipt) -> anyhow::Result<()> {
     if read_completed_ids(path)?
         .iter()
-        .any(|existing| existing == id)
+        .any(|existing| existing == &receipt.session_object_id)
     {
         return Ok(());
     }
     let mut file = OpenOptions::new().append(true).open(path)?;
-    writeln!(file, "{id}")?;
+    writeln!(file, "{}", serde_json::to_string(receipt)?)?;
     file.flush()?;
     file.sync_data()?;
     Ok(())
@@ -1380,8 +2052,149 @@ mod tests {
         .unwrap()
     }
 
+    fn append_legacy_frame(file: &mut File, kind: u8, payload: &[u8]) {
+        file.write_all(&[kind]).unwrap();
+        file.write_all(&(payload.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(Sha256::digest(payload).as_slice()).unwrap();
+        file.write_all(payload).unwrap();
+    }
+
+    #[test]
+    fn control_state_preserves_live_ui_snapshots_without_accepting_log_shaped_boxes() {
+        let boxes = json!({
+            "1":{
+                "id":1,
+                "owner":{"kind":"user"},
+                "canonical":{"eventId":1,"content":{"text":"hello"}},
+                "representation":{"kind":"hydrated"},
+                "active":true
+            }
+        });
+        let context = json!({"items":[{"boxId":1,"text":"hello"}]});
+        let history_ingress = json!({"format":"kennedy-chatend","version":1});
+        let saved = control_state(&json!({
+            "boxes":boxes,
+            "context":context,
+            "historyIngress":history_ingress,
+            "unrecognized":"discard me"
+        }));
+        assert_eq!(saved["boxes"], boxes);
+        assert_eq!(saved["context"], context);
+        assert_eq!(saved["historyIngress"], history_ingress);
+        assert!(saved.get("unrecognized").is_none());
+        assert!(
+            control_state(&json!({"commitReceipt":null}))
+                .get("commitReceipt")
+                .is_none()
+        );
+
+        let rejected = control_state(&json!({
+            "boxes":[{"owner":"user-message","content":{"text":"old projection"}}]
+        }));
+        assert!(rejected.get("boxes").is_none());
+    }
+
+    #[test]
+    fn legacy_chatend_is_migrated_without_losing_order_objects_or_control_state() {
+        let root = root("legacy");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let id = "8e388aa7-bdd7-4b27-b763-d9197ea4de6c";
+        let legacy_path = sessions.join(format!("{id}.chatend"));
+        let mut legacy = File::create(&legacy_path).unwrap();
+        legacy.write_all(LEGACY_MAGIC).unwrap();
+        append_legacy_frame(
+            &mut legacy,
+            LEGACY_JSON_FRAME,
+            &serde_json::to_vec(&json!({
+                "record":"session_opened",
+                "metadata":{
+                    "sessionId":id,
+                    "kind":"conversation",
+                    "createdAt":"2026-07-23T00:00:00Z",
+                    "effectiveContextTokens":1000,
+                    "channel":null,
+                }
+            }))
+            .unwrap(),
+        );
+        append_legacy_frame(
+            &mut legacy,
+            LEGACY_JSON_FRAME,
+            &serde_json::to_vec(&json!({
+                "record":"transition",
+                "transition":{
+                    "recordedAt":"2026-07-23T00:00:01Z",
+                    "events":[{
+                        "id":1,
+                        "recordedAt":"2026-07-23T00:00:01Z",
+                        "kind":{
+                            "type":"session_configured",
+                            "effective_context_tokens":1000,
+                            "kind":"conversation",
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+        );
+        let metadata = serde_json::to_vec(&json!({
+            "pendingId":"pending:2",
+            "eventId":2,
+            "recordedAt":"2026-07-23T00:00:02Z",
+            "mediaType":"text/plain",
+            "fileName":"note.txt",
+            "transport":null,
+        }))
+        .unwrap();
+        let mut object = Vec::new();
+        object.extend_from_slice(&2_u64.to_le_bytes());
+        object.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        object.extend_from_slice(&metadata);
+        object.extend_from_slice(b"remember me");
+        append_legacy_frame(&mut legacy, LEGACY_OBJECT_FRAME, &object);
+        append_legacy_frame(
+            &mut legacy,
+            LEGACY_JSON_FRAME,
+            &serde_json::to_vec(&json!({
+                "record":"sideband",
+                "kind":LIFECYCLE_SIDEBAND,
+                "recordedAt":"2026-07-23T00:00:03Z",
+                "value":{"id":id,"version":1,"phase":"active"}
+            }))
+            .unwrap(),
+        );
+        legacy.sync_all().unwrap();
+        drop(legacy);
+
+        let config = Config {
+            directory: sessions.clone(),
+            completed_list: root.join("session-history.txt"),
+            max_request_bytes: 1024 * 1024,
+        };
+        open(config).unwrap();
+
+        assert!(!legacy_path.exists());
+        assert!(
+            root.join("legacy-chatend-migration")
+                .join(format!("{id}.chatend"))
+                .exists()
+        );
+        let journal = SessionJournal::open(sessions.join(format!("{id}.session-log"))).unwrap();
+        assert_eq!(journal.list().events.len(), 2);
+        assert_eq!(journal.records().len(), 1);
+        let pending = journal
+            .log
+            .read_pending_object(session_log::EventPosition(1))
+            .unwrap();
+        assert_eq!(pending.file_name, "note.txt");
+        assert_eq!(pending.media_type, "text/plain");
+        assert_eq!(pending.bytes, b"remember me");
+    }
+
     #[tokio::test]
-    async fn managed_session_and_commands_live_in_one_journal() {
+    async fn managed_session_log_and_control_journal_remain_coordinated() {
         let service = service("commands");
         let record = service
             .post_json(
@@ -1395,6 +2208,12 @@ mod tests {
             .await
             .unwrap();
         let id = record["id"].as_str().unwrap();
+        let mut journal = open_by_id(&service.state, id).unwrap();
+        journal
+            .log
+            .add_event(Role::SystemError, "The message exceeded capacity.")
+            .unwrap();
+        drop(journal);
         let command = service
             .post_json(
                 &format!("/api/v1/conversations/{id}/commands"),
@@ -1410,7 +2229,15 @@ mod tests {
         assert!(
             materialized["state"]["chatendText"]
                 .as_str()
-                .is_some_and(|text| text.contains("[context budget"))
+                .is_some_and(|text| text.contains("[system-error]"))
+        );
+        assert_eq!(
+            materialized["state"]["transcript"][0],
+            json!({
+                "role":"system",
+                "content":"The message exceeded capacity.",
+                "boxId":1,
+            })
         );
         let listed = service
             .get_json("/api/v1/conversation-commands")
@@ -1421,12 +2248,127 @@ mod tests {
             std::fs::read_dir(&service.state.config.directory)
                 .unwrap()
                 .count(),
-            1
+            2
         );
     }
 
     #[tokio::test]
-    async fn committed_history_is_only_an_object_id_list() {
+    async fn checkpointed_live_chatend_shape_survives_materialization() {
+        let service = service("live-ui");
+        let record = service
+            .post_json(
+                "/api/v1/conversations/start",
+                json!({
+                    "idempotency_id":"live-ui-start",
+                    "started_at":"2026-07-23T00:00:00Z",
+                    "session_type":"conversation"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = record["id"].as_str().unwrap();
+        let boxes = json!({
+            "1":{
+                "id":1,
+                "owner":{"kind":"user"},
+                "canonical":{"eventId":1,"content":{"text":"hello"}},
+                "representation":{"kind":"hydrated"},
+                "active":true
+            }
+        });
+        let context = json!({"items":[{"boxId":1,"text":"hello"}]});
+        let checkpointed = service
+            .put_json(
+                &format!("/api/v1/conversations/{id}/checkpoint"),
+                json!({
+                    "expected_version":record["version"],
+                    "state":{
+                        "sessionId":id,
+                        "journalPath":record["state"]["journalPath"],
+                        "sessionType":"conversation",
+                        "boxes":boxes,
+                        "events":[],
+                        "context":context,
+                        "chatendText":"hello",
+                        "historyIngress":{"format":"kennedy-chatend","version":1}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(checkpointed["state"]["boxes"], boxes);
+        assert_eq!(checkpointed["state"]["context"], context);
+        assert_eq!(
+            checkpointed["state"]["historyIngress"]["format"],
+            "kennedy-chatend"
+        );
+
+        let fetched = service
+            .get_json(&format!("/api/v1/conversations/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(fetched["state"]["boxes"], boxes);
+        assert_eq!(fetched["state"]["context"], context);
+    }
+
+    #[tokio::test]
+    async fn nested_history_ingress_receipt_completes_the_source_session() {
+        let service = service("nested-completion");
+        let record = service
+            .post_json(
+                "/api/v1/conversations/start",
+                json!({
+                    "idempotency_id":"nested-completion-start",
+                    "started_at":"2026-07-23T00:00:00Z",
+                    "session_type":"conversation"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = record["id"].as_str().unwrap().to_owned();
+        let mut state = record["state"].clone();
+        state["historyIngress"] = json!({
+            "sessionType":"history-ingress",
+            "completed":true,
+            "sessionObjectId":"A1234567",
+            "commitReceipt":{
+                "transactionId":"T1234567",
+                "sessionObjectId":"A1234567",
+                "nodeIds":{},
+                "objectIds":{}
+            }
+        });
+        let completed = service
+            .post_json(
+                &format!("/api/v1/conversations/{id}/complete"),
+                json!({"expected_version":record["version"],"state":state}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed["phase"], "complete");
+        assert_eq!(completed["state"]["sessionObjectId"], "A1234567");
+        assert_eq!(
+            completed["state"]["commitReceipt"]["transactionId"],
+            "T1234567"
+        );
+        assert!(
+            !service
+                .state
+                .config
+                .directory
+                .join(format!("{id}.session-log"))
+                .exists()
+        );
+        assert!(!control_path(&service.state.config.directory, &id).exists());
+        assert_eq!(
+            read_completion_receipts(&service.state.config.completed_list).unwrap()[0]
+                .session_object_id,
+            "A1234567"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_history_records_a_structured_receipt() {
         let service = service("completed");
         append_completed_id(&service.state.config.completed_list, "A1234567").unwrap();
         let listed = service
@@ -1437,9 +2379,8 @@ mod tests {
             listed["conversations"][0]["state"]["sessionObjectId"],
             "A1234567"
         );
-        assert_eq!(
-            std::fs::read_to_string(&service.state.config.completed_list).unwrap(),
-            "A1234567\n"
-        );
+        let stored = std::fs::read_to_string(&service.state.config.completed_list).unwrap();
+        let receipt: CompletionReceipt = serde_json::from_str(stored.trim()).unwrap();
+        assert_eq!(receipt.session_object_id, "A1234567");
     }
 }

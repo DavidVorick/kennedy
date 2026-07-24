@@ -1,6 +1,6 @@
 import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260723.2";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260723.1";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260723.4";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260724.1";
 import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260720.2";
 
 const CONFIG = {
@@ -134,11 +134,85 @@ function freshIngressState(state) {
 
 const EMPTY_MEMORY = { directlyLoadedIdentifiers: [], nodes: [] };
 
+function isSessionLogArchive(value) {
+  return typeof value?.header?.formatVersion === "string"
+    && typeof value?.header?.sessionId === "string"
+    && Array.isArray(value?.events);
+}
+
+function decodedSessionEvent(event) {
+  if (typeof event?.text !== "string") return null;
+  try {
+    const decoded = JSON.parse(event.text);
+    return decoded && typeof decoded === "object" ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function sessionEventMessage(event, position) {
+  const decoded = decodedSessionEvent(event);
+  const kind = decoded?.kind;
+  const type = kind?.type;
+  let content = event?.text || "";
+  let displayRole = null;
+  if (type === "box_created") {
+    content = kind?.content?.text || "";
+    displayRole = kind?.name || null;
+  } else if (type === "tool_invoked") {
+    content = JSON.stringify({
+      name: kind?.tool_name,
+      arguments: kind?.arguments || {},
+    }, null, 2);
+    displayRole = `Tool call · ${kind?.tool_name || "unknown"}`;
+  } else if (type === "tool_completed") {
+    content = typeof kind?.outcome?.result === "string"
+      ? kind.outcome.result : JSON.stringify(kind?.outcome || {}, null, 2);
+    displayRole = `Tool result · ${kind?.tool_name || "unknown"}`;
+  } else if (decoded) {
+    content = JSON.stringify(kind || decoded, null, 2);
+  }
+  const role = event?.role === "user-message" ? "user"
+    : event?.role === "kennedy-message" ? "assistant" : "system";
+  return {
+    role,
+    content,
+    display_role: displayRole || `Event ${position + 1} · ${event?.role || "unknown"}`,
+    context_kind: [
+      "kennedy-tool-call", "tool-result", "tool-error", "object", "pending-object",
+    ].includes(event?.role) ? "box" : null,
+  };
+}
+
+function sessionLogDiagnostic(archive, mode) {
+  const messages = archive.events.map(sessionEventMessage);
+  return {
+    mode, provider, model,
+    chatend: messages,
+    chatendText: messages
+      .map(message => `[${message.display_role}]\n${message.content}`)
+      .join("\n\n"),
+    context: { boxCount: 0, eventCount: archive.events.length, staleBoxes: [] },
+    loadCalls: 0,
+    loadLimit: 0,
+    toolLog: [],
+    usage: null,
+    memory: EMPTY_MEMORY,
+    historySegments: [],
+    events: archive.events,
+    boxes: [],
+  };
+}
+
 function archivedDiagnostic(archive, mode, transcript = []) {
+  if (isSessionLogArchive(archive)) return sessionLogDiagnostic(archive, mode);
   if (archive?.version === 1 && archive?.boxes) return boxDiagnostic(archive, mode);
   return {
     mode, provider, model,
-    chatend: archive?.messages || transcript.map(item => ({ role: item.role === "kennedy" ? "assistant" : "user", content: item.content })),
+    chatend: archive?.messages || transcript.map(item => ({
+      role: item.role === "kennedy" ? "assistant" : item.role === "system" ? "system" : "user",
+      content: item.content,
+    })),
     chatendText: typeof archive?.chatendText === "string" ? archive.chatendText : null,
     context: archive?.context?.diagnostics || {},
     loadCalls: archive?.tools?.loadCalls || 0,
@@ -221,9 +295,13 @@ function boxDiagnostic(source, mode) {
 
 function conversationDiagnostic(record) {
   if (!record) return null;
-  if (record.state?.boxes) return boxDiagnostic(record.state, "session Chatend");
+  if (record.state?.boxes && !Array.isArray(record.state.boxes)) {
+    return boxDiagnostic(record.state, "session Chatend");
+  }
   const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
-  const archive = record.state?.archive?.format === "kennedy-chatend" ? record.state.archive : null;
+  const archive = isSessionLogArchive(record.state?.archive)
+    || record.state?.archive?.format === "kennedy-chatend"
+    ? record.state.archive : null;
   return archivedDiagnostic(archive, "saved conversation", transcript);
 }
 
@@ -277,12 +355,12 @@ function audioPieceDiagnostic(piece) {
 function audioPieceIngressActivity(piece) {
   const currentPiece = piece;
   let diagnostic = null;
-  const archive = currentPiece?.state?.historyIngress;
-  if (archive?.format === "kennedy-chatend") {
+  const source = audioPieceDiagnostic(currentPiece);
+  if (source) {
     diagnostic = {
-      chatend: { messages: archive.messages || [] },
-      usage: { snapshot: () => archive.usage || null },
-      toolLog: archive.tools?.log || [],
+      chatend: { messages: source.chatend || [] },
+      usage: { snapshot: () => source.usage || null },
+      toolLog: source.toolLog || [],
     };
   }
   const failed = currentPiece?.phase === "ingress_failed";
@@ -326,7 +404,11 @@ function audioRecordingDiagnostic() {
 }
 
 function visibleIngressActivity() {
-  return conversationIngressActivity({ record: selectedRecord() });
+  const record = selectedRecord();
+  return conversationIngressActivity({
+    record,
+    savedDiagnostic: historyIngressDiagnostic(record),
+  });
 }
 
 function update() {
@@ -490,10 +572,11 @@ async function hydrateHistoryRecord(recordOrId) {
     const archive = await kweb.sessionArchive(objectId);
     record = {
       ...record,
-      started_at: archive?.startedAt || archive?.session?.createdAt || record.started_at,
+      started_at: archive?.header?.createdAt || archive?.startedAt || archive?.session?.createdAt || record.started_at,
       state: {
-        ...archive,
-        sessionType: archive?.sessionType || archive?.session?.kind || "conversation",
+        archive,
+        sessionType: record.state?.sessionType
+          || archive?.sessionType || archive?.session?.kind || "conversation",
         sessionObjectId: objectId,
       },
     };

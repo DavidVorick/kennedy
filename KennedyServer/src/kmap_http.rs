@@ -150,7 +150,7 @@ impl Service {
         Ok(value)
     }
 
-    /// Commit all permanent effects of one completed Chatend session in one
+    /// Commit all permanent effects of one completed Kennedy session in one
     /// Kweb transaction. Pending object and node IDs are allocated first;
     /// pending node creates are then resolved and materialized; canonical node
     /// updates are applied last.
@@ -158,8 +158,80 @@ impl Service {
         &self,
         input: SessionCommit,
     ) -> Result<SessionCommitResult, ApiError> {
+        let session_id = input.session_id.clone();
+        let request = serde_json::to_vec(&input).map_err(ApiError::internal)?;
+        let request_sha256 = Sha256::digest(&request);
+        let receipts = self
+            .receipts
+            .lock()
+            .map_err(|_| ApiError::internal("Kmap idempotency mutex is poisoned"))?;
+        let existing = receipts
+            .query_row(
+                "SELECT request_sha256,prepared_json,result_json
+                 FROM kmap_session_commit_receipts WHERE session_id=?1",
+                [&session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ApiError::internal)?;
+        if let Some((stored_hash, prepared, result)) = existing {
+            if stored_hash.as_slice() != request_sha256.as_slice() {
+                return Err(ApiError::conflict(
+                    "session ID was already used for a different Kweb commit",
+                ));
+            }
+            if let Some(result) = result {
+                return serde_json::from_str(&result).map_err(ApiError::internal);
+            }
+            if let Some(prepared) = prepared {
+                let recovered: SessionCommitResult =
+                    serde_json::from_str(&prepared).map_err(ApiError::internal)?;
+                let session_object_id = parse_object_id(&recovered.session_object_id)?;
+                match self.database.get_object(session_object_id) {
+                    Ok(_) => {
+                        receipts
+                            .execute(
+                                "UPDATE kmap_session_commit_receipts
+                                 SET result_json=prepared_json,committed_at=?2
+                                 WHERE session_id=?1 AND result_json IS NULL",
+                                params![&session_id, Utc::now().to_rfc3339()],
+                            )
+                            .map_err(ApiError::internal)?;
+                        return Ok(recovered);
+                    }
+                    Err(KwebError::NotFound(_)) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            receipts
+                .execute(
+                    "DELETE FROM kmap_session_commit_receipts
+                     WHERE session_id=?1 AND result_json IS NULL",
+                    [&session_id],
+                )
+                .map_err(ApiError::internal)?;
+        }
+        receipts
+            .execute(
+                "INSERT INTO kmap_session_commit_receipts(
+                     session_id,request_sha256,prepared_json,result_json,started_at,committed_at
+                 ) VALUES(?1,?2,NULL,NULL,?3,NULL)",
+                params![
+                    &session_id,
+                    request_sha256.as_slice(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(ApiError::internal)?;
+
         let mut transaction = self.database.start_transaction(Provenance {
-            author: input.author,
+            author: input.author.clone(),
             source: "kennedy-session".into(),
             source_created_at: input.source_created_at,
             data: format!("Kennedy session {}.", input.session_id),
@@ -186,19 +258,49 @@ impl Service {
                 resolve_session_node_data(&update.data, &node_ids, &object_ids, session_object_id)?;
             transaction.update_node(id, data)?;
         }
-        let transaction_id = transaction.finalize()?;
-        Ok(SessionCommitResult {
-            transaction_id: transaction_id.to_string(),
+        let mut result = SessionCommitResult {
+            transaction_id: None,
             session_object_id: session_object_id.to_string(),
             node_ids: node_ids
-                .into_iter()
-                .map(|(pending, id)| (pending, id.to_string()))
+                .iter()
+                .map(|(pending, id)| (pending.clone(), id.to_string()))
                 .collect(),
             object_ids: object_ids
-                .into_iter()
-                .map(|(pending, id)| (pending, id.to_string()))
+                .iter()
+                .map(|(pending, id)| (pending.clone(), id.to_string()))
                 .collect(),
-        })
+        };
+        let prepared_json = serde_json::to_string(&result).map_err(ApiError::internal)?;
+        let updated = receipts
+            .execute(
+                "UPDATE kmap_session_commit_receipts
+                 SET prepared_json=?2
+                 WHERE session_id=?1 AND prepared_json IS NULL AND result_json IS NULL",
+                params![&session_id, prepared_json],
+            )
+            .map_err(ApiError::internal)?;
+        if updated != 1 {
+            return Err(ApiError::internal(
+                "Kweb session commit preparation receipt disappeared",
+            ));
+        }
+        let transaction_id = transaction.finalize()?;
+        result.transaction_id = Some(transaction_id.to_string());
+        let result_json = serde_json::to_string(&result).map_err(ApiError::internal)?;
+        let updated = receipts
+            .execute(
+                "UPDATE kmap_session_commit_receipts
+                 SET result_json=?2,committed_at=?3
+                 WHERE session_id=?1 AND result_json IS NULL",
+                params![&session_id, result_json, Utc::now().to_rfc3339(),],
+            )
+            .map_err(ApiError::internal)?;
+        if updated != 1 {
+            return Err(ApiError::internal(
+                "Kweb session commit receipt disappeared during mutation",
+            ));
+        }
+        Ok(result)
     }
 
     fn with_idempotency(
@@ -272,7 +374,7 @@ impl Service {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct SessionObject {
     pub pending_id: String,
     pub bytes: Vec<u8>,
@@ -309,6 +411,7 @@ pub(crate) struct SessionNodeUpdate {
     pub data: SessionNodeData,
 }
 
+#[derive(Clone, Serialize)]
 pub(crate) struct SessionCommit {
     pub session_id: String,
     pub author: String,
@@ -319,10 +422,10 @@ pub(crate) struct SessionCommit {
     pub updates: Vec<SessionNodeUpdate>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionCommitResult {
-    pub transaction_id: String,
+    pub transaction_id: Option<String>,
     pub session_object_id: String,
     pub node_ids: BTreeMap<String, String>,
     pub object_ids: BTreeMap<String, String>,
@@ -546,8 +649,30 @@ pub(crate) fn initialize(
              started_at TEXT NOT NULL,
              committed_at TEXT,
              CHECK((result_id IS NULL) = (committed_at IS NULL))
+         );
+         CREATE TABLE IF NOT EXISTS kmap_session_commit_receipts (
+             session_id TEXT PRIMARY KEY,
+             request_sha256 BLOB NOT NULL CHECK(length(request_sha256)=32),
+             prepared_json TEXT,
+             result_json TEXT,
+             started_at TEXT NOT NULL,
+             committed_at TEXT,
+             CHECK((result_json IS NULL) = (committed_at IS NULL))
          );",
     )?;
+    let has_prepared_session_receipt = {
+        let mut statement = identity.prepare("PRAGMA table_info(kmap_session_commit_receipts)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        columns.iter().any(|column| column == "prepared_json")
+    };
+    if !has_prepared_session_receipt {
+        identity.execute(
+            "ALTER TABLE kmap_session_commit_receipts ADD COLUMN prepared_json TEXT",
+            [],
+        )?;
+    }
     let database = KwebDb::open(kweb_root, config).map_err(anyhow::Error::new)?;
     let existing_user = system_root(&identity, "user")?;
     let existing_kennedy = system_root(&identity, "kennedy")?;
@@ -1424,6 +1549,58 @@ mod tests {
             b"{\"session\":\"archive\"}"
         );
         drop(service);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_commit_replay_returns_the_original_receipt_without_a_second_transaction() {
+        let directory = std::env::temp_dir().join(format!(
+            "kennedy-session-commit-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let identity = directory.join("users.sqlite3");
+        let kweb = directory.join("kweb");
+        let (database, roots) = initialize(&kweb, config(), &identity).unwrap();
+        let service = Service::new(database, roots, &identity).unwrap();
+        let input = SessionCommit {
+            session_id: "session-replay-test".into(),
+            author: "test-model".into(),
+            source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            archive: b"{\"header\":{},\"events\":[]}".to_vec(),
+            objects: Vec::new(),
+            creates: Vec::new(),
+            updates: Vec::new(),
+        };
+        let first = service.commit_session(input.clone()).unwrap();
+        let committed_length = std::fs::metadata(kweb.join("transactions.kwl"))
+            .unwrap()
+            .len();
+        service
+            .receipts
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE kmap_session_commit_receipts
+                 SET result_json=NULL,committed_at=NULL
+                 WHERE session_id='session-replay-test'",
+                [],
+            )
+            .unwrap();
+        let replay = service.commit_session(input.clone()).unwrap();
+        assert_eq!(replay.transaction_id, None);
+        assert_eq!(replay.session_object_id, first.session_object_id);
+        assert_eq!(replay.node_ids, first.node_ids);
+        assert_eq!(replay.object_ids, first.object_ids);
+        assert_eq!(
+            std::fs::metadata(kweb.join("transactions.kwl"))
+                .unwrap()
+                .len(),
+            committed_length
+        );
+        assert_eq!(service.commit_session(input).unwrap(), replay);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

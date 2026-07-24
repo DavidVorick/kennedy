@@ -8,25 +8,39 @@ sessions. The Rust crate retains its historical package name
 application-domain name and the runtime no longer uses a conversation SQLite
 database.
 
-An in-progress session has one authoritative append-only `.chatend` file.
+An in-progress session has one authoritative append-only `.session-log` file
+plus a separate `.session-control` file for lifecycle, browser commands, and
+the latest replaceable backend presentation checkpoint.
 After the session and its history-ingress phase commit, local Session History
-retains only the canonical Kweb object ID of the immutable session archive.
+retains a structured completion receipt.
 
 ## Storage
 
 The defaults are:
 
-- in-progress journals: `data/sessions/in-progress/{uuid}.chatend`;
+- in-progress transcripts: `data/sessions/in-progress/{uuid}.session-log`;
+- in-progress control state:
+  `data/sessions/in-progress/{uuid}.session-control`;
+- pending objects:
+  `data/sessions/in-progress/{uuid}-{event-position}.pending-object`;
 - completed ID list: `data/session-history.txt`.
 
-The completed list contains one eight-character canonical object ID per line,
-in commit order. Appending a duplicate ID is a successful no-op. Every append
-is flushed and fsynced. Session details are not duplicated in a local index;
-clients load the immutable archive from Kweb when needed.
+New completed-list entries are JSON-lines receipts containing the transaction
+ID when available, canonical archive object ID, pending-node mappings, and
+pending-object mappings, in commit order. Historical one-object-ID lines
+remain readable.
+Appending a receipt already represented by its archive ID is a successful
+no-op. Every append is flushed and synchronized. Clients load the immutable
+archive from Kweb when needed.
 
-The `.chatend` format and its recovery rules are owned by
-`kennedy-chatend`. Session History writes lifecycle and command sideband frames
-into the same file. It never rewrites the journal.
+The `.session-log` format and its recovery rules are owned by `session-log`.
+Session History writes lifecycle records, command records, and the explicitly
+enumerated current Chatend presentation checkpoint to `.session-control`; it
+does not add storage-specific sidebands to the transcript. The presentation
+checkpoint lets the browser render the live box map and context projection.
+It is a replaceable cache rather than replay authority: KennedyServer rebuilds
+Chatend from the session log, and successful completion deletes the control
+file.
 
 ## Lifecycle
 
@@ -39,9 +53,9 @@ active -> ingress_pending -> ingress_in_progress -> complete
 An `active` session accepts ordered commands and staged browser objects.
 Ending the source session changes it to `ingress_pending`. The single global
 Kweb writer lane claims it as `ingress_in_progress`. Source conversation and
-history ingress remain parts of the same Chatend journal. A successful Kweb
-commit supplies the permanent session object ID; Session History appends that
-ID to `session-history.txt` and then removes the local journal.
+history ingress remain parts of the same session log. A successful Kweb commit
+supplies a completion receipt; Session History synchronizes that receipt and
+then removes the session log, pending objects, and control file.
 
 Failures may return the record to `ingress_pending` with bounded diagnostics.
 If history ingress reaches its full context ceiling, Kennedy commits the work
@@ -87,9 +101,9 @@ Completed summary records intentionally contain only their permanent Kweb
 object ID. The frontend follows that ID through
 `GET /api/v1/session-history/{object_id}` to classify and display the archive.
 
-The object route accepts exactly one multipart `file`. It writes the raw bytes
-into the session journal and returns a temporary `pending:N` ID. Individual
-objects and the aggregate staged object payload are limited to 32 GiB.
+The object route accepts exactly one multipart `file`. It writes one durable
+pending-object file, appends the corresponding event, and returns the
+event-position-derived temporary `pending:N` ID.
 
 ## Isolation and cutover
 
@@ -104,6 +118,6 @@ mixed memory-ingress database before deletion.
 
 ## Verification
 
-Tests cover one-journal managed creation, durable command sidebands,
-idempotency, the completed object-ID-only list, upload exclusion while commands
-run, and immutable completed-history behavior.
+Tests cover coordinated transcript/control creation, durable commands, legacy
+Chatend migration, structured completion receipts, pending-object migration,
+and immutable completed-history behavior.

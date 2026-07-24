@@ -762,10 +762,14 @@ canonical documents; this file is not an append-only log.
   protections.
 - A terminal assistant response normally completes a browser or Telegram turn.
 - Use `EndSession` for history ingress, audio ingress, and self time. Terminal
-  prose without it receives a minimal controller continuation. `EndSession`
-  may appear alongside other Ktool calls and fails if another call in its
-  native call group fails. Its optional self-time handoff message retains the
-  existing validation and rollover semantics.
+  ingress prose without it receives a private controller message explaining
+  that the session is solo and giving the exact native `call_ktool` arguments
+  `{"name":"EndSession","arguments":{}}`. If Kennedy reaches the existing
+  tool-loop round limit without ending ingress, commit the staged transaction
+  instead of retrying it. `EndSession` may appear alongside other Ktool calls
+  and fails if another call in its native call group fails. Its optional
+  self-time handoff message retains the existing validation and rollover
+  semantics.
 - Keep the live system prompts minimal and consistent with their existing
   style: explain only `call_ktool`, relevant Ktool contracts, ordinary terminal
   conversation responses, and `EndSession` where applicable.
@@ -962,16 +966,22 @@ canonical documents; this file is not an append-only log.
   and finalize it only when history ingress completes successfully.
 - Set the live-session context budget to exactly 70% of the effective context
   window. Context accounting should be as accurate as practical while
-  conservatively avoiding underestimation.
+  conservatively avoiding underestimation. Before retaining a user message,
+  tool call or result, or Kennedy response, project the exact resulting
+  Chatend. If it would exceed 70%, reject it and retain a bounded,
+  user-visible system capacity message instead. If context after that message
+  exceeds 75%, force-end the source and queue history ingress.
 - Treat 75% of the ingress model's effective context window as the
   history-ingress *initial fitting target*, not its runtime ceiling. Before the
   first ingress inference, reduce eligible boxes largest-first until the
-  projection is below that target. Once ingress is running, Kennedy may use
-  the remaining headroom, including through hydration and tool calls, up to
-  100% of the effective context window; only the full-window boundary
-  force-ends ingress. Compaction performed during an already submitted
-  provider turn affects the next rendered request rather than retroactively
-  shrinking that turn's input.
+  projection is at or below that target. If only protected boxes remain, dehydrate
+  them largest-first as well. If a fully dehydrated projection is still above
+  the target, commit the transaction without starting ingress. Once ingress is
+  running, Kennedy may use the remaining headroom, including through hydration
+  and tool calls, up to 100% of the effective context window; only the
+  full-window boundary force-ends and commits ingress. Compaction performed
+  during an already submitted provider turn affects the next rendered request
+  rather than retroactively shrinking that turn's input.
 - Kennedy permanently retains session events, source contents, transformations,
   history-ingress activity, and archived Kweb objects. Purge and garbage
   collection semantics must not imply that accepted session data is erased.

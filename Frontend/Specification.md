@@ -30,11 +30,17 @@ Kennedy-owned APIs. The published Telegram transport remains on loopback port
 The UI calls the compatibility `/api/v1/conversations` routes through a client
 named `SessionHistoryAPI`.
 
-In-progress summaries come from the local `.chatend` journal. Completed
+In-progress summaries come from the local `.session-log` transcript and
+Session History control journal. Completed
 summaries contain only a Kweb object ID. The browser loads the corresponding
 immutable archive from `/api/v1/session-history/{object_id}` before classifying
 it as conversation, self-time, Telegram, or audio history. Hydrated records
 never regress to a later summary response of the same or older version.
+
+The completed archive is a three-field session header and an ordered array of
+role/text events. The browser reconstructs display messages from that stable
+event order; persisted box projections and active/retired snapshots are not
+part of the archive.
 
 Completed records are read-only. There is no purge control.
 
@@ -78,10 +84,13 @@ prepared-object API is deferred.
 ## Context limits
 
 Ordinary source sessions operate within 70% of the model's effective context
-window. History ingress can use 100%. An attempted operation that would exceed
-the active limit produces an error for Kennedy. If repeated failures leave the
-source above the 72% emergency boundary, the session is force-ended and queued
-for history ingress.
+window. A user message, tool call or result, or Kennedy response that would
+cross that limit is rejected and displayed as a system message. If the context
+after that message is above 75%, the source is force-ended and queued for
+history ingress. Ingress first fits boxes at or below a 75% target, dehydrating
+formerly protected boxes largest-first if necessary, and may then use 100%.
+If every box is dehydrated and the initial projection is still above 75%, the
+session commits without running ingress.
 
 The UI displays backend-projected usage. It does not estimate a different
 policy.

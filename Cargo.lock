@@ -2125,7 +2125,6 @@ dependencies = [
  "axum",
  "chrono",
  "kcode-audio-transcribe",
- "kennedy-chatend",
  "kennedy-memory-ingress",
  "rusqlite",
  "serde",
@@ -2137,25 +2136,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "kennedy-chatend"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "kennedy-conversation-history"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "kennedy-chatend",
  "serde",
  "serde_json",
+ "session-log",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "uuid",
@@ -2175,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "kennedy-server"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "age",
  "anyhow",
@@ -2197,7 +2187,6 @@ dependencies = [
  "kcode-tg-kennedy-bot",
  "kcode-web-fetch",
  "kennedy-audio-ingress",
- "kennedy-chatend",
  "kennedy-conversation-history",
  "kennedy-memory-ingress",
  "rand 0.9.5",
@@ -2207,6 +2196,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "session-log",
  "sha2 0.10.9",
  "tar",
  "tokio",
@@ -3515,6 +3505,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "session-log"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

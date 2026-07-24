@@ -14,18 +14,19 @@ Kennedy is one Rust server with deliberately separated library domains:
 1. `kcode-kweb-db` 1.0 owns the transactional Kweb, canonical nodes,
    immutable objects, signed transactions, binary disk formats, append-only
    transaction log, current-node files, WAL, and duplicate/dependency rules.
-2. `kennedy-chatend` owns the append-only session journal, event/box state
-   machine, temporary IDs, staged raw objects, replay, and provider projection.
+2. `session-log` 0.2.1 owns append-ordered role/text history, pending-object
+   files, recovery, integrity validation, sealing, and exact cleanup.
 3. `kennedy-conversation-history` implements the Session History lifecycle and
    browser adapter. Its package name is historical; it owns no conversation
    SQLite database.
-4. `kennedy-server` owns orchestration, provider calls, tool execution, graph
+4. `kennedy-server` owns the reconstructed Chatend, box and representation
+   state, context limits, orchestration, provider calls, tool execution, graph
    policy, the one Kweb writer lane, Kweb HTTP routes, roots, the credential
    vault, and static assets.
 5. `kennedy-audio-ingress` and `kcode-audio-transcribe` own durable audio
    intake and transcription.
 6. `kennedy-memory-ingress` retains prepared audio work. Conversational
-   history ingress now lives directly in the Chatend journal.
+   history ingress now uses the same session log as its source session.
 7. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
 8. The browser frontend is an observer and command client only.
 
@@ -42,10 +43,12 @@ Read APIs remain conventional node/object queries. A completed write session
 is adapted into one `kcode-kweb-db::Transaction`:
 
 1. create all staged objects;
-2. create the immutable Chatend archive object;
-3. resolve staged node creates in dependency order;
-4. apply complete node updates;
-5. finalize exactly once.
+2. create the immutable session-log archive object;
+3. reserve every pending node ID;
+4. resolve circular pending-node and pending-object references;
+5. create the reserved nodes;
+6. apply complete node updates;
+7. finalize the transaction.
 
 `SessionNodeData` contains complete fixed and recent connection arrays. The
 library imposes no application connection-count policy. Kennedy graph tools
@@ -55,48 +58,46 @@ The session archive object is attached to every affected node. The final result
 maps `pending:N` identifiers to canonical IDs. Pending IDs never cross into
 durable Kweb storage.
 
-The local transaction builder currently allocates random object/node IDs and
-sets its signed commit timestamp during `finalize`. Because V1 deliberately
-deferred a prepared `TransactionPackage`, there is a small crash window after
-Kweb commit and before the Chatend journal records the result. The journal and
-full semantic plan have already been appended, but they are not explicitly
-fsynced. Reconstructing after this particular crash does not guarantee the same
-signed transaction. This limitation is accepted and explicitly not described
-as exact-once recovery.
+The Kmap adapter stores a request hash and prepared result keyed by session ID
+before Kweb finalization. Replaying an identical request returns the recorded
+result. If final receipt recording was interrupted, visibility of the prepared
+archive object proves the atomic Kweb transaction committed and prevents a
+duplicate. The current Kweb API cannot recover that object's creator
+transaction ID, so that recovery path returns a null transaction ID with the
+complete archive, node, and object mappings. Reusing a session ID with
+different transaction input is rejected.
 
-## 4. Chatend journal
+## 4. Session log
 
-Each source session and its history-ingress continuation share one file:
+Each source session and its history-ingress continuation share one transcript:
 
 ```text
-data/sessions/in-progress/{session-uuid}.chatend
+data/sessions/in-progress/{session-uuid}.session-log
 ```
 
-The file begins with `KCHAT01\n`. Each frame contains:
+Its logical value is:
 
-- one-byte frame kind;
-- canonical little-endian payload length;
-- SHA-256 payload checksum;
-- payload.
+```text
+header { formatVersion, sessionId, createdAt }
+events [ { role, text }, ... ]
+```
 
-Transition and sideband frames contain JSON because the Chatend model is
-expected to evolve rapidly. Staged object frames contain a short JSON metadata
-prefix followed by raw bytes. The journal is append-only. Each ordinary update
-is one frame. Operations that naturally produce several events build them in
-memory and append one transition frame whose checksum covers the complete
-batch. There is no transaction candidate, rollback copy, group-commit worker,
-or explicit `fsync`.
+The format version is the string `0.2.1`. Event array position is stable
+identity. The package serializes no event ID, box ID, pending ID, correlation
+ID, representation state, context limit, Kweb plan, lifecycle record, command
+record, or generic metadata.
 
-On open, frames are checked and applied directly to the materialized state in
-order. The first incomplete or checksum-invalid frame is treated as the end of
-the usable log: that frame and the complete suffix after it are truncated.
-Checksum-valid structural, schema, or semantic errors remain fatal because
-they indicate incompatible code or an invalid locally generated event rather
-than an interrupted append.
+The physical file is framed and checksummed. Every append is synchronized.
+Opening truncates only an incomplete trailing frame and rejects durable
+checksum or structure failures. Sealing verifies referenced objects, appends a
+durable footer, and prevents further events. Tool completion is Kennedy
+semantics and is validated by KennedyServer before sealing.
 
-The process maintains only the replayed current state, current transaction
-plan, provider work, and staged object metadata in memory. Raw staged bytes are
-read from disk only for final commit.
+One pending object is stored in
+`{session-uuid}-{event-position}.pending-object`. The complete object file is
+synchronized and renamed into place before its transcript event is appended.
+On open, unreferenced temporary and final object files are removed. A
+referenced missing or invalid object is corruption.
 
 ## 5. Event and box model
 
@@ -185,10 +186,12 @@ diff is added.
 
 ## 8. Session lifecycle and context ceilings
 
-Ordinary source sessions have a hard working ceiling of floor(70% of the
-effective context window). History ingress has floor(75%). At the source
-72% emergency boundary, the controller terminates the source and queues the
-same journal for history ingress.
+Ordinary source sessions admit a user message, tool call or result, or Kennedy
+response only when its exact projected Chatend remains at or below floor(70%
+of the effective context window). A rejected addition is replaced by a bounded
+system capacity message. If the projection after that message is above
+floor(75%), the controller terminates the source and queues the same journal
+for history ingress.
 
 History ingress:
 
@@ -197,25 +200,38 @@ History ingress:
 3. revalidates loaded Kweb nodes;
 4. retains all current Kennedy-authored summaries and tentatively hydrates
    everything else;
-5. if needed, fits context below 75% by reducing eligible boxes from largest
-   to smallest while protecting conversation messages, full direct/fixed/active
-   Kweb nodes, the system prompt, and short tool invocations;
-6. lets Kennedy selectively hydrate source material;
-7. stages all Kweb effects;
-8. commits one Kweb transaction and one session archive object.
+5. if needed, fits context at or below the 75% initial target by reducing
+   eligible boxes from largest to smallest, then protected conversation messages,
+   full direct/fixed/active Kweb nodes, the system prompt, and short tool
+   invocations from largest to smallest;
+6. if every box is dehydrated and the projection is still above the target,
+   commits immediately without invoking Kennedy;
+7. lets Kennedy selectively hydrate source material while using up to 100% of
+   the effective context window;
+8. stages all Kweb effects;
+9. commits one Kweb transaction and one session archive object.
 
-If ingress reaches 75% and cannot progress, it commits the work completed so
-far. The remaining context window is the output and operating reserve.
+If running ingress exceeds the full effective context window, it commits the
+work completed so far.
+
+A terminal prose response during ingress is retained, then followed by a
+private controller message explaining that ingress is a solo session and
+showing the exact native `call_ktool` arguments for `EndSession`. Reaching the
+existing agent-loop round limit during ingress force-commits the staged
+transaction rather than returning it to the retry queue.
 
 ## 9. Session History
 
-Lifecycle and ordered browser commands are sidebands in the `.chatend` file.
-After commit, Session History appends only the archive object ID to
-`data/session-history.txt`, fsyncs it, and removes the journal.
+Lifecycle and ordered browser commands live in a separate
+`{session-uuid}.session-control` file. After commit, Session History appends a
+structured receipt to `data/session-history.txt`, synchronizes it, and removes
+the session log, pending objects, and control file.
 
-The frontend fetches completed detail from Kweb on demand. There is no local
-metadata database, completed archive duplication, purge endpoint, or legacy
-loader.
+The receipt includes the transaction ID when available, archive object ID,
+pending-node mappings, and pending-object mappings. The frontend fetches the immutable
+header/event archive from Kweb and rebuilds its display. There is no completed
+archive duplication or purge endpoint. Startup migrates legacy `.chatend`
+files and retains their originals under `data/sessions/legacy-chatend-migration`.
 
 ## 10. Concurrency
 
@@ -232,16 +248,16 @@ lane before loading. More granular concurrency is intentionally deferred.
 
 ## 11. Objects and limits
 
-Chatend and Kweb both enforce 32 GiB for one object and for aggregate object
-payload in one transaction. The implementation avoids cloning the complete
-payload in Kennedy's adapter, but the V1 boundary writes the object once into
-the Chatend journal and again into Kweb. Streaming and zero-copy handoff are
-future work.
+Kweb enforces its object and transaction payload limits. `session-log` does
+not own application or database limits. The current boundary writes each
+pending object once into its session sidecar and again into Kweb at commit.
+Streaming and zero-copy handoff are future work.
 
-Internal Kweb disk encodings are canonical binary and checksummed. Chatend's
-evolving control events are checksummed JSON frames. HTTP/provider boundaries
-use ordinary typed JSON and multipart data; internal binary formats are not
-exposed as API encodings.
+Internal Kweb disk encodings are canonical binary and checksummed. Session-log
+headers and events use checksummed frames; pending objects have a fixed header,
+declared lengths, and a byte checksum. HTTP/provider boundaries use ordinary
+typed JSON and multipart data; internal binary formats are not exposed as API
+encodings.
 
 ## 12. Credentials and backup
 
@@ -249,10 +265,10 @@ The Kweb writer signing key lives in the passphrase-encrypted credential vault.
 Kennedy never receives it. The server passes it directly to `kcode-kweb-db`
 after a human unlocks the vault.
 
-Backup format 10 captures:
+Backup format 11 captures:
 
 - the complete Kweb root;
-- active Chatend journals;
+- active session logs, pending-object files, and control journals;
 - `session-history.txt`;
 - runtime SQLite services;
 - audio media;

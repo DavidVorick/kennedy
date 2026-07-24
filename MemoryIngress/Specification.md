@@ -6,8 +6,8 @@ worker claims and checkpoints them through one globally serialized Kweb write
 lane.
 
 Conversational history ingress no longer uses this queue. A source session and
-its history-ingress continuation now remain in the same append-only Chatend
-journal and produce one final Kweb transaction. The `Conversation` source-kind
+its history-ingress continuation now remain in the same append-only session
+log and produce one final Kweb transaction. The `Conversation` source-kind
 value remains decodable only so the existing queue database format is stable;
 the cutover archived and removed all live conversation rows, and the runtime
 rejects any such row as a cutover invariant violation.
@@ -24,5 +24,5 @@ input-too-large error or fifth consecutive failure becomes terminal; an
 explicit retry preserves diagnostics while resetting the consecutive count.
 
 The queue remains SQLite because it is specialized intake state, not Kweb
-content or Session History. It contains no completed Chatend archives and does
-not translate or load legacy conversation sessions.
+content or Session History. It contains no completed session-log archives and
+does not translate or load legacy conversation sessions.

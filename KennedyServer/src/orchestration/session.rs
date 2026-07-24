@@ -5,14 +5,14 @@ use std::{
     time::Duration,
 };
 
+use super::chatend::{
+    BoxContent, BoxId, BoxOwner, BoxRepresentation, EventId, EventKind, PendingId, Representation,
+    SessionJournal, SessionKind, SessionMetadata, ToolSlotInput,
+};
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use kcode_kweb_db::NodeId;
-use kennedy_chatend::{
-    BoxContent, BoxId, BoxOwner, BoxRepresentation, EventId, EventKind, PendingId, Representation,
-    SessionJournal, SessionKind, SessionMetadata, ToolSlotInput,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use crate::{
     kmap_http::{
-        SessionCommit, SessionNodeCreate, SessionNodeData, SessionNodeUpdate, SessionObject,
+        SessionCommit, SessionCommitResult, SessionNodeCreate, SessionNodeData, SessionNodeUpdate,
+        SessionObject,
     },
     rust_lib_tools::RUST_LIB_TOOLS,
 };
@@ -38,6 +39,8 @@ const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INLINE_TOOL_INVOCATION_CHARACTERS: usize = 1_000;
 const KWEB_TOOL_INSTANCE: &str = "kweb";
 const HISTORY_TOOL_INSTANCE: &str = "history";
+const CAPACITY_ERROR_BOX_NAME: &str = "Context capacity error";
+const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -79,6 +82,26 @@ impl SessionOptions {
     }
 }
 
+fn restore_session_type(options: &mut SessionOptions, state: &Value) {
+    if !matches!(&options.mode, AgentMode::Ingress { .. }) {
+        options.session_type = state
+            .get("sessionType")
+            .and_then(Value::as_str)
+            .unwrap_or(&options.session_type)
+            .to_owned();
+    }
+}
+
+fn restore_commit_receipt(restored: Option<&Value>) -> anyhow::Result<Option<SessionCommitResult>> {
+    restored
+        .and_then(|state| state.get("commitReceipt"))
+        .filter(|receipt| !receipt.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decoding the stored session commit receipt")
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct KwebPlan {
@@ -87,7 +110,12 @@ struct KwebPlan {
 }
 
 impl KwebPlan {
-    fn from_journal(journal: &SessionJournal) -> anyhow::Result<Self> {
+    fn restore(restored: Option<&Value>, journal: &SessionJournal) -> anyhow::Result<Self> {
+        if let Some(plan) = restored.and_then(|state| state.get("kwebPlan")) {
+            return serde_json::from_value(plan.clone()).context("decoding the staged Kweb plan");
+        }
+        // Transitional compatibility for journals written before Kweb plans
+        // moved into KennedyServer lifecycle state.
         let latest = journal.state().events.iter().rev().find_map(|event| {
             let EventKind::KwebPlanChanged { operation } = &event.kind else {
                 return None;
@@ -136,6 +164,8 @@ pub(crate) struct Session {
     pub pending_external_event_id: Option<String>,
     pub completed: bool,
     pub rounds_used: u64,
+    commit_receipt: Option<SessionCommitResult>,
+    commit_author: String,
     mode: AgentMode,
     source_session_type: Option<String>,
     group_context: Value,
@@ -148,6 +178,12 @@ struct DesiredKwebBox {
     logical_slot: String,
     name: String,
     content: BoxContent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputStage {
+    Accepted,
+    RejectedForCapacity,
 }
 
 #[derive(Clone, Copy)]
@@ -193,7 +229,7 @@ fn mark_kweb_content(content: &mut BoxContent, logical_slot: &str, role: &str) {
     content.metadata["kwebRole"] = json!(role);
 }
 
-fn kweb_logical_slot(state: &kennedy_chatend::BoxState, actual_slot: &str) -> String {
+fn kweb_logical_slot(state: &super::chatend::BoxState, actual_slot: &str) -> String {
     state
         .canonical
         .content
@@ -204,7 +240,7 @@ fn kweb_logical_slot(state: &kennedy_chatend::BoxState, actual_slot: &str) -> St
         .to_owned()
 }
 
-fn kweb_node_identifier(state: &kennedy_chatend::BoxState) -> Option<&str> {
+fn kweb_node_identifier(state: &super::chatend::BoxState) -> Option<&str> {
     state
         .canonical
         .content
@@ -352,9 +388,14 @@ fn render_web_fetch_result(result: &Value) -> anyhow::Result<String> {
     Ok(text)
 }
 
+struct HistoryIngressRepresentationPlan {
+    desired: BTreeMap<BoxId, BoxRepresentation>,
+    fits: bool,
+}
+
 fn history_ingress_representation_plan(
-    state: &kennedy_chatend::Chatend,
-) -> anyhow::Result<BTreeMap<BoxId, BoxRepresentation>> {
+    state: &super::chatend::Chatend,
+) -> anyhow::Result<HistoryIngressRepresentationPlan> {
     let mut desired = state
         .active_boxes()
         .map(|box_state| {
@@ -369,23 +410,18 @@ fn history_ingress_representation_plan(
         })
         .collect::<BTreeMap<_, _>>();
     let projection = state.projection_with_box_representations(&desired)?;
-    let limit = state.history_context_limit();
-    if projection.estimated_tokens < limit {
-        return Ok(desired);
+    let limit = state.ingress_initial_context_limit();
+    if projection.estimated_tokens <= limit {
+        return Ok(HistoryIngressRepresentationPlan {
+            desired,
+            fits: true,
+        });
     }
 
-    let rendered_tokens = projection
-        .items
-        .iter()
-        .filter(|item| !item.marker)
-        .map(|item| (item.box_id, item.approximate_tokens))
-        .collect::<BTreeMap<_, _>>();
-    let mut candidates = state
+    let mut unprotected = state
         .active_boxes()
-        .filter_map(|box_state| {
-            if history_ingress_box_is_protected(box_state) {
-                return None;
-            }
+        .filter(|box_state| !history_ingress_box_is_protected(box_state))
+        .map(|box_state| {
             let target = if matches!(
                 desired.get(&box_state.id),
                 Some(BoxRepresentation::Summarized(_))
@@ -401,81 +437,75 @@ fn history_ingress_representation_plan(
             } else {
                 BoxRepresentation::Dehydrated
             };
-            Some((
-                box_state.id,
-                rendered_tokens
-                    .get(&box_state.id)
-                    .copied()
-                    .unwrap_or_default(),
-                target,
-            ))
+            (box_state.id, target)
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-
-    let mut all_desired = desired.clone();
-    for (box_id, _, target) in &candidates {
-        all_desired.insert(*box_id, target.clone());
+    if reduce_history_ingress_boxes(state, &mut desired, &mut unprotected, limit)? {
+        return Ok(HistoryIngressRepresentationPlan {
+            desired,
+            fits: true,
+        });
     }
-    let all_projection = state.projection_with_box_representations(&all_desired)?;
-    let baseline_box_tokens = projection_tokens_by_box(&projection);
-    let all_box_tokens = projection_tokens_by_box(&all_projection);
-    candidates.retain(|(box_id, _, _)| {
-        all_box_tokens.get(box_id).copied().unwrap_or_default()
-            < baseline_box_tokens.get(box_id).copied().unwrap_or_default()
+
+    let mut protected = state
+        .active_boxes()
+        .filter(|box_state| history_ingress_box_is_protected(box_state))
+        .map(|box_state| (box_state.id, BoxRepresentation::Dehydrated))
+        .collect::<Vec<_>>();
+    if reduce_history_ingress_boxes(state, &mut desired, &mut protected, limit)? {
+        return Ok(HistoryIngressRepresentationPlan {
+            desired,
+            fits: true,
+        });
+    }
+
+    let mut remaining = state
+        .active_boxes()
+        .map(|box_state| (box_state.id, BoxRepresentation::Dehydrated))
+        .collect::<Vec<_>>();
+    let fits = reduce_history_ingress_boxes(state, &mut desired, &mut remaining, limit)?;
+    Ok(HistoryIngressRepresentationPlan { desired, fits })
+}
+
+fn reduce_history_ingress_boxes(
+    state: &super::chatend::Chatend,
+    desired: &mut BTreeMap<BoxId, BoxRepresentation>,
+    candidates: &mut Vec<(BoxId, BoxRepresentation)>,
+    limit: u64,
+) -> anyhow::Result<bool> {
+    let projection = state.projection_with_box_representations(desired)?;
+    let rendered_tokens = projection
+        .items
+        .iter()
+        .filter(|item| !item.marker)
+        .map(|item| (item.box_id, item.approximate_tokens))
+        .collect::<BTreeMap<_, _>>();
+    candidates.retain(|(box_id, target)| desired.get(box_id) != Some(target));
+    candidates.sort_by(|left, right| {
+        rendered_tokens
+            .get(&right.0)
+            .copied()
+            .unwrap_or_default()
+            .cmp(&rendered_tokens.get(&left.0).copied().unwrap_or_default())
+            .then_with(|| left.0.cmp(&right.0))
     });
-
-    all_desired.clone_from(&desired);
-    for (box_id, _, target) in &candidates {
-        all_desired.insert(*box_id, target.clone());
-    }
-    let all_projection = state.projection_with_box_representations(&all_desired)?;
-    anyhow::ensure!(
-        all_projection.estimated_tokens < limit,
-        "history-ingress protected context uses at least {} estimated tokens, above the 75% model-context budget of {}",
-        all_projection.estimated_tokens,
-        limit
-    );
-
-    let mut lower = 0;
-    let mut upper = candidates.len();
-    while upper - lower > 1 {
-        let middle = lower + (upper - lower) / 2;
-        let candidate_desired = history_ingress_candidate_prefix(&desired, &candidates, middle);
-        let candidate_projection = state.projection_with_box_representations(&candidate_desired)?;
-        if candidate_projection.estimated_tokens < limit {
-            upper = middle;
-        } else {
-            lower = middle;
+    for (box_id, target) in candidates.drain(..) {
+        desired.insert(box_id, target);
+        if state
+            .projection_with_box_representations(desired)?
+            .estimated_tokens
+            <= limit
+        {
+            return Ok(true);
         }
     }
-    desired = history_ingress_candidate_prefix(&desired, &candidates, upper);
-    Ok(desired)
+    Ok(state
+        .projection_with_box_representations(desired)?
+        .estimated_tokens
+        <= limit)
 }
 
-fn projection_tokens_by_box(
-    projection: &kennedy_chatend::ContextProjection,
-) -> BTreeMap<BoxId, u64> {
-    let mut tokens = BTreeMap::<BoxId, u64>::new();
-    for item in &projection.items {
-        *tokens.entry(item.box_id).or_default() += item.approximate_tokens;
-    }
-    tokens
-}
-
-fn history_ingress_candidate_prefix(
-    baseline: &BTreeMap<BoxId, BoxRepresentation>,
-    candidates: &[(BoxId, u64, BoxRepresentation)],
-    length: usize,
-) -> BTreeMap<BoxId, BoxRepresentation> {
-    let mut desired = baseline.clone();
-    for (box_id, _, target) in candidates.iter().take(length) {
-        desired.insert(*box_id, target.clone());
-    }
-    desired
-}
-
-fn history_ingress_box_is_protected(state: &kennedy_chatend::BoxState) -> bool {
+fn history_ingress_box_is_protected(state: &super::chatend::BoxState) -> bool {
     if matches!(state.owner, BoxOwner::System)
         || matches!(state.owner, BoxOwner::User) && state.name == "User message"
         || matches!(state.owner, BoxOwner::Kennedy) && state.name == "Kennedy message"
@@ -496,7 +526,7 @@ fn history_ingress_box_is_protected(state: &kennedy_chatend::BoxState) -> bool {
         .is_some_and(|(_, characters)| characters <= INLINE_TOOL_INVOCATION_CHARACTERS)
 }
 
-fn tool_invocation(state: &kennedy_chatend::BoxState) -> Option<(&str, usize)> {
+fn tool_invocation(state: &super::chatend::BoxState) -> Option<(&str, usize)> {
     let BoxOwner::Kennedy = &state.owner else {
         return None;
     };
@@ -573,11 +603,7 @@ impl Session {
         restored: Option<&Value>,
     ) -> anyhow::Result<Self> {
         if let Some(state) = restored {
-            options.session_type = state
-                .get("sessionType")
-                .and_then(Value::as_str)
-                .unwrap_or(&options.session_type)
-                .to_owned();
+            restore_session_type(&mut options, state);
             options.channel = state.get("channel").cloned().unwrap_or(options.channel);
             options.free_time = state.get("freeTime").cloned().unwrap_or(options.free_time);
             options.orchestration = state
@@ -629,11 +655,26 @@ impl Session {
             manuals.compose_conversation(&runtime, &options.session_type, &session_context)?
         };
 
-        let (journal, _new_journal) = if let Some(path) = journal_path {
+        let (mut journal, _new_journal) = if let Some(path) = journal_path {
+            let session_id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("session-log filename is not valid UTF-8")?
+                .to_owned();
             (
-                SessionJournal::open(&path).with_context(|| {
+                SessionJournal::open_with_metadata(
+                    &path,
+                    SessionMetadata {
+                        session_id,
+                        kind: session_kind(&options.session_type, &options.mode),
+                        created_at: started_at.clone(),
+                        effective_context_tokens: runtime.context_window_tokens,
+                        channel: options.channel.clone(),
+                    },
+                )
+                .with_context(|| {
                     format!(
-                        "opening authoritative session journal {} (legacy snapshots are intentionally unsupported)",
+                        "opening authoritative session log {} (legacy snapshots are intentionally unsupported)",
                         path.display()
                     )
                 })?,
@@ -642,10 +683,10 @@ impl Session {
         } else {
             let session_id = Uuid::new_v4().to_string();
             #[cfg(test)]
-            let root = std::env::temp_dir().join("kennedy-chatend-tests");
+            let root = std::env::temp_dir().join("kennedy-session-log-tests");
             #[cfg(not(test))]
             let root = PathBuf::from("./data/sessions/in-progress");
-            let path = root.join(format!("{session_id}.chatend"));
+            let path = root.join(format!("{session_id}.session-log"));
             (
                 SessionJournal::create(
                     &path,
@@ -662,7 +703,7 @@ impl Session {
         };
         let mut context = KmapContext::new(api.clone(), options.root_node_ids.clone())?;
         restore_kweb_context(&journal, &mut context)?;
-        let plan = KwebPlan::from_journal(&journal)?;
+        let plan = KwebPlan::restore(restored, &journal)?;
         let transcript = transcript_from_journal(&journal);
         let journal_pending_external = transcript.iter().rev().find_map(|entry| {
             if entry.get("role").and_then(Value::as_str) != Some("user") {
@@ -670,8 +711,10 @@ impl Session {
             }
             let id = entry.get("externalEventId").and_then(Value::as_str)?;
             let answered = transcript.iter().any(|candidate| {
-                candidate.get("role").and_then(Value::as_str) == Some("kennedy")
-                    && candidate.get("externalEventId").and_then(Value::as_str) == Some(id)
+                matches!(
+                    candidate.get("role").and_then(Value::as_str),
+                    Some("kennedy" | "system")
+                ) && candidate.get("externalEventId").and_then(Value::as_str) == Some(id)
             });
             (!answered).then(|| id.to_owned())
         });
@@ -690,6 +733,17 @@ impl Session {
             .boxes
             .values()
             .any(|state| matches!(state.owner, BoxOwner::System));
+        let commit_receipt = restore_commit_receipt(restored)?;
+        let commit_author = restored
+            .and_then(|state| state.get("commitAuthor"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| runtime.attribution());
+        if let Some(receipt) = &commit_receipt {
+            journal.mark_completed(receipt.session_object_id.clone());
+        }
+        let completed =
+            journal.state().completed_session_object.is_some() || commit_receipt.is_some();
         let mut session = Self {
             api,
             runtime,
@@ -707,11 +761,13 @@ impl Session {
             transcript,
             pending_turn: restored_pending || pending_external_event_id.is_some(),
             pending_external_event_id,
-            completed: false,
+            completed,
             rounds_used: restored
                 .and_then(|state| state.get("roundsUsed"))
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
+            commit_receipt,
+            commit_author,
             mode: options.mode,
             source_session_type,
             group_context: options.group_context,
@@ -720,14 +776,19 @@ impl Session {
             fatal_persistence_error: None,
         };
 
+        if session.journal.is_sealed() {
+            anyhow::ensure!(
+                !matches!(session.mode, AgentMode::Conversation),
+                "a read-only conversation has an unexpectedly sealed session log"
+            );
+            if session.commit_receipt.is_none() {
+                session.finalize_kweb_session()?;
+            }
+            session.completed = true;
+            return Ok(session);
+        }
+
         if needs_initialization {
-            session.journal.record(
-                now(),
-                EventKind::SessionConfigured {
-                    effective_context_tokens: session.runtime.context_window_tokens,
-                    kind: session_kind(&session.session_type, &session.mode),
-                },
-            )?;
             session.journal.create_box(
                 now(),
                 "Kennedy system prompt",
@@ -748,6 +809,7 @@ impl Session {
             session.sync_kweb_boxes()?;
         }
         if matches!(session.mode, AgentMode::Ingress { .. })
+            && !session.completed
             && !session.journal.state().history_ingress_started
             && !needs_initialization
         {
@@ -780,17 +842,30 @@ impl Session {
             != self.runtime.context_window_tokens
             || self.journal.state().metadata.kind != ingress_kind
         {
-            self.journal.record(
-                now(),
-                EventKind::SessionConfigured {
-                    effective_context_tokens: self.runtime.context_window_tokens,
-                    kind: ingress_kind,
-                },
-            )?;
+            self.journal
+                .configure_context(ingress_kind, self.runtime.context_window_tokens);
         }
         self.revalidate_loaded_nodes().await?;
-        let desired = history_ingress_representation_plan(self.journal.state())?;
-        self.journal.apply_box_representations(now(), &desired)?;
+        let plan = history_ingress_representation_plan(self.journal.state())?;
+        self.journal
+            .apply_box_representations(now(), &plan.desired)?;
+        if !plan.fits {
+            self.journal.record(
+                now(),
+                EventKind::Note {
+                    label: INGRESS_FORCE_COMMIT_NOTE.into(),
+                    value: json!({
+                        "reason":"fully_dehydrated_context_above_initial_target",
+                        "estimatedTokens":self.journal.state().projection().estimated_tokens,
+                        "initialTargetTokens":self.journal.state().ingress_initial_context_limit(),
+                    }),
+                },
+            )?;
+            self.pending_turn = false;
+            self.finalize_kweb_session()?;
+            self.completed = true;
+            return Ok(());
+        }
         self.journal
             .record(now(), EventKind::HistoryIngressStarted)?;
         self.pending_turn = true;
@@ -860,6 +935,10 @@ impl Session {
         text: &str,
         metadata: &Value,
     ) -> anyhow::Result<()> {
+        if self.completed {
+            self.pending_turn = false;
+            return Ok(());
+        }
         if self.journal.state().history_ingress_started {
             self.pending_turn = true;
             return Ok(());
@@ -874,11 +953,11 @@ impl Session {
             .map(|state| state.canonical.content.text.clone())
             .context("ingress session has no system prompt")?;
         self.prepare_history_ingress(&prompt).await?;
-        self.pending_turn = true;
+        self.pending_turn = !self.completed;
         Ok(())
     }
 
-    pub(crate) fn stage_user_input(&mut self, text: &str, metadata: &Value) -> bool {
+    fn stage_user_input(&mut self, text: &str, metadata: &Value) -> Option<InputStage> {
         let text = text.trim();
         let attachments = metadata
             .get("attachments")
@@ -886,14 +965,17 @@ impl Session {
             .cloned()
             .unwrap_or_default();
         if text.is_empty() && attachments.is_empty() && metadata.get("media").is_none() {
-            return false;
+            return None;
         }
         let result = self.stage_user_input_inner(text, metadata, attachments);
-        if let Err(error) = result {
-            self.fatal_persistence_error = Some(error.to_string());
-            tracing::error!(error=%error, "Could not durably stage session input");
+        match result {
+            Ok(stage) => Some(stage),
+            Err(error) => {
+                self.fatal_persistence_error = Some(error.to_string());
+                tracing::error!(error=%error, "Could not durably stage session input");
+                Some(InputStage::Accepted)
+            }
         }
-        true
     }
 
     fn stage_user_input_inner(
@@ -901,7 +983,7 @@ impl Session {
         text: &str,
         metadata: &Value,
         attachments: Vec<Value>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<InputStage> {
         let mut content = BoxContent::text(text);
         content.metadata = message_metadata_without_attachment_payloads(metadata);
         let mut attachment_boxes = Vec::new();
@@ -991,22 +1073,42 @@ impl Session {
         } else {
             content.text.clone()
         };
-        self.journal
-            .create_box(now(), "User message", BoxOwner::User, content)?;
-        for (name, content) in attachment_boxes {
-            self.journal
-                .create_box(now(), name, BoxOwner::User, content)?;
+        let mut prospective_boxes =
+            vec![("User message".to_owned(), BoxOwner::User, content.clone())];
+        prospective_boxes.extend(
+            attachment_boxes
+                .iter()
+                .map(|(name, content)| (name.clone(), BoxOwner::User, content.clone())),
+        );
+        if !matches!(self.mode, AgentMode::Ingress { .. }) {
+            let projection = self
+                .journal
+                .state()
+                .projection_with_new_boxes(&prospective_boxes)?;
+            let limit = self.journal.state().live_context_limit();
+            if projection.estimated_tokens > limit {
+                self.record_live_capacity_error(
+                    "Your message",
+                    projection.estimated_tokens,
+                    limit,
+                    metadata.get("externalEventId").and_then(Value::as_str),
+                )?;
+                return Ok(InputStage::RejectedForCapacity);
+            }
+        }
+        for (name, owner, content) in prospective_boxes {
+            self.journal.create_box(now(), name, owner, content)?;
         }
         let mut transcript = json!({"role":"user","content":visible});
         if let Some(id) = metadata.get("externalEventId").and_then(Value::as_str) {
             transcript["externalEventId"] = json!(id);
         }
         self.transcript.push(transcript);
-        Ok(())
+        Ok(InputStage::Accepted)
     }
 
     pub(crate) fn append_final_user_message(&mut self, text: &str, metadata: &Value) -> bool {
-        self.stage_user_input(text, metadata)
+        self.stage_user_input(text, metadata).is_some()
     }
 
     pub(crate) fn stage_source_message(
@@ -1045,9 +1147,146 @@ impl Session {
 
     pub(crate) fn answer_for_external_event(&self, id: &str) -> Option<&Value> {
         self.transcript.iter().rev().find(|entry| {
-            entry.get("role").and_then(Value::as_str) == Some("kennedy")
-                && entry.get("externalEventId").and_then(Value::as_str) == Some(id)
+            matches!(
+                entry.get("role").and_then(Value::as_str),
+                Some("kennedy" | "system")
+            ) && entry.get("externalEventId").and_then(Value::as_str) == Some(id)
         })
+    }
+
+    fn record_live_capacity_error(
+        &mut self,
+        attempted_operation: &str,
+        projected_tokens: u64,
+        limit_tokens: u64,
+        external_event_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        if let Some(id) = external_event_id
+            && let Some(existing) = self.answer_for_external_event(id)
+            && existing.get("role").and_then(Value::as_str) == Some("system")
+            && let Some(text) = existing.get("content").and_then(Value::as_str)
+        {
+            let text = text.to_owned();
+            if self.journal.state().projection().estimated_tokens
+                > self.journal.state().forced_ingress_context_limit()
+                && !self.journal.state().source_terminated
+            {
+                self.journal.record(
+                    now(),
+                    EventKind::SourceTerminated {
+                        reason: "context_capacity_limit".into(),
+                    },
+                )?;
+            }
+            return Ok(text);
+        }
+        self.journal.record(
+            now(),
+            EventKind::CapacityError {
+                attempted_operation: attempted_operation.into(),
+                projected_tokens,
+                limit_tokens,
+            },
+        )?;
+        let text = format!(
+            "{attempted_operation} was not added because it would use approximately \
+             {projected_tokens} context tokens, above the 70% limit of {limit_tokens}. \
+             Reduce the size of the request or dehydrate existing context and try again."
+        );
+        let mut metadata = json!({
+            "transcriptRole":"system",
+            "capacityError":true,
+            "projectedTokens":projected_tokens,
+            "limitTokens":limit_tokens,
+        });
+        if let Some(id) = external_event_id {
+            metadata["externalEventId"] = json!(id);
+        }
+        self.journal.create_box(
+            now(),
+            CAPACITY_ERROR_BOX_NAME,
+            BoxOwner::Controller,
+            BoxContent {
+                text: text.clone(),
+                objects: Vec::new(),
+                metadata,
+            },
+        )?;
+        let mut transcript = json!({"role":"system","content":text});
+        if let Some(id) = external_event_id {
+            transcript["externalEventId"] = json!(id);
+        }
+        self.transcript.push(transcript);
+        if self.journal.state().projection().estimated_tokens
+            > self.journal.state().forced_ingress_context_limit()
+            && !self.journal.state().source_terminated
+        {
+            self.journal.record(
+                now(),
+                EventKind::SourceTerminated {
+                    reason: "context_capacity_limit".into(),
+                },
+            )?;
+        }
+        Ok(text)
+    }
+
+    fn request_ingress_force_commit(
+        &mut self,
+        reason: &str,
+        projected_tokens: u64,
+    ) -> anyhow::Result<()> {
+        if self.ingress_force_commit_requested() {
+            return Ok(());
+        }
+        self.journal.record(
+            now(),
+            EventKind::Note {
+                label: INGRESS_FORCE_COMMIT_NOTE.into(),
+                value: json!({
+                    "reason":reason,
+                    "projectedTokens":projected_tokens,
+                    "limitTokens":self.journal.state().ingress_context_limit(),
+                }),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn ingress_force_commit_requested(&self) -> bool {
+        self.journal.state().events.iter().rev().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::Note { label, .. } if label == INGRESS_FORCE_COMMIT_NOTE
+            )
+        })
+    }
+
+    fn pending_capacity_error(&self) -> bool {
+        self.pending_external_event_id
+            .as_deref()
+            .and_then(|id| self.answer_for_external_event(id))
+            .is_some_and(|entry| entry.get("role").and_then(Value::as_str) == Some("system"))
+    }
+
+    fn has_live_capacity_error(&self) -> bool {
+        self.journal.state().active_boxes().any(|box_state| {
+            box_state
+                .canonical
+                .content
+                .metadata
+                .get("capacityError")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+    }
+
+    fn current_live_capacity_error(&self) -> bool {
+        match self.mode {
+            AgentMode::Conversation => self.pending_capacity_error(),
+            AgentMode::FreeTime => self.has_live_capacity_error(),
+            AgentMode::Ingress { .. } => false,
+        }
     }
 
     pub(crate) fn requires_history_ingress(&self) -> bool {
@@ -1069,14 +1308,24 @@ impl Session {
                 "Message from the previous self-time session:\n\n{message}"
             ));
         }
-        let staged = self.stage_user_input(&blocks.join("\n\n"), &json!({"kind":"self-time"}));
-        self.pending_turn = staged;
-        staged
+        let Some(stage) = self.stage_user_input(&blocks.join("\n\n"), &json!({"kind":"self-time"}))
+        else {
+            return false;
+        };
+        self.pending_turn = matches!(stage, InputStage::Accepted);
+        true
     }
 
     pub(crate) fn begin_user_turn(&mut self, text: &str, metadata: &Value) -> bool {
-        if self.pending_turn || !self.stage_user_input(text, metadata) {
+        if self.pending_turn {
             return false;
+        }
+        let Some(stage) = self.stage_user_input(text, metadata) else {
+            return false;
+        };
+        if matches!(stage, InputStage::RejectedForCapacity) {
+            self.pending_external_event_id = None;
+            return true;
         }
         self.rounds_used = 0;
         self.pending_turn = true;
@@ -1119,8 +1368,24 @@ impl Session {
                     checkpoint(self.snapshot()?).await?;
                     return Ok(None);
                 }
-                let answer = result
-                    .context("Kennedy ended a conversational turn without an assistant response")?;
+                let Some(answer) = result else {
+                    if self
+                        .pending_external_event_id
+                        .as_deref()
+                        .and_then(|id| self.answer_for_external_event(id))
+                        .is_some_and(|entry| {
+                            entry.get("role").and_then(Value::as_str) == Some("system")
+                        })
+                    {
+                        self.pending_turn = false;
+                        self.pending_external_event_id = None;
+                        checkpoint(self.snapshot()?).await?;
+                        return Ok(None);
+                    }
+                    anyhow::bail!(
+                        "Kennedy ended a conversational turn without an assistant response"
+                    );
+                };
                 let mut response = json!({"role":"kennedy","content":answer});
                 if let Some(id) = &self.pending_external_event_id {
                     response["externalEventId"] = json!(id);
@@ -1158,29 +1423,21 @@ impl Session {
             let deadline_after_response = self.prepare_free_time_round()?;
             let input = self.journal.state().render();
             let projection = self.journal.state().projection();
-            let limit = if matches!(self.mode, AgentMode::Ingress { .. }) {
-                self.journal.state().history_context_limit()
-            } else {
-                self.journal.state().live_context_limit()
-            };
-            if projection.estimated_tokens > limit {
-                if matches!(self.mode, AgentMode::Ingress { .. }) {
+            if matches!(self.mode, AgentMode::Ingress { .. }) {
+                if projection.estimated_tokens > self.journal.state().ingress_context_limit()
+                    || self.ingress_force_commit_requested()
+                {
                     return Ok(None);
                 }
-                if projection.estimated_tokens > self.journal.state().emergency_context_limit() {
-                    self.journal.record(
-                        now(),
-                        EventKind::SourceTerminated {
-                            reason: "context_emergency_limit".into(),
-                        },
-                    )?;
-                    return Ok(None);
-                }
-                anyhow::bail!(
-                    "active Chatend uses {} tokens, above its {} token limit; dehydrate or summarize boxes",
+            } else if projection.estimated_tokens > self.journal.state().live_context_limit() {
+                let external_event_id = self.pending_external_event_id.clone();
+                self.record_live_capacity_error(
+                    "The pending turn",
                     projection.estimated_tokens,
-                    limit
-                );
+                    self.journal.state().live_context_limit(),
+                    external_event_id.as_deref(),
+                )?;
+                return Ok(None);
             }
             let manifest_hash = hex::encode(Sha256::digest(input.as_bytes()));
             self.journal.record(
@@ -1222,25 +1479,86 @@ impl Session {
                     kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
                         used_tool = true;
                         let call = native_ktool_call(&native);
-                        let outcome = match call {
+                        let mut outcome = match call {
                             Ok(call) => {
-                                self.journal.create_box(
-                                    now(),
-                                    format!("Kennedy tool call: {}", call.name),
-                                    BoxOwner::Kennedy,
-                                    BoxContent::text(serde_json::to_string_pretty(
-                                        &json!({"name":call.name,"arguments":call.arguments}),
-                                    )?),
-                                )?;
+                                let call_name = format!("Kennedy tool call: {}", call.name);
+                                let call_content = BoxContent::text(serde_json::to_string_pretty(
+                                    &json!({"name":call.name,"arguments":call.arguments}),
+                                )?);
                                 self.record_tool_invocation(&call.name, call.arguments.clone())?;
-                                match self.execute_tool(&call, operation_id).await {
-                                    Ok(outcome) => outcome,
-                                    Err(error) => ToolOutcome {
-                                        text: format!("{} failed: {error}", call.name),
-                                        store_result: call.name != "LoadNode",
+                                let rejected = if !matches!(self.mode, AgentMode::Ingress { .. }) {
+                                    if self.current_live_capacity_error() {
+                                        let external_event_id =
+                                            self.pending_external_event_id.clone();
+                                        Some(self.record_live_capacity_error(
+                                            &format!("Kennedy's {} tool call", call.name),
+                                            self.journal.state().projection().estimated_tokens,
+                                            self.journal.state().live_context_limit(),
+                                            external_event_id.as_deref(),
+                                        )?)
+                                    } else {
+                                        let projection =
+                                            self.journal.state().projection_with_new_boxes(&[(
+                                                call_name.clone(),
+                                                BoxOwner::Kennedy,
+                                                call_content.clone(),
+                                            )])?;
+                                        let limit = self.journal.state().live_context_limit();
+                                        if projection.estimated_tokens > limit {
+                                            let external_event_id =
+                                                self.pending_external_event_id.clone();
+                                            Some(self.record_live_capacity_error(
+                                                &format!("Kennedy's {} tool call", call.name),
+                                                projection.estimated_tokens,
+                                                limit,
+                                                external_event_id.as_deref(),
+                                            )?)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(text) = rejected {
+                                    ToolOutcome {
+                                        text,
+                                        store_result: false,
                                         ok: false,
                                         end_session: false,
-                                    },
+                                    }
+                                } else {
+                                    self.journal.create_box(
+                                        now(),
+                                        call_name,
+                                        BoxOwner::Kennedy,
+                                        call_content,
+                                    )?;
+                                    if matches!(self.mode, AgentMode::Ingress { .. })
+                                        && self.journal.state().projection().estimated_tokens
+                                            > self.journal.state().ingress_context_limit()
+                                    {
+                                        self.request_ingress_force_commit(
+                                            "tool_call_exceeded_full_window",
+                                            self.journal.state().projection().estimated_tokens,
+                                        )?;
+                                        ToolOutcome {
+                                            text: "The tool was not run because history ingress exceeded the full context window; the staged transaction will now be committed.".into(),
+                                            store_result: false,
+                                            ok: false,
+                                            end_session: false,
+                                        }
+                                    } else {
+                                        match self.execute_tool(&call, operation_id).await {
+                                            Ok(outcome) => outcome,
+                                            Err(error) => ToolOutcome {
+                                                text: format!("{} failed: {error}", call.name),
+                                                store_result: call.name != "LoadNode",
+                                                ok: false,
+                                                end_session: false,
+                                            },
+                                        }
+                                    }
                                 }
                             }
                             Err(error) => ToolOutcome {
@@ -1250,6 +1568,32 @@ impl Session {
                                 end_session: false,
                             },
                         };
+                        if !matches!(self.mode, AgentMode::Ingress { .. }) {
+                            let projection = if outcome.store_result {
+                                self.journal.state().projection_with_new_boxes(&[(
+                                    "Kennedy tool result".into(),
+                                    BoxOwner::Controller,
+                                    BoxContent::text(&outcome.text),
+                                )])?
+                            } else {
+                                self.journal.state().projection()
+                            };
+                            let limit = self.journal.state().live_context_limit();
+                            if projection.estimated_tokens > limit {
+                                let external_event_id = self.pending_external_event_id.clone();
+                                outcome = ToolOutcome {
+                                    text: self.record_live_capacity_error(
+                                        "Kennedy's tool result",
+                                        projection.estimated_tokens,
+                                        limit,
+                                        external_event_id.as_deref(),
+                                    )?,
+                                    store_result: false,
+                                    ok: false,
+                                    end_session: false,
+                                };
+                            }
+                        }
                         if outcome.store_result {
                             self.journal.create_box(
                                 now(),
@@ -1264,7 +1608,21 @@ impl Session {
                             json!({"ok":outcome.ok,"result":outcome.text}),
                         )?;
                         end_session |= outcome.ok && outcome.end_session;
+                        if matches!(self.mode, AgentMode::Ingress { .. })
+                            && self.journal.state().projection().estimated_tokens
+                                > self.journal.state().ingress_context_limit()
+                        {
+                            self.request_ingress_force_commit(
+                                "tool_context_exceeded_full_window",
+                                self.journal.state().projection().estimated_tokens,
+                            )?;
+                        }
                         checkpoint(self.snapshot()?).await?;
+                        if matches!(self.mode, AgentMode::Ingress { .. })
+                            && self.ingress_force_commit_requested()
+                        {
+                            return Ok(None);
+                        }
                         turn.respond(
                             &native.call_id,
                             if outcome.ok {
@@ -1274,6 +1632,12 @@ impl Session {
                             },
                         )
                         .await?;
+                        if !matches!(self.mode, AgentMode::Ingress { .. })
+                            && (self.current_live_capacity_error()
+                                || self.journal.state().source_terminated)
+                        {
+                            return Ok(None);
+                        }
                     }
                     kcode_codex_runtime_v2::AgentEvent::Completed(completed) => break completed,
                 }
@@ -1299,28 +1663,83 @@ impl Session {
                         .unwrap_or(Value::Null),
                 },
             )?;
-            let answer = completed.answer.trim().to_owned();
+            let mut answer = completed.answer.trim().to_owned();
+            if !matches!(self.mode, AgentMode::Ingress { .. }) && self.current_live_capacity_error()
+            {
+                answer.clear();
+            }
             if !answer.is_empty() {
                 let mut content = BoxContent::text(answer.clone());
                 if let Some(id) = &self.pending_external_event_id {
                     content.metadata["externalEventId"] = json!(id);
                 }
-                self.journal
-                    .create_box(now(), "Kennedy message", BoxOwner::Kennedy, content)?;
-                if !matches!(self.mode, AgentMode::Conversation) {
-                    self.transcript
-                        .push(json!({"role":"kennedy","content":answer}));
+                let rejected = if !matches!(self.mode, AgentMode::Ingress { .. }) {
+                    let projection = self.journal.state().projection_with_new_boxes(&[(
+                        "Kennedy message".into(),
+                        BoxOwner::Kennedy,
+                        content.clone(),
+                    )])?;
+                    let limit = self.journal.state().live_context_limit();
+                    if projection.estimated_tokens > limit {
+                        let external_event_id = self.pending_external_event_id.clone();
+                        self.record_live_capacity_error(
+                            "Kennedy's response",
+                            projection.estimated_tokens,
+                            limit,
+                            external_event_id.as_deref(),
+                        )?;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if rejected {
+                    answer.clear();
+                } else {
+                    self.journal.create_box(
+                        now(),
+                        "Kennedy message",
+                        BoxOwner::Kennedy,
+                        content,
+                    )?;
+                    if !matches!(self.mode, AgentMode::Conversation) {
+                        self.transcript
+                            .push(json!({"role":"kennedy","content":answer}));
+                    }
                 }
             }
+            if matches!(self.mode, AgentMode::Ingress { .. })
+                && self.journal.state().projection().estimated_tokens
+                    > self.journal.state().ingress_context_limit()
+            {
+                self.request_ingress_force_commit(
+                    "kennedy_output_exceeded_full_window",
+                    self.journal.state().projection().estimated_tokens,
+                )?;
+            }
             checkpoint(self.snapshot()?).await?;
+            if matches!(self.mode, AgentMode::Ingress { .. })
+                && self.ingress_force_commit_requested()
+            {
+                return Ok(None);
+            }
+            if !matches!(self.mode, AgentMode::Ingress { .. })
+                && (self.current_live_capacity_error() || self.journal.state().source_terminated)
+            {
+                return Ok(None);
+            }
             if end_session || deadline_after_response {
                 return Ok((!answer.is_empty()).then_some(answer));
             }
             if matches!(self.mode, AgentMode::Conversation) && !answer.is_empty() {
                 return Ok(Some(answer));
             }
+            let solo_ingress_response =
+                matches!(self.mode, AgentMode::Ingress { .. }) && !answer.is_empty();
             anyhow::ensure!(
-                used_tool,
+                used_tool || solo_ingress_response,
                 "provider completed without a response or tool call"
             );
             self.journal.create_box(
@@ -1329,6 +1748,14 @@ impl Session {
                 BoxOwner::Controller,
                 BoxContent::text(controller_message(&self.mode, &self.free_time)),
             )?;
+        }
+        if matches!(self.mode, AgentMode::Ingress { .. }) {
+            self.request_ingress_force_commit(
+                "agent_loop_round_limit",
+                self.journal.state().projection().estimated_tokens,
+            )?;
+            checkpoint(self.snapshot()?).await?;
+            return Ok(None);
         }
         Err(AgentLoopRoundLimitError.into())
     }
@@ -1513,20 +1940,35 @@ impl Session {
     }
 
     fn preflight_hydration(&mut self, id: BoxId) -> anyhow::Result<()> {
-        let state = self
-            .journal
+        self.journal
             .state()
             .box_state(id)
             .with_context(|| format!("box {id} does not exist"))?;
-        let current = self.journal.state().projection().estimated_tokens;
-        let added = kennedy_chatend::estimate_tokens(&state.canonical.content.text);
-        let projected = current.saturating_add(added);
-        let limit = if matches!(self.mode, AgentMode::Ingress { .. }) {
-            self.journal.state().history_context_limit()
+        let projected = self
+            .journal
+            .state()
+            .projection_with_box_representations(&BTreeMap::from([(
+                id,
+                BoxRepresentation::Hydrated,
+            )]))?
+            .estimated_tokens;
+        let ingress = matches!(self.mode, AgentMode::Ingress { .. });
+        let limit = if ingress {
+            self.journal.state().ingress_context_limit()
         } else {
             self.journal.state().live_context_limit()
         };
         if projected > limit {
+            if !matches!(self.mode, AgentMode::Ingress { .. }) {
+                let external_event_id = self.pending_external_event_id.clone();
+                let message = self.record_live_capacity_error(
+                    &format!("Hydrating box {id}"),
+                    projected,
+                    limit,
+                    external_event_id.as_deref(),
+                )?;
+                anyhow::bail!(message);
+            }
             self.journal.record(
                 now(),
                 EventKind::CapacityError {
@@ -1535,6 +1977,9 @@ impl Session {
                     limit_tokens: limit,
                 },
             )?;
+            if ingress {
+                self.request_ingress_force_commit("hydration_exceeded_full_window", projected)?;
+            }
             anyhow::bail!(
                 "hydrating box {id} would use approximately {projected} tokens, over the {limit} token limit"
             );
@@ -1860,12 +2305,6 @@ impl Session {
     }
 
     fn stage_plan(&mut self) -> anyhow::Result<()> {
-        self.journal.record(
-            now(),
-            EventKind::KwebPlanChanged {
-                operation: json!({"plan":self.plan}),
-            },
-        )?;
         self.sync_kweb_boxes()?;
         Ok(())
     }
@@ -2088,10 +2527,11 @@ impl Session {
     }
 
     fn finalize_kweb_session(&mut self) -> anyhow::Result<()> {
-        if self.journal.state().completed_session_object.is_some() {
+        if self.commit_receipt.is_some() {
             return Ok(());
         }
-        let archive = serde_json::to_vec(&self.archive()?)?;
+        self.journal.seal()?;
+        let archive = serde_json::to_vec(&self.journal.session_log())?;
         let object_locations = self
             .journal
             .objects()
@@ -2107,7 +2547,7 @@ impl Session {
         }
         let result = self.api.commit_kweb_session(SessionCommit {
             session_id: self.journal.state().metadata.session_id.clone(),
-            author: self.runtime.attribution(),
+            author: self.commit_author.clone(),
             source_created_at: DateTime::parse_from_rfc3339(&self.started_at)
                 .context("session start timestamp is invalid")?
                 .with_timezone(&Utc),
@@ -2124,24 +2564,9 @@ impl Session {
                 })
                 .collect(),
         })?;
-        let mappings = json!({
-            "nodes":result.node_ids,
-            "objects":result.object_ids,
-        });
-        self.journal.record(
-            now(),
-            EventKind::KwebCommitted {
-                transaction_id: result.transaction_id,
-                session_object_id: result.session_object_id.clone(),
-                mappings,
-            },
-        )?;
-        self.journal.record(
-            now(),
-            EventKind::SessionCompleted {
-                session_object_id: result.session_object_id,
-            },
-        )?;
+        self.journal
+            .mark_completed(result.session_object_id.clone());
+        self.commit_receipt = Some(result);
         Ok(())
     }
 
@@ -2226,6 +2651,8 @@ impl Session {
 
     pub(crate) fn snapshot(&self) -> anyhow::Result<Value> {
         Ok(json!({
+            "format":"kennedy-chatend",
+            "version":1,
             "stateVersion":3,
             "sessionId":self.journal.state().metadata.session_id,
             "journalPath":self.journal.path(),
@@ -2245,30 +2672,15 @@ impl Session {
             "roundsUsed":self.rounds_used,
             "completed":self.completed,
             "sessionObjectId":self.journal.state().completed_session_object,
+            "commitReceipt":self.commit_receipt,
+            "commitAuthor":self.commit_author,
+            "kwebPlan":self.plan,
             "boxCount":self.journal.state().boxes.len(),
             "eventCount":self.journal.state().events.len(),
-            "context":self.journal.state().projection(),
-            "chatendText":self.journal.state().render(),
-        }))
-    }
-
-    pub(crate) fn archive(&self) -> anyhow::Result<Value> {
-        Ok(json!({
-            "format":"kennedy-chatend",
-            "version":1,
-            "session":self.journal.state().metadata,
-            "sessionType":self.session_type,
-            "sourceSessionType":self.source_session_type,
-            "startedAt":self.started_at,
-            "channel":self.channel,
-            "events":self.journal.state().events,
             "boxes":self.journal.state().boxes,
-            "toolState":self.journal.state().tools,
+            "events":self.journal.state().events,
             "context":self.journal.state().projection(),
             "chatendText":self.journal.state().render(),
-            "objects":self.journal.objects().values().map(|location| &location.metadata).collect::<Vec<_>>(),
-            "stagedKwebPlan":self.plan,
-            "transcript":self.transcript,
         }))
     }
 
@@ -2350,6 +2762,17 @@ fn transcript_from_journal(journal: &SessionJournal) -> Vec<Value> {
             let role = match state.owner {
                 BoxOwner::User if state.name == "User message" => "user",
                 BoxOwner::Kennedy if state.name == "Kennedy message" => "kennedy",
+                BoxOwner::Controller
+                    if state
+                        .canonical
+                        .content
+                        .metadata
+                        .get("transcriptRole")
+                        .and_then(Value::as_str)
+                        == Some("system") =>
+                {
+                    "system"
+                }
                 _ => return None,
             };
             let mut entry = json!({
@@ -2658,7 +3081,7 @@ fn controller_message(mode: &AgentMode, free_time: &Value) -> String {
         }
         AgentMode::FreeTime => format!("Continue self time. {}", free_time_schedule(free_time)),
         AgentMode::Ingress { .. } => {
-            "Continue history ingress. EndSession when the staged Kweb plan is complete.".into()
+            "You are in a solo history-ingress session; there is no user to receive a conversational response. If you have completed all useful memory work, call EndSession now using the native call_ktool function with exactly this arguments object: {\"name\":\"EndSession\",\"arguments\":{}}. A normal response does not end this session. If work remains, continue it with tools, then call EndSession when finished.".into()
         }
     }
 }
@@ -2671,7 +3094,7 @@ mod tests {
 
     fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, SessionJournal) {
         let path = std::env::temp_dir().join(format!(
-            "kennedy-ingress-context-{label}-{}-{}.chatend",
+            "kennedy-ingress-context-{label}-{}-{}.session-log",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2689,6 +3112,7 @@ mod tests {
             },
         )
         .unwrap();
+        let path = journal.path().to_path_buf();
         (path, journal)
     }
 
@@ -2699,6 +3123,38 @@ mod tests {
             "pending:47".to_owned()
         );
         assert!(parse_resource_id("km:47").is_err());
+    }
+
+    #[test]
+    fn ingress_continuation_explains_the_solo_session_and_exact_end_session_call() {
+        let message = controller_message(&AgentMode::Ingress { record_id: None }, &Value::Null);
+        assert!(message.contains("solo history-ingress session"));
+        assert!(message.contains("there is no user"));
+        assert!(message.contains(r#"{"name":"EndSession","arguments":{}}"#));
+        assert!(message.contains("A normal response does not end this session"));
+    }
+
+    #[test]
+    fn restoring_a_source_record_does_not_relabel_history_ingress() {
+        let mut ingress = SessionOptions::conversation("history-ingress", Vec::new());
+        ingress.mode = AgentMode::Ingress { record_id: None };
+        ingress.source_session_type = Some("conversation".into());
+        restore_session_type(&mut ingress, &json!({"sessionType":"conversation"}));
+        assert_eq!(ingress.session_type, "history-ingress");
+        assert_eq!(ingress.source_session_type.as_deref(), Some("conversation"));
+
+        let mut conversation = SessionOptions::conversation("conversation", Vec::new());
+        restore_session_type(&mut conversation, &json!({"sessionType":"telegram"}));
+        assert_eq!(conversation.session_type, "telegram");
+    }
+
+    #[test]
+    fn a_null_stored_commit_receipt_means_not_committed() {
+        assert_eq!(
+            restore_commit_receipt(Some(&json!({"commitReceipt":null}))).unwrap(),
+            None
+        );
+        assert_eq!(restore_commit_receipt(Some(&json!({}))).unwrap(), None);
     }
 
     #[test]
@@ -2923,11 +3379,12 @@ mod tests {
         journal.dehydrate_box("t5", dehydrated).unwrap();
 
         let plan = history_ingress_representation_plan(journal.state()).unwrap();
+        assert!(plan.fits);
         assert_eq!(
-            plan[&summarized],
+            plan.desired[&summarized],
             BoxRepresentation::Summarized("Kennedy's important points".into())
         );
-        assert_eq!(plan[&dehydrated], BoxRepresentation::Hydrated);
+        assert_eq!(plan.desired[&dehydrated], BoxRepresentation::Hydrated);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2963,9 +3420,64 @@ mod tests {
             .unwrap();
 
         let plan = history_ingress_representation_plan(journal.state()).unwrap();
-        assert_eq!(plan[&message], BoxRepresentation::Hydrated);
-        assert_eq!(plan[&large], BoxRepresentation::Dehydrated);
-        assert_eq!(plan[&small], BoxRepresentation::Hydrated);
+        assert!(plan.fits);
+        assert_eq!(plan.desired[&message], BoxRepresentation::Hydrated);
+        assert_eq!(plan.desired[&large], BoxRepresentation::Dehydrated);
+        assert_eq!(plan.desired[&small], BoxRepresentation::Hydrated);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ingress_dehydrates_largest_protected_box_when_protected_context_exceeds_target() {
+        let (path, mut journal) = test_journal("protected-largest-first", 500);
+        let system = journal
+            .create_box(
+                "t1",
+                "system",
+                BoxOwner::System,
+                BoxContent::text("s".repeat(500)),
+            )
+            .unwrap();
+        let message = journal
+            .create_box(
+                "t2",
+                "User message",
+                BoxOwner::User,
+                BoxContent::text("m".repeat(1_200)),
+            )
+            .unwrap();
+
+        let plan = history_ingress_representation_plan(journal.state()).unwrap();
+        assert!(plan.fits);
+        assert_eq!(plan.desired[&message], BoxRepresentation::Dehydrated);
+        assert_eq!(plan.desired[&system], BoxRepresentation::Hydrated);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ingress_reports_no_fit_only_after_every_box_is_dehydrated() {
+        let (path, mut journal) = test_journal("fully-dehydrated", 100);
+        let mut box_ids = Vec::new();
+        for index in 0..40 {
+            box_ids.push(
+                journal
+                    .create_box(
+                        format!("t{index}"),
+                        format!("protected message {index}"),
+                        BoxOwner::User,
+                        BoxContent::text("x"),
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let plan = history_ingress_representation_plan(journal.state()).unwrap();
+        assert!(!plan.fits);
+        assert!(
+            box_ids
+                .iter()
+                .all(|box_id| plan.desired[box_id] == BoxRepresentation::Dehydrated)
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2985,7 +3497,7 @@ mod tests {
             )
             .unwrap();
         let large_plan = history_ingress_representation_plan(large_window.state()).unwrap();
-        assert_eq!(large_plan[&large_id], BoxRepresentation::Hydrated);
+        assert_eq!(large_plan.desired[&large_id], BoxRepresentation::Hydrated);
 
         let (small_path, mut small_window) = test_journal("tool-small-window", 300);
         small_window
@@ -3001,7 +3513,7 @@ mod tests {
             .unwrap();
         let small_plan = history_ingress_representation_plan(small_window.state()).unwrap();
         assert_eq!(
-            small_plan[&small_id],
+            small_plan.desired[&small_id],
             BoxRepresentation::Summarized(
                 "Tool invocation: LoadNode {arguments dehydrated: 1,284 characters}.".into()
             )
@@ -3029,7 +3541,7 @@ mod tests {
             .unwrap();
 
         let plan = history_ingress_representation_plan(journal.state()).unwrap();
-        assert_eq!(plan[&summarized], BoxRepresentation::Dehydrated);
+        assert_eq!(plan.desired[&summarized], BoxRepresentation::Dehydrated);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3070,6 +3582,37 @@ mod tests {
         let transcript = transcript_from_journal(&journal);
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0]["content"], "please inspect the attachment");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn capacity_errors_are_recovered_as_system_transcript_messages() {
+        let (path, mut journal) = test_journal("capacity-system-message", 1_000);
+        journal
+            .create_box(
+                "t1",
+                CAPACITY_ERROR_BOX_NAME,
+                BoxOwner::Controller,
+                BoxContent {
+                    text: "The message exceeded capacity.".into(),
+                    objects: Vec::new(),
+                    metadata: json!({
+                        "transcriptRole":"system",
+                        "externalEventId":"event-1",
+                        "capacityError":true,
+                    }),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            transcript_from_journal(&journal),
+            vec![json!({
+                "role":"system",
+                "content":"The message exceeded capacity.",
+                "externalEventId":"event-1",
+            })]
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

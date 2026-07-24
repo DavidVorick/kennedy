@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const BACKUP_FORMAT_VERSION: u32 = 10;
+const BACKUP_FORMAT_VERSION: u32 = 11;
 const ARCHIVE_PREFIX: &str = "kennedy-backup";
 const BACKUP_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -251,7 +251,7 @@ fn create_archive(options: &BackupOptions, created_at: DateTime<Utc>) -> anyhow:
             &options.session_directory,
             &data_directory.join("sessions"),
             "data/sessions",
-            "in-progress append-only Chatend journal",
+            "in-progress session log, pending object, or Session History control journal",
             &mut files,
         )?;
         let session_history_destination = data_directory.join("session-history.txt");
@@ -714,17 +714,19 @@ fn render_readme(manifest: &Manifest) -> String {
     readme.push_str(
         r#"
 
-All files are stored beneath one top-level archive directory. Runtime `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. `data/kweb/` is copied as a quiescent binary kcode-kweb-db root. Gzip provides compression only. The SQLite databases, Kweb files, Chatend journals, and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
+All files are stored beneath one top-level archive directory. Runtime `.sqlite3` entries are standalone SQLite database files; no `-wal` or `-shm` sidecar is required. `data/kweb/` is copied as a quiescent binary kcode-kweb-db root. Gzip provides compression only. The SQLite databases, Kweb files, session logs, pending objects, control journals, and audio media contain private plaintext. The optional credential vault remains encrypted, but the archive as a whole is not encrypted.
 
 ## Kmap data format
 
 `data/kweb/` is the durable knowledge web owned by `kcode-kweb-db` 1.0. Node and object IDs are canonical eight-character URL-safe unpadded Base64 strings whose type domains cannot collide. Current node records live in the two-level `nodes/` tree; immutable objects live in the similarly sharded `objects/` tree. Per-node history and accepted transaction packages are binary, canonical, checksummed records. `transactions.kwl` is the append-only transaction log, while `state.kws` stores the current generation, heads, log offset, and writer priority list. `wal/` provides atomic recovery for a transaction spanning the log, current node files, histories, objects, transaction index/package, state, and gossip outbox. Fixed and recent connections are complete ordered node-ID arrays with no application-level limits imposed by the library. Root roles remain in `users.sqlite3`, not in the Kweb. A lightweight backup deliberately lacks immutable object payloads and therefore requires those objects from another trusted copy for complete recovery.
 
-## Session History and Chatend data format
+## Session History and session-log data format
 
-`data/sessions/` contains in-progress `.chatend` files. Each is one append-only journal beginning with the `KCHAT01` magic. Every following frame has a kind byte, canonical little-endian payload length, SHA-256 checksum, and payload. JSON transition frames store canonical session events, box revisions and representation choices; raw object frames store metadata followed directly by staged object bytes. Recovery truncates the first incomplete or checksum-invalid frame and every later frame. Checksum-valid structural errors remain fatal. Lifecycle and command sidebands occupy the same file. Journal appends use ordinary write I/O without explicit flush or fsync.
+`data/sessions/` contains in-progress `.session-log` transcripts. Each logical transcript is a three-field header followed by an ordered array of role/text events. Physical frames have a kind byte, payload length, SHA-256 checksum, and payload. Complete appends are synchronized. Recovery truncates an incomplete trailing frame and rejects durable structural or checksum errors. A sealed footer prevents later events.
 
-`data/session-history.txt` is the complete local index for committed sessions: one canonical Kweb object ID per line, in commit order. Details are not duplicated locally. The referenced immutable Kweb object contains the complete versioned Chatend archive and is loaded from `data/kweb/objects/` on demand. An optional `data/legacy-conversations.sqlite3` is an offline pre-overhaul archive only; no runtime code reads it.
+Each pending object is a separate `<session-id>-<event-position>.pending-object` file containing a fixed header, filename, media type, declared byte length, checksum, and bytes. The object file is durable before its event is appended. `<session-id>.session-control` contains checksummed Session History lifecycle and command records outside the transcript.
+
+`data/session-history.txt` is the local completion index. New entries are JSON-lines receipts containing the Kweb transaction ID when available, canonical archive object ID, pending-node mappings, and pending-object mappings. Older one-object-ID lines remain readable. Details are not duplicated locally. The referenced immutable Kweb object contains the session header and ordered role/text event array and is loaded from `data/kweb/objects/` on demand. An optional `data/legacy-conversations.sqlite3` is an offline pre-overhaul archive only; no runtime code reads it.
 
 ## Telegram-relay data format
 
@@ -780,7 +782,7 @@ The following DDL was read from each verified snapshot's `sqlite_schema`. It is 
 3. Open each database with SQLite and run `PRAGMA integrity_check` and `PRAGMA foreign_key_check` before attempting a migration.
 4. Use the commit at the first line of this README as the primary behavioral reference. If that build was marked dirty or unavailable, use the exact schemas and JSON descriptions above to construct an explicit migration from copies of the files.
 5. Stop Kennedy. Place the standalone runtime databases, complete `data/kweb/` root, `data/sessions/`, `data/session-history.txt`, complete audio-ingress media directory, and optional encrypted vault at the paths supplied to the target binary. Do not restore old SQLite `-wal` or `-shm` files. A lightweight backup is not a complete Kweb recovery source unless its omitted objects are restored independently.
-6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify the external user/Kennedy role mappings, several Kmap histories and fixed/recent arrays, active Chatend journals and completed Session History objects, pending session/audio/group ingress, Telegram TOFU bindings/group decisions/events, audio SHA lookups, and vault unlock.
+6. Preserve another untouched extracted copy before allowing a newer Kennedy binary to run migrations. Start Kennedy and verify the external user/Kennedy role mappings, several Kmap histories and fixed/recent arrays, active session logs and completed Session History objects, pending session/audio/group ingress, Telegram TOFU bindings/group decisions/events, audio SHA lookups, and vault unlock.
 
 Tracked frontend assets, system prompts, source migrations, and external Codex/ChatGPT state are not duplicated here; the source commit identifies tracked assets, and the latter is not Kennedy-owned runtime persistence.
 "#,
@@ -929,8 +931,8 @@ mod tests {
         let session_directory = directory.path().join("sessions");
         fs::create_dir(&session_directory).unwrap();
         fs::write(
-            session_directory.join("in-progress.chatend"),
-            b"test Chatend journal",
+            session_directory.join("in-progress.session-log"),
+            b"test session log",
         )
         .unwrap();
         let session_history_file = directory.path().join("session-history.txt");
@@ -992,13 +994,13 @@ mod tests {
         let root = extracted.join("kennedy-backup-2026-07-16T12-34-56Z");
         let readme = fs::read_to_string(root.join("README.md")).unwrap();
         assert!(readme.starts_with(&format!("Kennedy commit: {}\n", env!("KENNEDY_GIT_COMMIT"))));
-        assert!(readme.contains("append-only Chatend"));
+        assert!(readme.contains("ordered array of role/text events"));
         assert!(readme.contains("kcode-kweb-db"));
         assert!(readme.contains("CREATE TABLE records"));
 
         let manifest: Value =
             serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["backup_format_version"], 10);
+        assert_eq!(manifest["backup_format_version"], 11);
         assert_eq!(manifest["snapshot_mode"], "offline-port-guard");
         assert!(manifest["files"].as_array().unwrap().len() >= 10);
         for file in manifest["files"].as_array().unwrap() {

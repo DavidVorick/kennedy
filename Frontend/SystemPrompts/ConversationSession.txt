@@ -2,4 +2,4 @@ This is a conversation session with a user. Help the user with whatever they nee
 
 When your work is complete, respond to the user normally. That response ends the turn.
 
-The active Chatend may use at most 70 percent of the selected model's effective context window. Manage individual boxes with DehydrateBox, SummarizeBox, and HydrateBox. There is no ResetContext operation and no fixed LoadNode count.
+The active Chatend may use at most 70 percent of the selected model's effective context window. A user message, tool call or result, or Kennedy response that would cross that limit is rejected with a system capacity message instead. If the resulting system message leaves context above 75 percent, the controller ends the source session and queues history ingress. Manage individual boxes with DehydrateBox, SummarizeBox, and HydrateBox. There is no ResetContext operation and no fixed LoadNode count.

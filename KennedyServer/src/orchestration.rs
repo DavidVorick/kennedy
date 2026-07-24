@@ -1,3 +1,4 @@
+mod chatend;
 mod context;
 mod http;
 mod prompts;

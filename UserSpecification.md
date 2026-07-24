@@ -131,48 +131,49 @@ for the operation.
 
 ## Temporary IDs and staged objects
 
-The Chatend journal uses one monotonic temporary identity space. A pending node
-or object is named `pending:N`, where N is the allocation event. Box and
-pending IDs cannot overlap at the integer level.
+The ordered session transcript is the identity space. A pending node or object
+is named `pending:N`, where N is reconstructed from the allocating event's
+array position. Event IDs and pending IDs are not serialized as separate
+session-log fields.
 
-Original object bytes are staged in the append-only journal before provider or
-Kweb work is acknowledged. A later Kweb commit reads those bytes and obtains
-canonical object IDs. The final archive may retain pending IDs as its internal
-references; the commit result separately returns the canonical IDs needed by
-live application state.
+Original object bytes are staged in one file per object before the matching
+`pending-object` event is appended. A later Kweb commit reads those bytes and
+obtains canonical object IDs. The Session History completion receipt records
+the pending-to-canonical mapping.
 
-V1 permits up to 32 GiB for one object and 32 GiB aggregate object payload in a
-transaction. Larger streaming objects are future work.
+Kweb owns its transaction and object limits. The session-log package does not
+interpret or duplicate those limits.
 
 ## Durability
 
-An in-progress session is one append-only, checksummed file. JSON is used for
-evolving Chatend state; object data is raw binary. Each update is appended as
-one checksummed frame. Related events may share one transition frame and
-checksum. Recovery replays the valid prefix in place and discards the first
-incomplete or checksum-invalid frame together with everything after it.
+An in-progress session has one append-only, checksummed `.session-log` file.
+Its durable logical value is a three-field header followed by an ordered array
+of `{role, text}` events. Every complete append is synchronized. Recovery
+discards an incomplete trailing frame but rejects durable checksum-valid
+structural failures.
 
-Journal writes use ordinary append I/O without explicit flush or `fsync`.
-Process termination does not discard data already accepted by the kernel, but
-the journal makes no stronger power-loss durability claim. Checksum-valid
-structural or semantic failures remain errors.
+A pending object file contains a fixed header, filename, media type, byte
+length, byte checksum, and object bytes. It is synchronized and atomically
+renamed before its event is appended. Opening a session removes object files
+that have no transcript event. Sealing verifies referenced objects, writes a
+durable footer, and makes the log immutable.
 
-V1 deliberately accepts one narrow exception: the current Kweb library commits
-a locally built transaction inside `finalize`, so Kennedy cannot prepare and
-persist the exact signed package before submitting it. A crash after Kweb
-commit but before the local completion event has an unknown outcome. A
-prepared-package API is deferred and this window must not be represented as
-exact-once behavior.
+Lifecycle and browser commands are stored in a separate Session History
+control journal. Chatend representation state, context policy, and Kweb plans
+belong to KennedyServer. Final transaction receipts belong to Kmap and Session
+History.
 
 ## Context budgets
 
 A normal source session may use 70% of the model's effective context window.
-History ingress may use 75% of the context window of the model it calls.
+A user message, tool call or result, or Kennedy response that would exceed
+that limit is rejected and replaced by a system capacity message. If context
+after that message exceeds 75%, the controller force-ends the source and
+queues history ingress.
 
-If a hydration or tool result would exceed capacity, Kennedy receives an
-error. If repeated failures push an ordinary source above 72%, the controller
-force-ends it and queues history ingress. If history ingress fills 75% and
-cannot continue, it commits the useful work completed so far.
+History ingress uses 75% only as its initial fitting target and may use the
+model's full effective context window once running. Exceeding the full window
+force-commits the useful work completed so far.
 
 ## History ingress
 
@@ -182,10 +183,12 @@ History ingress begins from the same journal. The controller:
 - retains Kennedy-authored summaries;
 - hydrates all other source boxes when the resulting context fits;
 - otherwise reduces eligible boxes from largest to smallest until the context
-  is below 75% of the ingress model's context window;
-- protects the system prompt, conversation messages, full directly
-  loaded/fixed/active Kweb nodes, and short tool invocations from automatic
-  dehydration;
+  is at or below 75% of the ingress model's context window;
+- initially protects the system prompt, conversation messages, full directly
+  loaded/fixed/active Kweb nodes, and short tool invocations, then dehydrates
+  those protected boxes largest-first if they alone cannot fit at or below 75%;
+- if a fully dehydrated projection is still above 75%, commits the
+  staged session transaction without invoking Kennedy;
 - programmatically summarizes a tool invocation longer than 1,000 characters
   only if the largest-first fitting pass reaches it;
 - loads Kennedy's and the user's root nodes;
@@ -217,8 +220,9 @@ are future work.
 ## Legacy cutover
 
 Legacy node IDs were already migrated independently and are not translated by
-Chatend. Legacy conversation records are not imported into the new session
-model.
+session-log. Legacy `.chatend` session files are converted on startup into
+session logs, pending-object files, and control journals. The original files
+are retained in the migration archive.
 
 At cutover:
 

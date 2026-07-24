@@ -1,27 +1,20 @@
-//! Durable, provider-independent session context.
+//! Kennedy's reconstructed, provider-independent session context.
 //!
-//! A [`SessionJournal`] is the sole authority for an in-progress session.  It
-//! stores JSON transitions and raw object bodies in one framed append-only
-//! file.  [`Chatend`] is a deterministic materialized view of those records.
+//! This module owns Kennedy's box model, context projection, context
+//! representations, token policy, and replay rules. Durable session history
+//! is owned by the separate `session-log` package.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
-use anyhow::{Context as _, bail, ensure};
+use anyhow::{Context as _, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-
-const MAGIC: &[u8; 8] = b"KCHAT01\n";
-const FRAME_HEADER_BYTES: u64 = 1 + 8 + 32;
-const JSON_FRAME: u8 = 1;
-const OBJECT_FRAME: u8 = 2;
-const OBJECT_PREFIX_BYTES: usize = 8 + 4;
+use session_log::{
+    EventPosition, Role, Session as DurableSession, SessionStore as DurableSessionStore,
+};
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_OBJECT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -75,10 +68,6 @@ impl PendingId {
         self.0["pending:".len()..]
             .parse()
             .expect("validated PendingId")
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -338,28 +327,19 @@ pub struct Transition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "record", rename_all = "snake_case")]
-enum JsonRecord {
-    SessionOpened {
-        format_version: u32,
-        metadata: SessionMetadata,
-    },
-    Transition {
-        transition: Transition,
-    },
-    Sideband {
-        kind: String,
-        recorded_at: String,
-        value: Value,
-    },
+#[serde(rename_all = "camelCase")]
+struct PersistedContextEvent {
+    context_event_version: u32,
+    recorded_at: String,
+    kind: EventKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SidebandRecord {
-    pub kind: String,
-    pub recorded_at: String,
-    pub value: Value,
+struct PersistedContextEventWire {
+    context_event_version: u32,
+    recorded_at: String,
+    kind: Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -451,12 +431,58 @@ impl Chatend {
         self.metadata.effective_context_tokens.saturating_mul(70) / 100
     }
 
-    pub fn emergency_context_limit(&self) -> u64 {
-        self.metadata.effective_context_tokens.saturating_mul(72) / 100
+    pub fn forced_ingress_context_limit(&self) -> u64 {
+        self.metadata.effective_context_tokens.saturating_mul(75) / 100
     }
 
-    pub fn history_context_limit(&self) -> u64 {
+    pub fn ingress_initial_context_limit(&self) -> u64 {
         self.metadata.effective_context_tokens.saturating_mul(75) / 100
+    }
+
+    pub fn ingress_context_limit(&self) -> u64 {
+        self.metadata.effective_context_tokens
+    }
+
+    pub fn active_context_limit(&self) -> u64 {
+        if matches!(
+            self.metadata.kind,
+            SessionKind::HistoryIngress | SessionKind::AudioIngress
+        ) {
+            self.ingress_context_limit()
+        } else {
+            self.live_context_limit()
+        }
+    }
+
+    pub fn projection_with_new_boxes(
+        &self,
+        boxes: &[(String, BoxOwner, BoxContent)],
+    ) -> anyhow::Result<ContextProjection> {
+        let mut preview = self.clone();
+        let mut next = preview.next_id;
+        let mut events = Vec::with_capacity(boxes.len());
+        for (name, owner, content) in boxes {
+            let id = EventId(next);
+            let box_id = BoxId(next);
+            next = next.checked_add(1).context("event identity overflow")?;
+            events.push(Event {
+                id,
+                recorded_at: "preview".into(),
+                kind: EventKind::BoxCreated {
+                    box_id,
+                    name: name.clone(),
+                    owner: owner.clone(),
+                    content: content.clone(),
+                },
+            });
+        }
+        if !events.is_empty() {
+            preview.apply_transition(&Transition {
+                recorded_at: "preview".into(),
+                events,
+            })?;
+        }
+        Ok(preview.projection())
     }
 
     pub fn projection_with_box_representations(
@@ -589,9 +615,9 @@ impl Chatend {
             .map(|item| item.approximate_tokens)
             .sum::<u64>();
         let preliminary_footer = format!(
-            "[context budget | estimated={} | live_limit={} | effective={}]\n[stale boxes: {}]",
+            "[context budget | estimated={} | turn_limit={} | effective={}]\n[stale boxes: {}]",
             body_tokens,
-            self.live_context_limit(),
+            self.active_context_limit(),
             self.metadata.effective_context_tokens,
             if stale_boxes.is_empty() {
                 "none".into()
@@ -606,9 +632,9 @@ impl Chatend {
         let preliminary_raw = body_tokens.saturating_add(estimate_tokens(&preliminary_footer));
         let preliminary_estimate = self.calibrated_estimate(preliminary_raw);
         let footer = format!(
-            "[context budget | estimated={} | live_limit={} | effective={}]\n[stale boxes: {}]",
+            "[context budget | estimated={} | turn_limit={} | effective={}]\n[stale boxes: {}]",
             preliminary_estimate,
-            self.live_context_limit(),
+            self.active_context_limit(),
             self.metadata.effective_context_tokens,
             if stale_boxes.is_empty() {
                 "none".into()
@@ -664,35 +690,6 @@ impl Chatend {
         } else {
             measured.saturating_sub(raw_at_measurement - raw_current)
         }
-    }
-
-    pub fn history_skeleton(&self) -> Vec<HistorySkeletonItem> {
-        self.events
-            .iter()
-            .map(|event| {
-                let (label, approximate_tokens) = match &event.kind {
-                    EventKind::BoxCreated { name, content, .. } => (
-                        format!("box created: {name}"),
-                        estimate_tokens(&content.render()),
-                    ),
-                    EventKind::CanonicalUpdated { content, .. } => (
-                        "canonical box update".into(),
-                        estimate_tokens(&content.render()),
-                    ),
-                    kind => (
-                        event_kind_label(kind).into(),
-                        estimate_tokens(
-                            &serde_json::to_string(kind).unwrap_or_else(|_| "{}".into()),
-                        ),
-                    ),
-                };
-                HistorySkeletonItem {
-                    event_id: event.id,
-                    label,
-                    approximate_hydration_tokens: approximate_tokens,
-                }
-            })
-            .collect()
     }
 
     pub fn render(&self) -> String {
@@ -975,34 +972,6 @@ fn event_box_id(kind: &EventKind) -> Option<BoxId> {
     }
 }
 
-fn event_kind_label(kind: &EventKind) -> &'static str {
-    match kind {
-        EventKind::SessionConfigured { .. } => "session configured",
-        EventKind::BoxCreated { .. } => "box created",
-        EventKind::CanonicalUpdated { .. } => "canonical box update",
-        EventKind::BoxRenamed { .. } => "box renamed",
-        EventKind::BoxDehydrated { .. } => "box dehydrated",
-        EventKind::BoxSummarized { .. } => "box summarized",
-        EventKind::BoxRehydrated { .. } => "box rehydrated",
-        EventKind::BoxRetired { .. } => "box retired",
-        EventKind::PendingAllocated { .. } => "pending identity allocated",
-        EventKind::ToolInvoked { .. } => "tool invoked",
-        EventKind::ToolCompleted { .. } => "tool completed",
-        EventKind::ToolLayoutChanged { .. } => "tool layout changed",
-        EventKind::InferenceSubmitted { .. } => "inference submitted",
-        EventKind::ProviderReceipt { .. } => "provider receipt",
-        EventKind::CapacityError { .. } => "context capacity error",
-        EventKind::SourceTerminated { .. } => "source session terminated",
-        EventKind::HistoryIngressStarted => "history ingress started",
-        EventKind::HistoryEventInspected { .. } => "history event inspected",
-        EventKind::HistoryEventReleased { .. } => "history event released",
-        EventKind::KwebPlanChanged { .. } => "Kweb plan changed",
-        EventKind::KwebCommitted { .. } => "Kweb transaction committed",
-        EventKind::SessionCompleted { .. } => "session completed",
-        EventKind::Note { .. } => "session note",
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionItem {
@@ -1037,25 +1006,131 @@ pub struct ContextProjection {
     pub raw_estimated_tokens: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HistorySkeletonItem {
-    pub event_id: EventId,
-    pub label: String,
-    pub approximate_hydration_tokens: u64,
-}
-
 pub fn estimate_tokens(text: &str) -> u64 {
     (text.chars().count() as u64).div_ceil(ESTIMATED_CHARACTERS_PER_TOKEN)
 }
 
+fn context_event_role(kind: &EventKind) -> Role {
+    match kind {
+        EventKind::BoxCreated { owner, content, .. } => match owner {
+            BoxOwner::System | BoxOwner::Controller => {
+                if content
+                    .metadata
+                    .get("capacityError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    Role::SystemError
+                } else {
+                    Role::SystemMessage
+                }
+            }
+            BoxOwner::User => Role::UserMessage,
+            BoxOwner::Kennedy => Role::KennedyMessage,
+            BoxOwner::Tool { .. } => Role::ToolResult,
+        },
+        EventKind::ToolInvoked { .. } => Role::KennedyToolCall,
+        EventKind::ToolCompleted { outcome, .. } => {
+            if outcome.get("ok").and_then(Value::as_bool).unwrap_or(true) {
+                Role::ToolResult
+            } else {
+                Role::ToolError
+            }
+        }
+        EventKind::CapacityError { .. } => Role::SystemError,
+        EventKind::PendingAllocated {
+            resource: PendingKind::Object,
+            ..
+        } => Role::PendingObject,
+        EventKind::BoxDehydrated { .. }
+        | EventKind::BoxSummarized { .. }
+        | EventKind::BoxRehydrated { .. }
+        | EventKind::BoxRetired { .. } => Role::KennedyToolCall,
+        _ => Role::SystemMessage,
+    }
+}
+
+fn encode_context_event(recorded_at: &str, kind: &EventKind) -> anyhow::Result<String> {
+    let mut kind = serde_json::to_value(kind)?;
+    let kind_object = kind
+        .as_object_mut()
+        .context("Kennedy context event kind must encode as an object")?;
+    match kind_object.get("type").and_then(Value::as_str) {
+        Some("box_created") => {
+            kind_object.remove("box_id");
+        }
+        Some("pending_allocated") => {
+            kind_object.remove("pending_id");
+        }
+        _ => {}
+    }
+    Ok(serde_json::to_string(&PersistedContextEventWire {
+        context_event_version: FORMAT_VERSION,
+        recorded_at: recorded_at.into(),
+        kind,
+    })?)
+}
+
+fn decode_context_event(
+    event: &session_log::SessionEvent,
+) -> anyhow::Result<PersistedContextEvent> {
+    let wire: PersistedContextEventWire = match serde_json::from_str(&event.text) {
+        Ok(persisted) => persisted,
+        Err(_) if event.role == Role::PendingObject => {
+            return Ok(PersistedContextEvent {
+                context_event_version: FORMAT_VERSION,
+                recorded_at: String::new(),
+                kind: EventKind::PendingAllocated {
+                    pending_id: PendingId::from_event(EventId(1)),
+                    resource: PendingKind::Object,
+                },
+            });
+        }
+        Err(error) => {
+            return Err(error).context("decoding Kennedy context event from session log");
+        }
+    };
+    ensure!(
+        wire.context_event_version == FORMAT_VERSION,
+        "unsupported Kennedy context event version {}",
+        wire.context_event_version
+    );
+    let mut kind = wire.kind;
+    let kind_object = kind
+        .as_object_mut()
+        .context("Kennedy context event kind must be an object")?;
+    match kind_object.get("type").and_then(Value::as_str) {
+        Some("box_created") if !kind_object.contains_key("box_id") => {
+            kind_object.insert("box_id".into(), Value::from(0));
+        }
+        Some("pending_allocated") if !kind_object.contains_key("pending_id") => {
+            kind_object.insert("pending_id".into(), Value::String("pending:1".into()));
+        }
+        _ => {}
+    }
+    Ok(PersistedContextEvent {
+        context_event_version: wire.context_event_version,
+        recorded_at: wire.recorded_at,
+        kind: serde_json::from_value(kind).context("decoding Kennedy context event kind")?,
+    })
+}
+
+fn normalize_derived_identity(kind: &mut EventKind, id: EventId) -> anyhow::Result<()> {
+    match kind {
+        EventKind::BoxCreated { box_id, .. } => *box_id = BoxId(id.0),
+        EventKind::PendingAllocated { pending_id, .. } => {
+            *pending_id = PendingId::from_event(id);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub struct SessionJournal {
     path: PathBuf,
-    file: File,
+    durable: DurableSession,
     chatend: Chatend,
     objects: BTreeMap<PendingId, ObjectLocation>,
-    sidebands: Vec<SidebandRecord>,
-    append_lock: Arc<Mutex<()>>,
 }
 
 impl SessionJournal {
@@ -1064,209 +1139,98 @@ impl SessionJournal {
             metadata.effective_context_tokens > 0,
             "effective context window must be positive"
         );
-        let path = path.as_ref().to_path_buf();
-        let append_lock = journal_lock(&path);
-        let _append_guard = append_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
-        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        file.write_all(MAGIC)?;
-        let opened = JsonRecord::SessionOpened {
-            format_version: FORMAT_VERSION,
-            metadata: metadata.clone(),
-        };
-        append_frame(&mut file, JSON_FRAME, &serde_json::to_vec(&opened)?)?;
-        drop(_append_guard);
+        let requested = path.as_ref();
+        let directory = requested
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let durable = DurableSessionStore::new(directory)
+            .create_session(&metadata.session_id, &metadata.created_at)?;
+        let path = durable.path().to_path_buf();
         Ok(Self {
             path,
-            file,
+            durable,
             chatend: Chatend::opened(metadata),
             objects: BTreeMap::new(),
-            sidebands: Vec::new(),
-            append_lock,
         })
     }
 
-    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let append_lock = journal_lock(&path);
-        let _append_guard = append_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        let mut magic = [0; MAGIC.len()];
-        file.read_exact(&mut magic)
-            .with_context(|| format!("reading header from {}", path.display()))?;
+    pub fn open_with_metadata(
+        path: impl AsRef<Path>,
+        metadata: SessionMetadata,
+    ) -> anyhow::Result<Self> {
+        let requested = path.as_ref();
         ensure!(
-            &magic == MAGIC,
-            "{} is not a Chatend journal",
-            path.display()
+            requested.extension().and_then(|value| value.to_str()) == Some("session-log"),
+            "{} is not a session-log path",
+            requested.display()
         );
-        let file_len = file.metadata()?.len();
-        let mut cursor = MAGIC.len() as u64;
-        let mut chatend = None;
+        let directory = requested
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let session_id = requested
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("session-log filename is not valid UTF-8")?;
+        let durable = DurableSessionStore::new(directory).open_session(session_id)?;
+        let log = durable.list();
+        ensure!(
+            metadata.session_id == log.header.session_id,
+            "session metadata and session-log identities differ"
+        );
+        ensure!(
+            metadata.created_at == log.header.created_at,
+            "session metadata and session-log creation times differ"
+        );
+        let mut chatend = Chatend::opened(metadata);
         let mut objects = BTreeMap::new();
-        let mut sidebands = Vec::new();
-        while cursor < file_len {
-            let remaining = file_len - cursor;
-            if remaining < FRAME_HEADER_BYTES {
-                file.set_len(cursor)?;
-                break;
+        for (position, stored) in log.events.iter().enumerate() {
+            let persisted = decode_context_event(stored)?;
+            let id = EventId(position as u64 + 1);
+            let mut kind = persisted.kind;
+            normalize_derived_identity(&mut kind, id)?;
+            let event = Event {
+                id,
+                recorded_at: persisted.recorded_at.clone(),
+                kind: kind.clone(),
+            };
+            chatend.apply_transition(&Transition {
+                recorded_at: persisted.recorded_at,
+                events: vec![event],
+            })?;
+            if let EventKind::PendingAllocated {
+                pending_id,
+                resource: PendingKind::Object,
+            } = kind
+            {
+                let object = durable.read_pending_object(EventPosition(position as u64))?;
+                let metadata = ObjectMetadata {
+                    pending_id: pending_id.clone(),
+                    event_id: id,
+                    recorded_at: chatend
+                        .event(id)
+                        .map(|event| event.recorded_at.clone())
+                        .unwrap_or_default(),
+                    media_type: object.media_type,
+                    file_name: Some(object.file_name),
+                    transport: Value::Null,
+                };
+                objects.insert(
+                    pending_id,
+                    ObjectLocation {
+                        metadata,
+                        payload_offset: position as u64,
+                        payload_len: object.bytes.len() as u64,
+                    },
+                );
             }
-            file.seek(SeekFrom::Start(cursor))?;
-            let mut header = [0; FRAME_HEADER_BYTES as usize];
-            file.read_exact(&mut header)?;
-            let kind = header[0];
-            let payload_len = u64::from_le_bytes(header[1..9].try_into().unwrap());
-            let frame_end = cursor
-                .checked_add(FRAME_HEADER_BYTES)
-                .and_then(|value| value.checked_add(payload_len))
-                .context("journal frame length overflow")?;
-            if frame_end > file_len {
-                file.set_len(cursor)?;
-                break;
-            }
-            match kind {
-                JSON_FRAME => {
-                    let payload_len_usize = usize::try_from(payload_len)
-                        .context("journal JSON frame does not fit address space")?;
-                    let mut payload = vec![0; payload_len_usize];
-                    file.read_exact(&mut payload)?;
-                    let checksum = Sha256::digest(&payload);
-                    if checksum.as_slice() != &header[9..] {
-                        file.set_len(cursor)?;
-                        break;
-                    }
-                    let record: JsonRecord = serde_json::from_slice(&payload)
-                        .with_context(|| format!("decoding JSON frame at byte {cursor}"))?;
-                    match record {
-                        JsonRecord::SessionOpened {
-                            format_version,
-                            metadata,
-                        } => {
-                            ensure!(cursor == MAGIC.len() as u64, "duplicate session header");
-                            ensure!(
-                                format_version == FORMAT_VERSION,
-                                "unsupported Chatend journal version {format_version}"
-                            );
-                            chatend = Some(Chatend::opened(metadata));
-                        }
-                        JsonRecord::Transition { transition } => chatend
-                            .as_mut()
-                            .context("transition precedes session header")?
-                            .apply_transition(&transition)?,
-                        JsonRecord::Sideband {
-                            kind,
-                            recorded_at,
-                            value,
-                        } => sidebands.push(SidebandRecord {
-                            kind,
-                            recorded_at,
-                            value,
-                        }),
-                    }
-                }
-                OBJECT_FRAME => {
-                    let payload_start = cursor + FRAME_HEADER_BYTES;
-                    let mut hasher = Sha256::new();
-                    let mut remaining = payload_len;
-                    let mut buffer = vec![0_u8; 1024 * 1024];
-                    while remaining > 0 {
-                        let take = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
-                        file.read_exact(&mut buffer[..take])?;
-                        hasher.update(&buffer[..take]);
-                        remaining -= take as u64;
-                    }
-                    if hasher.finalize().as_slice() != &header[9..] {
-                        file.set_len(cursor)?;
-                        break;
-                    }
-                    ensure!(
-                        payload_len >= OBJECT_PREFIX_BYTES as u64,
-                        "raw object frame is shorter than its prefix"
-                    );
-                    file.seek(SeekFrom::Start(payload_start))?;
-                    let mut prefix = [0_u8; OBJECT_PREFIX_BYTES];
-                    file.read_exact(&mut prefix)?;
-                    let event_id = EventId(u64::from_le_bytes(prefix[..8].try_into().unwrap()));
-                    let metadata_len =
-                        u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as usize;
-                    let body_start = OBJECT_PREFIX_BYTES
-                        .checked_add(metadata_len)
-                        .context("object metadata length overflow")?;
-                    ensure!(
-                        body_start as u64 <= payload_len,
-                        "raw object frame has truncated metadata"
-                    );
-                    let mut metadata_bytes = vec![0_u8; metadata_len];
-                    file.read_exact(&mut metadata_bytes)?;
-                    let metadata: ObjectMetadata = serde_json::from_slice(&metadata_bytes)?;
-                    ensure!(
-                        metadata.event_id == event_id,
-                        "raw object prefix and metadata event IDs differ"
-                    );
-                    ensure!(
-                        metadata.pending_id.number() == event_id.0,
-                        "raw object pending identity differs from its event ID"
-                    );
-                    let body_len = payload_len
-                        .checked_sub(body_start as u64)
-                        .context("invalid raw object frame length")?;
-                    ensure!(body_len <= MAX_OBJECT_BYTES, "staged object exceeds 32 GiB");
-                    let payload_offset = payload_start + body_start as u64;
-                    let state = chatend.as_mut().context("object precedes session header")?;
-                    let allocation = Event {
-                        id: metadata.event_id,
-                        recorded_at: metadata.recorded_at.clone(),
-                        kind: EventKind::PendingAllocated {
-                            pending_id: metadata.pending_id.clone(),
-                            resource: PendingKind::Object,
-                        },
-                    };
-                    state.apply_transition(&Transition {
-                        recorded_at: metadata.recorded_at.clone(),
-                        events: vec![allocation],
-                    })?;
-                    let location = ObjectLocation {
-                        metadata: metadata.clone(),
-                        payload_offset,
-                        payload_len: body_len,
-                    };
-                    ensure!(
-                        objects
-                            .insert(metadata.pending_id.clone(), location)
-                            .is_none(),
-                        "duplicate staged object {}",
-                        metadata.pending_id
-                    );
-                }
-                other => bail!("unknown complete journal frame kind {other} at byte {cursor}"),
-            }
-            cursor = frame_end;
         }
-        let chatend = chatend.context("journal has no session header")?;
-        file.seek(SeekFrom::End(0))?;
-        drop(_append_guard);
         Ok(Self {
-            path,
-            file,
+            path: durable.path().to_path_buf(),
+            durable,
             chatend,
             objects,
-            sidebands,
-            append_lock,
         })
     }
 
@@ -1282,40 +1246,54 @@ impl SessionJournal {
         &self.objects
     }
 
-    pub fn sidebands(&self) -> &[SidebandRecord] {
-        &self.sidebands
+    pub fn session_log(&self) -> session_log::SessionLog {
+        self.durable.list()
     }
 
-    pub fn append_sideband(
-        &mut self,
-        kind: impl Into<String>,
-        recorded_at: impl Into<String>,
-        value: Value,
-    ) -> anyhow::Result<()> {
-        let record = JsonRecord::Sideband {
-            kind: kind.into(),
-            recorded_at: recorded_at.into(),
-            value,
-        };
-        let append_lock = self.append_lock.clone();
-        let _append_guard = append_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
-        append_frame(&mut self.file, JSON_FRAME, &serde_json::to_vec(&record)?)?;
-        let JsonRecord::Sideband {
-            kind,
-            recorded_at,
-            value,
-        } = record
-        else {
-            unreachable!()
-        };
-        self.sidebands.push(SidebandRecord {
-            kind,
-            recorded_at,
-            value,
-        });
+    pub fn is_sealed(&self) -> bool {
+        self.durable.is_sealed()
+    }
+
+    pub fn seal(&mut self) -> anyhow::Result<()> {
+        let mut unfinished_tools = Vec::new();
+        for event in &self.chatend.events {
+            match &event.kind {
+                EventKind::ToolInvoked { tool_name, .. } => {
+                    unfinished_tools.push(tool_name.as_str());
+                }
+                EventKind::ToolCompleted { tool_name, .. } => {
+                    if tool_name == "call_ktool" {
+                        // An invalid native call still produces an error result
+                        // even when it could not be decoded into ToolInvoked.
+                        unfinished_tools.pop();
+                    } else {
+                        let before = unfinished_tools.len();
+                        unfinished_tools.retain(|unfinished| *unfinished != tool_name);
+                        ensure!(
+                            unfinished_tools.len() != before,
+                            "tool {tool_name} completed without a matching invocation"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        ensure!(
+            unfinished_tools.is_empty(),
+            "session ends with unfinished tools {}",
+            unfinished_tools.join(", ")
+        );
+        self.durable.seal()?;
         Ok(())
+    }
+
+    pub fn mark_completed(&mut self, session_object_id: String) {
+        self.chatend.completed_session_object = Some(session_object_id);
+    }
+
+    pub fn configure_context(&mut self, kind: SessionKind, effective_context_tokens: u64) {
+        self.chatend.metadata.kind = kind;
+        self.chatend.metadata.effective_context_tokens = effective_context_tokens;
     }
 
     pub fn create_box(
@@ -1503,36 +1481,29 @@ impl SessionJournal {
             file_name,
             transport,
         };
-        let metadata_bytes = serde_json::to_vec(&metadata)?;
-        let metadata_len =
-            u32::try_from(metadata_bytes.len()).context("object metadata exceeds 4 GiB")?;
-        let payload_len =
-            OBJECT_PREFIX_BYTES as u64 + metadata_bytes.len() as u64 + bytes.len() as u64;
-        let append_lock = self.append_lock.clone();
-        let _append_guard = append_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
-        let frame_start = self.file.seek(SeekFrom::End(0))?;
-        let mut hasher = Sha256::new();
-        hasher.update(event_id.0.to_le_bytes());
-        hasher.update(metadata_len.to_le_bytes());
-        hasher.update(&metadata_bytes);
-        hasher.update(bytes);
-        let checksum = hasher.finalize();
-        self.file.write_all(&[OBJECT_FRAME])?;
-        self.file.write_all(&payload_len.to_le_bytes())?;
-        self.file.write_all(&checksum)?;
-        self.file.write_all(&event_id.0.to_le_bytes())?;
-        self.file.write_all(&metadata_len.to_le_bytes())?;
-        self.file.write_all(&metadata_bytes)?;
-        self.file.write_all(bytes)?;
+        let kind = EventKind::PendingAllocated {
+            pending_id: pending_id.clone(),
+            resource: PendingKind::Object,
+        };
+        let text = encode_context_event(&metadata.recorded_at, &kind)?;
+        let object_file_name = metadata
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("object-{}", event_id.0));
+        let position = self.durable.add_pending_object(
+            text,
+            object_file_name,
+            metadata.media_type.clone(),
+            bytes,
+        )?;
+        ensure!(
+            position.0 + 1 == event_id.0,
+            "session-log event position diverged from Kennedy context identity"
+        );
         let allocation = Event {
             id: event_id,
             recorded_at: metadata.recorded_at.clone(),
-            kind: EventKind::PendingAllocated {
-                pending_id: pending_id.clone(),
-                resource: PendingKind::Object,
-            },
+            kind,
         };
         self.chatend.apply_transition(&Transition {
             recorded_at: metadata.recorded_at.clone(),
@@ -1542,10 +1513,7 @@ impl SessionJournal {
             pending_id.clone(),
             ObjectLocation {
                 metadata,
-                payload_offset: frame_start
-                    + FRAME_HEADER_BYTES
-                    + OBJECT_PREFIX_BYTES as u64
-                    + metadata_bytes.len() as u64,
+                payload_offset: position.0,
                 payload_len: bytes.len() as u64,
             },
         );
@@ -1558,13 +1526,10 @@ impl SessionJournal {
             .get(id)
             .with_context(|| format!("staged object {id} does not exist"))?
             .clone();
-        let len =
-            usize::try_from(location.payload_len).context("object does not fit address space")?;
-        let mut bytes = vec![0; len];
-        self.file.seek(SeekFrom::Start(location.payload_offset))?;
-        self.file.read_exact(&mut bytes)?;
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(bytes)
+        Ok(self
+            .durable
+            .read_pending_object(EventPosition(location.payload_offset))?
+            .bytes)
     }
 
     pub fn record(
@@ -1598,16 +1563,34 @@ impl SessionJournal {
             !transition.events.is_empty(),
             "a transition cannot be empty"
         );
-        let record = JsonRecord::Transition { transition };
-        let append_lock = self.append_lock.clone();
-        let _append_guard = append_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session journal append lock is poisoned"))?;
-        append_frame(&mut self.file, JSON_FRAME, &serde_json::to_vec(&record)?)?;
-        let JsonRecord::Transition { transition } = record else {
-            unreachable!()
-        };
-        self.chatend.apply_transition(&transition)?;
+        ensure!(
+            !transition.events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::PendingAllocated {
+                        resource: PendingKind::Object,
+                        ..
+                    }
+                )
+            }),
+            "pending objects must be added through stage_object"
+        );
+        let mut preview = self.chatend.clone();
+        preview.apply_transition(&transition)?;
+        for event in &transition.events {
+            let expected = self.durable.list().events.len() as u64 + 1;
+            ensure!(
+                event.id.0 == expected,
+                "Kennedy context event {} does not match session-log position {}",
+                event.id,
+                expected - 1
+            );
+            self.durable.add_event(
+                context_event_role(&event.kind),
+                encode_context_event(&event.recorded_at, &event.kind)?,
+            )?;
+        }
+        self.chatend = preview;
         Ok(())
     }
 
@@ -1796,55 +1779,25 @@ impl SessionJournal {
     }
 }
 
-fn journal_lock(path: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().expect("journal lock registry is poisoned");
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
-}
-
-fn append_frame(file: &mut File, kind: u8, payload: &[u8]) -> anyhow::Result<()> {
-    file.seek(SeekFrom::End(0))?;
-    let capacity = FRAME_HEADER_BYTES
-        .checked_add(payload.len() as u64)
-        .and_then(|length| usize::try_from(length).ok())
-        .context("journal frame does not fit address space")?;
-    let mut frame = Vec::with_capacity(capacity);
-    frame.push(kind);
-    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    frame.extend_from_slice(&Sha256::digest(payload));
-    frame.extend_from_slice(payload);
-    file.write_all(&frame)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::OpenOptions,
-        io::Write,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
     use super::*;
 
     fn path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "kennedy-chatend-{label}-{}-{}.journal",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        std::env::temp_dir()
+            .join(format!(
+                "kennedy-chatend-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("session-1.session-log")
     }
 
     fn metadata() -> SessionMetadata {
@@ -1855,18 +1808,6 @@ mod tests {
             effective_context_tokens: 1_000,
             channel: json!({"kind":"test"}),
         }
-    }
-
-    fn frame_starts(bytes: &[u8]) -> Vec<usize> {
-        let mut starts = Vec::new();
-        let mut cursor = MAGIC.len();
-        while cursor < bytes.len() {
-            starts.push(cursor);
-            let payload_len =
-                u64::from_le_bytes(bytes[cursor + 1..cursor + 9].try_into().unwrap()) as usize;
-            cursor += FRAME_HEADER_BYTES as usize + payload_len;
-        }
-        starts
     }
 
     #[test]
@@ -1901,7 +1842,7 @@ mod tests {
         assert!(projection.items[2].text.contains("summary"));
         assert!(projection.items[2].stale);
         drop(journal);
-        let reopened = SessionJournal::open(&path).unwrap();
+        let reopened = SessionJournal::open_with_metadata(&path, metadata()).unwrap();
         assert_eq!(reopened.state().box_state(id), Some(&state));
         std::fs::remove_file(path).unwrap();
     }
@@ -1923,37 +1864,48 @@ mod tests {
                 b"\0binary\xff",
             )
             .unwrap();
-        assert_eq!(first.as_str(), "pending:1");
+        assert_eq!(first.to_string(), "pending:1");
         assert_eq!(box_id, BoxId(2));
-        assert_eq!(object.as_str(), "pending:3");
+        assert_eq!(object.to_string(), "pending:3");
         assert_eq!(journal.read_object(&object).unwrap(), b"\0binary\xff");
+        let stored = journal.session_log();
+        assert!(!stored.events[0].text.contains("pending_id"));
+        assert!(!stored.events[1].text.contains("box_id"));
+        assert!(!stored.events[2].text.contains("pending_id"));
         drop(journal);
-        let mut reopened = SessionJournal::open(&path).unwrap();
+        let mut reopened = SessionJournal::open_with_metadata(&path, metadata()).unwrap();
         assert_eq!(reopened.read_object(&object).unwrap(), b"\0binary\xff");
         assert_eq!(reopened.state().next_id, 4);
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn incomplete_final_frame_is_discarded_and_append_can_resume() {
-        let path = path("tail");
+    fn kennedy_tool_completion_is_validated_before_storage_seals() {
+        let path = path("seal-tool");
         let mut journal = SessionJournal::create(&path, metadata()).unwrap();
         journal
-            .create_box("t1", "box", BoxOwner::User, BoxContent::text("safe"))
+            .record(
+                "t1",
+                EventKind::ToolInvoked {
+                    tool_instance: "CreateNode:1".into(),
+                    tool_name: "CreateNode".into(),
+                    arguments: json!({}),
+                },
+            )
             .unwrap();
-        drop(journal);
-        let good_len = std::fs::metadata(&path).unwrap().len();
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&[JSON_FRAME]).unwrap();
-        file.write_all(&500_u64.to_le_bytes()).unwrap();
-        file.write_all(&[0; 7]).unwrap();
-        drop(file);
-        let mut recovered = SessionJournal::open(&path).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
-        let id = recovered
-            .create_box("t2", "next", BoxOwner::Kennedy, BoxContent::text("resumed"))
+        assert!(journal.seal().is_err());
+        journal
+            .record(
+                "t2",
+                EventKind::ToolCompleted {
+                    tool_instance: "call_ktool".into(),
+                    tool_name: "call_ktool".into(),
+                    outcome: json!({"ok":true}),
+                },
+            )
             .unwrap();
-        assert_eq!(id, BoxId(2));
+        journal.seal().unwrap();
+        assert!(journal.is_sealed());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1982,7 +1934,7 @@ mod tests {
         }
 
         drop(journal);
-        let reopened = SessionJournal::open(&path).unwrap();
+        let reopened = SessionJournal::open_with_metadata(&path, metadata()).unwrap();
         assert_eq!(
             reopened
                 .state()
@@ -1992,121 +1944,6 @@ mod tests {
                 .content,
             BoxContent::text("canonical")
         );
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn checksum_mismatch_discards_the_frame_and_every_later_frame() {
-        let path = path("checksum-tail");
-        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
-        let first = journal
-            .create_box("t1", "first", BoxOwner::User, BoxContent::text("safe"))
-            .unwrap();
-        let second = journal
-            .create_box(
-                "t2",
-                "second",
-                BoxOwner::Kennedy,
-                BoxContent::text("discard"),
-            )
-            .unwrap();
-        journal
-            .create_box(
-                "t3",
-                "third",
-                BoxOwner::Kennedy,
-                BoxContent::text("also discard"),
-            )
-            .unwrap();
-        drop(journal);
-
-        let mut bytes = std::fs::read(&path).unwrap();
-        let starts = frame_starts(&bytes);
-        let corrupted_start = starts[2];
-        bytes[corrupted_start + 9] ^= 0xff;
-        std::fs::write(&path, bytes).unwrap();
-
-        let mut recovered = SessionJournal::open(&path).unwrap();
-        assert!(recovered.state().box_state(first).is_some());
-        assert!(recovered.state().box_state(second).is_none());
-        assert_eq!(recovered.state().next_id, 2);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            corrupted_start as u64
-        );
-        let resumed = recovered
-            .create_box("t4", "resumed", BoxOwner::Kennedy, BoxContent::text("new"))
-            .unwrap();
-        assert_eq!(resumed, BoxId(2));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn checksum_mismatch_discards_a_whole_multi_event_transition() {
-        let path = path("checksum-batch");
-        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
-        let first = journal
-            .create_box("t1", "first", BoxOwner::User, BoxContent::text("one"))
-            .unwrap();
-        let second = journal
-            .create_box("t2", "second", BoxOwner::Kennedy, BoxContent::text("two"))
-            .unwrap();
-        journal
-            .apply_box_representations(
-                "t3",
-                &BTreeMap::from([
-                    (first, BoxRepresentation::Dehydrated),
-                    (second, BoxRepresentation::Dehydrated),
-                ]),
-            )
-            .unwrap();
-        drop(journal);
-
-        let mut bytes = std::fs::read(&path).unwrap();
-        let batch_start = *frame_starts(&bytes).last().unwrap();
-        bytes[batch_start + 9] ^= 0xff;
-        std::fs::write(&path, bytes).unwrap();
-
-        let recovered = SessionJournal::open(&path).unwrap();
-        assert!(matches!(
-            recovered.state().box_state(first).unwrap().representation,
-            Representation::Hydrated { .. }
-        ));
-        assert!(matches!(
-            recovered.state().box_state(second).unwrap().representation,
-            Representation::Hydrated { .. }
-        ));
-        assert_eq!(recovered.state().next_id, 3);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn object_checksum_mismatch_discards_the_object_and_later_frames() {
-        let path = path("object-checksum-tail");
-        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
-        let object = journal
-            .stage_object(
-                "t1",
-                "application/octet-stream",
-                Some("object.bin".into()),
-                Value::Null,
-                b"object payload",
-            )
-            .unwrap();
-        journal
-            .create_box("t2", "later", BoxOwner::User, BoxContent::text("discard"))
-            .unwrap();
-        drop(journal);
-
-        let mut bytes = std::fs::read(&path).unwrap();
-        let object_start = frame_starts(&bytes)[1];
-        bytes[object_start + 9] ^= 0xff;
-        std::fs::write(&path, bytes).unwrap();
-
-        let recovered = SessionJournal::open(&path).unwrap();
-        assert!(!recovered.objects().contains_key(&object));
-        assert!(recovered.state().events.is_empty());
-        assert_eq!(recovered.state().next_id, 1);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2234,7 +2071,7 @@ mod tests {
             Representation::Summarized { .. }
         ));
         drop(journal);
-        let reopened = SessionJournal::open(&path).unwrap();
+        let reopened = SessionJournal::open_with_metadata(&path, metadata()).unwrap();
         assert_eq!(reopened.state().tools["rust-1"].slots.len(), 3);
         assert!(reopened.state().tools["rust-1"].slots[1].retired);
         std::fs::remove_file(path).unwrap();
@@ -2275,7 +2112,7 @@ mod tests {
             vec![direct_id, active_id]
         );
         drop(journal);
-        let reopened = SessionJournal::open(&path).unwrap();
+        let reopened = SessionJournal::open_with_metadata(&path, metadata()).unwrap();
         assert_eq!(reopened.state().render(), rendered);
         std::fs::remove_file(path).unwrap();
     }
@@ -2287,9 +2124,41 @@ mod tests {
             ..metadata()
         });
         assert_eq!(state.live_context_limit(), 70);
-        assert_eq!(state.emergency_context_limit(), 72);
-        assert_eq!(state.history_context_limit(), 75);
+        assert_eq!(state.forced_ingress_context_limit(), 75);
+        assert_eq!(state.ingress_initial_context_limit(), 75);
+        assert_eq!(state.ingress_context_limit(), 101);
+        assert_eq!(state.active_context_limit(), 70);
+        let ingress = Chatend::opened(SessionMetadata {
+            kind: SessionKind::HistoryIngress,
+            effective_context_tokens: 101,
+            ..metadata()
+        });
+        assert_eq!(ingress.active_context_limit(), 101);
         assert_eq!(estimate_tokens("1234"), 2);
+    }
+
+    #[test]
+    fn new_box_projection_preview_matches_the_committed_projection() {
+        let path = path("new-box-preview");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        let boxes = vec![
+            (
+                "User message".into(),
+                BoxOwner::User,
+                BoxContent::text("prospective user text"),
+            ),
+            (
+                "attachment".into(),
+                BoxOwner::User,
+                BoxContent::text("prospective attachment text"),
+            ),
+        ];
+        let preview = journal.state().projection_with_new_boxes(&boxes).unwrap();
+        for (name, owner, content) in boxes {
+            journal.create_box("t1", name, owner, content).unwrap();
+        }
+        assert_eq!(journal.state().projection(), preview);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

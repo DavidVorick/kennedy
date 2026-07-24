@@ -118,9 +118,13 @@ export function renderTranscript(container, transcript, ingressActivity = null, 
     container.append(ingressRetryNotice(Boolean(retryAction.retrying), retryAction.onRetry));
   }
   for (const item of transcript) {
-    const message = element("article", `message ${item.role === "kennedy" ? "assistant" : "user"}`);
+    const messageClass =
+      item.role === "kennedy" ? "assistant" : item.role === "system" ? "system" : "user";
+    const roleLabel =
+      item.role === "kennedy" ? "Kennedy" : item.role === "system" ? "System" : "You";
+    const message = element("article", `message ${messageClass}`);
     const body = element("div", "body"); appendLinkedText(body, item.content);
-    message.append(element("span", "role", item.role === "kennedy" ? "Kennedy" : "You"));
+    message.append(element("span", "role", roleLabel));
     if (item.inputKind === "voice") message.append(element("span", "voice-note-badge", "Voice note · paid transcription"));
     if (Array.isArray(item.attachments) && item.attachments.length) {
       message.append(element("span", "voice-note-badge", `${item.attachments.length} document${item.attachments.length === 1 ? "" : "s"} · ${item.attachments.map(attachment => attachment.fileName).join(", ")}`));
@@ -542,10 +546,22 @@ export function renderAudioRecording(container, detail, {
   restoreViewState(container, viewKey, viewState);
 }
 
-export function conversationIngressActivity({ record, liveRecordId = null, liveDiagnostic = null, dismissedId = null }) {
+export function conversationIngressActivity({
+  record,
+  liveRecordId = null,
+  liveDiagnostic = null,
+  savedDiagnostic = null,
+  dismissedId = null,
+}) {
   if (!record || record.id === dismissedId) return null;
   const archive = record.state?.historyIngress;
-  const saved = archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
+  const saved = savedDiagnostic
+    ? {
+        chatend: { messages: savedDiagnostic.chatend || [] },
+        usage: { snapshot: () => savedDiagnostic.usage || null },
+        toolLog: savedDiagnostic.toolLog || [],
+      }
+    : archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
     ? { chatend: { messages: archive.messages || [] }, usage: { snapshot: () => archive.usage || null }, toolLog: archive.tools?.log || [] }
     : null;
   const failed = record.phase === "ingress_failed";

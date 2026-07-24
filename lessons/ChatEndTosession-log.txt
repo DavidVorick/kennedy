@@ -1,0 +1,390 @@
+ChatEnd to session-log
+======================
+
+Purpose
+-------
+
+The original Chatend package combined two different responsibilities:
+
+1. preserving the durable history of a Kennedy session; and
+2. constructing and managing the current model context derived from that
+   history.
+
+Those responsibilities should not share a package. The durable component is
+not itself a Chatend. It is an ordered account of how a session happened.
+KennedyServer can rebuild a Chatend from that account by interpreting messages
+and tool calls according to current application policy.
+
+The durable package is therefore named `session-log`.
+
+The central boundary is:
+
+    session-log preserves an ordered historical transcript and the bytes of
+    pending objects. It does not interpret Kennedy, tools, context, ingress,
+    Kweb, or database transactions.
+
+Everything that decides what session history means belongs outside
+`session-log`.
+
+
+Final logical data model
+------------------------
+
+A session contains one header followed by one ordered array of events.
+
+The header contains exactly:
+
+    format version
+    session ID
+    creation time
+
+There is no generic header metadata. Session type, channel, provider model,
+Telegram information, context-window size, Kweb roots, ingress state, retry
+state, and worker state are application concerns.
+
+The format version is a string. Its initial value is the semantic version of
+the Kennedy release in which this file format is introduced. A later Kennedy
+release does not change the stored format version unless the on-disk format
+changes.
+
+Each event contains exactly:
+
+    role
+    text
+
+The event's position in the ordered array is its stable identity. Event IDs,
+box IDs, tool-call IDs, pending-object IDs, and pending-node IDs do not need
+to be serialized when they can be reconstructed from this position.
+
+This requires three permanent invariants:
+
+1. events are append-only;
+2. events are never reordered; and
+3. events are never removed.
+
+Corrections and later observations are appended as later events.
+
+
+Roles
+-----
+
+Role is a rendering classification. It tells the frontend and a Chatend
+replayer how an entry should be presented. It does not grant authority and it
+does not cause `session-log` to interpret the text.
+
+The initial text roles are:
+
+    system-message
+    system-error
+    user-message
+    kennedy-message
+    kennedy-tool-call
+    tool-result
+    tool-error
+
+The object roles are:
+
+    object
+    pending-object
+
+A system message includes a system prompt, controller continuation, or neutral
+controller notice. A system error is a controller-generated failure that
+should be displayed as an error. A Kennedy tool call contains the canonical
+serialized tool name and arguments. A tool result contains the exact
+successful result. A tool error contains the exact failed result.
+
+Hydration, dehydration, summarization, loading nodes, creating nodes, updating
+nodes, web operations, code operations, EndSession, and every other tool
+operation are represented as Kennedy tool calls followed by tool results or
+tool errors. The storage package does not understand any tool name or
+argument.
+
+A stored object is represented by an `object` event whose text contains its
+full value-store object ID. The full ID is not reconstructible and therefore
+must remain in the transcript.
+
+A pending object is represented by a `pending-object` event. Its pending
+identity is reconstructed from its event position. Its bytes are stored in a
+separate file.
+
+If object authorship later needs distinct frontend placement, the role schema
+must be changed deliberately to enumerate system, user, Kennedy, and tool
+objects in both stored and pending forms. The initial `object` and
+`pending-object` roles mean that all objects use the common object
+presentation.
+
+
+What session-log deliberately does not store
+--------------------------------------------
+
+The historical log does not store a current box representation. In
+particular, it does not store:
+
+    hydrated state
+    dehydrated state
+    summarized state
+    stale state
+    active state
+    retired state
+
+Those states are reconstructed by the Chatend/context component outside this
+package by replaying canonical tool calls and their results.
+
+The log also does not store or interpret:
+
+    token estimates
+    provider token calibration
+    context-window limits
+    live-session percentages
+    ingress-fitting percentages
+    protected-box policy
+    provider request rendering
+    prompt selection
+    transcript filtering
+    tool authorization
+    tool execution
+    Kweb plans
+    Kweb node creates
+    Kweb node updates
+    Kweb connection resolution
+    Kweb transaction construction
+    database signing
+    transaction receipts
+    history-ingress lifecycle
+    retry scheduling
+    worker ownership
+    browser commands
+    Telegram delivery
+    self-time scheduling
+    audio-ingress policy
+
+There are no generic metadata maps, generic auxiliary records, generic notes,
+or uninterpreted sidebands. If the application needs durable information, it
+must express that information through an enumerated session event or persist
+it in the application component that understands it.
+
+
+On-disk files
+-------------
+
+Each open session has one log file:
+
+    <session-id>.session-log
+
+Each pending object has one separate file:
+
+    <session-id>-<event-position>.pending-object
+
+An object is written before its pending-object event is appended. The object
+filename uses the event position that the pending-object event will have.
+Session mutation is serialized by one exclusive session lock so no other event
+can consume that position between the object write and the event append.
+
+Each pending-object file contains:
+
+1. object-file magic;
+2. object-file format version;
+3. filename byte length;
+4. media-type byte length;
+5. object-data byte length;
+6. SHA-256 of the object data;
+7. filename bytes;
+8. media-type bytes; and
+9. object bytes.
+
+The checksum provides integrity validation. It is not a write-ahead log.
+
+
+Pending-object write protocol
+-----------------------------
+
+Adding a pending object performs these steps while holding the session lock:
+
+1. determine the next event position;
+2. derive the final pending-object filename;
+3. write the header and bytes to a temporary file in the same directory;
+4. synchronize the temporary file;
+5. atomically rename it to the final pending-object filename;
+6. synchronize the containing directory;
+7. append the pending-object event to the session log;
+8. synchronize the session log; and
+9. release the session lock.
+
+The temporary filename is:
+
+    <session-id>-<event-position>.pending-object.tmp
+
+This is not a WAL. The temporary rename prevents a partially written file from
+appearing under its final name.
+
+The crash cases are:
+
+1. A crash before rename leaves an unreferenced temporary file.
+2. A crash after rename but before the event leaves an unreferenced complete
+   object.
+3. A crash during event append causes recovery to discard the incomplete event
+   tail, leaving an unreferenced complete object.
+4. A crash after the event is durable leaves both the event and its already
+   durable object.
+
+The protocol never makes a durable pending-object event refer to an object
+that had not already been synchronized.
+
+
+Recovery and cleanup
+--------------------
+
+Opening a session:
+
+1. validates the session header;
+2. replays every complete event in append order;
+3. discards an incomplete trailing event frame;
+4. reconstructs event identities from array positions;
+5. finds every event whose role is pending-object;
+6. verifies the corresponding object file;
+7. validates its header, declared sizes, and checksum;
+8. removes unreferenced temporary object files; and
+9. removes unreferenced final object files.
+
+An orphan is safe because it is not connected to the session transcript. A
+referenced object that is missing, truncated, or checksum-invalid is session
+corruption and must not be silently converted into an orphan.
+
+Cleanup must match exact validated filenames. It must never delete an
+unrestricted string prefix. The recognized names are:
+
+    <validated-session-id>.session-log
+    <validated-session-id>-<canonical-event-position>.pending-object
+    <validated-session-id>-<canonical-event-position>.pending-object.tmp
+
+
+Sealing, committing, and deletion
+---------------------------------
+
+Sealing and committing are different operations.
+
+Sealing:
+
+1. verifies every pending-object event has exactly one valid object file;
+2. verifies no referenced object file is malformed;
+3. appends a sealed footer;
+4. synchronizes the session log and object files;
+5. prevents later event additions; and
+6. returns an immutable view of the session.
+
+Whether Kennedy has an unfinished tool call is semantic application state.
+KennedyServer validates that condition before asking `session-log` to seal;
+the storage package does not pair or interpret tool-call and result roles.
+
+Pending-object files must remain after EndSession and after sealing because
+the database transaction still needs their bytes.
+
+The external session finalizer:
+
+1. seals the session;
+2. replays canonical Kennedy tool calls, tool results, and tool errors;
+3. reconstructs the successful staged Kweb creates and updates;
+4. reads every pending-object file;
+5. serializes the header and ordered event array as the session archive;
+6. starts one database transaction;
+7. creates every pending object and records its full object ID;
+8. reserves every pending node ID before creating any node;
+9. resolves pending node and object references;
+10. creates all reserved nodes;
+11. applies all existing-node updates;
+12. creates the session archive object;
+13. signs and commits the transaction;
+14. durably records the transaction ID when available, archive object ID, node
+    mappings, and object mappings in Session History; and
+15. deletes the live session log and pending-object files only after the
+    completion record is durable.
+
+Session History also retains the explicitly enumerated original session ID,
+session type, creation time, and completion time so clients can classify and
+order completed records without adding those application fields to the
+session-log header. This is lifecycle/index data, not generic session-log
+metadata.
+
+While a session is active, Session History's separate control journal may
+retain KennedyServer's latest explicitly enumerated Chatend presentation
+checkpoint so the browser can render the current box map and context
+projection. That checkpoint is a replaceable cache outside `session-log`;
+KennedyServer still rebuilds Chatend from the ordered session events, and the
+control journal is deleted after successful completion.
+
+An explicitly abandoned session may be deleted after its abandonment decision
+is durable.
+
+Finalization is idempotent by session ID. The Kmap adapter records the request
+hash and prepared archive/node/object IDs before finalizing. If the process
+stops after the database commit but before the final receipt update, retrying
+checks whether the prepared archive object became visible. A visible object
+proves that the atomic Kweb transaction committed, so retry returns the
+prepared mappings instead of creating a second transaction.
+
+The current Kweb library does not expose an object's creator transaction ID.
+After that exact interruption, the recovered receipt therefore has a null
+transaction ID while retaining the archive object ID and every node/object
+mapping. Normal commits retain the transaction ID. Avoiding duplicate Kweb
+effects and automatic progress takes priority over inventing an identifier.
+
+`session-log` does not perform database finalization. Its `seal` operation
+only makes the historical input immutable and durable.
+
+
+API
+---
+
+The intended package API is:
+
+    SessionStore::create_session(session_id, created_at) -> Session
+    SessionStore::open_session(session_id) -> Session
+
+    session.list() -> SessionLog
+    session.add_event(role, text) -> EventPosition
+    session.add_pending_object(text, filename, media_type, bytes)
+        -> EventPosition
+    session.read_pending_object(event_position) -> PendingObject
+    session.seal() -> SealedSession
+    session.delete_committed()
+    session.delete_abandoned()
+
+Callers cannot add a pending-object role through the ordinary `add_event`
+method. The package must create and synchronize the object file before it
+appends that event.
+
+The public `SessionLog` returned by `list` contains the three-field header and
+the ordered event array. Event positions are derived from array indexes and
+are not serialized inside events.
+
+
+Package and application boundaries
+----------------------------------
+
+The Rust package is named `session-log`; its Rust crate name is `session_log`.
+
+The package owns:
+
+    file naming
+    session header encoding
+    event encoding
+    event append ordering
+    event-position reconstruction
+    pending-object encoding
+    pending-object durability
+    checksum validation
+    crash-tail recovery
+    orphan cleanup
+    sealing
+    exact session-file deletion
+
+KennedyServer owns the reconstructed Chatend and every interpretation of the
+event text. ConversationHistory owns listing and presentation policy. The
+Kweb adapter owns transaction construction and signing. The worker owns
+session lifecycle and retries.
+
+This direction prevents storage-format code from accumulating Kennedy policy
+again. A future context-policy change should not require a session-log format
+change. A future Kweb change should not require a session-log format change.
+The session-log format changes only when the header, event, pending-object, or
+sealing representation changes.

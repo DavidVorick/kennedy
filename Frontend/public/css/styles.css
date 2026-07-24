@@ -82,6 +82,7 @@ h3 { margin-bottom: 8px; }
 .message .body { white-space: pre-wrap; line-height: 1.55; }
 .message.user { margin-left: auto; padding: 13px 16px; border-radius: 14px 14px 3px 14px; background: #e9e4d9; }
 .message.assistant { border-left: 3px solid var(--accent); padding-left: 16px; }
+.message.system { padding: 12px 14px; border: 1px solid #e2aaa5; border-radius: 9px; background: #fff0ee; color: #70443f; }
 .composer { flex: 0 0 auto; min-height: 0; border-top: 1px solid var(--line); padding: 14px; background: #f8f5ee; }
 .composer-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
 .composer-heading label { color: var(--ink); font-size: 12px; font-weight: 800; }

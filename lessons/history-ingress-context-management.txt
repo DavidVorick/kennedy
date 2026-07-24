@@ -56,10 +56,10 @@ The final refinement recognized two kinds of summaries:
    should be created only when the context budget requires them.
 
 
-The final budget
-----------------
+The initial target and runtime budget
+-------------------------------------
 
-History ingress has an input budget equal to:
+History ingress has an initial fitting target equal to:
 
     floor(model context window tokens * 75 / 100)
 
@@ -67,14 +67,14 @@ The context window is taken from the model actually selected for the ingress
 call. It is not a fixed byte count and is not inherited blindly from an older
 model selection. If the selected model changes, the budget changes with it.
 
-Chatend compares its estimated projected token count with that limit. The
+Chatend compares its estimated projected token count with that target. The
 projection includes box headers, continuation markers, the context footer,
 and rendered box representations. Existing provider usage measurements may
 calibrate the estimate.
 
-The same 75-percent limit is enforced by ingress hydration preflight and by
-the agent loop. The remaining quarter of the model's context window is an
-output and operating reserve.
+Once ingress starts, hydration preflight and the agent loop use 100 percent of
+the effective model window. Exceeding that full-window boundary force-commits
+the staged transaction.
 
 
 Ingress preparation order
@@ -106,8 +106,8 @@ Only the current summarized representation is treated this way. If Kennedy
 later rehydrated or dehydrated a previously summarized box, that later choice
 is the active representation.
 
-If the baseline projection is below 75 percent, no automatic dehydration or
-programmatic summarization occurs.
+If the baseline projection is at or below 75 percent, no automatic dehydration
+or programmatic summarization occurs.
 
 
 Largest-first fitting
@@ -119,8 +119,8 @@ already been reinstated, a summarized box is ranked by the size of its
 summary, not by the size of its canonical content. Box ID is the deterministic
 tie-breaker.
 
-The planner walks this ordering until the projected input is below the
-75-percent limit:
+The planner walks this ordering until the projected input is at or below the
+75-percent target:
 
 - an unprotected Kennedy-summarized box is dehydrated if the progression
   reaches it;
@@ -128,16 +128,14 @@ The planner walks this ordering until the projected input is below the
   programmatic summary if the progression reaches it;
 - another eligible box is dehydrated.
 
-An operation is retained only if it actually reduces the projected token
-count. This avoids replacing a tiny box with representation markers that cost
-more than the original content.
+The selected representation is retained even when a marker costs more than a
+tiny box. This allows the final fallback to reach the required fully
+dehydrated state deterministically.
 
 Planning is hypothetical. The journal does not record a temporary
 "rehydrate everything" pass followed by many corrections. Only the final
-representation choices are appended, together, after the plan fits.
-Candidate ordering costs O(n log n), and the planner finds the smallest fitting
-prefix with logarithmically many complete projection previews rather than
-reprojecting after every box.
+representation choices are appended, together, after the plan fits or every
+box has been dehydrated.
 
 
 Protected content
@@ -158,13 +156,11 @@ such attribution solely for ingress would add complexity without improving
 the intended result. Per-loaded-node fanout summaries and the three aggregate
 Kweb summary boxes are not protected.
 
-Protection applies to the underlying entity. If a protected box already has a
-Kennedy-authored summary, that summary is reinstated and remains protected
-from later automatic dehydration.
-
-If protected content alone cannot fit below 75 percent, ingress preparation
-fails with an explicit diagnostic. It never silently violates the protection
-rules.
+Protection applies during the first fitting pass. If protected content alone
+cannot fit at or below 75 percent, those boxes are ordered by rendered size and
+dehydrated largest-first too. If every box is dehydrated and the projection
+is still above the target, the staged transaction commits immediately without
+an ingress inference.
 
 
 Programmatic tool summaries
