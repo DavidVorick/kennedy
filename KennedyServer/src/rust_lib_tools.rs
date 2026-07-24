@@ -15,13 +15,19 @@ pub(crate) const CREATE_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/create";
 pub(crate) const OPEN_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/open";
 pub(crate) const DOCS_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/docs";
 pub(crate) const WRITE_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/write";
+pub(crate) const WRITE_FILE_FREEFORM_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/write-file-freeform";
+pub(crate) const DELETE_FILE_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/delete-file";
 pub(crate) const CHECK_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/check";
 pub(crate) const PUBLISH_RUST_LIB_TOOL: &str = "kcode-rust-libs-v2/publish";
-pub(crate) const RUST_LIB_TOOLS: [&str; 6] = [
+pub(crate) const PREVIEW_WRITE_FILE_RUST_LIB_TOOL: &str =
+    "kcode-rust-libs-v2/internal-preview-write-file";
+pub(crate) const RUST_LIB_TOOLS: [&str; 8] = [
     CREATE_RUST_LIB_TOOL,
     OPEN_RUST_LIB_TOOL,
     DOCS_RUST_LIB_TOOL,
     WRITE_RUST_LIB_TOOL,
+    WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+    DELETE_FILE_RUST_LIB_TOOL,
     CHECK_RUST_LIB_TOOL,
     PUBLISH_RUST_LIB_TOOL,
 ];
@@ -114,6 +120,21 @@ struct WriteArguments {
 struct WriteFile {
     path: String,
     contents: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SingleFileWriteArguments {
+    name: String,
+    path: String,
+    contents: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteFileArguments {
+    name: String,
+    path: String,
 }
 
 #[derive(Debug)]
@@ -309,6 +330,68 @@ impl RustLibToolService {
                     );
                     Ok(ToolExecution::with_snapshot(
                         text,
+                        LibrarySnapshot::new(&result_name, &rust_lib.files),
+                    ))
+                })
+            }
+            WRITE_FILE_FREEFORM_RUST_LIB_TOOL => {
+                let arguments: SingleFileWriteArguments = parse_arguments(arguments)?;
+                validate_library_name(&arguments.name)?;
+                let result_name = arguments.name.clone();
+                let result_path = arguments.path.clone();
+                self.with_open_library(session_id, &arguments.name, move |rust_lib| {
+                    let previous = rust_lib.files.clone();
+                    upsert_file(&mut rust_lib.files, arguments.path, arguments.contents);
+                    if let Err(error) = rust_lib.write() {
+                        rust_lib.files = previous;
+                        return Err(self.map_library_error(error));
+                    }
+                    Ok(ToolExecution::with_snapshot(
+                        format!("Wrote file {result_path} in Rust library {result_name}."),
+                        LibrarySnapshot::new(&result_name, &rust_lib.files),
+                    ))
+                })
+            }
+            PREVIEW_WRITE_FILE_RUST_LIB_TOOL => {
+                let arguments: SingleFileWriteArguments = parse_arguments(arguments)?;
+                validate_library_name(&arguments.name)?;
+                let result_name = arguments.name.clone();
+                self.with_open_library(session_id, &arguments.name, move |rust_lib| {
+                    let mut files = rust_lib.files.clone();
+                    upsert_file(&mut files, arguments.path, arguments.contents);
+                    Ok(ToolExecution::snapshot(LibrarySnapshot::new(
+                        &result_name,
+                        &files,
+                    )))
+                })
+            }
+            DELETE_FILE_RUST_LIB_TOOL => {
+                let arguments: DeleteFileArguments = parse_arguments(arguments)?;
+                validate_library_name(&arguments.name)?;
+                let result_name = arguments.name.clone();
+                let result_path = arguments.path.clone();
+                self.with_open_library(session_id, &arguments.name, move |rust_lib| {
+                    let Some(index) = rust_lib
+                        .files
+                        .iter()
+                        .position(|file| file.path == arguments.path)
+                    else {
+                        return Err(ToolError::not_found(
+                            "rust_lib_file_not_found",
+                            format!(
+                                "File {:?} does not exist in Rust library {:?}.",
+                                arguments.path, result_name
+                            ),
+                        ));
+                    };
+                    let previous = rust_lib.files.clone();
+                    rust_lib.files.remove(index);
+                    if let Err(error) = rust_lib.write() {
+                        rust_lib.files = previous;
+                        return Err(self.map_library_error(error));
+                    }
+                    Ok(ToolExecution::with_snapshot(
+                        format!("Deleted file {result_path} from Rust library {result_name}."),
                         LibrarySnapshot::new(&result_name, &rust_lib.files),
                     ))
                 })
@@ -633,6 +716,14 @@ fn validate_library_name(name: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
+fn upsert_file(files: &mut Vec<RustLibFile>, path: String, contents: String) {
+    if let Some(file) = files.iter_mut().find(|file| file.path == path) {
+        file.contents = contents;
+    } else {
+        files.push(RustLibFile { path, contents });
+    }
+}
+
 pub(crate) fn proposed_write_snapshot(arguments: &Value) -> Option<LibrarySnapshot> {
     let arguments: WriteArguments = serde_json::from_value(arguments.clone()).ok()?;
     validate_library_name(&arguments.name).ok()?;
@@ -823,6 +914,203 @@ mod tests {
         assert!(!opened.contains("File: tests/temporary.rs"));
         assert!(opened.contains("File: src/lib.rs\npub fn answer() -> u8 { 43 }\n"));
         service.release("conversation:test".into()).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_file_write_previews_creates_and_overwrites_without_replacing_other_files() {
+        let root = temporary_root();
+        let service = service(&root);
+        service
+            .execute(
+                "conversation:test".into(),
+                CREATE_RUST_LIB_TOOL.into(),
+                json!({"name":"single-file-lib"}),
+            )
+            .await
+            .unwrap();
+
+        let preview = service
+            .execute_detailed(
+                "conversation:test".into(),
+                PREVIEW_WRITE_FILE_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"single-file-lib",
+                    "path":"src/preview.rs",
+                    "contents":"pub fn preview_only() {}\n",
+                }),
+            )
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert!(
+            preview
+                .text
+                .contains("File: src/preview.rs\npub fn preview_only() {}\n")
+        );
+        let unchanged = service
+            .execute_detailed(
+                "conversation:test".into(),
+                OPEN_RUST_LIB_TOOL.into(),
+                json!({"name":"single-file-lib"}),
+            )
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert!(!unchanged.text.contains("src/preview.rs"));
+
+        let created = service
+            .execute_detailed(
+                "conversation:test".into(),
+                WRITE_FILE_FREEFORM_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"single-file-lib",
+                    "path":"src/additional.rs",
+                    "contents":"pub fn additional() -> u8 { 1 }\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            created.text,
+            "Wrote file src/additional.rs in Rust library single-file-lib."
+        );
+        let created_snapshot = created.snapshot.unwrap();
+        assert!(
+            created_snapshot
+                .text
+                .contains("File: src/additional.rs\npub fn additional() -> u8 { 1 }\n")
+        );
+        assert!(created_snapshot.text.contains("File: Cargo.toml\n"));
+        assert!(created_snapshot.text.contains("File: Documentation.md\n"));
+
+        let overwritten = service
+            .execute_detailed(
+                "conversation:test".into(),
+                WRITE_FILE_FREEFORM_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"single-file-lib",
+                    "path":"src/additional.rs",
+                    "contents":"pub fn additional() -> u8 { 2 }\n",
+                }),
+            )
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert!(
+            overwritten
+                .text
+                .contains("File: src/additional.rs\npub fn additional() -> u8 { 2 }\n")
+        );
+        assert!(!overwritten.text.contains("additional() -> u8 { 1 }"));
+
+        service.release("conversation:test".into()).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_file_removes_one_file_and_rolls_back_failed_deletions() {
+        let root = temporary_root();
+        let service = service(&root);
+        service
+            .execute(
+                "conversation:test".into(),
+                CREATE_RUST_LIB_TOOL.into(),
+                json!({"name":"delete-file-lib"}),
+            )
+            .await
+            .unwrap();
+        service
+            .execute(
+                "conversation:test".into(),
+                WRITE_FILE_FREEFORM_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"delete-file-lib",
+                    "path":"src/temporary.rs",
+                    "contents":"pub fn temporary() {}\n",
+                }),
+            )
+            .await
+            .unwrap();
+
+        let deleted = service
+            .execute_detailed(
+                "conversation:test".into(),
+                DELETE_FILE_RUST_LIB_TOOL.into(),
+                json!({"name":"delete-file-lib","path":"src/temporary.rs"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted.text,
+            "Deleted file src/temporary.rs from Rust library delete-file-lib."
+        );
+        assert!(!deleted.snapshot.unwrap().text.contains("src/temporary.rs"));
+
+        let missing = service
+            .execute(
+                "conversation:test".into(),
+                DELETE_FILE_RUST_LIB_TOOL.into(),
+                json!({"name":"delete-file-lib","path":"src/temporary.rs"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "rust_lib_file_not_found");
+
+        let mandatory = service
+            .execute(
+                "conversation:test".into(),
+                DELETE_FILE_RUST_LIB_TOOL.into(),
+                json!({"name":"delete-file-lib","path":"Cargo.toml"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(mandatory.code, "invalid_arguments");
+        let reopened = service
+            .execute_detailed(
+                "conversation:test".into(),
+                OPEN_RUST_LIB_TOOL.into(),
+                json!({"name":"delete-file-lib"}),
+            )
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert!(reopened.text.contains("File: Cargo.toml\n"));
+
+        service.release("conversation:test".into()).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_file_tools_require_the_named_library_to_be_open() {
+        let root = temporary_root();
+        let service = service(&root);
+        let write = service
+            .execute(
+                "conversation:test".into(),
+                WRITE_FILE_FREEFORM_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"closed-lib",
+                    "path":"src/lib.rs",
+                    "contents":"pub fn replacement() {}\n",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(write.code, "rust_lib_not_open");
+        let delete = service
+            .execute(
+                "conversation:test".into(),
+                DELETE_FILE_RUST_LIB_TOOL.into(),
+                json!({"name":"closed-lib","path":"src/lib.rs"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(delete.code, "rust_lib_not_open");
         std::fs::remove_dir_all(root).unwrap();
     }
 

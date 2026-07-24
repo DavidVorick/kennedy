@@ -24,7 +24,8 @@ use crate::{
         SessionObject,
     },
     rust_lib_tools::{
-        LibrarySnapshot, RUST_LIB_TOOLS, WRITE_RUST_LIB_TOOL, proposed_write_snapshot,
+        LibrarySnapshot, PREVIEW_WRITE_FILE_RUST_LIB_TOOL, RUST_LIB_TOOLS,
+        WRITE_FILE_FREEFORM_RUST_LIB_TOOL, WRITE_RUST_LIB_TOOL, proposed_write_snapshot,
     },
 };
 
@@ -572,6 +573,68 @@ struct ToolCall {
     arguments: Value,
 }
 
+#[derive(Clone)]
+struct FreeformWriteRequest {
+    name: String,
+    path: String,
+    update_description: String,
+}
+
+struct PendingFreeformWrite {
+    request: FreeformWriteRequest,
+    call_box_id: BoxId,
+}
+
+fn freeform_write_request(arguments: &Value) -> anyhow::Result<FreeformWriteRequest> {
+    validate_arguments(arguments, &["name", "path", "updateDescription"], &[])?;
+    let name = nonempty_string(arguments, "name", 255)?;
+    let path = nonempty_string(arguments, "path", 4_096)?;
+    let update_description = nonempty_string(arguments, "updateDescription", 4_000)?;
+    anyhow::ensure!(
+        !path.contains(['\r', '\n']),
+        "path must contain exactly one line"
+    );
+    anyhow::ensure!(
+        !update_description.contains(['\r', '\n']),
+        "updateDescription must contain exactly one line"
+    );
+    Ok(FreeformWriteRequest {
+        name,
+        path,
+        update_description,
+    })
+}
+
+fn captured_write_box_content(request: &FreeformWriteRequest, contents: String) -> BoxContent {
+    BoxContent {
+        text: contents,
+        objects: Vec::new(),
+        metadata: json!({
+            "capturedFreeformOutput":true,
+            "toolName":WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+            "arguments":{
+                "name":request.name,
+                "path":request.path,
+                "updateDescription":request.update_description,
+            },
+        }),
+    }
+}
+
+fn ensure_final_newline(mut contents: String) -> String {
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents
+}
+
+fn captured_write_summary(request: &FreeformWriteRequest) -> String {
+    format!(
+        "Kennedy called write-file on {} in {}, and she describes the update as: {}",
+        request.path, request.name, request.update_description
+    )
+}
+
 fn tool_call_box_content(call: &ToolCall) -> anyhow::Result<BoxContent> {
     if call.name == WRITE_RUST_LIB_TOOL {
         let name = call
@@ -727,6 +790,7 @@ struct ToolOutcome {
     store_result: bool,
     ok: bool,
     end_session: bool,
+    freeform_write: Option<FreeformWriteRequest>,
 }
 
 #[derive(Debug)]
@@ -1613,6 +1677,7 @@ impl Session {
             let mut turn = self.api.start_agent_turn(operation_id, request).await?;
             let mut end_session = false;
             let mut used_tool = false;
+            let mut pending_freeform_write = None;
             let completed = loop {
                 let event = turn
                     .next_event()
@@ -1631,6 +1696,23 @@ impl Session {
                     }
                     kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
                         used_tool = true;
+                        if pending_freeform_write.is_some() {
+                            let text = format!(
+                                "{WRITE_FILE_FREEFORM_RUST_LIB_TOOL} is awaiting the complete file contents; no other Ktool can run before that output."
+                            );
+                            self.record_tool_completion(
+                                "call_ktool",
+                                json!({"ok":false,"result":text}),
+                            )?;
+                            checkpoint(self.snapshot()?).await?;
+                            turn.respond(
+                                &native.call_id,
+                                kcode_codex_runtime_v2::ToolResult::failure(text),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let mut created_call_box_id = None;
                         let call = native_ktool_call(&native);
                         let mut outcome = match call {
                             Ok(call) => {
@@ -1683,14 +1765,15 @@ impl Session {
                                         store_result: false,
                                         ok: false,
                                         end_session: false,
+                                        freeform_write: None,
                                     }
                                 } else {
-                                    self.journal.create_box(
+                                    created_call_box_id = Some(self.journal.create_box(
                                         now(),
                                         call_name,
                                         BoxOwner::Kennedy,
                                         call_content,
-                                    )?;
+                                    )?);
                                     if matches!(self.mode, AgentMode::Ingress { .. })
                                         && prospective_tokens
                                             > self.journal.state().ingress_context_limit()
@@ -1704,6 +1787,7 @@ impl Session {
                                             store_result: false,
                                             ok: false,
                                             end_session: false,
+                                            freeform_write: None,
                                         }
                                     } else {
                                         match self.execute_tool(&call, operation_id).await {
@@ -1713,6 +1797,7 @@ impl Session {
                                                 store_result: call.name != "LoadNode",
                                                 ok: false,
                                                 end_session: false,
+                                                freeform_write: None,
                                             },
                                         }
                                     }
@@ -1723,6 +1808,7 @@ impl Session {
                                 store_result: true,
                                 ok: false,
                                 end_session: false,
+                                freeform_write: None,
                             },
                         };
                         if !matches!(self.mode, AgentMode::Ingress { .. }) {
@@ -1748,8 +1834,16 @@ impl Session {
                                     store_result: false,
                                     ok: false,
                                     end_session: false,
+                                    freeform_write: None,
                                 };
                             }
+                        }
+                        if let Some(request) = outcome.freeform_write.take() {
+                            pending_freeform_write = Some(PendingFreeformWrite {
+                                request,
+                                call_box_id: created_call_box_id
+                                    .context("freeform write call box was not created")?,
+                            });
                         }
                         if outcome.store_result {
                             self.journal.create_box(
@@ -1822,7 +1916,37 @@ impl Session {
                         .unwrap_or(Value::Null),
                 },
             )?;
-            let mut answer = completed.answer.trim().to_owned();
+            let mut answer = if let Some(pending) = pending_freeform_write {
+                let result_metadata = pending.request.clone();
+                let outcome = self
+                    .complete_freeform_write(pending, completed.answer)
+                    .await?;
+                if outcome.store_result {
+                    self.journal.create_box(
+                        now(),
+                        "Kennedy tool result",
+                        BoxOwner::Controller,
+                        BoxContent::text(&outcome.text),
+                    )?;
+                }
+                self.journal.record(
+                    now(),
+                    EventKind::Note {
+                        label: "write_file_freeform_result".into(),
+                        value: json!({
+                            "tool":WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+                            "name":result_metadata.name,
+                            "path":result_metadata.path,
+                            "updateDescription":result_metadata.update_description,
+                            "ok":outcome.ok,
+                            "result":outcome.text,
+                        }),
+                    },
+                )?;
+                String::new()
+            } else {
+                completed.answer.trim().to_owned()
+            };
             if !matches!(self.mode, AgentMode::Ingress { .. }) && self.current_live_capacity_error()
             {
                 answer.clear();
@@ -1919,6 +2043,127 @@ impl Session {
         Err(AgentLoopRoundLimitError.into())
     }
 
+    async fn complete_freeform_write(
+        &mut self,
+        pending: PendingFreeformWrite,
+        contents: String,
+    ) -> anyhow::Result<ToolOutcome> {
+        let request = pending.request;
+        let contents = ensure_final_newline(contents);
+        self.journal.update_box(
+            now(),
+            pending.call_box_id,
+            captured_write_box_content(&request, contents.clone()),
+        )?;
+        self.journal
+            .summarize_box(now(), pending.call_box_id, captured_write_summary(&request))?;
+
+        let backend_arguments = json!({
+            "name":request.name,
+            "path":request.path,
+            "contents":contents,
+        });
+        let preview = match self
+            .api
+            .rust_lib_execute(
+                &self.rust_lib_session_id,
+                PREVIEW_WRITE_FILE_RUST_LIB_TOOL,
+                backend_arguments.clone(),
+            )
+            .await
+        {
+            Ok(preview) => preview,
+            Err(error) => {
+                return Ok(ToolOutcome {
+                    text: format!("{WRITE_FILE_FREEFORM_RUST_LIB_TOOL} failed: {error}"),
+                    store_result: true,
+                    ok: false,
+                    end_session: false,
+                    freeform_write: None,
+                });
+            }
+        };
+        let preview = preview
+            .snapshot
+            .context("freeform write preview omitted the resulting library snapshot")?;
+        let source_box_id = rust_lib_box_id(&self.journal, &request.name)
+            .context("the managed Rust library box disappeared during freeform capture")?;
+        let prospective = self.journal.state().projection_with_new_boxes_and_updates(
+            &[],
+            &BTreeMap::from([(source_box_id, rust_lib_box_content(&preview))]),
+        )?;
+        let prospective_tokens = prospective.estimated_tokens;
+        let limit = if matches!(self.mode, AgentMode::Ingress { .. }) {
+            self.journal.state().ingress_context_limit()
+        } else {
+            self.journal.state().live_context_limit()
+        };
+        if prospective_tokens > limit {
+            if matches!(self.mode, AgentMode::Ingress { .. }) {
+                self.request_ingress_force_commit(
+                    "write_file_freeform_exceeded_full_window",
+                    prospective_tokens,
+                )?;
+                return Ok(ToolOutcome {
+                    text: "The file was not written because its resulting managed-library snapshot exceeded the full context window; the staged transaction will now be committed.".into(),
+                    store_result: false,
+                    ok: false,
+                    end_session: false,
+                    freeform_write: None,
+                });
+            }
+            let external_event_id = self.pending_external_event_id.clone();
+            let text = self.record_live_capacity_error(
+                &format!(
+                    "Kennedy's {WRITE_FILE_FREEFORM_RUST_LIB_TOOL} output for {}",
+                    request.path
+                ),
+                prospective_tokens,
+                limit,
+                external_event_id.as_deref(),
+            )?;
+            return Ok(ToolOutcome {
+                text,
+                store_result: false,
+                ok: false,
+                end_session: false,
+                freeform_write: None,
+            });
+        }
+
+        let execution = match self
+            .api
+            .rust_lib_execute(
+                &self.rust_lib_session_id,
+                WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+                backend_arguments,
+            )
+            .await
+        {
+            Ok(execution) => execution,
+            Err(error) => {
+                return Ok(ToolOutcome {
+                    text: format!("{WRITE_FILE_FREEFORM_RUST_LIB_TOOL} failed: {error}"),
+                    store_result: true,
+                    ok: false,
+                    end_session: false,
+                    freeform_write: None,
+                });
+            }
+        };
+        let snapshot = execution
+            .snapshot
+            .context("freeform write omitted the resulting library snapshot")?;
+        apply_rust_lib_snapshot(&mut self.journal, snapshot)?;
+        Ok(ToolOutcome {
+            text: execution.text,
+            store_result: false,
+            ok: true,
+            end_session: false,
+            freeform_write: None,
+        })
+    }
+
     async fn execute_tool(
         &mut self,
         call: &ToolCall,
@@ -1927,6 +2172,7 @@ impl Session {
         self.assert_tool_allowed(&call.name)?;
         let mut end_session = false;
         let mut store_result = true;
+        let mut freeform_write = None;
         let text = match call.name.as_str() {
             "EndSession" => {
                 validate_arguments(&call.arguments, &[], &["message"])?;
@@ -2061,6 +2307,22 @@ impl Session {
             "SetFixedConnection" => self.set_fixed_connection(&call.arguments)?,
             "CreateNode" => self.create_node(&call.arguments)?,
             "UpdateNode" => self.update_node(&call.arguments)?,
+            WRITE_FILE_FREEFORM_RUST_LIB_TOOL => {
+                let request = freeform_write_request(&call.arguments)?;
+                anyhow::ensure!(
+                    rust_lib_box_id(&self.journal, &request.name).is_some(),
+                    "Rust library {:?} is not open in this Kennedy session. Call {} first.",
+                    request.name,
+                    crate::rust_lib_tools::OPEN_RUST_LIB_TOOL
+                );
+                store_result = false;
+                let acknowledgement = format!(
+                    "Ready. Output the complete contents of {} only, with no Markdown fences or commentary.",
+                    request.path
+                );
+                freeform_write = Some(request);
+                acknowledgement
+            }
             name if RUST_LIB_TOOLS.contains(&name) => {
                 let execution = self
                     .api
@@ -2079,6 +2341,7 @@ impl Session {
             store_result,
             ok: true,
             end_session,
+            freeform_write,
         })
     }
 
@@ -3558,6 +3821,97 @@ mod tests {
             1
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn freeform_write_capture_preserves_the_exact_file_and_summarizes_its_active_box() {
+        let request = freeform_write_request(&json!({
+            "name":"example-lib",
+            "path":"src/lib.rs",
+            "updateDescription":"Preserved raw Rust source",
+        }))
+        .unwrap();
+        let raw = "\n//! leading newline\npub fn quote() -> &'static str { \"raw\\\\text\" }\n";
+        let content = captured_write_box_content(&request, raw.into());
+        assert_eq!(content.text, raw);
+        assert_eq!(
+            content.metadata["arguments"],
+            json!({
+                "name":"example-lib",
+                "path":"src/lib.rs",
+                "updateDescription":"Preserved raw Rust source",
+            })
+        );
+
+        let (path, mut journal) = test_journal("freeform-write-capture", 10_000);
+        let box_id = journal
+            .create_box(
+                "t1",
+                format!("Kennedy tool call: {WRITE_FILE_FREEFORM_RUST_LIB_TOOL}"),
+                BoxOwner::Kennedy,
+                BoxContent::text("initial metadata"),
+            )
+            .unwrap();
+        journal.update_box("t2", box_id, content).unwrap();
+        let summary = captured_write_summary(&request);
+        journal.summarize_box("t3", box_id, &summary).unwrap();
+
+        let state = journal.state().box_state(box_id).unwrap();
+        assert_eq!(state.canonical.content.text, raw);
+        assert_eq!(
+            summary,
+            "Kennedy called write-file on src/lib.rs in example-lib, and she describes the update as: Preserved raw Rust source"
+        );
+        let rendered = journal.state().render();
+        assert!(rendered.contains(&summary));
+        assert!(!rendered.contains("raw\\\\text"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn freeform_write_capture_adds_only_a_missing_final_newline() {
+        assert_eq!(
+            ensure_final_newline("pub fn example() {}".into()),
+            "pub fn example() {}\n"
+        );
+        assert_eq!(
+            ensure_final_newline("pub fn example() {}\n".into()),
+            "pub fn example() {}\n"
+        );
+        assert_eq!(
+            ensure_final_newline("pub fn example() {}\n\n".into()),
+            "pub fn example() {}\n\n"
+        );
+        assert_eq!(ensure_final_newline(String::new()), "\n");
+    }
+
+    #[test]
+    fn freeform_write_metadata_is_strict_and_single_line() {
+        assert!(
+            freeform_write_request(&json!({
+                "name":"example-lib",
+                "path":"src/lib.rs",
+                "updateDescription":"valid",
+                "contents":"not accepted in the Ktool call",
+            }))
+            .is_err()
+        );
+        assert!(
+            freeform_write_request(&json!({
+                "name":"example-lib",
+                "path":"src/lib.rs\nanother",
+                "updateDescription":"valid",
+            }))
+            .is_err()
+        );
+        assert!(
+            freeform_write_request(&json!({
+                "name":"example-lib",
+                "path":"src/lib.rs",
+                "updateDescription":"line one\nline two",
+            }))
+            .is_err()
+        );
     }
 
     #[test]

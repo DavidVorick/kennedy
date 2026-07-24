@@ -1019,3 +1019,5 @@ canonical documents; this file is not an append-only log.
   transaction. Kennedy may attach the resulting object reference to any number
   of nodes, retrieve such references later, and ask a capable communication
   adapter to deliver the object to the user.
+- When `write-file-freeform` captures model output without a final newline,
+  append one automatically before previewing and writing the file.

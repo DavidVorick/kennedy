@@ -333,22 +333,44 @@ impl Api {
                         code: "invalid_tool_result".into(),
                         message: "Rust library tool returned a non-text result.".into(),
                     })?;
-                let snapshot = if name == crate::rust_lib_tools::WRITE_RUST_LIB_TOOL {
-                    crate::rust_lib_tools::proposed_write_snapshot(&arguments)
-                } else if matches!(
-                    name,
-                    crate::rust_lib_tools::CREATE_RUST_LIB_TOOL
-                        | crate::rust_lib_tools::OPEN_RUST_LIB_TOOL
-                ) {
-                    arguments.get("name").and_then(Value::as_str).map(|name| {
-                        crate::rust_lib_tools::LibrarySnapshot {
-                            name: name.to_owned(),
-                            text: text.clone(),
-                        }
+                let snapshot = payload
+                    .get("snapshot")
+                    .and_then(Value::as_str)
+                    .map(|snapshot| crate::rust_lib_tools::LibrarySnapshot {
+                        name: arguments
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        text: snapshot.to_owned(),
                     })
-                } else {
-                    None
-                };
+                    .or_else(|| {
+                        if name == crate::rust_lib_tools::WRITE_RUST_LIB_TOOL {
+                            crate::rust_lib_tools::proposed_write_snapshot(&arguments)
+                        } else if name == crate::rust_lib_tools::PREVIEW_WRITE_FILE_RUST_LIB_TOOL {
+                            Some(crate::rust_lib_tools::LibrarySnapshot {
+                                name: arguments
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                text: text.clone(),
+                            })
+                        } else if matches!(
+                            name,
+                            crate::rust_lib_tools::CREATE_RUST_LIB_TOOL
+                                | crate::rust_lib_tools::OPEN_RUST_LIB_TOOL
+                        ) {
+                            arguments.get("name").and_then(Value::as_str).map(|name| {
+                                crate::rust_lib_tools::LibrarySnapshot {
+                                    name: name.to_owned(),
+                                    text: text.clone(),
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    });
                 Ok(crate::rust_lib_tools::ToolExecution { text, snapshot })
             }
         }
