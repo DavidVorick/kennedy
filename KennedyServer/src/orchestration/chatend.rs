@@ -277,6 +277,8 @@ pub enum EventKind {
         manifest_hash: String,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        #[serde(default)]
+        raw_context_tokens: Option<u64>,
         provider_data: Value,
     },
     CapacityError {
@@ -658,32 +660,41 @@ impl Chatend {
     }
 
     fn calibrated_estimate(&self, raw_current: u64) -> u64 {
-        let Some((manifest_hash, measured)) = self.events.iter().rev().find_map(|event| {
-            let EventKind::ProviderReceipt {
-                manifest_hash,
-                input_tokens: Some(input_tokens),
-                ..
-            } = &event.kind
-            else {
-                return None;
-            };
-            Some((manifest_hash, *input_tokens))
-        }) else {
+        let Some((manifest_hash, measured, raw_at_receipt)) =
+            self.events.iter().rev().find_map(|event| {
+                let EventKind::ProviderReceipt {
+                    manifest_hash,
+                    input_tokens: Some(input_tokens),
+                    raw_context_tokens,
+                    ..
+                } = &event.kind
+                else {
+                    return None;
+                };
+                Some((manifest_hash, *input_tokens, *raw_context_tokens))
+            })
+        else {
             return raw_current;
         };
-        let Some(raw_at_measurement) = self.events.iter().rev().find_map(|event| {
-            let EventKind::InferenceSubmitted {
-                manifest_hash: submitted,
-                estimated_input_tokens,
-                raw_estimated_input_tokens,
-            } = &event.kind
-            else {
-                return None;
-            };
-            (submitted == manifest_hash)
-                .then_some(raw_estimated_input_tokens.unwrap_or(*estimated_input_tokens))
-        }) else {
-            return raw_current;
+        let raw_at_measurement = match raw_at_receipt {
+            Some(raw) => raw,
+            None => {
+                let Some(raw) = self.events.iter().rev().find_map(|event| {
+                    let EventKind::InferenceSubmitted {
+                        manifest_hash: submitted,
+                        estimated_input_tokens,
+                        raw_estimated_input_tokens,
+                    } = &event.kind
+                    else {
+                        return None;
+                    };
+                    (submitted == manifest_hash)
+                        .then_some(raw_estimated_input_tokens.unwrap_or(*estimated_input_tokens))
+                }) else {
+                    return raw_current;
+                };
+                raw
+            }
         };
         if raw_current >= raw_at_measurement {
             measured.saturating_add(raw_current - raw_at_measurement)
@@ -1971,20 +1982,36 @@ mod tests {
             )
             .unwrap();
         journal
-            .record(
+            .create_box(
                 "t3",
+                "tool result",
+                BoxOwner::Controller,
+                BoxContent::text("x".repeat(3_000)),
+            )
+            .unwrap();
+        let measured_context = journal.state().projection();
+        journal
+            .record(
+                "t4",
                 EventKind::ProviderReceipt {
                     manifest_hash: "manifest-1".into(),
                     input_tokens: Some(777),
                     output_tokens: Some(3),
+                    raw_context_tokens: Some(measured_context.raw_estimated_tokens),
                     provider_data: Value::Null,
                 },
             )
             .unwrap();
         assert_eq!(journal.state().projection().estimated_tokens, 777);
+        assert!(
+            777 + measured_context
+                .raw_estimated_tokens
+                .saturating_sub(submitted.raw_estimated_tokens)
+                > journal.state().projection().estimated_tokens
+        );
         journal
             .create_box(
-                "t4",
+                "t5",
                 "new material",
                 BoxOwner::User,
                 BoxContent::text("x".repeat(300)),
@@ -1994,6 +2021,25 @@ mod tests {
         assert!(expanded.estimated_tokens > 777);
         assert!(expanded.raw_estimated_tokens > submitted.raw_estimated_tokens);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_provider_receipts_without_a_raw_context_anchor_remain_readable() {
+        let receipt: EventKind = serde_json::from_value(json!({
+            "type":"provider_receipt",
+            "manifest_hash":"legacy-manifest",
+            "input_tokens":123,
+            "output_tokens":4,
+            "provider_data":null
+        }))
+        .unwrap();
+        assert!(matches!(
+            receipt,
+            EventKind::ProviderReceipt {
+                raw_context_tokens: None,
+                ..
+            }
+        ));
     }
 
     #[test]

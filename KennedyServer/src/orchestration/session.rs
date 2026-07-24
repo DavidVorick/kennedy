@@ -1643,6 +1643,7 @@ impl Session {
                 }
             };
             let usage = completed.usage.as_ref();
+            let raw_context_tokens = self.journal.state().projection().raw_estimated_tokens;
             self.journal.record(
                 now(),
                 EventKind::ProviderReceipt {
@@ -1651,6 +1652,7 @@ impl Session {
                         .map(|usage| usage.last_input_tokens.unwrap_or(usage.input_tokens)),
                     output_tokens: usage
                         .map(|usage| usage.last_output_tokens.unwrap_or(usage.output_tokens)),
+                    raw_context_tokens: Some(raw_context_tokens),
                     provider_data: usage
                         .map(|usage| {
                             json!({
