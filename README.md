@@ -8,7 +8,7 @@ orchestrator; the browser does not run Kennedy.
 
 - `kcode-kweb-db` 1.0 owns canonical binary Kweb nodes, immutable objects,
   histories, signed transactions, the append-only transaction log, and WAL.
-- `session-log` 0.2.1 owns one append-only, checksummed transcript per
+- `kcode-session-log` 0.2.1 owns one append-only, checksummed transcript per
   in-progress session and one durable file per pending object.
 - `ConversationHistory` retains its historical crate/package name but
   implements the Session History domain: lifecycle and commands in a separate
@@ -157,7 +157,7 @@ Opening the session removes object files not referenced by the ordered event
 array.
 
 Chatend boxes, representations, token policy, context projection, Kweb plans,
-tool interpretation, lifecycle, and commands are outside `session-log`.
+tool interpretation, lifecycle, and commands are outside `kcode-session-log`.
 KennedyServer reconstructs the current Chatend from the transcript.
 
 The browser uploads original objects as multipart data and receives a shared

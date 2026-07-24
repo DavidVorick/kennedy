@@ -32,13 +32,14 @@ Appending a receipt already represented by its archive ID is a successful
 no-op. Every append is flushed and synchronized. Clients load the immutable
 archive from Kweb when needed.
 
-The `.session-log` format and its recovery rules are owned by `session-log`.
+The `.session-log` format and its recovery rules are owned by
+`kcode-session-log`.
 Session History writes only lifecycle and command records to
 `.session-control`; it does not add storage-specific sidebands to the
 transcript. Transcript entries, box events, tool events, and pending objects
-come from `session-log`. KennedyServer rebuilds Chatend from that ordered log,
-and the browser falls back to the same events rather than requiring a durable
-presentation snapshot. Successful completion deletes the control file.
+come from `kcode-session-log`. KennedyServer rebuilds Chatend from that ordered
+log, and the browser falls back to the same events rather than requiring a
+durable presentation snapshot. Successful completion deletes the control file.
 
 At startup, Session History compacts control journals written by older builds.
 It retains the latest lifecycle record and the latest state of every command,

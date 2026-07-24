@@ -1,7 +1,8 @@
 //! Session lifecycle and local Session History.
 //!
-//! In-progress transcript entries live in `session-log`. Session lifecycle and
-//! command records live in a separate Session History control journal.
+//! In-progress transcript entries live in `kcode-session-log`. Session
+//! lifecycle and command records live in a separate Session History control
+//! journal.
 //! Successfully committed sessions leave only one local line containing their
 //! immutable Kweb object ID; their details are loaded from Kweb on demand.
 
@@ -22,9 +23,9 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use kcode_session_log::{Role, Session as DurableSession, SessionLog, SessionStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use session_log::{Role, Session as DurableSession, SessionLog, SessionStore};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -1756,14 +1757,14 @@ fn summary_state(control: &Value, journal: &SessionJournal) -> Value {
     })
 }
 
-fn persisted_context_kind(event: &session_log::SessionEvent) -> Option<Value> {
+fn persisted_context_kind(event: &kcode_session_log::SessionEvent) -> Option<Value> {
     serde_json::from_str::<Value>(&event.text)
         .ok()?
         .get("kind")
         .cloned()
 }
 
-fn display_text(event: &session_log::SessionEvent) -> String {
+fn display_text(event: &kcode_session_log::SessionEvent) -> String {
     persisted_context_kind(event)
         .and_then(|kind| {
             (kind.get("type").and_then(Value::as_str) == Some("box_created"))
@@ -1792,7 +1793,7 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-fn transcript_entry(position: usize, event: &session_log::SessionEvent) -> Option<Value> {
+fn transcript_entry(position: usize, event: &kcode_session_log::SessionEvent) -> Option<Value> {
     let role = match event.role {
         Role::UserMessage => "user",
         Role::KennedyMessage => "kennedy",
@@ -2490,7 +2491,7 @@ mod tests {
         assert_eq!(journal.records().len(), 1);
         let pending = journal
             .log
-            .read_pending_object(session_log::EventPosition(1))
+            .read_pending_object(kcode_session_log::EventPosition(1))
             .unwrap();
         assert_eq!(pending.file_name, "note.txt");
         assert_eq!(pending.media_type, "text/plain");

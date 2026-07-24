@@ -12,7 +12,7 @@ Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
 
 ## Session-log UI Authority
 
-- The append-ordered `session-log` is the canonical source of session events
+- The append-ordered `kcode-session-log` is the canonical source of session events
   across the source and history-ingress phases. The browser derives transcript,
   diagnostic, and ingress views from that one event stream and must partition
   phases at the durable source-termination and history-ingress markers.
@@ -814,7 +814,7 @@ canonical documents; this file is not an append-only log.
   every later audio claim, checkpoint, retry, failure, repair, and completion
   transition in one SQLite database.
 - KennedyServer consumes complete audio pieces directly from AudioIngress and
-  owns the model loop, session-log/Kweb commit, and global writer lane.
+  owns the model loop, kcode-session-log/Kweb commit, and global writer lane.
   Conversation and self-time ingress never use the audio queue.
 
 ## Kweb DB 1.0 Migration Direction

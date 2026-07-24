@@ -14,7 +14,7 @@ Kennedy is one Rust server with deliberately separated library domains:
 1. `kcode-kweb-db` 1.0 owns the transactional Kweb, canonical nodes,
    immutable objects, signed transactions, binary disk formats, append-only
    transaction log, current-node files, WAL, and duplicate/dependency rules.
-2. `session-log` 0.2.1 owns append-ordered role/text history, pending-object
+2. `kcode-session-log` 0.2.1 owns append-ordered role/text history, pending-object
    files, recovery, integrity validation, sealing, and exact cleanup.
 3. `kennedy-conversation-history` implements the Session History lifecycle and
    browser adapter. Its package name is historical; it owns no conversation
@@ -250,7 +250,7 @@ lane before loading. More granular concurrency is intentionally deferred.
 
 ## 11. Objects and limits
 
-Kweb enforces its object and transaction payload limits. `session-log` does
+Kweb enforces its object and transaction payload limits. `kcode-session-log` does
 not own application or database limits. The current boundary writes each
 pending object once into its session sidecar and again into Kweb at commit.
 Streaming and zero-copy handoff are future work.

@@ -141,7 +141,7 @@ Original object bytes are staged in one file per object before the matching
 obtains canonical object IDs. The Session History completion receipt records
 the pending-to-canonical mapping.
 
-Kweb owns its transaction and object limits. The session-log package does not
+Kweb owns its transaction and object limits. The `kcode-session-log` package does not
 interpret or duplicate those limits.
 
 ## Durability

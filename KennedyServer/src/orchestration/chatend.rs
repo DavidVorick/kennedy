@@ -2,7 +2,7 @@
 //!
 //! This module owns Kennedy's box model, context projection, context
 //! representations, token policy, and replay rules. Durable session history
-//! is owned by the separate `session-log` package.
+//! is owned by the separate `kcode-session-log` package.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -10,11 +10,11 @@ use std::{
 };
 
 use anyhow::{Context as _, ensure};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use session_log::{
+use kcode_session_log::{
     EventPosition, Role, Session as DurableSession, SessionStore as DurableSessionStore,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_OBJECT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -1083,7 +1083,7 @@ fn encode_context_event(recorded_at: &str, kind: &EventKind) -> anyhow::Result<S
 }
 
 fn decode_context_event(
-    event: &session_log::SessionEvent,
+    event: &kcode_session_log::SessionEvent,
 ) -> anyhow::Result<PersistedContextEvent> {
     let wire: PersistedContextEventWire = match serde_json::from_str(&event.text) {
         Ok(persisted) => persisted,
@@ -1257,7 +1257,7 @@ impl SessionJournal {
         &self.objects
     }
 
-    pub fn session_log(&self) -> session_log::SessionLog {
+    pub fn session_log(&self) -> kcode_session_log::SessionLog {
         self.durable.list()
     }
 

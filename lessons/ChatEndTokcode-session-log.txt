@@ -1,5 +1,5 @@
-ChatEnd to session-log
-======================
+ChatEnd to kcode-session-log
+============================
 
 Purpose
 -------
@@ -15,16 +15,16 @@ not itself a Chatend. It is an ordered account of how a session happened.
 KennedyServer can rebuild a Chatend from that account by interpreting messages
 and tool calls according to current application policy.
 
-The durable package is therefore named `session-log`.
+The durable package is therefore named `kcode-session-log`.
 
 The central boundary is:
 
-    session-log preserves an ordered historical transcript and the bytes of
+    kcode-session-log preserves an ordered historical transcript and the bytes of
     pending objects. It does not interpret Kennedy, tools, context, ingress,
     Kweb, or database transactions.
 
 Everything that decides what session history means belongs outside
-`session-log`.
+`kcode-session-log`.
 
 
 Final logical data model
@@ -70,7 +70,7 @@ Roles
 
 Role is a rendering classification. It tells the frontend and a Chatend
 replayer how an entry should be presented. It does not grant authority and it
-does not cause `session-log` to interpret the text.
+does not cause `kcode-session-log` to interpret the text.
 
 The initial text roles are:
 
@@ -114,8 +114,8 @@ objects in both stored and pending forms. The initial `object` and
 presentation.
 
 
-What session-log deliberately does not store
---------------------------------------------
+What kcode-session-log deliberately does not store
+--------------------------------------------------
 
 The historical log does not store a current box representation. In
 particular, it does not store:
@@ -273,7 +273,7 @@ Sealing:
 6. returns an immutable view of the session.
 
 Whether Kennedy has an unfinished tool call is semantic application state.
-KennedyServer validates that condition before asking `session-log` to seal;
+KennedyServer validates that condition before asking `kcode-session-log` to seal;
 the storage package does not pair or interpret tool-call and result roles.
 
 Pending-object files must remain after EndSession and after sealing because
@@ -307,7 +307,7 @@ metadata.
 
 While a session is active, Session History's separate control journal retains
 only lifecycle, command, and transaction-recovery state that cannot be
-reconstructed from `session-log`. It does not retain transcript, box,
+reconstructed from `kcode-session-log`. It does not retain transcript, box,
 representation, context-projection, or rendered-Chatend snapshots. The browser
 renders the ordered log events, and KennedyServer rebuilds Chatend from those
 events. The control journal is deleted after successful completion.
@@ -328,7 +328,7 @@ transaction ID while retaining the archive object ID and every node/object
 mapping. Normal commits retain the transaction ID. Avoiding duplicate Kweb
 effects and automatic progress takes priority over inventing an identifier.
 
-`session-log` does not perform database finalization. Its `seal` operation
+`kcode-session-log` does not perform database finalization. Its `seal` operation
 only makes the historical input immutable and durable.
 
 
@@ -361,7 +361,8 @@ are not serialized inside events.
 Package and application boundaries
 ----------------------------------
 
-The Rust package is named `session-log`; its Rust crate name is `session_log`.
+The Rust package is named `kcode-session-log`; its Rust crate name is
+`kcode_session_log`.
 
 The package owns:
 
