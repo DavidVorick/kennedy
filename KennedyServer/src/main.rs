@@ -3,8 +3,7 @@ mod credentials;
 mod intelligence;
 mod kmap_http;
 mod kmap_size;
-mod kweb_migration;
-mod legacy_session_archive;
+mod kweb_writer;
 mod orchestration;
 mod rust_lib_tools;
 mod telegram_identity;
@@ -65,7 +64,7 @@ struct Args {
         long = "memory-ingress-database",
         global = true,
         default_value = "./data/kennedy-memory-ingress.sqlite3",
-        help = "Retired queue database used only for one-time audio adoption and legacy maintenance"
+        help = "Optional retired queue database retained in offline backups when present"
     )]
     legacy_memory_ingress_database: PathBuf,
     #[arg(long, global = true, default_value = "./data/audio-ingress-media")]
@@ -100,20 +99,6 @@ enum Command {
     },
     /// Estimate the token footprint of all current Kmap node text.
     KmapSize,
-    /// Migrate the stopped live kweb-db-core database into kcode-kweb-db 1.0.
-    MigrateKweb {
-        #[arg(long, default_value = "./data/kweb-db-core.sqlite3")]
-        legacy_database: PathBuf,
-        #[arg(long, default_value = "./data/kweb-provenance-artifacts")]
-        legacy_artifacts: PathBuf,
-        #[arg(long)]
-        archive_directory: Option<PathBuf>,
-    },
-    /// Archive the stopped legacy Conversation History store for the Chatend cutover.
-    ArchiveLegacySessions {
-        #[arg(long)]
-        archive_directory: Option<PathBuf>,
-    },
     /// Generate Kennedy's permanent Kweb key inside the encrypted vault.
     ProvisionKwebWriter,
 }
@@ -186,65 +171,6 @@ async fn main() -> anyhow::Result<()> {
             let vault = CredentialVault::unlock(&vault_path, passphrase)?;
             let size = kmap_size::measure(&args.kweb_root, kweb_config(&vault)?)?;
             println!("{}", kmap_size::render(&size));
-            Ok(())
-        }
-        Some(Command::MigrateKweb {
-            legacy_database,
-            legacy_artifacts,
-            archive_directory,
-        }) => {
-            let _maintenance_guard =
-                maintenance_guard(&args.kweb_bind, "migrating the Kweb").await?;
-            let archive_directory = archive_directory.unwrap_or_else(|| {
-                PathBuf::from("./data/archive").join(format!(
-                    "kweb-db-core-{}",
-                    chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ")
-                ))
-            });
-            let result = kweb_migration::run(&kweb_migration::MigrationOptions {
-                target_root: args.kweb_root,
-                legacy_database,
-                legacy_artifacts,
-                identity_database: args.user_database,
-                conversation_database: args.conversation_history_database,
-                memory_ingress_database: args.legacy_memory_ingress_database,
-                archive_directory,
-            })?;
-            println!(
-                "Migrated {} nodes with migration writer {}. Purged {} terminal conversations and {} mirrored memory jobs. Archived legacy storage at {}.",
-                result.nodes,
-                result.migration_writer,
-                result.purged_conversations,
-                result.purged_memory_jobs,
-                result.archive.display()
-            );
-            println!(
-                "Kennedy remains intentionally unable to open the new Kweb until you run scripts/provision-kweb-writer.sh."
-            );
-            Ok(())
-        }
-        Some(Command::ArchiveLegacySessions { archive_directory }) => {
-            let _maintenance_guard =
-                maintenance_guard(&args.kweb_bind, "archiving legacy sessions").await?;
-            let archive_directory = archive_directory.unwrap_or_else(|| {
-                PathBuf::from("./data/archive").join(format!(
-                    "legacy-sessions-{}",
-                    chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ")
-                ))
-            });
-            let result = legacy_session_archive::run(&legacy_session_archive::ArchiveOptions {
-                conversation_database: args.conversation_history_database,
-                memory_ingress_database: args.legacy_memory_ingress_database,
-                archive_directory,
-                session_directory: args.session_directory,
-                session_history_file: args.session_history_file,
-            })?;
-            println!(
-                "Archived {} unfinished sessions and {} legacy conversation ingress jobs at {}.",
-                result.unfinished_sessions,
-                result.memory_jobs,
-                result.archive_directory.display()
-            );
             Ok(())
         }
         Some(Command::ProvisionKwebWriter) => {
@@ -338,7 +264,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let audio_service = kennedy_audio_ingress::open(
         kennedy_audio_ingress::Config {
             database: args.audio_ingress_database,
-            legacy_memory_ingress_database: Some(args.legacy_memory_ingress_database),
             media_directory: args.audio_ingress_media,
             max_upload_bytes: args.audio_ingress_max_upload_bytes,
         },
@@ -492,7 +417,7 @@ fn provision_kweb_writer(kweb_root: &Path, vault_path: &Path) -> anyhow::Result<
     };
     let permanent_writer = WriterId::from_signing_key(&signing_key);
     let writers = if kweb_root.exists() {
-        kweb_migration::install_permanent_writer(kweb_root, permanent_writer)?
+        kweb_writer::install_permanent_writer(kweb_root, permanent_writer)?
     } else {
         vec![permanent_writer]
     };

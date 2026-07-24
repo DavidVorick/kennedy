@@ -41,10 +41,11 @@ come from `kcode-session-log`. KennedyServer rebuilds Chatend from that ordered
 log, and the browser falls back to the same events rather than requiring a
 durable presentation snapshot. Successful completion deletes the control file.
 
-At startup, Session History compacts control journals written by older builds.
-It retains the latest lifecycle record and the latest state of every command,
-removes superseded records and presentation snapshots, writes the replacement
-atomically, and leaves `.session-log` and pending-object files unchanged.
+At startup, Session History compacts active control journals. It retains the
+latest lifecycle record and the latest state of every command, removes
+superseded records and any historical presentation snapshots, writes the
+replacement atomically, and leaves `.session-log` and pending-object files
+unchanged.
 
 ## Lifecycle
 
@@ -122,6 +123,6 @@ mixed memory-ingress database before deletion.
 
 ## Verification
 
-Tests cover coordinated transcript/control creation, durable commands, legacy
-Chatend migration, structured completion receipts, pending-object migration,
+Tests cover coordinated transcript/control creation, durable commands,
+structured completion receipts, pending objects, control-journal compaction,
 and immutable completed-history behavior.

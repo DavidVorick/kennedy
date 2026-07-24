@@ -213,15 +213,7 @@ The old conversation SQLite runtime was retired on 2026-07-23. Six unfinished
 sessions were exported one file each, the complete legacy database was moved
 under `data/archive/`, and 67 legacy conversation-ingress rows were archived
 before removal from the live mixed queue. No runtime code loads those files.
-
-The one-time command remains available for reproducibility:
-
-```sh
-cargo run -p kennedy-server -- archive-legacy-sessions
-```
-
-It refuses to overwrite an existing archive and requires the server to be
-stopped.
+The completed cutover tools are no longer part of the runtime binary.
 
 ## Deliberate V1 limits
 

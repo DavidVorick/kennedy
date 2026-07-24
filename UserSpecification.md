@@ -227,9 +227,9 @@ are future work.
 ## Legacy cutover
 
 Legacy node IDs were already migrated independently and are not translated by
-session-log. Legacy `.chatend` session files are converted on startup into
-session logs, pending-object files, and control journals. The original files
-are retained in the migration archive.
+session-log. The completed `.chatend` conversion retained its original files
+in the migration archive; the live directory now accepts only current
+session-log and control-journal files.
 
 At cutover:
 
@@ -237,6 +237,6 @@ At cutover:
 - the complete legacy conversation database and its provenance are archived;
 - legacy conversation work is removed from the live mixed ingress queue only
   after an archive copy exists;
-- no runtime compatibility store or loader remains.
+- no runtime cutover command, compatibility store, or legacy loader remains.
 
 The archives can be moved off-machine and manually ingressed if desired.

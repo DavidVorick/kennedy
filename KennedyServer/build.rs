@@ -10,7 +10,6 @@ fn main() {
         "../Cargo.toml",
         "../Cargo.lock",
         "../ConversationHistory/src",
-        "../ConversationHistory/migrations",
         "../Frontend/public/js",
         "../Frontend/SystemPrompts",
     ] {

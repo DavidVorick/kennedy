@@ -237,8 +237,9 @@ the session log, pending objects, and control file.
 The receipt includes the transaction ID when available, archive object ID,
 pending-node mappings, and pending-object mappings. The frontend fetches the immutable
 header/event archive from Kweb and rebuilds its display. There is no completed
-archive duplication or purge endpoint. Startup migrates legacy `.chatend`
-files and retains their originals under `data/sessions/legacy-chatend-migration`.
+archive duplication or purge endpoint. The live directory accepts only current
+`.session-log` and `.session-control` files; completed cutover inputs remain
+offline under `data/archive/` and `data/sessions/legacy-chatend-migration/`.
 
 ## 10. Concurrency
 

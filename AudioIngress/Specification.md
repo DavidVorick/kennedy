@@ -116,7 +116,6 @@ Terminal retry preserves the transcript, provenance, and diagnostic log. The
 caller may replace the opaque frontend state so an exhausted model checkpoint
 can be discarded before the piece returns to the durable ingress queue.
 
-On the first version-5 startup, AudioIngress adopts matching audio jobs from
-the retired `kennedy-memory-ingress.sqlite3` database. The retired database is
-read only as a one-time migration source; conversation rows remain legacy
-archive material and are never admitted to the audio queue.
+The completed version-5 queue adoption is no longer part of AudioIngress.
+Retired queue files are offline archive material and are never read by this
+service.

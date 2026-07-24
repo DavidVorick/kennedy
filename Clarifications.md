@@ -134,8 +134,8 @@ canonical documents; this file is not an append-only log.
   its queue, the complete transactional Kweb root and audio-ingress media tree,
   and the encrypted credential vault when present.
   If the retired standalone queue file still exists, include it as an optional
-  read-only upgrade source so a backup taken before first version-5 startup
-  cannot omit pre-adoption checkpoints.
+  offline archive so retained pre-unification checkpoints are not silently
+  dropped from the backup set.
   Each archive is self-describing: its README starts with the creating commit
   hash and records the exact schemas and current data-format semantics.
 - Backups are deliberately offline. Before reading persistent data, the backup

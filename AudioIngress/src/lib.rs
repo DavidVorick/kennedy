@@ -38,16 +38,12 @@ const UNIFIED_INGRESS_QUEUE_MIGRATION: &str =
 pub const COMPLETION_PROTOCOL: &str = "end-session-v2";
 const FAILURE_LIMIT: i64 = 5;
 const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
-const LEGACY_QUEUE_MIGRATION: &str = "legacy-memory-ingress-v1";
 const MAX_INGRESS_TOKENS: u64 = 50_000;
 const ESTIMATED_CHARACTERS_PER_TOKEN: u64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub database: PathBuf,
-    /// Optional source used once to adopt jobs from the retired standalone
-    /// memory-ingress database.
-    pub legacy_memory_ingress_database: Option<PathBuf>,
     pub media_directory: PathBuf,
     pub max_upload_bytes: usize,
 }
@@ -281,17 +277,12 @@ pub async fn open(
         "audio upload limit must be positive"
     );
     ensure_private_directory(&config.media_directory)?;
-    let mut connection = Connection::open(&config.database)
+    let connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
     connection.execute_batch(
         "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
     )?;
     apply_migrations(&connection).context("applying audio-ingress migrations")?;
-    migrate_legacy_memory_ingress(
-        &mut connection,
-        config.legacy_memory_ingress_database.as_deref(),
-    )
-    .context("adopting the retired memory-ingress queue")?;
     let completed_recording_ids = {
         let mut statement = connection
             .prepare("SELECT id FROM audio_recordings WHERE status='complete'")
@@ -473,185 +464,6 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     if version < 5 {
         connection.execute_batch(UNIFIED_INGRESS_QUEUE_MIGRATION)?;
     }
-    Ok(())
-}
-
-fn migrate_legacy_memory_ingress(
-    connection: &mut Connection,
-    legacy_path: Option<&Path>,
-) -> anyhow::Result<()> {
-    let already_migrated = connection
-        .query_row(
-            "SELECT 1 FROM audio_ingress_migrations WHERE name=?1",
-            [LEGACY_QUEUE_MIGRATION],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .is_some();
-    if already_migrated {
-        return Ok(());
-    }
-
-    if let Some(legacy_path) = legacy_path.filter(|path| path.exists()) {
-        ensure!(
-            legacy_path.is_file(),
-            "retired memory-ingress path {} is not a regular file",
-            legacy_path.display()
-        );
-    }
-    let Some(legacy_path) = legacy_path.filter(|path| path.is_file()) else {
-        connection.execute(
-            "INSERT INTO audio_ingress_migrations(name,completed_at,details) VALUES(?1,?2,?3)",
-            params![
-                LEGACY_QUEUE_MIGRATION,
-                Utc::now().to_rfc3339(),
-                "No retired memory-ingress database was present."
-            ],
-        )?;
-        return Ok(());
-    };
-
-    let legacy_path = legacy_path.to_string_lossy().into_owned();
-    connection.execute(
-        "ATTACH DATABASE ?1 AS legacy_memory_ingress",
-        [&legacy_path],
-    )?;
-    let result = (|| -> anyhow::Result<(i64, i64)> {
-        let has_jobs_table = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM legacy_memory_ingress.sqlite_schema WHERE type='table' AND name='memory_ingress_jobs')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? == 1;
-        if !has_jobs_table {
-            connection.execute(
-                "INSERT INTO audio_ingress_migrations(name,completed_at,details) VALUES(?1,?2,?3)",
-                params![
-                    LEGACY_QUEUE_MIGRATION,
-                    Utc::now().to_rfc3339(),
-                    "The retired database existed but contained no memory-ingress table."
-                ],
-            )?;
-            return Ok((0, 0));
-        }
-        ensure!(
-            connection.query_row("PRAGMA legacy_memory_ingress.integrity_check", [], |row| {
-                row.get::<_, String>(0)
-            })? == "ok",
-            "retired memory-ingress database failed SQLite integrity_check"
-        );
-        let conversation_jobs = connection.query_row(
-            "SELECT COUNT(*) FROM legacy_memory_ingress.memory_ingress_jobs WHERE source_kind='conversation'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let missing_audio_pieces = connection.query_row(
-            "SELECT COUNT(*)
-             FROM legacy_memory_ingress.memory_ingress_jobs jobs
-             LEFT JOIN audio_ingress_pieces pieces ON pieces.id=jobs.source_id
-             WHERE jobs.source_kind='audio' AND pieces.id IS NULL",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        ensure!(
-            missing_audio_pieces == 0,
-            "retired memory-ingress database contains {missing_audio_pieces} audio jobs without matching transcript pieces"
-        );
-        let mismatched_audio_pieces = connection.query_row(
-            "SELECT COUNT(*)
-             FROM legacy_memory_ingress.memory_ingress_jobs jobs
-             JOIN audio_ingress_pieces pieces ON pieces.id=jobs.source_id
-             JOIN audio_recordings recordings ON recordings.id=pieces.recording_id
-             WHERE jobs.source_kind='audio'
-               AND (jobs.source_position<>pieces.piece_index OR jobs.source_created_at<>recordings.source_created_at)",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        ensure!(
-            mismatched_audio_pieces == 0,
-            "retired memory-ingress database contains {mismatched_audio_pieces} audio jobs whose immutable source identity does not match AudioIngress"
-        );
-        let invalid_json = connection.query_row(
-            "SELECT COUNT(*) FROM legacy_memory_ingress.memory_ingress_jobs
-             WHERE source_kind='audio' AND (NOT json_valid(state_json) OR NOT json_valid(failures_json))",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        ensure!(
-            invalid_json == 0,
-            "retired memory-ingress database contains {invalid_json} audio jobs with invalid JSON"
-        );
-        let audio_jobs = connection.query_row(
-            "SELECT COUNT(*) FROM legacy_memory_ingress.memory_ingress_jobs WHERE source_kind='audio'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-
-        let tx = connection.transaction()?;
-        tx.execute(
-            "UPDATE audio_ingress_pieces SET phase='ingress_pending'
-             WHERE id IN (
-                 SELECT source_id FROM legacy_memory_ingress.memory_ingress_jobs
-                 WHERE source_kind='audio'
-             )",
-            [],
-        )?;
-        tx.execute(
-            "UPDATE audio_ingress_pieces AS pieces
-             SET phase=(SELECT jobs.phase FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
-                 provenance_id=(SELECT jobs.provenance_id FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
-                 state_json=(SELECT jobs.state_json FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
-                 version=(SELECT jobs.version FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
-                 ingress_failure_count=(SELECT jobs.failure_count FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
-                 ingress_failures_json=(SELECT jobs.failures_json FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
-                 next_attempt_at=(SELECT jobs.next_attempt_at FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
-                 updated_at=(SELECT jobs.updated_at FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id)
-             WHERE EXISTS(
-                 SELECT 1 FROM legacy_memory_ingress.memory_ingress_jobs jobs
-                 WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id
-             )",
-            [],
-        )?;
-        let imported_ids = {
-            let mut statement = tx.prepare(
-                "SELECT source_id
-                 FROM legacy_memory_ingress.memory_ingress_jobs
-                 WHERE source_kind='audio'
-                 ORDER BY datetime(updated_at),source_id",
-            )?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for id in imported_ids {
-            project_piece_transition(&tx, &id).map_err(|error| anyhow::anyhow!(error.message))?;
-        }
-        tx.execute(
-            "INSERT INTO audio_ingress_migrations(name,completed_at,details) VALUES(?1,?2,?3)",
-            params![
-                LEGACY_QUEUE_MIGRATION,
-                Utc::now().to_rfc3339(),
-                format!(
-                    "Adopted {audio_jobs} audio jobs; retained {conversation_jobs} legacy conversation rows only in the retired source database."
-                )
-            ],
-        )?;
-        tx.commit()?;
-        Ok((audio_jobs, conversation_jobs))
-    })();
-    let detach_result = connection.execute_batch("DETACH DATABASE legacy_memory_ingress");
-    let (audio_jobs, conversation_jobs) = result?;
-    detach_result?;
-    if conversation_jobs > 0 {
-        tracing::warn!(
-            conversation_jobs,
-            "Retired memory-ingress database still contains legacy conversation rows"
-        );
-    }
-    tracing::info!(
-        audio_jobs,
-        source = %legacy_path,
-        "Adopted the retired memory-ingress queue into AudioIngress"
-    );
     Ok(())
 }
 
@@ -2287,72 +2099,6 @@ mod tests {
         assert!(has_successful_final_commit(
             &json!({"historyIngress":{"tools":{"log":[{"name":"EndSession","ok":true}]}}})
         ));
-    }
-
-    #[test]
-    fn retired_memory_queue_is_adopted_once() {
-        let root =
-            std::env::temp_dir().join(format!("kennedy-audio-queue-migration-{}", Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        let legacy_path = root.join("memory-ingress.sqlite3");
-        let legacy = Connection::open(&legacy_path).unwrap();
-        legacy
-            .execute_batch(
-                "CREATE TABLE memory_ingress_jobs (
-                id TEXT PRIMARY KEY NOT NULL,
-                source_kind TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                source_created_at TEXT NOT NULL,
-                source_position INTEGER NOT NULL,
-                phase TEXT NOT NULL,
-                provenance_id TEXT,
-                state_json TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                failure_count INTEGER NOT NULL,
-                failures_json TEXT NOT NULL,
-                next_attempt_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-             );
-             INSERT INTO memory_ingress_jobs VALUES(
-                'audio:piece','audio','piece','2026-01-01T00:00:00Z',0,
-                'ingress_in_progress','session:audio:piece',
-                '{\"historyIngress\":{\"tools\":{\"log\":[]}}}',7,2,
-                '[{\"attempt\":1}]',NULL,
-                '2026-01-01T00:00:00Z','2026-01-02T00:00:00Z'
-             );",
-            )
-            .unwrap();
-        drop(legacy);
-
-        let mut db = database();
-        insert_ready_piece(&db, "recording", "piece", 'a', "2026-01-01T00:00:00Z", 0);
-        migrate_legacy_memory_ingress(&mut db, Some(&legacy_path)).unwrap();
-        let adopted = fetch_piece(&db, "piece").unwrap();
-        assert_eq!(adopted.phase, "ingress_in_progress");
-        assert_eq!(adopted.version, 7);
-        assert_eq!(adopted.ingress_failure_count, 2);
-        assert_eq!(
-            db.query_row(
-                "SELECT COUNT(*) FROM audio_ingress_migrations WHERE name=?1",
-                [LEGACY_QUEUE_MIGRATION],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-
-        let legacy = Connection::open(&legacy_path).unwrap();
-        legacy
-            .execute(
-                "UPDATE memory_ingress_jobs SET version=99 WHERE source_id='piece'",
-                [],
-            )
-            .unwrap();
-        drop(legacy);
-        migrate_legacy_memory_ingress(&mut db, Some(&legacy_path)).unwrap();
-        assert_eq!(fetch_piece(&db, "piece").unwrap().version, 7);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
