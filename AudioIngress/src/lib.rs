@@ -19,9 +19,6 @@ use kcode_audio_transcribe::{
     AudioTranscriber, JobState, RECONCILIATION_MODEL, RECONCILIATION_REASONING, Step, StepState,
     TRANSCRIPTION_MODEL, TranscriptionJob, TranscriptionStatus,
 };
-use kennedy_memory_ingress::{
-    Failure as QueueFailure, Job as QueueJob, LegacySubmission, Queue, SourceKind, Submission,
-};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,12 +33,21 @@ const TRANSCRIPTION_STATUS_MIGRATION: &str =
     include_str!("../migrations/003_transcription_status.sql");
 const RETRY_ROUNDED_WAV_INTERVALS_MIGRATION: &str =
     include_str!("../migrations/004_retry_rounded_wav_intervals.sql");
+const UNIFIED_INGRESS_QUEUE_MIGRATION: &str =
+    include_str!("../migrations/005_unified_ingress_queue.sql");
+pub const COMPLETION_PROTOCOL: &str = "end-session-v2";
+const FAILURE_LIMIT: i64 = 5;
+const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
+const LEGACY_QUEUE_MIGRATION: &str = "legacy-memory-ingress-v1";
 const MAX_INGRESS_TOKENS: u64 = 50_000;
 const ESTIMATED_CHARACTERS_PER_TOKEN: u64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub database: PathBuf,
+    /// Optional source used once to adopt jobs from the retired standalone
+    /// memory-ingress database.
+    pub legacy_memory_ingress_database: Option<PathBuf>,
     pub media_directory: PathBuf,
     pub max_upload_bytes: usize,
 }
@@ -52,7 +58,6 @@ struct AppState {
     db: Arc<Mutex<Connection>>,
     transcriber: Option<AudioTranscriber>,
     jobs: Arc<Mutex<HashMap<String, TranscriptionJob>>>,
-    queue: Queue,
 }
 
 #[derive(Clone)]
@@ -134,16 +139,6 @@ impl ApiError {
             "An unexpected audio-ingress error occurred.",
         )
     }
-
-    fn queue(error: kennedy_memory_ingress::Error) -> Self {
-        use kennedy_memory_ingress::ErrorKind;
-        match error.kind {
-            ErrorKind::Invalid => Self::bad(error.message),
-            ErrorKind::NotFound => Self::not_found(),
-            ErrorKind::Conflict => Self::conflict(error.message),
-            ErrorKind::Internal => Self::internal(error),
-        }
-    }
 }
 
 impl IntoResponse for ApiError {
@@ -195,6 +190,8 @@ struct IngressPieceRecord {
     version: i64,
     ingress_failure_count: i64,
     ingress_failures: Value,
+    #[serde(skip_serializing)]
+    next_attempt_at: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -278,21 +275,23 @@ struct RecordIngressFailure {
 pub async fn open(
     config: Config,
     transcriber: Option<AudioTranscriber>,
-    queue: Queue,
 ) -> anyhow::Result<Service> {
     ensure!(
         config.max_upload_bytes > 0,
         "audio upload limit must be positive"
     );
     ensure_private_directory(&config.media_directory)?;
-    let connection = Connection::open(&config.database)
+    let mut connection = Connection::open(&config.database)
         .with_context(|| format!("opening {}", config.database.display()))?;
     connection.execute_batch(
         "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
     )?;
     apply_migrations(&connection).context("applying audio-ingress migrations")?;
-    import_legacy_ingress(&connection, &queue)
-        .context("moving audio ingress into the shared queue")?;
+    migrate_legacy_memory_ingress(
+        &mut connection,
+        config.legacy_memory_ingress_database.as_deref(),
+    )
+    .context("adopting the retired memory-ingress queue")?;
     let completed_recording_ids = {
         let mut statement = connection
             .prepare("SELECT id FROM audio_recordings WHERE status='complete'")
@@ -314,7 +313,6 @@ pub async fn open(
         db: Arc::new(Mutex::new(connection)),
         transcriber,
         jobs: Arc::new(Mutex::new(HashMap::new())),
-        queue,
     };
     let max_upload_bytes = state.config.max_upload_bytes;
     tracing::info!(media=%state.config.media_directory.display(), "Audio ingress initialized");
@@ -354,6 +352,11 @@ impl Service {
         db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
             .map_err(ApiError::internal)?;
         Ok(json!({"service":"audio-ingress","status":"ok"}))
+    }
+
+    pub fn next_ingress_piece(&self) -> Result<Option<Value>, ServiceError> {
+        let db = self.state.db.lock().map_err(ApiError::internal)?;
+        select_next_ingress_piece(&db)?.map(json_value).transpose()
     }
 
     pub async fn get_json(&self, path: &str) -> Result<Value, ServiceError> {
@@ -467,78 +470,189 @@ fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     if version < 4 {
         connection.execute_batch(RETRY_ROUNDED_WAV_INTERVALS_MIGRATION)?;
     }
-    Ok(())
-}
-
-fn import_legacy_ingress(connection: &Connection, queue: &Queue) -> anyhow::Result<()> {
-    let mut statement = connection.prepare(&format!(
-        "{} WHERE p.phase IN ('ingress_pending','ingress_in_progress','ingress_failed') ORDER BY datetime(r.source_created_at),p.piece_index,p.id",
-        piece_select()
-    ))?;
-    let pieces = statement
-        .query_map([], row_piece)?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    for piece in pieces {
-        let next_attempt_at = connection.query_row(
-            "SELECT next_attempt_at FROM audio_recordings WHERE id=?1",
-            [&piece.recording_id],
-            |row| row.get::<_, Option<String>>(0),
-        )?;
-        let job = queue.import_legacy(LegacySubmission {
-            source_kind: SourceKind::Audio,
-            source_id: piece.id.clone(),
-            source_created_at: piece.source_created_at.clone(),
-            source_position: piece.piece_index,
-            phase: piece.phase.clone(),
-            provenance_id: piece.provenance_id.clone(),
-            state: piece.state.clone(),
-            version: piece.version,
-            failure_count: piece.ingress_failure_count,
-            failures: piece.ingress_failures.clone(),
-            next_attempt_at,
-        })?;
-        mirror_queue_job(connection, &job).map_err(|error| anyhow::anyhow!(error.message))?;
+    if version < 5 {
+        connection.execute_batch(UNIFIED_INGRESS_QUEUE_MIGRATION)?;
     }
     Ok(())
 }
 
-fn mirror_queue_job(db: &Connection, job: &QueueJob) -> Result<IngressPieceRecord, ApiError> {
-    let state_json = serde_json::to_string(&job.state).map_err(ApiError::internal)?;
-    let failures_json = serde_json::to_string(&job.failures).map_err(ApiError::internal)?;
-    let changed = db.execute(
-        "UPDATE audio_ingress_pieces SET phase=?1,provenance_id=?2,state_json=?3,version=?4,ingress_failure_count=?5,ingress_failures_json=?6,updated_at=?7 WHERE id=?8",
-        params![job.phase,job.provenance_id,state_json,job.version,job.failure_count,failures_json,job.updated_at,job.source_id],
-    ).map_err(ApiError::internal)?;
-    if changed == 0 {
-        return Err(ApiError::not_found());
-    }
-    let piece = fetch_piece(db, &job.source_id)?;
-    let remaining = db
+fn migrate_legacy_memory_ingress(
+    connection: &mut Connection,
+    legacy_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let already_migrated = connection
         .query_row(
-            "SELECT COUNT(*) FROM audio_ingress_pieces WHERE recording_id=?1 AND phase<>'complete'",
-            [&piece.recording_id],
+            "SELECT 1 FROM audio_ingress_migrations WHERE name=?1",
+            [LEGACY_QUEUE_MIGRATION],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(ApiError::internal)?;
-    let (status, next_attempt_at, last_error) = match job.phase.as_str() {
-        "ingress_in_progress" => ("ingressing", None, None),
-        "ingress_failed" => (
-            "ingress_failed",
-            None,
-            Some(format!(
-                "Transcript piece {} requires manual ingress retry",
-                piece.piece_index + 1
-            )),
-        ),
-        "complete" if remaining == 0 => ("complete", None, None),
-        _ => ("ready_for_ingress", job.next_attempt_at.clone(), None),
+        .optional()?
+        .is_some();
+    if already_migrated {
+        return Ok(());
+    }
+
+    if let Some(legacy_path) = legacy_path.filter(|path| path.exists()) {
+        ensure!(
+            legacy_path.is_file(),
+            "retired memory-ingress path {} is not a regular file",
+            legacy_path.display()
+        );
+    }
+    let Some(legacy_path) = legacy_path.filter(|path| path.is_file()) else {
+        connection.execute(
+            "INSERT INTO audio_ingress_migrations(name,completed_at,details) VALUES(?1,?2,?3)",
+            params![
+                LEGACY_QUEUE_MIGRATION,
+                Utc::now().to_rfc3339(),
+                "No retired memory-ingress database was present."
+            ],
+        )?;
+        return Ok(());
     };
-    db.execute(
-        "UPDATE audio_recordings SET status=?1,next_attempt_at=?2,last_error=?3,updated_at=?4 WHERE id=?5",
-        params![status,next_attempt_at,last_error,job.updated_at,piece.recording_id],
-    ).map_err(ApiError::internal)?;
-    fetch_piece(db, &job.source_id)
+
+    let legacy_path = legacy_path.to_string_lossy().into_owned();
+    connection.execute(
+        "ATTACH DATABASE ?1 AS legacy_memory_ingress",
+        [&legacy_path],
+    )?;
+    let result = (|| -> anyhow::Result<(i64, i64)> {
+        let has_jobs_table = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM legacy_memory_ingress.sqlite_schema WHERE type='table' AND name='memory_ingress_jobs')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? == 1;
+        if !has_jobs_table {
+            connection.execute(
+                "INSERT INTO audio_ingress_migrations(name,completed_at,details) VALUES(?1,?2,?3)",
+                params![
+                    LEGACY_QUEUE_MIGRATION,
+                    Utc::now().to_rfc3339(),
+                    "The retired database existed but contained no memory-ingress table."
+                ],
+            )?;
+            return Ok((0, 0));
+        }
+        ensure!(
+            connection.query_row("PRAGMA legacy_memory_ingress.integrity_check", [], |row| {
+                row.get::<_, String>(0)
+            })? == "ok",
+            "retired memory-ingress database failed SQLite integrity_check"
+        );
+        let conversation_jobs = connection.query_row(
+            "SELECT COUNT(*) FROM legacy_memory_ingress.memory_ingress_jobs WHERE source_kind='conversation'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let missing_audio_pieces = connection.query_row(
+            "SELECT COUNT(*)
+             FROM legacy_memory_ingress.memory_ingress_jobs jobs
+             LEFT JOIN audio_ingress_pieces pieces ON pieces.id=jobs.source_id
+             WHERE jobs.source_kind='audio' AND pieces.id IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        ensure!(
+            missing_audio_pieces == 0,
+            "retired memory-ingress database contains {missing_audio_pieces} audio jobs without matching transcript pieces"
+        );
+        let mismatched_audio_pieces = connection.query_row(
+            "SELECT COUNT(*)
+             FROM legacy_memory_ingress.memory_ingress_jobs jobs
+             JOIN audio_ingress_pieces pieces ON pieces.id=jobs.source_id
+             JOIN audio_recordings recordings ON recordings.id=pieces.recording_id
+             WHERE jobs.source_kind='audio'
+               AND (jobs.source_position<>pieces.piece_index OR jobs.source_created_at<>recordings.source_created_at)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        ensure!(
+            mismatched_audio_pieces == 0,
+            "retired memory-ingress database contains {mismatched_audio_pieces} audio jobs whose immutable source identity does not match AudioIngress"
+        );
+        let invalid_json = connection.query_row(
+            "SELECT COUNT(*) FROM legacy_memory_ingress.memory_ingress_jobs
+             WHERE source_kind='audio' AND (NOT json_valid(state_json) OR NOT json_valid(failures_json))",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        ensure!(
+            invalid_json == 0,
+            "retired memory-ingress database contains {invalid_json} audio jobs with invalid JSON"
+        );
+        let audio_jobs = connection.query_row(
+            "SELECT COUNT(*) FROM legacy_memory_ingress.memory_ingress_jobs WHERE source_kind='audio'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        let tx = connection.transaction()?;
+        tx.execute(
+            "UPDATE audio_ingress_pieces SET phase='ingress_pending'
+             WHERE id IN (
+                 SELECT source_id FROM legacy_memory_ingress.memory_ingress_jobs
+                 WHERE source_kind='audio'
+             )",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE audio_ingress_pieces AS pieces
+             SET phase=(SELECT jobs.phase FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
+                 provenance_id=(SELECT jobs.provenance_id FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
+                 state_json=(SELECT jobs.state_json FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
+                 version=(SELECT jobs.version FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
+                 ingress_failure_count=(SELECT jobs.failure_count FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
+                 ingress_failures_json=(SELECT jobs.failures_json FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
+                 next_attempt_at=(SELECT jobs.next_attempt_at FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id),
+                 updated_at=(SELECT jobs.updated_at FROM legacy_memory_ingress.memory_ingress_jobs jobs WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id)
+             WHERE EXISTS(
+                 SELECT 1 FROM legacy_memory_ingress.memory_ingress_jobs jobs
+                 WHERE jobs.source_kind='audio' AND jobs.source_id=pieces.id
+             )",
+            [],
+        )?;
+        let imported_ids = {
+            let mut statement = tx.prepare(
+                "SELECT source_id
+                 FROM legacy_memory_ingress.memory_ingress_jobs
+                 WHERE source_kind='audio'
+                 ORDER BY datetime(updated_at),source_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in imported_ids {
+            project_piece_transition(&tx, &id).map_err(|error| anyhow::anyhow!(error.message))?;
+        }
+        tx.execute(
+            "INSERT INTO audio_ingress_migrations(name,completed_at,details) VALUES(?1,?2,?3)",
+            params![
+                LEGACY_QUEUE_MIGRATION,
+                Utc::now().to_rfc3339(),
+                format!(
+                    "Adopted {audio_jobs} audio jobs; retained {conversation_jobs} legacy conversation rows only in the retired source database."
+                )
+            ],
+        )?;
+        tx.commit()?;
+        Ok((audio_jobs, conversation_jobs))
+    })();
+    let detach_result = connection.execute_batch("DETACH DATABASE legacy_memory_ingress");
+    let (audio_jobs, conversation_jobs) = result?;
+    detach_result?;
+    if conversation_jobs > 0 {
+        tracing::warn!(
+            conversation_jobs,
+            "Retired memory-ingress database still contains legacy conversation rows"
+        );
+    }
+    tracing::info!(
+        audio_jobs,
+        source = %legacy_path,
+        "Adopted the retired memory-ingress queue into AudioIngress"
+    );
+    Ok(())
 }
 
 fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
@@ -1239,31 +1353,18 @@ fn prepare_transcript_ingress(
         "DELETE FROM audio_chunks WHERE recording_id=?1",
         [&recording.id],
     )?;
-    let mut submissions = Vec::with_capacity(pieces.len());
     for (index, piece) in pieces.iter().enumerate() {
         let piece_id = Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'ingress_pending',?6,?6)",
             params![piece_id,recording.id,index as i64,piece,estimate_tokens(piece) as i64,now],
         )?;
-        submissions.push(Submission {
-            source_kind: SourceKind::Audio,
-            source_id: piece_id,
-            source_created_at: recording.source_created_at.clone(),
-            source_position: index as i64,
-            state: json!({}),
-            version: 1,
-        });
     }
     tx.execute(
         "UPDATE audio_recordings SET status='ready_for_ingress',final_transcript=?1,transcription_status_json=?2,attempt_count=0,next_attempt_at=NULL,last_error=NULL,updated_at=?3 WHERE id=?4",
         params![final_transcript,status_json,now,recording.id],
     )?;
     tx.commit()?;
-    for submission in submissions {
-        let job = state.queue.submit(submission)?;
-        mirror_queue_job(&db, &job).map_err(|error| anyhow::anyhow!(error.message))?;
-    }
     tracing::info!(
         recording_id = %recording.id,
         pieces = pieces.len(),
@@ -1360,7 +1461,7 @@ fn concise_text(value: &str, limit: usize, fallback: &str) -> String {
 }
 
 fn piece_select() -> &'static str {
-    "SELECT p.id,p.recording_id,r.sha256,r.original_filename,r.source_created_at,p.piece_index,(SELECT COUNT(*) FROM audio_ingress_pieces count_p WHERE count_p.recording_id=p.recording_id),p.transcript_text,p.estimated_tokens,p.phase,p.provenance_id,p.state_json,p.version,p.ingress_failure_count,p.ingress_failures_json,p.created_at,p.updated_at FROM audio_ingress_pieces p JOIN audio_recordings r ON r.id=p.recording_id"
+    "SELECT p.id,p.recording_id,r.sha256,r.original_filename,r.source_created_at,p.piece_index,(SELECT COUNT(*) FROM audio_ingress_pieces count_p WHERE count_p.recording_id=p.recording_id),p.transcript_text,p.estimated_tokens,p.phase,p.provenance_id,p.state_json,p.version,p.ingress_failure_count,p.ingress_failures_json,p.next_attempt_at,p.created_at,p.updated_at FROM audio_ingress_pieces p JOIN audio_recordings r ON r.id=p.recording_id"
 }
 
 fn row_piece(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngressPieceRecord> {
@@ -1391,8 +1492,9 @@ fn row_piece(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngressPieceRecord> {
                 Box::new(error),
             )
         })?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        next_attempt_at: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -1407,6 +1509,333 @@ fn fetch_piece(db: &Connection, id: &str) -> Result<IngressPieceRecord, ApiError
     .ok_or_else(ApiError::not_found)
 }
 
+fn select_next_ingress_piece(db: &Connection) -> Result<Option<IngressPieceRecord>, ApiError> {
+    db.query_row(
+        &format!(
+            "{} WHERE p.phase IN ('ingress_in_progress','ingress_pending')
+             AND (p.next_attempt_at IS NULL OR datetime(p.next_attempt_at)<=datetime('now'))
+             ORDER BY CASE p.phase WHEN 'ingress_in_progress' THEN 0 ELSE 1 END,
+                      datetime(r.source_created_at),p.piece_index,p.id
+             LIMIT 1",
+            piece_select()
+        ),
+        [],
+        row_piece,
+    )
+    .optional()
+    .map_err(ApiError::internal)
+}
+
+fn validate_expected_version(version: i64) -> Result<(), ApiError> {
+    if version < 1 {
+        Err(ApiError::bad("expected_version must be positive."))
+    } else {
+        Ok(())
+    }
+}
+
+fn project_piece_transition(db: &Connection, id: &str) -> Result<IngressPieceRecord, ApiError> {
+    let piece = fetch_piece(db, id)?;
+    let remaining = db
+        .query_row(
+            "SELECT COUNT(*) FROM audio_ingress_pieces WHERE recording_id=?1 AND phase<>'complete'",
+            [&piece.recording_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(ApiError::internal)?;
+    let (status, next_attempt_at, last_error) = match piece.phase.as_str() {
+        "ingress_in_progress" => ("ingressing", None, None),
+        "ingress_failed" => (
+            "ingress_failed",
+            None,
+            Some(format!(
+                "Transcript piece {} requires manual ingress retry",
+                piece.piece_index + 1
+            )),
+        ),
+        "complete" if remaining == 0 => ("complete", None, None),
+        _ => ("ready_for_ingress", piece.next_attempt_at.clone(), None),
+    };
+    db.execute(
+        "UPDATE audio_recordings SET status=?1,next_attempt_at=?2,last_error=?3,updated_at=?4 WHERE id=?5",
+        params![
+            status,
+            next_attempt_at,
+            last_error,
+            piece.updated_at,
+            piece.recording_id
+        ],
+    )
+    .map_err(ApiError::internal)?;
+    fetch_piece(db, id)
+}
+
+fn start_ingress_transition(
+    db: &mut Connection,
+    id: &str,
+    input: &StartIngress,
+) -> Result<IngressPieceRecord, ApiError> {
+    validate_expected_version(input.expected_version)?;
+    if input.provenance_id.trim().is_empty() {
+        return Err(ApiError::bad("provenance_id must not be empty."));
+    }
+    if input.completion_protocol.as_deref() != Some(COMPLETION_PROTOCOL) {
+        return Err(ApiError::conflict(
+            "This client does not support the required explicit history-ingress completion protocol.",
+        ));
+    }
+    let existing = fetch_piece(db, id)?;
+    if existing.phase == "ingress_in_progress"
+        && existing.provenance_id.as_deref() == Some(input.provenance_id.as_str())
+    {
+        return project_piece_transition(db, id);
+    }
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE audio_ingress_pieces
+             SET phase='ingress_in_progress',provenance_id=?1,next_attempt_at=NULL,updated_at=?2,version=version+1
+             WHERE id=?3 AND phase='ingress_pending' AND version=?4
+               AND NOT EXISTS(SELECT 1 FROM audio_ingress_pieces WHERE phase='ingress_in_progress')",
+            params![
+                input.provenance_id,
+                Utc::now().to_rfc3339(),
+                id,
+                input.expected_version
+            ],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "Another job is active or this job is not ready to start memory ingress.",
+        ));
+    }
+    let piece = project_piece_transition(&tx, id)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(piece)
+}
+
+fn checkpoint_ingress_transition(
+    db: &mut Connection,
+    id: &str,
+    input: &CheckpointIngress,
+) -> Result<IngressPieceRecord, ApiError> {
+    validate_expected_version(input.expected_version)?;
+    let state_json = serde_json::to_string(&input.state).map_err(ApiError::internal)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE audio_ingress_pieces SET state_json=?1,updated_at=?2,version=version+1
+             WHERE id=?3 AND phase='ingress_in_progress' AND version=?4",
+            params![
+                state_json,
+                Utc::now().to_rfc3339(),
+                id,
+                input.expected_version
+            ],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "Memory ingress changed in another session or is no longer in progress.",
+        ));
+    }
+    let piece = project_piece_transition(&tx, id)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(piece)
+}
+
+fn complete_ingress_transition(
+    db: &mut Connection,
+    id: &str,
+    input: &VersionedTransition,
+) -> Result<IngressPieceRecord, ApiError> {
+    validate_expected_version(input.expected_version)?;
+    let existing = fetch_piece(db, id)?;
+    if existing.phase == "complete" {
+        return project_piece_transition(db, id);
+    }
+    if !has_successful_final_commit(&existing.state) {
+        return Err(ApiError::conflict(
+            "Memory ingress cannot complete without a successful final Chatend/Kweb commit.",
+        ));
+    }
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE audio_ingress_pieces
+             SET phase='complete',state_json=json_remove(state_json,'$.historyIngressRepairRequired'),next_attempt_at=NULL,updated_at=?1,version=version+1
+             WHERE id=?2 AND phase='ingress_in_progress' AND version=?3",
+            params![Utc::now().to_rfc3339(), id, input.expected_version],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "Memory-ingress job is not in the expected state.",
+        ));
+    }
+    let piece = project_piece_transition(&tx, id)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(piece)
+}
+
+fn fail_ingress_transition(
+    db: &mut Connection,
+    id: &str,
+    input: &RecordIngressFailure,
+) -> Result<IngressPieceRecord, ApiError> {
+    validate_expected_version(input.expected_version)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let existing = fetch_piece(&tx, id)?;
+    if !matches!(
+        existing.phase.as_str(),
+        "ingress_pending" | "ingress_in_progress"
+    ) || existing.version != input.expected_version
+    {
+        return Err(ApiError::conflict(
+            "Memory-ingress job is no longer in the expected attempt.",
+        ));
+    }
+    let attempt = existing.ingress_failure_count + 1;
+    let terminal = input.code.as_deref() == Some("input_too_large") || attempt >= FAILURE_LIMIT;
+    let mut failures = existing
+        .ingress_failures
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    failures.push(json!({
+        "attempt":attempt,
+        "occurred_at":Utc::now().to_rfc3339(),
+        "stage":concise_text(&input.stage,80,"unknown"),
+        "code":input.code.as_deref().map(|value|concise_text(value,80,"unknown_error")),
+        "message":concise_text(&input.message,2000,"Memory ingress failed without an error message."),
+        "rounds_used":input.rounds_used,
+        "context_tokens":input.context_tokens,
+        "context_window_tokens":input.context_window_tokens,
+    }));
+    if failures.len() > FAILURE_LIMIT as usize {
+        failures.drain(..failures.len() - FAILURE_LIMIT as usize);
+    }
+    let now = Utc::now();
+    let phase = if terminal {
+        "ingress_failed"
+    } else {
+        "ingress_pending"
+    };
+    let next_attempt_at = (!terminal)
+        .then(|| (now + ChronoDuration::seconds(INGRESS_RETRY_DELAY_SECONDS)).to_rfc3339());
+    let changed = tx
+        .execute(
+            "UPDATE audio_ingress_pieces
+             SET phase=?1,ingress_failure_count=?2,ingress_failures_json=?3,next_attempt_at=?4,updated_at=?5,version=version+1
+             WHERE id=?6 AND phase IN ('ingress_pending','ingress_in_progress') AND version=?7",
+            params![
+                phase,
+                attempt,
+                serde_json::to_string(&failures).map_err(ApiError::internal)?,
+                next_attempt_at,
+                now.to_rfc3339(),
+                id,
+                input.expected_version
+            ],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "Memory ingress changed while recording a failure.",
+        ));
+    }
+    let piece = project_piece_transition(&tx, id)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(piece)
+}
+
+fn retry_ingress_transition(
+    db: &mut Connection,
+    id: &str,
+    expected_version: i64,
+    state: &Value,
+) -> Result<IngressPieceRecord, ApiError> {
+    validate_expected_version(expected_version)?;
+    let state_json = serde_json::to_string(state).map_err(ApiError::internal)?;
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE audio_ingress_pieces
+             SET phase='ingress_pending',state_json=?1,ingress_failure_count=0,next_attempt_at=NULL,updated_at=?2,version=version+1
+             WHERE id=?3 AND phase='ingress_failed' AND version=?4",
+            params![
+                state_json,
+                Utc::now().to_rfc3339(),
+                id,
+                expected_version
+            ],
+        )
+        .map_err(ApiError::internal)?;
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "Memory-ingress job is not in the expected failed state.",
+        ));
+    }
+    let piece = project_piece_transition(&tx, id)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(piece)
+}
+
+fn release_ingress_repairs_transition(db: &mut Connection) -> Result<usize, ApiError> {
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let ids = {
+        let mut statement = tx
+            .prepare(
+                "SELECT id FROM audio_ingress_pieces
+                 WHERE phase='ingress_failed'
+                   AND json_extract(state_json,'$.historyIngressRepairRequired')=1
+                   AND json_extract(state_json,'$.historyIngressRepairReleasePending')=1",
+            )
+            .map_err(ApiError::internal)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(ApiError::internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::internal)?
+    };
+    let changed = tx
+        .execute(
+            "UPDATE audio_ingress_pieces
+             SET phase='ingress_pending',state_json=json_remove(state_json,'$.historyIngress','$.historyIngressRepairReleasePending'),next_attempt_at=NULL,ingress_failure_count=0,updated_at=?1,version=version+1
+             WHERE phase='ingress_failed'
+               AND json_extract(state_json,'$.historyIngressRepairRequired')=1
+               AND json_extract(state_json,'$.historyIngressRepairReleasePending')=1",
+            [Utc::now().to_rfc3339()],
+        )
+        .map_err(ApiError::internal)?;
+    for id in ids {
+        project_piece_transition(&tx, &id)?;
+    }
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(changed)
+}
+
+fn has_successful_final_commit(state: &Value) -> bool {
+    let current_snapshot = state.get("historyIngress").is_some_and(|history| {
+        history.get("completed").and_then(Value::as_bool) == Some(true)
+            && history
+                .get("sessionObjectId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+    });
+    let legacy_end_session = state
+        .pointer("/historyIngress/tools/log")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("name").and_then(Value::as_str) == Some("EndSession")
+                    && entry.get("ok").and_then(Value::as_bool) == Some(true)
+            })
+        });
+    current_snapshot || legacy_end_session
+}
+
 async fn get_ingress_piece(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -1416,30 +1845,8 @@ async fn get_ingress_piece(
 }
 
 async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let released = state
-        .queue
-        .release_repairs_for(SourceKind::Audio)
-        .map_err(ApiError::queue)?;
-    let db = state.db.lock().map_err(ApiError::internal)?;
-    let ids = {
-        let mut statement = db
-            .prepare("SELECT id FROM audio_ingress_pieces WHERE phase IN ('ingress_pending','ingress_failed')")
-            .map_err(ApiError::internal)?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(ApiError::internal)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ApiError::internal)?
-    };
-    for id in ids {
-        if let Some(job) = state
-            .queue
-            .get(SourceKind::Audio, &id)
-            .map_err(ApiError::queue)?
-        {
-            mirror_queue_job(&db, &job)?;
-        }
-    }
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    let released = release_ingress_repairs_transition(&mut db)?;
     Ok(Json(json!({"released":released})))
 }
 
@@ -1448,18 +1855,8 @@ async fn ingress_started(
     AxumPath(id): AxumPath<String>,
     Json(input): Json<StartIngress>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
-    let db = state.db.lock().map_err(ApiError::internal)?;
-    let job = state
-        .queue
-        .start(
-            SourceKind::Audio,
-            &id,
-            input.expected_version,
-            &input.provenance_id,
-            input.completion_protocol.as_deref(),
-        )
-        .map_err(ApiError::queue)?;
-    Ok(Json(mirror_queue_job(&db, &job)?))
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    Ok(Json(start_ingress_transition(&mut db, &id, &input)?))
 }
 
 async fn ingress_checkpoint(
@@ -1467,12 +1864,8 @@ async fn ingress_checkpoint(
     AxumPath(id): AxumPath<String>,
     Json(input): Json<CheckpointIngress>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
-    let db = state.db.lock().map_err(ApiError::internal)?;
-    let job = state
-        .queue
-        .checkpoint(SourceKind::Audio, &id, input.expected_version, &input.state)
-        .map_err(ApiError::queue)?;
-    Ok(Json(mirror_queue_job(&db, &job)?))
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    Ok(Json(checkpoint_ingress_transition(&mut db, &id, &input)?))
 }
 
 async fn ingress_completed(
@@ -1481,12 +1874,8 @@ async fn ingress_completed(
     Json(input): Json<VersionedTransition>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
     let (completed_piece, recording_id, recording_complete) = {
-        let db = state.db.lock().map_err(ApiError::internal)?;
-        let job = state
-            .queue
-            .complete(SourceKind::Audio, &id, input.expected_version)
-            .map_err(ApiError::queue)?;
-        let completed = mirror_queue_job(&db, &job)?;
+        let mut db = state.db.lock().map_err(ApiError::internal)?;
+        let completed = complete_ingress_transition(&mut db, &id, &input)?;
         let recording_id = completed.recording_id.clone();
         let remaining = db.query_row(
             "SELECT COUNT(*) FROM audio_ingress_pieces WHERE recording_id=?1 AND phase<>'complete'",
@@ -1509,24 +1898,8 @@ async fn ingress_failure(
     AxumPath(id): AxumPath<String>,
     Json(input): Json<RecordIngressFailure>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
-    let db = state.db.lock().map_err(ApiError::internal)?;
-    let job = state
-        .queue
-        .fail(
-            SourceKind::Audio,
-            &id,
-            input.expected_version,
-            &QueueFailure {
-                stage: input.stage,
-                code: input.code,
-                message: input.message,
-                rounds_used: input.rounds_used,
-                context_tokens: input.context_tokens,
-                context_window_tokens: input.context_window_tokens,
-            },
-        )
-        .map_err(ApiError::queue)?;
-    Ok(Json(mirror_queue_job(&db, &job)?))
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
+    Ok(Json(fail_ingress_transition(&mut db, &id, &input)?))
 }
 
 async fn retry_ingress(
@@ -1534,18 +1907,14 @@ async fn retry_ingress(
     AxumPath(id): AxumPath<String>,
     Json(input): Json<RetryIngress>,
 ) -> Result<Json<IngressPieceRecord>, ApiError> {
-    let db = state.db.lock().map_err(ApiError::internal)?;
+    let mut db = state.db.lock().map_err(ApiError::internal)?;
     let existing = fetch_piece(&db, &id)?;
-    let job = state
-        .queue
-        .retry(
-            SourceKind::Audio,
-            &id,
-            input.expected_version,
-            input.state.as_ref().unwrap_or(&existing.state),
-        )
-        .map_err(ApiError::queue)?;
-    Ok(Json(mirror_queue_job(&db, &job)?))
+    Ok(Json(retry_ingress_transition(
+        &mut db,
+        &id,
+        input.expected_version,
+        input.state.as_ref().unwrap_or(&existing.state),
+    )?))
 }
 
 #[cfg(test)]
@@ -1557,6 +1926,43 @@ mod tests {
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         apply_migrations(&db).unwrap();
         db
+    }
+
+    fn insert_ready_piece(
+        db: &Connection,
+        recording_id: &str,
+        piece_id: &str,
+        sha_character: char,
+        source_created_at: &str,
+        piece_index: i64,
+    ) {
+        db.execute(
+            "INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning)
+             VALUES(?1,?2,?3,'audio/wav',10,?4,?4,?4,?5,'ready_for_ingress',?6,?7,?8)",
+            params![
+                recording_id,
+                sha_character.to_string().repeat(64),
+                format!("{recording_id}.wav"),
+                source_created_at,
+                format!("originals/{recording_id}.wav"),
+                TRANSCRIPTION_MODEL,
+                RECONCILIATION_MODEL,
+                RECONCILIATION_REASONING
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,1,'ingress_pending',?5,?5)",
+            params![
+                piece_id,
+                recording_id,
+                piece_index,
+                format!("piece {piece_index}"),
+                source_created_at
+            ],
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1610,7 +2016,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES('next','r',1,'text',1,'ingress_in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
     }
@@ -1669,25 +2075,284 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 
     #[test]
-    fn prepared_audio_pieces_are_adopted_by_the_shared_queue_in_piece_order() {
+    fn prepared_audio_pieces_are_selected_directly_in_piece_order() {
         let db = database();
         db.execute("INSERT INTO audio_recordings(id,sha256,original_filename,content_type,size_bytes,source_created_at,received_at,updated_at,original_relative_path,status,gemini_model,reconciliation_model,reconciliation_reasoning) VALUES('r',?1,'note.wav','audio/wav',10,'2026-01-01T00:00:00Z','2026-07-01T00:00:00Z','2026-07-01T00:00:00Z','originals/x.wav','ready_for_ingress',?2,?3,?4)",params!["a".repeat(64),TRANSCRIPTION_MODEL,RECONCILIATION_MODEL,RECONCILIATION_REASONING]).unwrap();
         for (id, index) in [("later", 1), ("first", 0)] {
             db.execute("INSERT INTO audio_ingress_pieces(id,recording_id,piece_index,transcript_text,estimated_tokens,phase,created_at,updated_at) VALUES(?1,'r',?2,?3,1,'ingress_pending','2026-07-01T00:00:00Z','2026-07-01T00:00:00Z')",params![id,index,format!("piece {index}")]).unwrap();
         }
-        let queue = Queue::open(std::path::Path::new(":memory:")).unwrap();
 
-        import_legacy_ingress(&db, &queue).unwrap();
+        let next = select_next_ingress_piece(&db).unwrap().unwrap();
+        assert_eq!(next.id, "first");
+        assert_eq!(next.piece_index, 0);
+    }
 
-        let next = queue.next().unwrap().unwrap();
-        assert_eq!(next.source_kind, SourceKind::Audio);
-        assert_eq!(next.source_id, "first");
-        assert_eq!(next.source_position, 0);
+    #[test]
+    fn claims_require_the_current_protocol_and_one_active_piece() {
+        let mut db = database();
+        insert_ready_piece(
+            &db,
+            "recording-a",
+            "piece-a",
+            'a',
+            "2026-01-01T00:00:00Z",
+            0,
+        );
+        insert_ready_piece(
+            &db,
+            "recording-b",
+            "piece-b",
+            'b',
+            "2026-01-02T00:00:00Z",
+            0,
+        );
+        let old_protocol = start_ingress_transition(
+            &mut db,
+            "piece-a",
+            &StartIngress {
+                expected_version: 1,
+                provenance_id: "session:audio:piece-a".into(),
+                completion_protocol: Some("one-session-transaction-v1".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(old_protocol.status, StatusCode::CONFLICT);
+
+        let active = start_ingress_transition(
+            &mut db,
+            "piece-a",
+            &StartIngress {
+                expected_version: 1,
+                provenance_id: "session:audio:piece-a".into(),
+                completion_protocol: Some(COMPLETION_PROTOCOL.into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(active.phase, "ingress_in_progress");
+        let replayed = start_ingress_transition(
+            &mut db,
+            "piece-a",
+            &StartIngress {
+                expected_version: 1,
+                provenance_id: "session:audio:piece-a".into(),
+                completion_protocol: Some(COMPLETION_PROTOCOL.into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(replayed.version, active.version);
+        assert_eq!(
+            select_next_ingress_piece(&db).unwrap().unwrap().id,
+            "piece-a"
+        );
+
+        let conflict = start_ingress_transition(
+            &mut db,
+            "piece-b",
+            &StartIngress {
+                expected_version: 1,
+                provenance_id: "session:audio:piece-b".into(),
+                completion_protocol: Some(COMPLETION_PROTOCOL.into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn checkpoint_failure_retry_and_completion_remain_one_state_machine() {
+        let mut db = database();
+        insert_ready_piece(&db, "recording", "piece", 'a', "2026-01-01T00:00:00Z", 0);
+        let active = start_ingress_transition(
+            &mut db,
+            "piece",
+            &StartIngress {
+                expected_version: 1,
+                provenance_id: "session:audio:piece".into(),
+                completion_protocol: Some(COMPLETION_PROTOCOL.into()),
+            },
+        )
+        .unwrap();
+        let checkpoint = checkpoint_ingress_transition(
+            &mut db,
+            "piece",
+            &CheckpointIngress {
+                expected_version: active.version,
+                state: json!({"historyIngress":{"tools":{"log":[]}}}),
+            },
+        )
+        .unwrap();
+        let pending = fail_ingress_transition(
+            &mut db,
+            "piece",
+            &RecordIngressFailure {
+                expected_version: checkpoint.version,
+                stage: "generation".into(),
+                code: None,
+                message: "temporary".into(),
+                rounds_used: None,
+                context_tokens: None,
+                context_window_tokens: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(pending.phase, "ingress_pending");
+        assert_eq!(pending.ingress_failure_count, 1);
+        assert!(pending.next_attempt_at.is_some());
+        assert!(select_next_ingress_piece(&db).unwrap().is_none());
+
+        db.execute(
+            "UPDATE audio_ingress_pieces SET next_attempt_at=NULL WHERE id='piece'",
+            [],
+        )
+        .unwrap();
+        let active = start_ingress_transition(
+            &mut db,
+            "piece",
+            &StartIngress {
+                expected_version: pending.version,
+                provenance_id: "session:audio:piece".into(),
+                completion_protocol: Some(COMPLETION_PROTOCOL.into()),
+            },
+        )
+        .unwrap();
+        let committed = checkpoint_ingress_transition(
+            &mut db,
+            "piece",
+            &CheckpointIngress {
+                expected_version: active.version,
+                state: json!({"historyIngress":{"completed":true,"sessionObjectId":"AAECAwQF"}}),
+            },
+        )
+        .unwrap();
+        let complete = complete_ingress_transition(
+            &mut db,
+            "piece",
+            &VersionedTransition {
+                expected_version: committed.version,
+            },
+        )
+        .unwrap();
+        assert_eq!(complete.phase, "complete");
+        assert!(select_next_ingress_piece(&db).unwrap().is_none());
+        assert_eq!(
+            fetch_recording(&db, "recording").unwrap().status,
+            "complete"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_retry_preserves_diagnostics_and_resets_attempts() {
+        let mut db = database();
+        insert_ready_piece(&db, "recording", "piece", 'a', "2026-01-01T00:00:00Z", 0);
+        let failed = fail_ingress_transition(
+            &mut db,
+            "piece",
+            &RecordIngressFailure {
+                expected_version: 1,
+                stage: "model_loop".into(),
+                code: Some("input_too_large".into()),
+                message: "too large".into(),
+                rounds_used: Some(1),
+                context_tokens: Some(60_000),
+                context_window_tokens: Some(50_000),
+            },
+        )
+        .unwrap();
+        assert_eq!(failed.phase, "ingress_failed");
+        assert_eq!(failed.ingress_failures.as_array().unwrap().len(), 1);
+
+        let retried =
+            retry_ingress_transition(&mut db, "piece", failed.version, &failed.state).unwrap();
+        assert_eq!(retried.phase, "ingress_pending");
+        assert_eq!(retried.ingress_failure_count, 0);
+        assert_eq!(retried.ingress_failures.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn completion_evidence_supports_current_and_legacy_checkpoints() {
+        assert!(has_successful_final_commit(
+            &json!({"historyIngress":{"completed":true,"sessionObjectId":"AAECAwQF"}})
+        ));
+        assert!(!has_successful_final_commit(
+            &json!({"historyIngress":{"completed":true,"sessionObjectId":null}})
+        ));
+        assert!(!has_successful_final_commit(
+            &json!({"historyIngress":{"completed":false,"sessionObjectId":"AAECAwQF"}})
+        ));
+        assert!(has_successful_final_commit(
+            &json!({"historyIngress":{"tools":{"log":[{"name":"EndSession","ok":true}]}}})
+        ));
+    }
+
+    #[test]
+    fn retired_memory_queue_is_adopted_once() {
+        let root =
+            std::env::temp_dir().join(format!("kennedy-audio-queue-migration-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let legacy_path = root.join("memory-ingress.sqlite3");
+        let legacy = Connection::open(&legacy_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE memory_ingress_jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                source_created_at TEXT NOT NULL,
+                source_position INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                provenance_id TEXT,
+                state_json TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                failure_count INTEGER NOT NULL,
+                failures_json TEXT NOT NULL,
+                next_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO memory_ingress_jobs VALUES(
+                'audio:piece','audio','piece','2026-01-01T00:00:00Z',0,
+                'ingress_in_progress','session:audio:piece',
+                '{\"historyIngress\":{\"tools\":{\"log\":[]}}}',7,2,
+                '[{\"attempt\":1}]',NULL,
+                '2026-01-01T00:00:00Z','2026-01-02T00:00:00Z'
+             );",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let mut db = database();
+        insert_ready_piece(&db, "recording", "piece", 'a', "2026-01-01T00:00:00Z", 0);
+        migrate_legacy_memory_ingress(&mut db, Some(&legacy_path)).unwrap();
+        let adopted = fetch_piece(&db, "piece").unwrap();
+        assert_eq!(adopted.phase, "ingress_in_progress");
+        assert_eq!(adopted.version, 7);
+        assert_eq!(adopted.ingress_failure_count, 2);
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM audio_ingress_migrations WHERE name=?1",
+                [LEGACY_QUEUE_MIGRATION],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+
+        let legacy = Connection::open(&legacy_path).unwrap();
+        legacy
+            .execute(
+                "UPDATE memory_ingress_jobs SET version=99 WHERE source_id='piece'",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+        migrate_legacy_memory_ingress(&mut db, Some(&legacy_path)).unwrap();
+        assert_eq!(fetch_piece(&db, "piece").unwrap().version, 7);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

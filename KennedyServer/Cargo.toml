@@ -16,7 +16,6 @@ flate2.workspace = true
 hex.workspace = true
 kennedy-audio-ingress = { path = "../AudioIngress" }
 kennedy-conversation-history = { path = "../ConversationHistory" }
-kennedy-memory-ingress = { path = "../MemoryIngress" }
 kcode-audio-transcribe.workspace = true
 kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true

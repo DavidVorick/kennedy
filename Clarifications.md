@@ -45,8 +45,8 @@ canonical documents; this file is not an append-only log.
   Kennedy starts a new job from the retained original and may repeat provider
   work.
 - `kcode-audio-transcribe` owns transcription only. It has no Kennedy HTTP,
-  Chatend, Kmap, provenance, or MemoryIngress behavior. Kennedy alone persists
-  the final transcript, maps it into MemoryIngress jobs, and builds and
+  Chatend, Kmap, provenance, or memory-ingress behavior. AudioIngress persists
+  the final transcript and ordered queue pieces; KennedyServer builds and
   checkpoints the audio-ingress Chatend.
 
 ## Repository-Local Runtime Data
@@ -82,11 +82,11 @@ canonical documents; this file is not an append-only log.
   identity through in-process service handles. HTTP remains a browser adapter;
   the published Telegram relay remains the sole temporary loopback exception
   until its crate exposes an in-process service API.
-- Use one durable memory-ingress queue for conversation Chatend archives and
-  prepared audio transcript pieces. The source libraries submit ordered jobs;
-  the shared queue alone owns claiming, provenance binding, checkpoints,
-  retries, failures, and completion. Keep source-record fields as compatibility
-  mirrors while existing browser APIs still expose them.
+- Keep prepared audio transcript pieces and their complete claim, provenance,
+  checkpoint, retry, failure, and completion lifecycle in the AudioIngress
+  database. Conversation history ingress remains in its source session log.
+  KennedyServer's one writer lane, rather than a shared persistence queue,
+  serializes both sources.
 
 ## Kmap DB Core
 
@@ -120,9 +120,12 @@ canonical documents; this file is not an append-only log.
 ## Offline Backups
 
 - `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
-  all five application SQLite databases, including the shared memory-ingress
-  queue, the complete transactional Kweb root and audio-ingress media tree, and the
-  encrypted credential vault when present.
+  the application SQLite databases, including the AudioIngress database and
+  its queue, the complete transactional Kweb root and audio-ingress media tree,
+  and the encrypted credential vault when present.
+  If the retired standalone queue file still exists, include it as an optional
+  read-only upgrade source so a backup taken before first version-5 startup
+  cannot omit pre-adoption checkpoints.
   Each archive is self-describing: its README starts with the creating commit
   hash and records the exact schemas and current data-format semantics.
 - Backups are deliberately offline. Before reading persistent data, the backup
@@ -609,9 +612,10 @@ canonical documents; this file is not an append-only log.
 - Add a browser `Send & end` action that checkpoints one final user message
   without generating a Kennedy response, then immediately queues the complete
   Chatend for history ingress.
-- Keep memory-ingress lifecycle orchestration outside the frontend. The shared
-  MemoryIngress service owns cross-source queue selection, claims, checkpoints,
-  retries, failures, and completion.
+- Keep memory-ingress lifecycle orchestration outside the frontend.
+  AudioIngress owns audio queue selection, claims, checkpoints, retries,
+  failures, and completion; Session History owns conversation ingress state.
+  KennedyServer serializes their Kweb writes.
 
 ## Autonomous Self Time
 
@@ -803,17 +807,15 @@ canonical documents; this file is not an append-only log.
   current context-window occupancy, not cumulative tokens consumed across the
   provider thread. Keep cumulative token totals separate as usage telemetry.
 
-## AudioIngress and MemoryIngress Boundary
+## Unified AudioIngress Boundary
 
-- `kennedy-audio-ingress` remains Kennedy-specific and accepts a
-  `kennedy-memory-ingress` queue, but it owns only durable audio intake,
-  delegation to the external transcriber, and persistence and preparation of
-  the final transcript. Its interaction with MemoryIngress ends after inserting
-  the immutable transcript payload or ordered transcript pieces into that queue.
-- MemoryIngress owns the submitted payload and every later claim, checkpoint,
-  retry, failure, repair, and completion transition. The orchestration worker
-  must consume audio payloads directly from MemoryIngress instead of fetching
-  pieces from, or proxying lifecycle operations through, AudioIngress.
+- `kennedy-audio-ingress` owns durable audio intake, delegation to the external
+  transcriber, the final transcript, immutable ordered transcript pieces, and
+  every later audio claim, checkpoint, retry, failure, repair, and completion
+  transition in one SQLite database.
+- KennedyServer consumes complete audio pieces directly from AudioIngress and
+  owns the model loop, session-log/Kweb commit, and global writer lane.
+  Conversation and self-time ingress never use the audio queue.
 
 ## Kweb DB 1.0 Migration Direction
 

@@ -24,9 +24,11 @@ Kennedy is one Rust server with deliberately separated library domains:
    policy, the one Kweb writer lane, Kweb HTTP routes, roots, the credential
    vault, and static assets.
 5. `kennedy-audio-ingress` and `kcode-audio-transcribe` own durable audio
-   intake and transcription.
-6. `kennedy-memory-ingress` retains prepared audio work. Conversational
-   history ingress now uses the same session log as its source session.
+   intake and transcription. The AudioIngress database also owns prepared
+   transcript pieces and their complete memory-ingress queue lifecycle.
+6. Conversational history ingress uses the same session log as its source
+   session; KennedyServer serializes it with audio work through the global
+   Kweb writer lane.
 7. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
 8. The browser frontend is an observer and command client only.
 

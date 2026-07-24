@@ -639,30 +639,13 @@ impl Orchestrator {
             .await;
             return Ok(());
         }
-        let Some(job) = self.api.next_memory_ingress()? else {
+        let Some(piece) = self.api.next_audio_ingress()? else {
             return Ok(());
         };
-        match job.source_kind {
-            kennedy_memory_ingress::SourceKind::Conversation => {
-                anyhow::bail!(
-                    "legacy conversation memory-ingress job {} remained after the Session History cutover",
-                    job.source_id
-                );
-            }
-            kennedy_memory_ingress::SourceKind::Audio => {
-                let piece = self
-                    .api
-                    .audio_get(&format!(
-                        "/api/v1/audio-ingress/pieces/{}",
-                        encode_path(&job.source_id)
-                    ))
-                    .await?;
-                self.launch_writer_job("audio ingress", move |worker| async move {
-                    worker.process_audio_ingress(piece).await
-                })
-                .await;
-            }
-        }
+        self.launch_writer_job("audio ingress", move |worker| async move {
+            worker.process_audio_ingress(piece).await
+        })
+        .await;
         Ok(())
     }
 
@@ -859,7 +842,7 @@ impl Orchestrator {
                         json!({
                             "expected_version":version(&piece)?,
                             "provenance_id":format!("session:audio:{id}"),
-                            "completion_protocol":kennedy_memory_ingress::COMPLETION_PROTOCOL
+                            "completion_protocol":kennedy_audio_ingress::COMPLETION_PROTOCOL
                         }),
                     )
                     .await?;

@@ -17,8 +17,9 @@ orchestrator; the browser does not run Kennedy.
   orchestration, Ktools, Kweb graph policy, credential handling, the global
   Kweb writer lane, HTTP adapters, and static frontend serving.
 - `Frontend/public` is a browser-native observer and command client.
-- `AudioIngress`, `MemoryIngress`, and the Telegram crate own their specialized
-  durable intake streams.
+- `AudioIngress` owns durable audio intake, transcription state, prepared
+  transcript pieces, and the audio memory-ingress queue. The Telegram crate
+  owns its durable intake stream.
 
 Every provider-visible item is a Chatend box. Boxes can be hydrated,
 dehydrated, summarized, or stale. Kennedy controls their representation. There

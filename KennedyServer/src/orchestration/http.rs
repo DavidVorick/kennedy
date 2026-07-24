@@ -24,7 +24,6 @@ pub(crate) struct LocalServices {
     pub history: kennedy_conversation_history::Service,
     pub audio: kennedy_audio_ingress::Service,
     pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
-    pub memory_ingress: kennedy_memory_ingress::Queue,
     pub rust_lib_tools: crate::rust_lib_tools::RustLibToolService,
 }
 
@@ -558,14 +557,14 @@ impl Api {
         }
     }
 
-    pub fn next_memory_ingress(&self) -> Result<Option<kennedy_memory_ingress::Job>, ApiError> {
+    pub fn next_audio_ingress(&self) -> Result<Option<Value>, ApiError> {
         match &self.services {
-            ServiceBackend::Local(local) => local.memory_ingress.next().map_err(queue_error),
+            ServiceBackend::Local(local) => local.audio.next_ingress_piece().map_err(audio_error),
             #[cfg(test)]
             ServiceBackend::Http(_) => Err(ApiError {
                 status: None,
                 code: "local_service_unavailable".into(),
-                message: "The shared memory-ingress queue is unavailable in HTTP test mode.".into(),
+                message: "The audio-ingress queue is unavailable in HTTP test mode.".into(),
             }),
         }
     }
@@ -730,21 +729,6 @@ fn audio_error(error: kennedy_audio_ingress::ServiceError) -> ApiError {
     ApiError {
         status: StatusCode::from_u16(error.status).ok(),
         code: error.code.into(),
-        message: error.message,
-    }
-}
-
-fn queue_error(error: kennedy_memory_ingress::Error) -> ApiError {
-    use kennedy_memory_ingress::ErrorKind;
-    let status = match error.kind {
-        ErrorKind::Invalid => StatusCode::BAD_REQUEST,
-        ErrorKind::NotFound => StatusCode::NOT_FOUND,
-        ErrorKind::Conflict => StatusCode::CONFLICT,
-        ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    ApiError {
-        status: Some(status),
-        code: "memory_ingress_error".into(),
         message: error.message,
     }
 }

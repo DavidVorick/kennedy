@@ -2125,7 +2125,6 @@ dependencies = [
  "axum",
  "chrono",
  "kcode-audio-transcribe",
- "kennedy-memory-ingress",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2149,18 +2148,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "kennedy-memory-ingress"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "rusqlite",
- "serde",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -2188,7 +2175,6 @@ dependencies = [
  "kcode-web-fetch",
  "kennedy-audio-ingress",
  "kennedy-conversation-history",
- "kennedy-memory-ingress",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rpassword",

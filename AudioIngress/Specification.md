@@ -64,14 +64,14 @@ reconciliation model attribution in the transcript header.
 
 ## Kennedy ingress queue
 
-Every prepared piece submits its source ID, recording timestamp, and piece
-index to `kennedy-memory-ingress`. That shared queue owns the optimistic
-version, provenance ID, complete history-ingress checkpoint, concise failure
-history, retry schedule, and the single global claim across audio and
-conversation sources. It resumes an in-progress job first, otherwise choosing
-the oldest source and lowest piece index. A failed Kennedy turn is eligible for
+Every prepared piece is inserted into `audio_ingress_pieces` in the same
+transaction that stores the final transcript. That table owns the immutable
+payload, optimistic version, provenance ID, complete history-ingress
+checkpoint, concise failure history, retry schedule, and the single audio
+claim. It resumes an in-progress piece first, otherwise choosing the oldest
+recording and lowest piece index. A failed Kennedy turn is eligible for
 retry after a durable 15-second delay. Every nonterminal failure releases the
-global claim so other conversation or recording work can proceed. The fifth consecutive
+claim so other recording work can proceed. The fifth consecutive
 failure remains terminal, but the UI can explicitly requeue the preserved
 piece; doing so keeps the old diagnostics while resetting the
 consecutive-failure counter. A provider input-size rejection is known to be
@@ -115,3 +115,8 @@ HTTP routes.
 Terminal retry preserves the transcript, provenance, and diagnostic log. The
 caller may replace the opaque frontend state so an exhausted model checkpoint
 can be discarded before the piece returns to the durable ingress queue.
+
+On the first version-5 startup, AudioIngress adopts matching audio jobs from
+the retired `kennedy-memory-ingress.sqlite3` database. The retired database is
+read only as a one-time migration source; conversation rows remain legacy
+archive material and are never admitted to the audio queue.

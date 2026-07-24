@@ -62,11 +62,12 @@ struct Args {
     #[arg(long, global = true, default_value = "./data/kennedy-audio.sqlite3")]
     audio_ingress_database: PathBuf,
     #[arg(
-        long,
+        long = "memory-ingress-database",
         global = true,
-        default_value = "./data/kennedy-memory-ingress.sqlite3"
+        default_value = "./data/kennedy-memory-ingress.sqlite3",
+        help = "Retired queue database used only for one-time audio adoption and legacy maintenance"
     )]
-    memory_ingress_database: PathBuf,
+    legacy_memory_ingress_database: PathBuf,
     #[arg(long, global = true, default_value = "./data/audio-ingress-media")]
     audio_ingress_media: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
@@ -170,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 telegram_database: args.telegram_database,
                 user_database: args.user_database,
                 audio_database: args.audio_ingress_database,
-                memory_ingress_database: args.memory_ingress_database,
+                legacy_memory_ingress_database: Some(args.legacy_memory_ingress_database),
                 audio_media_directory: args.audio_ingress_media,
                 vault: vault_path,
             })
@@ -206,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
                 legacy_artifacts,
                 identity_database: args.user_database,
                 conversation_database: args.conversation_history_database,
-                memory_ingress_database: args.memory_ingress_database,
+                memory_ingress_database: args.legacy_memory_ingress_database,
                 archive_directory,
             })?;
             println!(
@@ -233,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
             });
             let result = legacy_session_archive::run(&legacy_session_archive::ArchiveOptions {
                 conversation_database: args.conversation_history_database,
-                memory_ingress_database: args.memory_ingress_database,
+                memory_ingress_database: args.legacy_memory_ingress_database,
                 archive_directory,
                 session_directory: args.session_directory,
                 session_history_file: args.session_history_file,
@@ -297,8 +298,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let kmap_service = kmap_http::Service::new(kmap, system_roots, &args.user_database)?;
     let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT, crates_io_key)
         .with_context(|| format!("opening managed Rust libraries root {RUST_LIBS_ROOT}"))?;
-    let memory_ingress = kennedy_memory_ingress::Queue::open(&args.memory_ingress_database)
-        .context("opening shared memory-ingress queue")?;
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
@@ -339,11 +338,11 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let audio_service = kennedy_audio_ingress::open(
         kennedy_audio_ingress::Config {
             database: args.audio_ingress_database,
+            legacy_memory_ingress_database: Some(args.legacy_memory_ingress_database),
             media_directory: args.audio_ingress_media,
             max_upload_bytes: args.audio_ingress_max_upload_bytes,
         },
         audio_transcriber,
-        memory_ingress.clone(),
     )
     .await?;
     let audio_ingress_router = kennedy_audio_ingress::router(audio_service.clone());
@@ -368,7 +367,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             history: history_service,
             audio: audio_service,
             directory: telegram_identity.clone(),
-            memory_ingress,
             rust_lib_tools,
         },
     )?;
@@ -399,7 +397,6 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.telegram_database,
         &args.user_database,
         &args.audio_ingress_database,
-        &args.memory_ingress_database,
         &args.audio_ingress_media,
     ] {
         let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) else {
@@ -739,7 +736,7 @@ mod tests {
             telegram_database: telegram.clone(),
             user_database: users.clone(),
             audio_ingress_database: audio.clone(),
-            memory_ingress_database: memory_ingress.clone(),
+            legacy_memory_ingress_database: memory_ingress.clone(),
             audio_ingress_media: audio_media.clone(),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
