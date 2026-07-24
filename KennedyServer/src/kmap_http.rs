@@ -1553,6 +1553,60 @@ mod tests {
     }
 
     #[test]
+    fn session_commit_preserves_legacy_node_text_outside_live_kennedy_policy() {
+        let directory = std::env::temp_dir().join(format!(
+            "kennedy-session-legacy-node-text-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let identity = directory.join("users.sqlite3");
+        let (database, roots) = initialize(&directory.join("kweb"), config(), &identity).unwrap();
+        let service = Service::new(database, roots, &identity).unwrap();
+        let pending_node = "pending:7".to_owned();
+        let long_description = std::iter::repeat_n("a", 3_001)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(long_description.chars().count() > 5_000);
+        assert!(long_description.split_whitespace().count() > 1_000);
+
+        let result = service
+            .commit_session(SessionCommit {
+                session_id: "legacy-node-text".into(),
+                author: "test-model".into(),
+                source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                archive: b"{\"session\":\"sealed-before-policy-change\"}".to_vec(),
+                objects: Vec::new(),
+                creates: vec![SessionNodeCreate {
+                    pending_id: pending_node.clone(),
+                    data: SessionNodeData {
+                        short_name: String::new(),
+                        short_description: "x".repeat(201),
+                        long_description: long_description.clone(),
+                        owner: "self".into(),
+                        fixed_connections: Vec::new(),
+                        recent_connections: Vec::new(),
+                        objects: Vec::new(),
+                        include_session_object: true,
+                    },
+                }],
+                updates: Vec::new(),
+            })
+            .unwrap();
+        let created = service
+            .database
+            .get_node(result.node_ids[&pending_node].parse().unwrap())
+            .unwrap();
+        assert_eq!(created.data.short_name, "");
+        assert_eq!(created.data.short_description.chars().count(), 201);
+        assert_eq!(created.data.long_description, long_description);
+
+        drop(service);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn session_commit_replay_returns_the_original_receipt_without_a_second_transaction() {
         let directory = std::env::temp_dir().join(format!(
             "kennedy-session-commit-replay-{}",

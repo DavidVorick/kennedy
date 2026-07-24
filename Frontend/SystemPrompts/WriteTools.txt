@@ -12,7 +12,7 @@ SetFixedConnection
 
 CreateNode
   Call: {"parentIdentifiers":["AAECAwQF","AAECAwQG"],"ownerIdentifier":"AAECAwQH","shortName":"New Memory","shortDescription":"Short description.","longDescription":"Complete durable knowledge."}
-  Requires one or more distinct, fully available parent nodes and a fully available owner. It stages a node and returns a stable session-local ID such as pending:47. Later staged operations may use that pending ID. The short name is 4–50 characters, the short description is at most 200 characters, and the long description is at most 1000 words.
+  Requires one or more distinct, fully available parent nodes and a fully available owner. It stages a node and returns a stable session-local ID such as pending:47. Later staged operations may use that pending ID. The short name is 4–50 characters, the short description is at most 200 characters, and the long description is at most 5,000 characters. A field-limit error rejects only that staged tool update so you can correct the field and retry during the same session.
 
 UpdateNode
   Call: {"identifier":"AAECAwQF","ownerIdentifier":"AAECAwQH","newShortName":"Updated Memory","newShortDescription":"Updated description.","newLongDescription":"Complete updated durable knowledge."}

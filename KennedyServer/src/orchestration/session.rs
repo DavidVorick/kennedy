@@ -40,6 +40,10 @@ const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
 const BROWSER_CONVERSATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INLINE_TOOL_INVOCATION_CHARACTERS: usize = 1_000;
+const MIN_NODE_SHORT_NAME_CHARACTERS: usize = 4;
+const MAX_NODE_SHORT_NAME_CHARACTERS: usize = 50;
+const MAX_NODE_SHORT_DESCRIPTION_CHARACTERS: usize = 200;
+const MAX_NODE_LONG_DESCRIPTION_CHARACTERS: usize = 5_000;
 const KWEB_TOOL_INSTANCE: &str = "kweb";
 const HISTORY_TOOL_INSTANCE: &str = "history";
 const RUST_LIB_TOOL_INSTANCE: &str = "managed-rust-libraries";
@@ -2878,6 +2882,8 @@ impl Session {
             ],
             &[],
         )?;
+        let (short_name, short_description, long_description) =
+            node_text_arguments(args, "shortName", "shortDescription", "longDescription")?;
         let parents = resource_id_array(args, "parentIdentifiers", 1)?;
         let owner = resource_id(args, "ownerIdentifier")?;
         for id in parents.iter().chain(std::iter::once(&owner)) {
@@ -2889,9 +2895,9 @@ impl Session {
         self.plan.creates.push(SessionNodeCreate {
             pending_id: pending.clone(),
             data: SessionNodeData {
-                short_name: string_value(args, "shortName")?,
-                short_description: string_value(args, "shortDescription")?,
-                long_description: string_value(args, "longDescription")?,
+                short_name,
+                short_description,
+                long_description,
                 owner,
                 fixed_connections: Vec::new(),
                 recent_connections: parents.clone(),
@@ -2921,6 +2927,12 @@ impl Session {
             ],
             &[],
         )?;
+        let (short_name, short_description, long_description) = node_text_arguments(
+            args,
+            "newShortName",
+            "newShortDescription",
+            "newLongDescription",
+        )?;
         let id = resource_id(args, "identifier")?;
         let owner = resource_id(args, "ownerIdentifier")?;
         self.ensure_known_node(&id)?;
@@ -2929,9 +2941,9 @@ impl Session {
         }
         let mut data = self.node_data(&id)?;
         data.owner = owner;
-        data.short_name = string_value(args, "newShortName")?;
-        data.short_description = string_value(args, "newShortDescription")?;
-        data.long_description = string_value(args, "newLongDescription")?;
+        data.short_name = short_name;
+        data.short_description = short_description;
+        data.long_description = long_description;
         data.include_session_object = true;
         self.put_node_data(&id, data)?;
         self.stage_plan()?;
@@ -3432,6 +3444,38 @@ fn string_value(value: &Value, key: &str) -> anyhow::Result<String> {
         .with_context(|| format!("{key} must be a string"))
 }
 
+fn node_text_arguments(
+    value: &Value,
+    short_name_key: &str,
+    short_description_key: &str,
+    long_description_key: &str,
+) -> anyhow::Result<(String, String, String)> {
+    let short_name = string_value(value, short_name_key)?;
+    let short_description = string_value(value, short_description_key)?;
+    let long_description = string_value(value, long_description_key)?;
+    let short_name_characters = short_name.chars().count();
+    let short_description_characters = short_description.chars().count();
+    let long_description_characters = long_description.chars().count();
+    anyhow::ensure!(
+        (MIN_NODE_SHORT_NAME_CHARACTERS..=MAX_NODE_SHORT_NAME_CHARACTERS)
+            .contains(&short_name_characters),
+        "{short_name_key} must contain between {MIN_NODE_SHORT_NAME_CHARACTERS} and \
+         {MAX_NODE_SHORT_NAME_CHARACTERS} characters; received {short_name_characters}. \
+         Correct it and retry."
+    );
+    anyhow::ensure!(
+        short_description_characters <= MAX_NODE_SHORT_DESCRIPTION_CHARACTERS,
+        "{short_description_key} must be at most {MAX_NODE_SHORT_DESCRIPTION_CHARACTERS} \
+         characters; received {short_description_characters}. Shorten it and retry."
+    );
+    anyhow::ensure!(
+        long_description_characters <= MAX_NODE_LONG_DESCRIPTION_CHARACTERS,
+        "{long_description_key} must be at most {MAX_NODE_LONG_DESCRIPTION_CHARACTERS} \
+         characters; received {long_description_characters}. Shorten it and retry."
+    );
+    Ok((short_name, short_description, long_description))
+}
+
 fn nonempty_string(value: &Value, key: &str, max: usize) -> anyhow::Result<String> {
     let value = string_value(value, key)?;
     let trimmed = value.trim();
@@ -3610,6 +3654,76 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn node_text_policy_counts_unicode_characters_at_the_live_tool_boundary() {
+        let accepted_long_description = "🦀".repeat(MAX_NODE_LONG_DESCRIPTION_CHARACTERS);
+        let accepted = node_text_arguments(
+            &json!({
+                "shortName":"Four",
+                "shortDescription":"A concise summary.",
+                "longDescription":accepted_long_description,
+            }),
+            "shortName",
+            "shortDescription",
+            "longDescription",
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.2.chars().count(),
+            MAX_NODE_LONG_DESCRIPTION_CHARACTERS
+        );
+        assert!(accepted.2.len() > MAX_NODE_LONG_DESCRIPTION_CHARACTERS);
+
+        let error = node_text_arguments(
+            &json!({
+                "shortName":"Four",
+                "shortDescription":"",
+                "longDescription":"🦀".repeat(MAX_NODE_LONG_DESCRIPTION_CHARACTERS + 1),
+            }),
+            "shortName",
+            "shortDescription",
+            "longDescription",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("longDescription must be at most 5000 characters"));
+        assert!(error.contains("received 5001"));
+        assert!(error.contains("Shorten it and retry"));
+    }
+
+    #[test]
+    fn node_text_policy_reports_create_and_update_field_names() {
+        let short_name_error = node_text_arguments(
+            &json!({
+                "newShortName":"abc",
+                "newShortDescription":"",
+                "newLongDescription":"",
+            }),
+            "newShortName",
+            "newShortDescription",
+            "newLongDescription",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(short_name_error.contains("newShortName"));
+        assert!(short_name_error.contains("received 3"));
+
+        let short_description_error = node_text_arguments(
+            &json!({
+                "shortName":"Valid name",
+                "shortDescription":"x".repeat(MAX_NODE_SHORT_DESCRIPTION_CHARACTERS + 1),
+                "longDescription":"",
+            }),
+            "shortName",
+            "shortDescription",
+            "longDescription",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(short_description_error.contains("shortDescription"));
+        assert!(short_description_error.contains("received 201"));
     }
 
     #[test]

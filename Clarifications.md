@@ -100,13 +100,22 @@ canonical documents; this file is not an append-only log.
 
 ## Kmap DB Core
 
-- Kennedy uses the published, exact-pinned `kcode-kweb-db` 1.0 crate. The
+- Kennedy uses the published `kcode-kweb-db` 1.x crate through a compatible
+  Cargo version requirement; `Cargo.lock` records the reviewed release used by
+  reproducible builds without making the manifest an exact dependency pin. The
   retired `kweb-db-core` SQLite database is not a runtime dependency.
   `kennedy-server` owns the application adapter and root/user policy.
 - `NodeData` atomically replaces the complete node: text, owner, ordered fixed
   connections, ordered recent connections, and object references. The core
   assigns no active/fanout, slot, root-role, user, or policy meaning and imposes
   no application-level connection-count limits.
+- KennedyServer enforces node-text policy while the write session is still
+  open: short names contain 4–50 Unicode characters, short descriptions at
+  most 200, and long descriptions at most 5,000. `CreateNode` or `UpdateNode`
+  rejects an invalid field without changing the staged Kweb plan so Kennedy can
+  correct and retry it in-session. Final session commit and `kcode-kweb-db` do
+  not re-enforce these application limits; sealed historical sessions remain
+  commit-compatible.
 - The Kweb is a canonical binary on-disk store rooted at `data/kweb/`. Current
   nodes and immutable objects use two-level sharded files. History, accepted
   transactions, state, and the append-only transaction log are binary and
@@ -914,8 +923,9 @@ canonical documents; this file is not an append-only log.
   validation functionality belongs in separate Kennedy-owned tooling rather
   than new primary-library APIs. Test changes will likewise be requested later
   through separate narrowly scoped documents.
-- Publish the reviewed library as version `1.0.0`, then have Kennedy audit and
-  exact-pin that release before executing the data migration.
+- Publish the reviewed library as version `1.0.0`, then have Kennedy audit the
+  selected compatible 1.x release recorded in `Cargo.lock` before executing the
+  data migration.
 - The one-time live migration assigns every legacy node a fresh random
   canonical ID and uses an in-memory old/new table only long enough to
   translate owners, connections, application roots, and active-conversation
