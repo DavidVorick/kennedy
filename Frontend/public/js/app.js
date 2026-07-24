@@ -298,18 +298,27 @@ function conversationDiagnostic(record) {
   if (record.state?.boxes && !Array.isArray(record.state.boxes)) {
     return boxDiagnostic(record.state, "session Chatend");
   }
-  const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
   const archive = isSessionLogArchive(record.state?.archive)
     || record.state?.archive?.format === "kennedy-chatend"
     ? record.state.archive : null;
+  if (!archive && Array.isArray(record.state?.events)) {
+    return sessionLogDiagnostic({ events: record.state.events }, "session log");
+  }
+  const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
   return archivedDiagnostic(archive, "saved conversation", transcript);
 }
 
 function historyIngressDiagnostic(record) {
   const archive = record?.state?.historyIngress;
-  return archive?.format === "kennedy-chatend" && archive?.sessionType === "history-ingress"
-    ? archivedDiagnostic(archive, "history ingress")
-    : null;
+  if (archive?.format !== "kennedy-chatend" || archive?.sessionType !== "history-ingress") {
+    return null;
+  }
+  if (archive?.boxes || archive?.messages || isSessionLogArchive(archive)) {
+    return archivedDiagnostic(archive, "history ingress");
+  }
+  return Array.isArray(record.state?.events)
+    ? sessionLogDiagnostic({ events: record.state.events }, "history ingress")
+    : archivedDiagnostic(archive, "history ingress");
 }
 
 function ingressStatus(record, ingress) {

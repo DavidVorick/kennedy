@@ -305,12 +305,12 @@ order completed records without adding those application fields to the
 session-log header. This is lifecycle/index data, not generic session-log
 metadata.
 
-While a session is active, Session History's separate control journal may
-retain KennedyServer's latest explicitly enumerated Chatend presentation
-checkpoint so the browser can render the current box map and context
-projection. That checkpoint is a replaceable cache outside `session-log`;
-KennedyServer still rebuilds Chatend from the ordered session events, and the
-control journal is deleted after successful completion.
+While a session is active, Session History's separate control journal retains
+only lifecycle, command, and transaction-recovery state that cannot be
+reconstructed from `session-log`. It does not retain transcript, box,
+representation, context-projection, or rendered-Chatend snapshots. The browser
+renders the ordered log events, and KennedyServer rebuilds Chatend from those
+events. The control journal is deleted after successful completion.
 
 An explicitly abandoned session may be deleted after its abandonment decision
 is durable.

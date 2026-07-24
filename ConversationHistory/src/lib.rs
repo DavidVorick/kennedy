@@ -744,6 +744,7 @@ fn remove_partial_session_log_migration(
 pub fn open(config: Config) -> anyhow::Result<Service> {
     create_private_directory(&config.directory)?;
     migrate_legacy_journals(&config.directory)?;
+    compact_control_journals(&config.directory)?;
     if let Some(parent) = config
         .completed_list
         .parent()
@@ -1833,7 +1834,6 @@ fn control_state(value: &Value) -> Value {
         "rootNodeIds",
         "referenceRootNodeIds",
         "startedAt",
-        "transcript",
         "pendingTurn",
         "pendingExternalEventId",
         "roundsUsed",
@@ -1843,27 +1843,173 @@ fn control_state(value: &Value) -> Value {
         "commitAuthor",
         "kwebPlan",
         "startIdempotencyId",
-        "boxCount",
-        "eventCount",
-        "boxes",
-        "events",
-        "context",
-        "chatendText",
         "historyIngress",
     ];
     let mut output = Map::new();
     for key in KEYS {
         if let Some(item) = value.get(*key) {
-            if *key == "boxes" && !item.is_object() {
-                continue;
-            }
             if *key == "commitReceipt" && item.is_null() {
                 continue;
             }
-            output.insert((*key).into(), item.clone());
+            let item = if *key == "historyIngress" {
+                control_state(item)
+            } else {
+                item.clone()
+            };
+            output.insert((*key).into(), item);
         }
     }
     Value::Object(output)
+}
+
+fn compact_control_journals(directory: &FilePath) -> anyhow::Result<()> {
+    let mut paths = std::fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some(CONTROL_EXTENSION))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        compact_control_journal(&path)?;
+    }
+    Ok(())
+}
+
+fn compact_control_journal(path: &FilePath) -> anyhow::Result<()> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let original_bytes = file.metadata()?.len();
+    if original_bytes >= 16 * 1024 * 1024 {
+        tracing::info!(
+            path = %path.display(),
+            original_bytes,
+            "Compacting legacy Session History control journal"
+        );
+    }
+    let mut reader = BufReader::new(file);
+    let mut latest_lifecycle = None;
+    let mut latest_commands = BTreeMap::<String, (u64, ControlRecord)>::new();
+    let mut retained_other = Vec::new();
+    let mut sequence = 0_u64;
+    let mut needs_rewrite = false;
+
+    loop {
+        let mut line = Vec::new();
+        let bytes = reader.read_until(b'\n', &mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            needs_rewrite = true;
+            break;
+        }
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let mut record = parse_control_record(&line)?;
+        match record.kind.as_str() {
+            LIFECYCLE_SIDEBAND => {
+                if let Some(state) = record.value.get_mut("state") {
+                    let projected = control_state(state);
+                    if *state != projected {
+                        *state = projected;
+                        needs_rewrite = true;
+                    }
+                }
+                if latest_lifecycle.replace((sequence, record)).is_some() {
+                    needs_rewrite = true;
+                }
+            }
+            COMMAND_SIDEBAND => {
+                let id = record
+                    .value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("session command record has no ID")?
+                    .to_owned();
+                if latest_commands.insert(id, (sequence, record)).is_some() {
+                    needs_rewrite = true;
+                }
+            }
+            _ => retained_other.push((sequence, record)),
+        }
+        sequence += 1;
+    }
+    drop(reader);
+
+    if !needs_rewrite {
+        return Ok(());
+    }
+
+    let mut retained = retained_other;
+    retained.extend(latest_lifecycle);
+    retained.extend(latest_commands.into_values());
+    retained.sort_by_key(|(sequence, _)| *sequence);
+    rewrite_control_journal(path, retained.into_iter().map(|(_, record)| record))?;
+    tracing::info!(
+        path = %path.display(),
+        original_bytes,
+        compacted_bytes = std::fs::metadata(path)?.len(),
+        "Compacted Session History control journal"
+    );
+    Ok(())
+}
+
+fn parse_control_record(line: &[u8]) -> anyhow::Result<ControlRecord> {
+    let separator = line
+        .iter()
+        .position(|byte| *byte == b' ')
+        .context("session-control record has no checksum separator")?;
+    let expected = std::str::from_utf8(&line[..separator])?;
+    let payload = &line[separator + 1..];
+    ensure!(
+        hex_sha256(payload) == expected,
+        "session-control record checksum mismatch"
+    );
+    serde_json::from_slice(payload).context("decoding session-control record")
+}
+
+fn rewrite_control_journal(
+    path: &FilePath,
+    records: impl IntoIterator<Item = ControlRecord>,
+) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| FilePath::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("session-control filename is not valid UTF-8")?;
+    let temporary = parent.join(format!(".{file_name}.compact-{}.tmp", Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        file.set_permissions(std::fs::metadata(path)?.permissions())?;
+        for record in records {
+            write_control_record(&mut file, &record)?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("installing compacted {}", path.display()))?;
+        sync_directory(parent)?;
+        Ok(())
+    })();
+    if result.is_err() && temporary.exists() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_control_record(file: &mut File, record: &ControlRecord) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(record)?;
+    writeln!(
+        file,
+        "{} {}",
+        hex_sha256(&payload),
+        String::from_utf8(payload)?
+    )?;
+    Ok(())
 }
 
 fn journal_paths(directory: &FilePath) -> Result<Vec<PathBuf>, ApiError> {
@@ -2061,38 +2207,196 @@ mod tests {
     }
 
     #[test]
-    fn control_state_preserves_live_ui_snapshots_without_accepting_log_shaped_boxes() {
-        let boxes = json!({
-            "1":{
-                "id":1,
-                "owner":{"kind":"user"},
-                "canonical":{"eventId":1,"content":{"text":"hello"}},
-                "representation":{"kind":"hydrated"},
-                "active":true
-            }
-        });
-        let context = json!({"items":[{"boxId":1,"text":"hello"}]});
-        let history_ingress = json!({"format":"kennedy-chatend","version":1});
+    fn control_state_retains_only_authoritative_lifecycle_and_recovery_fields() {
         let saved = control_state(&json!({
-            "boxes":boxes,
-            "context":context,
-            "historyIngress":history_ingress,
+            "sessionType":"conversation",
+            "pendingTurn":true,
+            "transcript":[{"role":"user","content":"hello"}],
+            "boxCount":1,
+            "eventCount":1,
+            "boxes":{"1":{"id":1}},
+            "events":[{"id":1}],
+            "context":{"estimatedTokens":10},
+            "chatendText":"hello",
+            "historyIngress":{
+                "format":"kennedy-chatend",
+                "sessionType":"history-ingress",
+                "completed":true,
+                "commitReceipt":{"sessionObjectId":"A1234567"},
+                "boxes":{"2":{"id":2}},
+                "events":[{"id":2}],
+                "context":{"estimatedTokens":20},
+                "chatendText":"ingress"
+            },
             "unrecognized":"discard me"
         }));
-        assert_eq!(saved["boxes"], boxes);
-        assert_eq!(saved["context"], context);
-        assert_eq!(saved["historyIngress"], history_ingress);
+        assert_eq!(saved["sessionType"], "conversation");
+        assert_eq!(saved["pendingTurn"], true);
+        assert_eq!(saved["historyIngress"]["sessionType"], "history-ingress");
+        assert_eq!(saved["historyIngress"]["completed"], true);
+        assert_eq!(
+            saved["historyIngress"]["commitReceipt"]["sessionObjectId"],
+            "A1234567"
+        );
+        for field in [
+            "transcript",
+            "boxCount",
+            "eventCount",
+            "boxes",
+            "events",
+            "context",
+            "chatendText",
+        ] {
+            assert!(saved.get(field).is_none(), "{field} was retained");
+            assert!(
+                saved["historyIngress"].get(field).is_none(),
+                "nested {field} was retained"
+            );
+        }
         assert!(saved.get("unrecognized").is_none());
         assert!(
             control_state(&json!({"commitReceipt":null}))
                 .get("commitReceipt")
                 .is_none()
         );
+    }
 
-        let rejected = control_state(&json!({
-            "boxes":[{"owner":"user-message","content":{"text":"old projection"}}]
-        }));
-        assert!(rejected.get("boxes").is_none());
+    #[test]
+    fn startup_compacts_superseded_control_records_without_losing_recovery_state() {
+        let root = root("control-compaction");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let id = "9078bb6e-0931-4477-9ce9-b1430d0335a2";
+        drop(
+            SessionStore::new(&sessions)
+                .create_session(id, "2026-07-24T00:00:00Z")
+                .unwrap(),
+        );
+        let control_path = control_path(&sessions, id);
+        let mut file = File::create(&control_path).unwrap();
+        let base = SessionRecord {
+            id: id.into(),
+            phase: "active".into(),
+            started_at: "2026-07-24T00:00:00Z".into(),
+            updated_at: "2026-07-24T00:00:00Z".into(),
+            state: json!({
+                "sessionType":"conversation",
+                "journalPath":sessions.join(format!("{id}.session-log")),
+                "boxes":{"1":{"canonical":{"content":{"text":"x".repeat(20_000)}}}},
+                "events":[{"kind":"old presentation"}],
+                "context":{"estimatedTokens":5_000},
+                "chatendText":"x".repeat(20_000),
+            }),
+            provenance_id: None,
+            version: 1,
+            last_user_message_at: None,
+            ended_at: None,
+            ingress_failure_count: 0,
+            ingress_failures: json!([]),
+            ingress_next_attempt_at: None,
+            summary: false,
+        };
+        write_control_record(
+            &mut file,
+            &ControlRecord {
+                kind: LIFECYCLE_SIDEBAND.into(),
+                recorded_at: "2026-07-24T00:00:00Z".into(),
+                value: serde_json::to_value(&base).unwrap(),
+            },
+        )
+        .unwrap();
+        let pending_command = SessionCommand {
+            id: "command-1".into(),
+            conversation_id: id.into(),
+            sequence: 1,
+            kind: "message".into(),
+            payload: json!({"text":"hello"}),
+            status: "pending".into(),
+            cancel_requested: false,
+            outcome: None,
+            created_at: "2026-07-24T00:00:01Z".into(),
+            processing_started_at: None,
+            completed_at: None,
+            idempotency_id: "message-1".into(),
+        };
+        write_control_record(
+            &mut file,
+            &ControlRecord {
+                kind: COMMAND_SIDEBAND.into(),
+                recorded_at: "2026-07-24T00:00:01Z".into(),
+                value: serde_json::to_value(&pending_command).unwrap(),
+            },
+        )
+        .unwrap();
+        let mut latest = base;
+        latest.version = 2;
+        latest.updated_at = "2026-07-24T00:00:02Z".into();
+        latest.state["pendingTurn"] = json!(true);
+        latest.state["historyIngress"] = json!({
+            "format":"kennedy-chatend",
+            "sessionType":"history-ingress",
+            "completed":true,
+            "commitReceipt":{"sessionObjectId":"A1234567"},
+            "boxes":{"2":{"canonical":{"content":{"text":"y".repeat(20_000)}}}},
+            "events":[{"kind":"ingress presentation"}],
+            "context":{"estimatedTokens":7_000},
+            "chatendText":"y".repeat(20_000),
+        });
+        write_control_record(
+            &mut file,
+            &ControlRecord {
+                kind: LIFECYCLE_SIDEBAND.into(),
+                recorded_at: "2026-07-24T00:00:02Z".into(),
+                value: serde_json::to_value(&latest).unwrap(),
+            },
+        )
+        .unwrap();
+        let mut completed_command = pending_command;
+        completed_command.status = "complete".into();
+        completed_command.outcome = Some(json!({"accepted":true}));
+        completed_command.completed_at = Some("2026-07-24T00:00:03Z".into());
+        write_control_record(
+            &mut file,
+            &ControlRecord {
+                kind: COMMAND_SIDEBAND.into(),
+                recorded_at: "2026-07-24T00:00:03Z".into(),
+                value: serde_json::to_value(&completed_command).unwrap(),
+            },
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let original_bytes = std::fs::metadata(&control_path).unwrap().len();
+
+        let service = open(Config {
+            directory: sessions.clone(),
+            completed_list: root.join("session-history.txt"),
+            max_request_bytes: 1024 * 1024,
+        })
+        .unwrap();
+        let compacted_bytes = std::fs::metadata(&control_path).unwrap().len();
+        assert!(compacted_bytes < original_bytes / 10);
+        let journal = open_by_id(&service.state, id).unwrap();
+        assert_eq!(journal.records().len(), 2);
+        let restored = latest_lifecycle(&journal).unwrap();
+        assert_eq!(restored.version, 2);
+        assert_eq!(restored.state["pendingTurn"], true);
+        assert!(restored.state.get("boxes").is_none());
+        assert!(restored.state.get("events").is_none());
+        assert!(restored.state.get("context").is_none());
+        assert!(restored.state.get("chatendText").is_none());
+        assert_eq!(
+            restored.state["historyIngress"]["commitReceipt"]["sessionObjectId"],
+            "A1234567"
+        );
+        assert!(restored.state["historyIngress"].get("boxes").is_none());
+        let restored_commands = commands(&journal);
+        assert_eq!(restored_commands.len(), 1);
+        assert_eq!(restored_commands["command-1"].status, "complete");
+        assert_eq!(
+            restored_commands["command-1"].outcome,
+            Some(json!({"accepted":true}))
+        );
     }
 
     #[test]
@@ -2253,7 +2557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpointed_live_chatend_shape_survives_materialization() {
+    async fn checkpointed_presentation_is_rebuilt_from_the_session_log() {
         let service = service("live-ui");
         let record = service
             .post_json(
@@ -2267,6 +2571,12 @@ mod tests {
             .await
             .unwrap();
         let id = record["id"].as_str().unwrap();
+        let mut journal = open_by_id(&service.state, id).unwrap();
+        journal
+            .log
+            .add_event(Role::UserMessage, "hello from the log")
+            .unwrap();
+        drop(journal);
         let boxes = json!({
             "1":{
                 "id":1,
@@ -2296,8 +2606,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(checkpointed["state"]["boxes"], boxes);
-        assert_eq!(checkpointed["state"]["context"], context);
+        assert!(checkpointed["state"].get("boxes").is_none());
+        assert!(checkpointed["state"].get("context").is_none());
+        assert_eq!(
+            checkpointed["state"]["transcript"][0]["content"],
+            "hello from the log"
+        );
+        assert_eq!(checkpointed["state"]["events"][0]["role"], "user-message");
+        assert!(
+            checkpointed["state"]["chatendText"]
+                .as_str()
+                .is_some_and(|text| text.contains("hello from the log"))
+        );
         assert_eq!(
             checkpointed["state"]["historyIngress"]["format"],
             "kennedy-chatend"
@@ -2307,8 +2627,12 @@ mod tests {
             .get_json(&format!("/api/v1/conversations/{id}"))
             .await
             .unwrap();
-        assert_eq!(fetched["state"]["boxes"], boxes);
-        assert_eq!(fetched["state"]["context"], context);
+        assert!(fetched["state"].get("boxes").is_none());
+        assert!(fetched["state"].get("context").is_none());
+        assert_eq!(
+            fetched["state"]["transcript"][0]["content"],
+            "hello from the log"
+        );
     }
 
     #[tokio::test]

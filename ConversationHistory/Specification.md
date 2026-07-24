@@ -9,8 +9,7 @@ application-domain name and the runtime no longer uses a conversation SQLite
 database.
 
 An in-progress session has one authoritative append-only `.session-log` file
-plus a separate `.session-control` file for lifecycle, browser commands, and
-the latest replaceable backend presentation checkpoint.
+plus a separate `.session-control` file for lifecycle and browser commands.
 After the session and its history-ingress phase commit, local Session History
 retains a structured completion receipt.
 
@@ -34,13 +33,17 @@ no-op. Every append is flushed and synchronized. Clients load the immutable
 archive from Kweb when needed.
 
 The `.session-log` format and its recovery rules are owned by `session-log`.
-Session History writes lifecycle records, command records, and the explicitly
-enumerated current Chatend presentation checkpoint to `.session-control`; it
-does not add storage-specific sidebands to the transcript. The presentation
-checkpoint lets the browser render the live box map and context projection.
-It is a replaceable cache rather than replay authority: KennedyServer rebuilds
-Chatend from the session log, and successful completion deletes the control
-file.
+Session History writes only lifecycle and command records to
+`.session-control`; it does not add storage-specific sidebands to the
+transcript. Transcript entries, box events, tool events, and pending objects
+come from `session-log`. KennedyServer rebuilds Chatend from that ordered log,
+and the browser falls back to the same events rather than requiring a durable
+presentation snapshot. Successful completion deletes the control file.
+
+At startup, Session History compacts control journals written by older builds.
+It retains the latest lifecycle record and the latest state of every command,
+removes superseded records and presentation snapshots, writes the replacement
+atomically, and leaves `.session-log` and pending-object files unchanged.
 
 ## Lifecycle
 
