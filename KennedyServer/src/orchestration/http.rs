@@ -303,11 +303,11 @@ impl Api {
         session_id: &str,
         name: &str,
         arguments: Value,
-    ) -> Result<String, ApiError> {
+    ) -> Result<crate::rust_lib_tools::ToolExecution, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local
                 .rust_lib_tools
-                .execute(session_id.to_owned(), name.to_owned(), arguments)
+                .execute_detailed(session_id.to_owned(), name.to_owned(), arguments)
                 .await
                 .map_err(rust_lib_error),
             #[cfg(test)]
@@ -324,7 +324,7 @@ impl Api {
                         })),
                     )
                     .await?;
-                payload
+                let text = payload
                     .get("result")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
@@ -332,7 +332,24 @@ impl Api {
                         status: None,
                         code: "invalid_tool_result".into(),
                         message: "Rust library tool returned a non-text result.".into(),
+                    })?;
+                let snapshot = if name == crate::rust_lib_tools::WRITE_RUST_LIB_TOOL {
+                    crate::rust_lib_tools::proposed_write_snapshot(&arguments)
+                } else if matches!(
+                    name,
+                    crate::rust_lib_tools::CREATE_RUST_LIB_TOOL
+                        | crate::rust_lib_tools::OPEN_RUST_LIB_TOOL
+                ) {
+                    arguments.get("name").and_then(Value::as_str).map(|name| {
+                        crate::rust_lib_tools::LibrarySnapshot {
+                            name: name.to_owned(),
+                            text: text.clone(),
+                        }
                     })
+                } else {
+                    None
+                };
+                Ok(crate::rust_lib_tools::ToolExecution { text, snapshot })
             }
         }
     }

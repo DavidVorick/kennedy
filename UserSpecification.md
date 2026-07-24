@@ -118,8 +118,15 @@ boxes add summaries or names only for nodes not already represented earlier.
 A manual `LoadNode` invocation remains visible in its normal JSON call box.
 Every Ktool result is raw text. Ordinary result boxes contain that text
 directly, without a JSON envelope or pretty-printing. Managed Rust library
-tools are ordinary tools; opening a library returns its complete textual
-snapshot in one result box rather than creating one box per file.
+`create` and `open` establish or refresh one stateful complete-source box per
+library. A successful `write` advances that same box's canonical revision
+without changing its box ID or adding a generic result box. Its active tool-call
+box records only the library name and file count; complete write arguments
+remain in the durable invocation event but are not projected into later
+provider input. Failed writes leave the library box unchanged and return a
+short ordinary error. A summarized or dehydrated library box keeps that
+representation and becomes stale when its canonical source changes. Other
+managed Rust operations retain ordinary result behavior.
 
 The successful `LoadNode` result is not copied into a generic result box. Instead,
 the native tool response contains exactly the Kweb boxes that the load created

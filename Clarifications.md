@@ -10,6 +10,16 @@ Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
 `chatend-overhaul/chatend-overhaul-clarifications.md`, and
 `chatend-overhaul/chatend-discussion-review.txt`.
 
+## Managed Rust Library Context
+
+- Keep one complete managed Rust source snapshot in Kennedy's active context.
+  `create` and `open` establish a stable stateful box, and successful `write`
+  calls update that box rather than adding another complete-source box.
+- Retain exact write arguments in durable invocation history, but project only
+  a compact write-call receipt into later Kennedy inputs. Failed writes do not
+  change the source box. Existing summarized or dehydrated representations
+  remain under Kennedy's control when the canonical source changes.
+
 ## Session-log UI Authority
 
 - The append-ordered `kcode-session-log` is the canonical source of session events

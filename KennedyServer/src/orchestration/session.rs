@@ -23,7 +23,9 @@ use crate::{
         SessionCommit, SessionCommitResult, SessionNodeCreate, SessionNodeData, SessionNodeUpdate,
         SessionObject,
     },
-    rust_lib_tools::RUST_LIB_TOOLS,
+    rust_lib_tools::{
+        LibrarySnapshot, RUST_LIB_TOOLS, WRITE_RUST_LIB_TOOL, proposed_write_snapshot,
+    },
 };
 
 use super::{
@@ -39,6 +41,7 @@ const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INLINE_TOOL_INVOCATION_CHARACTERS: usize = 1_000;
 const KWEB_TOOL_INSTANCE: &str = "kweb";
 const HISTORY_TOOL_INSTANCE: &str = "history";
+const RUST_LIB_TOOL_INSTANCE: &str = "managed-rust-libraries";
 const CAPACITY_ERROR_BOX_NAME: &str = "Context capacity error";
 const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
 
@@ -567,6 +570,156 @@ fn unique_kweb_slot(logical: &str, used: &mut HashSet<String>) -> String {
 struct ToolCall {
     name: String,
     arguments: Value,
+}
+
+fn tool_call_box_content(call: &ToolCall) -> anyhow::Result<BoxContent> {
+    if call.name == WRITE_RUST_LIB_TOOL {
+        let name = call
+            .arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| name.chars().take(255).collect::<String>());
+        let file_count = call
+            .arguments
+            .get("files")
+            .and_then(Value::as_array)
+            .map(Vec::len);
+        return Ok(BoxContent {
+            text: serde_json::to_string_pretty(&json!({
+                "name":call.name,
+                "arguments":{
+                    "name":name,
+                    "fileCount":file_count,
+                    "completeFileContents":"omitted from active context; retained in the durable tool invocation"
+                }
+            }))?,
+            objects: Vec::new(),
+            metadata: json!({
+                "compactedToolInvocation":true,
+                "toolName":call.name,
+            }),
+        });
+    }
+    Ok(BoxContent::text(serde_json::to_string_pretty(
+        &json!({"name":call.name,"arguments":call.arguments}),
+    )?))
+}
+
+fn rust_lib_box_content(snapshot: &LibrarySnapshot) -> BoxContent {
+    BoxContent {
+        text: snapshot.text.clone(),
+        objects: Vec::new(),
+        metadata: json!({"managedRustLibrary":snapshot.name}),
+    }
+}
+
+fn rust_lib_logical_name(state: &super::chatend::BoxState, fallback: &str) -> String {
+    state
+        .canonical
+        .content
+        .metadata
+        .get("managedRustLibrary")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn rust_lib_box_id(journal: &SessionJournal, name: &str) -> Option<BoxId> {
+    journal
+        .state()
+        .tools
+        .get(RUST_LIB_TOOL_INSTANCE)?
+        .slots
+        .iter()
+        .find_map(|slot| {
+            if slot.retired {
+                return None;
+            }
+            let state = journal.state().box_state(slot.box_id)?;
+            (rust_lib_logical_name(state, &slot.slot) == name).then_some(slot.box_id)
+        })
+}
+
+fn prospective_rust_lib_box_updates(
+    journal: &SessionJournal,
+    call: &ToolCall,
+) -> BTreeMap<BoxId, BoxContent> {
+    if call.name != WRITE_RUST_LIB_TOOL {
+        return BTreeMap::new();
+    }
+    let Some(snapshot) = proposed_write_snapshot(&call.arguments) else {
+        return BTreeMap::new();
+    };
+    let Some(box_id) = rust_lib_box_id(journal, &snapshot.name) else {
+        return BTreeMap::new();
+    };
+    BTreeMap::from([(box_id, rust_lib_box_content(&snapshot))])
+}
+
+fn apply_rust_lib_snapshot(
+    journal: &mut SessionJournal,
+    snapshot: LibrarySnapshot,
+) -> anyhow::Result<BoxId> {
+    let current = journal
+        .state()
+        .tools
+        .get(RUST_LIB_TOOL_INSTANCE)
+        .cloned()
+        .unwrap_or_default();
+    let mut selected_slot = None;
+    let mut slots = Vec::with_capacity(current.slots.len() + 1);
+    let mut used_slots = current
+        .slots
+        .iter()
+        .map(|slot| slot.slot.clone())
+        .collect::<HashSet<_>>();
+    for slot in &current.slots {
+        let state = journal
+            .state()
+            .box_state(slot.box_id)
+            .context("managed Rust library slot box is missing")?;
+        let selected = selected_slot.is_none()
+            && !slot.retired
+            && rust_lib_logical_name(state, &slot.slot) == snapshot.name;
+        if selected {
+            selected_slot = Some(slot.slot.clone());
+            slots.push(ToolSlotInput {
+                slot: slot.slot.clone(),
+                name: format!("Managed Rust library {}", snapshot.name),
+                content: rust_lib_box_content(&snapshot),
+                retired: false,
+            });
+        } else {
+            slots.push(ToolSlotInput {
+                slot: slot.slot.clone(),
+                name: state.name.clone(),
+                content: state.canonical.content.clone(),
+                retired: slot.retired,
+            });
+        }
+    }
+    let selected_slot = selected_slot.unwrap_or_else(|| {
+        let slot = unique_kweb_slot(&snapshot.name, &mut used_slots);
+        slots.push(ToolSlotInput {
+            slot: slot.clone(),
+            name: format!("Managed Rust library {}", snapshot.name),
+            content: rust_lib_box_content(&snapshot),
+            retired: false,
+        });
+        slot
+    });
+    journal.apply_tool_slots(now(), RUST_LIB_TOOL_INSTANCE, slots)?;
+    journal
+        .state()
+        .tools
+        .get(RUST_LIB_TOOL_INSTANCE)
+        .and_then(|tool| {
+            tool.slots
+                .iter()
+                .find(|slot| slot.slot == selected_slot && !slot.retired)
+        })
+        .map(|slot| slot.box_id)
+        .context("managed Rust library box was not installed")
 }
 
 struct ToolOutcome {
@@ -1482,10 +1635,20 @@ impl Session {
                         let mut outcome = match call {
                             Ok(call) => {
                                 let call_name = format!("Kennedy tool call: {}", call.name);
-                                let call_content = BoxContent::text(serde_json::to_string_pretty(
-                                    &json!({"name":call.name,"arguments":call.arguments}),
-                                )?);
+                                let call_content = tool_call_box_content(&call)?;
                                 self.record_tool_invocation(&call.name, call.arguments.clone())?;
+                                let prospective_updates =
+                                    prospective_rust_lib_box_updates(&self.journal, &call);
+                                let prospective_projection =
+                                    self.journal.state().projection_with_new_boxes_and_updates(
+                                        &[(
+                                            call_name.clone(),
+                                            BoxOwner::Kennedy,
+                                            call_content.clone(),
+                                        )],
+                                        &prospective_updates,
+                                    )?;
+                                let prospective_tokens = prospective_projection.estimated_tokens;
                                 let rejected = if !matches!(self.mode, AgentMode::Ingress { .. }) {
                                     if self.current_live_capacity_error() {
                                         let external_event_id =
@@ -1497,19 +1660,13 @@ impl Session {
                                             external_event_id.as_deref(),
                                         )?)
                                     } else {
-                                        let projection =
-                                            self.journal.state().projection_with_new_boxes(&[(
-                                                call_name.clone(),
-                                                BoxOwner::Kennedy,
-                                                call_content.clone(),
-                                            )])?;
                                         let limit = self.journal.state().live_context_limit();
-                                        if projection.estimated_tokens > limit {
+                                        if prospective_tokens > limit {
                                             let external_event_id =
                                                 self.pending_external_event_id.clone();
                                             Some(self.record_live_capacity_error(
                                                 &format!("Kennedy's {} tool call", call.name),
-                                                projection.estimated_tokens,
+                                                prospective_tokens,
                                                 limit,
                                                 external_event_id.as_deref(),
                                             )?)
@@ -1535,12 +1692,12 @@ impl Session {
                                         call_content,
                                     )?;
                                     if matches!(self.mode, AgentMode::Ingress { .. })
-                                        && self.journal.state().projection().estimated_tokens
+                                        && prospective_tokens
                                             > self.journal.state().ingress_context_limit()
                                     {
                                         self.request_ingress_force_commit(
                                             "tool_call_exceeded_full_window",
-                                            self.journal.state().projection().estimated_tokens,
+                                            prospective_tokens,
                                         )?;
                                         ToolOutcome {
                                             text: "The tool was not run because history ingress exceeded the full context window; the staged transaction will now be committed.".into(),
@@ -1905,9 +2062,15 @@ impl Session {
             "CreateNode" => self.create_node(&call.arguments)?,
             "UpdateNode" => self.update_node(&call.arguments)?,
             name if RUST_LIB_TOOLS.contains(&name) => {
-                self.api
+                let execution = self
+                    .api
                     .rust_lib_execute(&self.rust_lib_session_id, name, call.arguments.clone())
-                    .await?
+                    .await?;
+                if let Some(snapshot) = execution.snapshot {
+                    apply_rust_lib_snapshot(&mut self.journal, snapshot)?;
+                    store_result = false;
+                }
+                execution.text
             }
             _ => anyhow::bail!("Tool {} is not available", call.name),
         };
@@ -3286,6 +3449,151 @@ mod tests {
             render_load_node_result(&journal, &unchanged).unwrap(),
             "LoadNode completed. The shared Kweb boxes were already current."
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn managed_rust_write_revises_one_stable_box_without_a_second_source_copy() {
+        let (path, mut journal) = test_journal("managed-rust-write", 10_000);
+        let initial = LibrarySnapshot {
+            name: "example-lib".into(),
+            text: "Rust library: example-lib\nFiles: 1\n\nFile: src/lib.rs\npub fn old_revision() {}\n"
+                .into(),
+        };
+        let box_id = apply_rust_lib_snapshot(&mut journal, initial).unwrap();
+        let call = ToolCall {
+            name: WRITE_RUST_LIB_TOOL.into(),
+            arguments: json!({
+                "name":"example-lib",
+                "files":[{
+                    "path":"src/lib.rs",
+                    "contents":"pub fn unique_new_revision() {}\n"
+                }]
+            }),
+        };
+        journal
+            .record(
+                "t2",
+                EventKind::ToolInvoked {
+                    tool_instance: "test-write".into(),
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            )
+            .unwrap();
+        let compact_call = tool_call_box_content(&call).unwrap();
+        assert!(!compact_call.text.contains("unique_new_revision"));
+        assert!(compact_call.text.contains("completeFileContents"));
+        journal
+            .create_box(
+                "t3",
+                format!("Kennedy tool call: {}", call.name),
+                BoxOwner::Kennedy,
+                compact_call,
+            )
+            .unwrap();
+        let updated = proposed_write_snapshot(&call.arguments).unwrap();
+        let same_box_id = apply_rust_lib_snapshot(&mut journal, updated).unwrap();
+
+        assert_eq!(same_box_id, box_id);
+        assert_eq!(journal.state().tools[RUST_LIB_TOOL_INSTANCE].slots.len(), 1);
+        let rendered = journal.state().render();
+        assert!(!rendered.contains("old_revision"));
+        assert_eq!(rendered.matches("unique_new_revision").count(), 1);
+        assert!(journal.state().events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ToolInvoked { arguments, .. }
+                    if arguments.to_string().contains("unique_new_revision")
+            )
+        }));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn managed_rust_write_capacity_previews_replacement_instead_of_duplication() {
+        let (path, mut journal) = test_journal("managed-rust-capacity", 1_200);
+        let initial = LibrarySnapshot {
+            name: "large-lib".into(),
+            text: format!(
+                "Rust library: large-lib\nFiles: 1\n\nFile: src/lib.rs\n{}",
+                "a".repeat(1_800)
+            ),
+        };
+        apply_rust_lib_snapshot(&mut journal, initial).unwrap();
+        let call = ToolCall {
+            name: WRITE_RUST_LIB_TOOL.into(),
+            arguments: json!({
+                "name":"large-lib",
+                "files":[{"path":"src/lib.rs","contents":"b".repeat(1_800)}]
+            }),
+        };
+        let call_name = format!("Kennedy tool call: {}", call.name);
+        let full_call = BoxContent::text(
+            serde_json::to_string_pretty(&json!({"name":call.name,"arguments":call.arguments}))
+                .unwrap(),
+        );
+        let duplicated = journal
+            .state()
+            .projection_with_new_boxes(&[(call_name.clone(), BoxOwner::Kennedy, full_call)])
+            .unwrap();
+        assert!(duplicated.estimated_tokens > journal.state().live_context_limit());
+
+        let compact = tool_call_box_content(&call).unwrap();
+        let updates = prospective_rust_lib_box_updates(&journal, &call);
+        let replacement = journal
+            .state()
+            .projection_with_new_boxes_and_updates(
+                &[(call_name, BoxOwner::Kennedy, compact)],
+                &updates,
+            )
+            .unwrap();
+        assert!(replacement.estimated_tokens <= journal.state().live_context_limit());
+        assert_eq!(
+            replacement
+                .items
+                .iter()
+                .filter(|item| item.text.contains(&"b".repeat(200)))
+                .count(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn managed_rust_snapshot_updates_preserve_kennedy_representation_choices() {
+        let (path, mut journal) = test_journal("managed-rust-representation", 10_000);
+        let box_id = apply_rust_lib_snapshot(
+            &mut journal,
+            LibrarySnapshot {
+                name: "summary-lib".into(),
+                text: "old canonical source".into(),
+            },
+        )
+        .unwrap();
+        journal
+            .summarize_box("t2", box_id, "Kennedy's retained library summary")
+            .unwrap();
+        let same_box_id = apply_rust_lib_snapshot(
+            &mut journal,
+            LibrarySnapshot {
+                name: "summary-lib".into(),
+                text: "new canonical source".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(same_box_id, box_id);
+        let state = journal.state().box_state(box_id).unwrap();
+        assert_eq!(state.canonical.content.text, "new canonical source");
+        assert!(state.stale());
+        assert!(matches!(
+            state.representation,
+            Representation::Summarized { .. }
+        ));
+        let rendered = journal.state().render();
+        assert!(rendered.contains("Kennedy's retained library summary"));
+        assert!(!rendered.contains("new canonical source"));
         std::fs::remove_file(path).unwrap();
     }
 

@@ -142,12 +142,17 @@ string unchanged. An ordinary result box stores the same text directly,
 without a JSON envelope, Serde rendering, diagnostic wrapper, or
 pretty-printing. Its normal Chatend header is added only when Chatend projects
 the retained box in a later context. Multiple tool calls in one model response
-are recorded independently. Managed Rust library results use the same path as
-every other ordinary result, so an opened library and all of its files occupy
-one result box. `LoadNode` is the deliberate result exception: its invocation
-remains a box, but it updates the shared Kweb boxes and returns the exact newly
-created or revised box renderings directly to the in-flight provider turn. It
-does not create a second generic result box.
+are recorded independently. Managed Rust library `create` and `open` install
+one stateful complete-source box per library. Successful writes revise that
+box in place and suppress a generic result copy. The durable invocation event
+retains the exact complete write arguments, while its active call box contains
+only bounded identifying metadata so a later provider request sees one
+complete source. Failed writes do not revise the source box. Kennedy-authored
+summaries and dehydration survive canonical source updates and become stale
+under the ordinary box rules. `LoadNode` is the other deliberate result
+exception: its invocation remains a box, but it updates the shared Kweb boxes
+and returns the exact newly created or revised box renderings directly to the
+in-flight provider turn. It does not create a second generic result box.
 
 ## 7. Kweb context and writes
 

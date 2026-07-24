@@ -460,9 +460,17 @@ impl Chatend {
         &self,
         boxes: &[(String, BoxOwner, BoxContent)],
     ) -> anyhow::Result<ContextProjection> {
+        self.projection_with_new_boxes_and_updates(boxes, &BTreeMap::new())
+    }
+
+    pub fn projection_with_new_boxes_and_updates(
+        &self,
+        boxes: &[(String, BoxOwner, BoxContent)],
+        updates: &BTreeMap<BoxId, BoxContent>,
+    ) -> anyhow::Result<ContextProjection> {
         let mut preview = self.clone();
         let mut next = preview.next_id;
-        let mut events = Vec::with_capacity(boxes.len());
+        let mut events = Vec::with_capacity(boxes.len() + updates.len());
         for (name, owner, content) in boxes {
             let id = EventId(next);
             let box_id = BoxId(next);
@@ -474,6 +482,25 @@ impl Chatend {
                     box_id,
                     name: name.clone(),
                     owner: owner.clone(),
+                    content: content.clone(),
+                },
+            });
+        }
+        for (box_id, content) in updates {
+            let state = preview
+                .box_state(*box_id)
+                .with_context(|| format!("box {box_id} does not exist"))?;
+            ensure!(state.active, "box {box_id} is retired");
+            if state.canonical.content == *content {
+                continue;
+            }
+            let id = EventId(next);
+            next = next.checked_add(1).context("event identity overflow")?;
+            events.push(Event {
+                id,
+                recorded_at: "preview".into(),
+                kind: EventKind::CanonicalUpdated {
+                    box_id: *box_id,
                     content: content.clone(),
                 },
             });

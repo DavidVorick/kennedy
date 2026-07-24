@@ -34,6 +34,18 @@ pub(crate) struct RustLibToolService {
     inner: Arc<ServiceInner>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LibrarySnapshot {
+    pub(crate) name: String,
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ToolExecution {
+    pub(crate) text: String,
+    pub(crate) snapshot: Option<LibrarySnapshot>,
+}
+
 struct ServiceInner {
     root: PathBuf,
     registry_token: Zeroizing<String>,
@@ -210,12 +222,24 @@ impl RustLibToolService {
         })
     }
 
-    pub(crate) async fn execute(
+    #[cfg(test)]
+    async fn execute(
         &self,
         session_id: String,
         name: String,
         arguments: Value,
     ) -> Result<String, ToolError> {
+        self.execute_detailed(session_id, name, arguments)
+            .await
+            .map(|execution| execution.text)
+    }
+
+    pub(crate) async fn execute_detailed(
+        &self,
+        session_id: String,
+        name: String,
+        arguments: Value,
+    ) -> Result<ToolExecution, ToolError> {
         validate_session_id(&session_id)?;
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.execute_blocking(&session_id, &name, arguments))
@@ -231,7 +255,7 @@ impl RustLibToolService {
         session_id: &str,
         tool_name: &str,
         arguments: Value,
-    ) -> Result<String, ToolError> {
+    ) -> Result<ToolExecution, ToolError> {
         self.remove_expired_handles()?;
         match tool_name {
             CREATE_RUST_LIB_TOOL => {
@@ -250,10 +274,10 @@ impl RustLibToolService {
                 let (version, documentation) =
                     kcode_rust_libs_v2::docs(&self.inner.root, &arguments.name)
                         .map_err(|error| self.map_library_error(error))?;
-                Ok(format!(
+                Ok(ToolExecution::plain(format!(
                     "Rust library: {}\nVersion: {version}\n\n{documentation}",
                     arguments.name
-                ))
+                )))
             }
             WRITE_RUST_LIB_TOOL => {
                 let arguments: WriteArguments = parse_arguments(arguments)?;
@@ -279,9 +303,13 @@ impl RustLibToolService {
                         .map(|file| format!("- {}", file.path))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    Ok(format!(
+                    let text = format!(
                         "Wrote {} files to Rust library {result_name}.\n{paths}",
                         rust_lib.files.len()
+                    );
+                    Ok(ToolExecution::with_snapshot(
+                        text,
+                        LibrarySnapshot::new(&result_name, &rust_lib.files),
                     ))
                 })
             }
@@ -292,10 +320,10 @@ impl RustLibToolService {
                     rust_lib
                         .check()
                         .map_err(|error| self.map_library_error(error))?;
-                    Ok(format!(
+                    Ok(ToolExecution::plain(format!(
                         "Rust library {} passed its checks.",
                         arguments.name
-                    ))
+                    )))
                 })
             }
             PUBLISH_RUST_LIB_TOOL => {
@@ -305,7 +333,10 @@ impl RustLibToolService {
                     rust_lib
                         .publish()
                         .map_err(|error| self.map_library_error(error))?;
-                    Ok(format!("Published Rust library {}.", arguments.name))
+                    Ok(ToolExecution::plain(format!(
+                        "Published Rust library {}.",
+                        arguments.name
+                    )))
                 })
             }
             _ => Err(ToolError::invalid(format!(
@@ -314,7 +345,7 @@ impl RustLibToolService {
         }
     }
 
-    fn create(&self, session_id: &str, name: &str) -> Result<String, ToolError> {
+    fn create(&self, session_id: &str, name: &str) -> Result<ToolExecution, ToolError> {
         let key = HandleKey::new(session_id, name);
         let mut registry = self.inner.registry.entries.lock().map_err(|_| {
             ToolError::internal("The Rust library snapshot registry is unavailable.")
@@ -328,12 +359,12 @@ impl RustLibToolService {
         let rust_lib =
             kcode_rust_libs_v2::create(&self.inner.root, name, self.inner.registry_token.as_str())
                 .map_err(|error| self.map_library_error(error))?;
-        let snapshot = library_snapshot_text(name, &rust_lib);
+        let snapshot = LibrarySnapshot::new(name, &rust_lib.files);
         registry.libraries.insert(key, OpenLibrary::new(rust_lib));
-        Ok(snapshot)
+        Ok(ToolExecution::snapshot(snapshot))
     }
 
-    fn open(&self, session_id: &str, name: &str) -> Result<String, ToolError> {
+    fn open(&self, session_id: &str, name: &str) -> Result<ToolExecution, ToolError> {
         let key = HandleKey::new(session_id, name);
         let registry = self.inner.registry.entries.lock().map_err(|_| {
             ToolError::internal("The Rust library snapshot registry is unavailable.")
@@ -348,7 +379,10 @@ impl RustLibToolService {
                 )
                 .map_err(|error| self.map_library_error(error))?;
                 *rust_lib = reopened;
-                Ok(library_snapshot_text(name, rust_lib))
+                Ok(ToolExecution::snapshot(LibrarySnapshot::new(
+                    name,
+                    &rust_lib.files,
+                )))
             });
         }
 
@@ -356,17 +390,17 @@ impl RustLibToolService {
         let rust_lib =
             kcode_rust_libs_v2::open(&self.inner.root, name, self.inner.registry_token.as_str())
                 .map_err(|error| self.map_library_error(error))?;
-        let snapshot = library_snapshot_text(name, &rust_lib);
+        let snapshot = LibrarySnapshot::new(name, &rust_lib.files);
         registry.libraries.insert(key, OpenLibrary::new(rust_lib));
-        Ok(snapshot)
+        Ok(ToolExecution::snapshot(snapshot))
     }
 
     fn with_open_library(
         &self,
         session_id: &str,
         name: &str,
-        operation: impl FnOnce(&mut OpenedRustLib) -> Result<String, ToolError>,
-    ) -> Result<String, ToolError> {
+        operation: impl FnOnce(&mut OpenedRustLib) -> Result<ToolExecution, ToolError>,
+    ) -> Result<ToolExecution, ToolError> {
         let (handle, active_operation) = self.begin_operation(session_id, name)?;
         let mut rust_lib = handle
             .lock()
@@ -511,6 +545,38 @@ impl RustLibToolService {
     }
 }
 
+impl LibrarySnapshot {
+    fn new(name: &str, files: &[RustLibFile]) -> Self {
+        Self {
+            name: name.to_owned(),
+            text: library_snapshot_text(name, files),
+        }
+    }
+}
+
+impl ToolExecution {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            snapshot: None,
+        }
+    }
+
+    fn snapshot(snapshot: LibrarySnapshot) -> Self {
+        Self {
+            text: snapshot.text.clone(),
+            snapshot: Some(snapshot),
+        }
+    }
+
+    fn with_snapshot(text: impl Into<String>, snapshot: LibrarySnapshot) -> Self {
+        Self {
+            text: text.into(),
+            snapshot: Some(snapshot),
+        }
+    }
+}
+
 impl HandleKey {
     fn new(session_id: &str, library_name: &str) -> Self {
         Self {
@@ -567,9 +633,24 @@ fn validate_library_name(name: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn library_snapshot_text(name: &str, rust_lib: &OpenedRustLib) -> String {
-    let mut text = format!("Rust library: {name}\nFiles: {}", rust_lib.files.len());
-    for file in &rust_lib.files {
+pub(crate) fn proposed_write_snapshot(arguments: &Value) -> Option<LibrarySnapshot> {
+    let arguments: WriteArguments = serde_json::from_value(arguments.clone()).ok()?;
+    validate_library_name(&arguments.name).ok()?;
+    let mut files = arguments
+        .files
+        .into_iter()
+        .map(|file| RustLibFile {
+            path: file.path,
+            contents: file.contents,
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Some(LibrarySnapshot::new(&arguments.name, &files))
+}
+
+fn library_snapshot_text(name: &str, files: &[RustLibFile]) -> String {
+    let mut text = format!("Rust library: {name}\nFiles: {}", files.len());
+    for file in files {
         text.push_str("\n\nFile: ");
         text.push_str(&file.path);
         text.push('\n');
@@ -741,6 +822,68 @@ mod tests {
             .unwrap();
         assert!(!opened.contains("File: tests/temporary.rs"));
         assert!(opened.contains("File: src/lib.rs\npub fn answer() -> u8 { 43 }\n"));
+        service.release("conversation:test".into()).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detailed_create_open_and_write_results_carry_the_current_snapshot() {
+        let root = temporary_root();
+        let service = service(&root);
+        let created = service
+            .execute_detailed(
+                "conversation:test".into(),
+                CREATE_RUST_LIB_TOOL.into(),
+                json!({"name":"snapshot-lib"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            created
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.name.as_str()),
+            Some("snapshot-lib")
+        );
+        assert_eq!(
+            created.text,
+            created.snapshot.as_ref().unwrap().text,
+            "create returns the same source installed into Chatend"
+        );
+
+        let written = service
+            .execute_detailed(
+                "conversation:test".into(),
+                WRITE_RUST_LIB_TOOL.into(),
+                json!({
+                    "name":"snapshot-lib",
+                    "files":complete_files(
+                        "snapshot-lib",
+                        "updated docs\n",
+                        "pub fn current_revision() {}\n"
+                    ),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(written.text.starts_with("Wrote 3 files"));
+        let snapshot = written.snapshot.unwrap();
+        assert!(snapshot.text.contains("updated docs\n"));
+        assert!(
+            snapshot
+                .text
+                .contains("File: src/lib.rs\npub fn current_revision() {}\n")
+        );
+
+        let reopened = service
+            .execute_detailed(
+                "conversation:test".into(),
+                OPEN_RUST_LIB_TOOL.into(),
+                json!({"name":"snapshot-lib"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.snapshot.unwrap().text, snapshot.text);
         service.release("conversation:test".into()).await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
