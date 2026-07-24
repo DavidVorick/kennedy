@@ -29,6 +29,10 @@ import {
   parseFreeTimeMinutes,
   parseSelfTimePrompt,
 } from "../public/js/self_time.js";
+import {
+  projectSessionLog,
+  projectSessionRecord,
+} from "../public/js/session_log_view.js";
 
 async function withMockFetch(handler, operation) {
   const original = globalThis.fetch;
@@ -45,6 +49,122 @@ function jsonResponse(value, status = 200) {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function sessionEvent(role, kind, recordedAt = "2026-07-24T00:00:00Z") {
+  return {
+    role,
+    text: JSON.stringify({
+      contextEventVersion: 1,
+      recordedAt,
+      kind,
+    }),
+  };
+}
+
+function combinedConversationAndIngressLog() {
+  const events = [
+    sessionEvent("system-message", {
+      type: "session_configured",
+      effective_context_tokens: 128_000,
+      kind: "conversation",
+    }),
+    sessionEvent("system-message", {
+      type: "box_created",
+      box_id: 2,
+      name: "Kennedy system prompt",
+      owner: { kind: "system" },
+      content: { text: "Conversation instructions", metadata: {} },
+    }),
+    sessionEvent("user-message", {
+      type: "box_created",
+      box_id: 3,
+      name: "User message",
+      owner: { kind: "user" },
+      content: {
+        text: "Plan the release",
+        metadata: {
+          inputKind: "voice",
+          attachments: [{ fileName: "release.txt" }],
+        },
+      },
+    }),
+    sessionEvent("kennedy-message", {
+      type: "box_created",
+      box_id: 4,
+      name: "Kennedy message",
+      owner: { kind: "kennedy" },
+      content: { text: "Here is the release plan.", metadata: {} },
+    }),
+    sessionEvent("system-message", {
+      type: "source_terminated",
+      reason: "history_ingress",
+    }),
+    sessionEvent("system-message", {
+      type: "canonical_updated",
+      box_id: 2,
+      content: { text: "History ingress instructions", metadata: {} },
+    }),
+    sessionEvent("system-message", { type: "history_ingress_started" }),
+    sessionEvent("system-message", {
+      type: "note",
+      label: "provider_input",
+      value: "exact ingress provider input",
+    }),
+    sessionEvent("kennedy-tool-call", {
+      type: "tool_invoked",
+      tool_instance: "CreateNode:operation",
+      tool_name: "CreateNode",
+      arguments: { shortName: "Release plan" },
+    }),
+    sessionEvent("kennedy-message", {
+      type: "box_created",
+      box_id: 10,
+      name: "Kennedy tool call: CreateNode",
+      owner: { kind: "kennedy" },
+      content: { text: "duplicate tool presentation", metadata: {} },
+    }),
+    sessionEvent("system-message", {
+      type: "box_created",
+      box_id: 11,
+      name: "Kennedy tool result",
+      owner: { kind: "controller" },
+      content: { text: "duplicate tool result presentation", metadata: {} },
+    }),
+    sessionEvent("tool-result", {
+      type: "tool_completed",
+      tool_instance: "call_ktool",
+      tool_name: "call_ktool",
+      outcome: { ok: true, result: "Created staged node pending:12." },
+    }),
+    sessionEvent("system-message", {
+      type: "provider_receipt",
+      manifest_hash: "manifest",
+      input_tokens: 2_000,
+      output_tokens: 100,
+      raw_context_tokens: 1_900,
+      provider_data: {
+        inputTokens: 2_000,
+        outputTokens: 100,
+        cachedInputTokens: 800,
+      },
+    }),
+    sessionEvent("kennedy-message", {
+      type: "box_created",
+      box_id: 14,
+      name: "Kennedy message",
+      owner: { kind: "kennedy" },
+      content: { text: "Internal ingress response", metadata: {} },
+    }),
+  ];
+  return {
+    header: {
+      formatVersion: "0.2.1",
+      sessionId: "session-1",
+      createdAt: "2026-07-24T00:00:00Z",
+    },
+    events,
+  };
 }
 
 test("browser idempotency identifiers are random hexadecimal values", () => {
@@ -100,6 +220,103 @@ test("conversation and audio titles use durable source data", () => {
   assert.equal(audioRecordingTitle({ original_filename: "2026-07-20-vnote.wav" }), "2026-07-20-vnote.wav");
 });
 
+test("session-log projection separates source conversation from history ingress", () => {
+  const log = combinedConversationAndIngressLog();
+  const projection = projectSessionLog(log, { provider: "openai", model: "gpt-test" });
+
+  assert.deepEqual(
+    projection.transcript.map(item => [item.role, item.content]),
+    [
+      ["user", "Plan the release"],
+      ["kennedy", "Here is the release plan."],
+    ],
+  );
+  assert.equal(projection.transcript[0].inputKind, "voice");
+  assert.equal(projection.transcript[0].attachments[0].fileName, "release.txt");
+  assert.equal(projection.firstUserMessage, "Plan the release");
+  assert.deepEqual(projection.boundaries, {
+    sourceEnd: 4,
+    transitionStart: 4,
+    historyStart: 6,
+  });
+
+  const sourceText = projection.conversationDiagnostic.chatend
+    .map(message => message.content).join("\n");
+  const ingressText = projection.ingressDiagnostic.chatend
+    .map(message => message.content).join("\n");
+  assert.match(sourceText, /Plan the release|Here is the release plan/);
+  assert.doesNotMatch(sourceText, /Internal ingress response|Created staged node/);
+  assert.match(ingressText, /Internal ingress response|Created staged node/);
+  assert.doesNotMatch(ingressText, /Plan the release|Here is the release plan/);
+  assert.doesNotMatch(ingressText, /duplicate tool presentation|duplicate tool result presentation/);
+
+  assert.deepEqual(projection.ingressDiagnostic.toolLog, [{
+    name: "CreateNode",
+    ok: true,
+    result: "Created staged node pending:12.",
+  }]);
+  assert.equal(
+    projection.ingressDiagnostic.chatend
+      .find(message => message.display_role === "Memory tool result")
+      ?.tool_name,
+    "CreateNode",
+  );
+  assert.equal(projection.ingressDiagnostic.usage.requests, 1);
+  assert.equal(projection.ingressDiagnostic.usage.contextWindowTokens, 128_000);
+  assert.equal(projection.ingressDiagnostic.chatendText, "exact ingress provider input");
+  assert.equal(projection.ingressDiagnostic.historySegments.length, 1);
+  assert.equal(
+    projection.boundaries.sourceEnd
+      + (projection.boundaries.historyStart - projection.boundaries.transitionStart + 1)
+      + (log.events.length - projection.boundaries.historyStart - 1),
+    log.events.length,
+  );
+});
+
+test("live and completed records project the same canonical session log", () => {
+  const log = combinedConversationAndIngressLog();
+  const live = {
+    id: "session-1",
+    phase: "ingress_in_progress",
+    started_at: log.header.createdAt,
+    state: {
+      sessionId: log.header.sessionId,
+      startedAt: log.header.createdAt,
+      events: log.events,
+      historyIngress: {
+        format: "kennedy-chatend",
+        sessionType: "history-ingress",
+      },
+    },
+  };
+  const completed = {
+    id: "archive-1",
+    phase: "complete",
+    state: {
+      sessionType: "conversation",
+      sessionObjectId: "archive-1",
+      archive: log,
+    },
+  };
+  const liveProjection = projectSessionRecord(live);
+  const completedProjection = projectSessionRecord(completed);
+
+  assert.deepEqual(completedProjection.transcript, liveProjection.transcript);
+  assert.deepEqual(
+    completedProjection.conversationDiagnostic.chatend,
+    liveProjection.conversationDiagnostic.chatend,
+  );
+  assert.deepEqual(
+    completedProjection.ingressDiagnostic.chatend,
+    liveProjection.ingressDiagnostic.chatend,
+  );
+  assert.equal(conversationTitle(live), "Plan the release");
+  assert.equal(conversationTitle(completed), "Plan the release");
+  assert.equal(conversationTitle({
+    state: { firstUserMessage: "Summary-only title", transcript: [] },
+  }), "Summary-only title");
+});
+
 test("session history groups phases without mutating backend results", () => {
   const records = [
     { id: "complete", phase: "complete", updated_at: "2026-07-20T12:00:00Z" },
@@ -152,6 +369,11 @@ test("ingress activity is scoped to the selected record", () => {
   const live = conversationIngressActivity({ record, liveRecordId: "selected", liveDiagnostic: { round: 3 } });
   assert.equal(live.diagnostic.round, 3);
   assert.equal(conversationIngressActivity({ record, dismissedId: "selected" }), null);
+  const preparing = conversationIngressActivity({
+    record: { id: "queued", phase: "ingress_pending", state: {} },
+  });
+  assert.equal(preparing.active, true);
+  assert.deepEqual(preparing.diagnostic.chatend.messages, []);
 });
 
 test("self-time validation and display timing use the backend deadline", () => {
@@ -233,10 +455,11 @@ test("Main inspector consumes one combined result for a LoadNode batch", () => {
 });
 
 test("production frontend is server-driven and uses the consolidated origin", async () => {
-  const [app, api, render, humanFormat] = await Promise.all([
+  const [app, api, render, sessionLogView, humanFormat] = await Promise.all([
     readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
     readFile(new URL("../public/js/api.js", import.meta.url), "utf8"),
     readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/session_log_view.js", import.meta.url), "utf8"),
     readFile(new URL("../public/js/human_format.js", import.meta.url), "utf8"),
   ]);
   assert.match(app, /kwebBase: window\.location\.origin/);
@@ -244,7 +467,7 @@ test("production frontend is server-driven and uses the consolidated origin", as
   assert.match(app, /conversationHistoryBase: window\.location\.origin/);
   assert.match(app, /audioIngressBase: window\.location\.origin/);
   assert.doesNotMatch(app, /4323|4325/);
-  assert.doesNotMatch(`${app}\n${api}\n${render}`, /innerHTML|insertAdjacentHTML|outerHTML/);
+  assert.doesNotMatch(`${app}\n${api}\n${render}\n${sessionLogView}`, /innerHTML|insertAdjacentHTML|outerHTML/);
   assert.doesNotMatch(`${api}\n${humanFormat}`, /RustLib|rust-libs/);
   assert.doesNotMatch(app, /legacy_orchestration/);
 });

@@ -1,6 +1,7 @@
 import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260723.2";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260723.1";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260724.1";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260724.2";
+import { isSessionLogArchive, projectSessionRecord } from "./session_log_view.js?v=20260724.1";
 import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260720.2";
 
 const CONFIG = {
@@ -134,78 +135,7 @@ function freshIngressState(state) {
 
 const EMPTY_MEMORY = { directlyLoadedIdentifiers: [], nodes: [] };
 
-function isSessionLogArchive(value) {
-  return typeof value?.header?.formatVersion === "string"
-    && typeof value?.header?.sessionId === "string"
-    && Array.isArray(value?.events);
-}
-
-function decodedSessionEvent(event) {
-  if (typeof event?.text !== "string") return null;
-  try {
-    const decoded = JSON.parse(event.text);
-    return decoded && typeof decoded === "object" ? decoded : null;
-  } catch {
-    return null;
-  }
-}
-
-function sessionEventMessage(event, position) {
-  const decoded = decodedSessionEvent(event);
-  const kind = decoded?.kind;
-  const type = kind?.type;
-  let content = event?.text || "";
-  let displayRole = null;
-  if (type === "box_created") {
-    content = kind?.content?.text || "";
-    displayRole = kind?.name || null;
-  } else if (type === "tool_invoked") {
-    content = JSON.stringify({
-      name: kind?.tool_name,
-      arguments: kind?.arguments || {},
-    }, null, 2);
-    displayRole = `Tool call · ${kind?.tool_name || "unknown"}`;
-  } else if (type === "tool_completed") {
-    content = typeof kind?.outcome?.result === "string"
-      ? kind.outcome.result : JSON.stringify(kind?.outcome || {}, null, 2);
-    displayRole = `Tool result · ${kind?.tool_name || "unknown"}`;
-  } else if (decoded) {
-    content = JSON.stringify(kind || decoded, null, 2);
-  }
-  const role = event?.role === "user-message" ? "user"
-    : event?.role === "kennedy-message" ? "assistant" : "system";
-  return {
-    role,
-    content,
-    display_role: displayRole || `Event ${position + 1} · ${event?.role || "unknown"}`,
-    context_kind: [
-      "kennedy-tool-call", "tool-result", "tool-error", "object", "pending-object",
-    ].includes(event?.role) ? "box" : null,
-  };
-}
-
-function sessionLogDiagnostic(archive, mode) {
-  const messages = archive.events.map(sessionEventMessage);
-  return {
-    mode, provider, model,
-    chatend: messages,
-    chatendText: messages
-      .map(message => `[${message.display_role}]\n${message.content}`)
-      .join("\n\n"),
-    context: { boxCount: 0, eventCount: archive.events.length, staleBoxes: [] },
-    loadCalls: 0,
-    loadLimit: 0,
-    toolLog: [],
-    usage: null,
-    memory: EMPTY_MEMORY,
-    historySegments: [],
-    events: archive.events,
-    boxes: [],
-  };
-}
-
 function archivedDiagnostic(archive, mode, transcript = []) {
-  if (isSessionLogArchive(archive)) return sessionLogDiagnostic(archive, mode);
   if (archive?.version === 1 && archive?.boxes) return boxDiagnostic(archive, mode);
   return {
     mode, provider, model,
@@ -293,22 +223,21 @@ function boxDiagnostic(source, mode) {
   };
 }
 
-function conversationDiagnostic(record) {
+function conversationDiagnostic(record, projection = null) {
   if (!record) return null;
+  if (projection?.conversationDiagnostic) return projection.conversationDiagnostic;
   if (record.state?.boxes && !Array.isArray(record.state.boxes)) {
     return boxDiagnostic(record.state, "session Chatend");
   }
   const archive = isSessionLogArchive(record.state?.archive)
     || record.state?.archive?.format === "kennedy-chatend"
     ? record.state.archive : null;
-  if (!archive && Array.isArray(record.state?.events)) {
-    return sessionLogDiagnostic({ events: record.state.events }, "session log");
-  }
   const transcript = Array.isArray(record.state?.transcript) ? record.state.transcript : [];
   return archivedDiagnostic(archive, "saved conversation", transcript);
 }
 
-function historyIngressDiagnostic(record) {
+function historyIngressDiagnostic(record, projection = null) {
+  if (projection?.ingressDiagnostic) return projection.ingressDiagnostic;
   const archive = record?.state?.historyIngress;
   if (archive?.format !== "kennedy-chatend" || archive?.sessionType !== "history-ingress") {
     return null;
@@ -316,9 +245,7 @@ function historyIngressDiagnostic(record) {
   if (archive?.boxes || archive?.messages || isSessionLogArchive(archive)) {
     return archivedDiagnostic(archive, "history ingress");
   }
-  return Array.isArray(record.state?.events)
-    ? sessionLogDiagnostic({ events: record.state.events }, "history ingress")
-    : archivedDiagnostic(archive, "history ingress");
+  return null;
 }
 
 function ingressStatus(record, ingress) {
@@ -338,11 +265,11 @@ function historyPhase(label, status, source) {
   };
 }
 
-function diagnostic() {
+function diagnostic(projection = null) {
   if (activeView === "audio") return audioRecordingDiagnostic();
   const record = selectedRecord();
-  const conversation = conversationDiagnostic(record);
-  const ingress = historyIngressDiagnostic(record);
+  const conversation = conversationDiagnostic(record, projection);
+  const ingress = historyIngressDiagnostic(record, projection);
   const status = ingressStatus(record, ingress);
   const current = ingress || conversation || {
     mode: "offline", provider, model, chatend: [], context: {}, loadCalls: 0, loadLimit: 0,
@@ -412,11 +339,10 @@ function audioRecordingDiagnostic() {
   return { ...current, fullHistory: { phases } };
 }
 
-function visibleIngressActivity() {
-  const record = selectedRecord();
+function visibleIngressActivity(record, projection = null) {
   return conversationIngressActivity({
     record,
-    savedDiagnostic: historyIngressDiagnostic(record),
+    savedDiagnostic: historyIngressDiagnostic(record, projection),
   });
 }
 
@@ -469,19 +395,22 @@ function update() {
   const telegramView = activeView === "telegram";
   const selfTimeView = activeView === "self-time";
   const freeTimeView = sessionTypeOf(record) === "free-time";
-  const ingressActivity = visibleIngressActivity();
+  const projection = projectSessionRecord(record, { provider, model });
+  const transcript = projection?.transcript
+    || (Array.isArray(record?.state?.transcript) ? record.state.transcript : []);
+  const ingressActivity = visibleIngressActivity(record, projection);
   renderTranscript(
     ui.transcript,
-    record?.state?.transcript || [],
+    transcript,
     ingressActivity,
     `${activeView}:${selectedConversationId || "none"}`,
     record?.phase === "ingress_failed"
       ? { retrying: retryingConversationIds.has(record.id), onRetry: () => retryConversationIngress(record) }
       : null,
   );
-  if (telegramView && !(record?.state?.transcript || []).length && !ingressActivity?.diagnostic) {
+  if (telegramView && !transcript.length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Kennedy's backend continues answering even when no browser is open."));
-  } else if (selfTimeView && !(record?.state?.transcript || []).length && !ingressActivity?.diagnostic) {
+  } else if (selfTimeView && !transcript.length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "empty-state", "Start a self-time run above. Kennedy can follow your optional prompt or explore freely, and every clean-slate slice will remain visible here."));
   }
   renderConversationHistory(ui.conversation_history, recordsForView(), {
@@ -491,7 +420,7 @@ function update() {
     onRetryIngress: retryConversationIngress,
     viewKey: `sidebar:${activeView}`,
   });
-  const currentDiagnostic = diagnostic();
+  const currentDiagnostic = diagnostic(projection);
   renderInspector(
     ui.context_inspector,
     currentDiagnostic,
@@ -1329,7 +1258,10 @@ ui.memory_home.addEventListener("click", () => explorer?.home());
 ui.memory_kennedy_home.addEventListener("click", () => explorer?.kennedyHome());
 ui.copy_context.addEventListener("click", async () => {
   try {
-    await navigator.clipboard.writeText(inspectorText(diagnostic(), inspectorMode));
+    const projection = activeView === "audio"
+      ? null
+      : projectSessionRecord(selectedRecord(), { provider, model });
+    await navigator.clipboard.writeText(inspectorText(diagnostic(projection), inspectorMode));
     ui.copy_context.textContent = "Copied";
     setTimeout(() => { ui.copy_context.textContent = "Copy view"; }, 1200);
   } catch {

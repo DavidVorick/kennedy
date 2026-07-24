@@ -10,6 +10,17 @@ Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
 `chatend-overhaul/chatend-overhaul-clarifications.md`, and
 `chatend-overhaul/chatend-discussion-review.txt`.
 
+## Session-log UI Authority
+
+- The append-ordered `session-log` is the canonical source of session events
+  across the source and history-ingress phases. The browser derives transcript,
+  diagnostic, and ingress views from that one event stream and must partition
+  phases at the durable source-termination and history-ingress markers.
+- Session History control state remains the separate authority for lifecycle,
+  failures, recovery checkpoints, staged Kweb plans, and commit receipts. The
+  UI must not substitute source-phase events when ingress event activity is
+  absent.
+
 # Original Project Clarifications
 
 These user-provided decisions supplement the repository specifications and

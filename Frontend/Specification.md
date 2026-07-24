@@ -42,6 +42,12 @@ role/text events. The browser reconstructs display messages from that stable
 event order; persisted box projections and active/retired snapshots are not
 part of the archive.
 
+One session log spans the source and history-ingress phases. The browser uses
+the durable `source_terminated` and `history_ingress_started` context events to
+produce non-overlapping conversation, transition, and ingress views. Session
+History control state supplies lifecycle, failure, recovery, and commit status;
+it is not an alternative source of display events.
+
 Completed records are read-only. There is no purge control.
 
 ## Chatend display
@@ -121,6 +127,7 @@ Frontend/
       human_format.js
       memory_explorer.js
       render.js
+      session_log_view.js
       self_time.js
   tests/mvp.test.mjs
 ```

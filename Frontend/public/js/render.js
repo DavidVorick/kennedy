@@ -1,5 +1,6 @@
 import { formatKmapContext } from "./human_format.js?v=20260720.2";
 import { contextUsageMeasurement, formatChatend } from "./chatend_format.js?v=20260722.1";
+import { firstSourceUserMessage } from "./session_log_view.js?v=20260724.1";
 
 const RESPONSE_PREVIEW_CHARACTERS = 500;
 
@@ -170,8 +171,12 @@ export function conversationTitle(record, limit = 54) {
     return username ? `@${String(username).replace(/^@/, "")}` : displayName;
   }
   const transcript = Array.isArray(record?.state?.transcript) ? record.state.transcript : [];
-  const firstUserMessage = transcript.find(item => item?.role === "user" && typeof item.content === "string")?.content;
-  const normalized = (firstUserMessage || "New conversation").replace(/\s+/g, " ").trim() || "New conversation";
+  const firstUserMessage = firstSourceUserMessage(record)
+    || transcript.find(item => item?.role === "user" && typeof item.content === "string")?.content;
+  const summaryMessage = typeof record?.state?.firstUserMessage === "string"
+    ? record.state.firstUserMessage : "";
+  const normalized = (firstUserMessage || summaryMessage || "New conversation")
+    .replace(/\s+/g, " ").trim() || "New conversation";
   return normalized.length > limit ? `${normalized.slice(0, limit - 1).trimEnd()}…` : normalized;
 }
 
@@ -565,14 +570,17 @@ export function conversationIngressActivity({
     ? { chatend: { messages: archive.messages || [] }, usage: { snapshot: () => archive.usage || null }, toolLog: archive.tools?.log || [] }
     : null;
   const failed = record.phase === "ingress_failed";
+  const active = record.phase === "ingress_pending" || record.phase === "ingress_in_progress";
   const failures = Array.isArray(record.ingress_failures) ? record.ingress_failures : [];
   const diagnostic = record.id === liveRecordId && liveDiagnostic
     ? liveDiagnostic
-    : saved || (failed ? { chatend: { messages: [] }, usage: { snapshot: () => null }, toolLog: [] } : null);
+    : saved || (failed || active
+      ? { chatend: { messages: [] }, usage: { snapshot: () => null }, toolLog: [] }
+      : null);
   if (!diagnostic) return null;
   return {
     diagnostic,
-    active: record.phase === "ingress_pending" || record.phase === "ingress_in_progress",
+    active,
     failed,
     failures,
   };
