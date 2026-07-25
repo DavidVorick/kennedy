@@ -1,6 +1,6 @@
 import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260723.2";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260723.1";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, element } from "./render.js?v=20260724.2";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, historyRefreshCanApply, historyObservationSignature, element } from "./render.js?v=20260725.1";
 import { isSessionLogArchive, projectSessionRecord } from "./session_log_view.js?v=20260724.1";
 import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260720.2";
 
@@ -17,6 +17,10 @@ const ui = Object.fromEntries([
 ].map(id => [id.replaceAll("-", "_"), document.getElementById(id)]));
 
 const INSPECTOR_MODES = ["main", "full", "history"];
+const ACTIVE_OBSERVED_REFRESH_MS = 1_000;
+const IDLE_OBSERVED_REFRESH_MS = 3_000;
+const HISTORY_HYDRATION_RENDER_MS = 1_000;
+const HISTORY_HYDRATION_GAP_MS = 150;
 const kweb = KwebAPI(CONFIG.kwebBase);
 const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = SessionHistoryAPI(CONFIG.conversationHistoryBase);
@@ -56,6 +60,15 @@ let extractingAttachments = new Set();
 let freeTimeStarting = false;
 let freeTimeStartPromise = null;
 let backgroundRefreshRunning = false;
+let historyMutationGeneration = 0;
+let lastObservedRefreshStartedAt = 0;
+let renderedHistoryObservation = null;
+let backgroundHistoryHydrationRunning = false;
+let backgroundHistoryHydrationRenderTimer = null;
+let historyHydrationQueue = [];
+let queuedHistoryHydrationIds = new Set();
+let attemptedHistoryHydrationIds = new Set();
+let historyHydrationPromises = new Map();
 let kwebReady = false;
 let conversationHistoryReady = false;
 let audioIngressReady = false;
@@ -346,6 +359,25 @@ function visibleIngressActivity(record, projection = null) {
   });
 }
 
+function currentHistoryObservation() {
+  return historyObservationSignature(
+    historyRecords,
+    conversationCommandHeads,
+    selectedConversationId,
+  );
+}
+
+function renderConversationSidebar() {
+  renderConversationHistory(ui.conversation_history, recordsForView(), {
+    selectedId: selectedConversationId,
+    onSelect: id => selectConversation(id).catch(error => showError(ui.error_banner, error.message)),
+    retryingIds: retryingConversationIds,
+    onRetryIngress: retryConversationIngress,
+    viewKey: `sidebar:${activeView}`,
+  });
+  renderedHistoryObservation = currentHistoryObservation();
+}
+
 function update() {
   renderSelfTimeControls();
   ui.self_time_panel.classList.toggle("hidden", activeView !== "self-time");
@@ -420,13 +452,7 @@ function update() {
   } else if (selfTimeView && !transcript.length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "empty-state", "Start a self-time run above. Kennedy can follow your optional prompt or explore freely, and every clean-slate slice will remain visible here."));
   }
-  renderConversationHistory(ui.conversation_history, recordsForView(), {
-    selectedId: selectedConversationId,
-    onSelect: id => selectConversation(id).catch(error => showError(ui.error_banner, error.message)),
-    retryingIds: retryingConversationIds,
-    onRetryIngress: retryConversationIngress,
-    viewKey: `sidebar:${activeView}`,
-  });
+  renderConversationSidebar();
   const currentDiagnostic = diagnostic(projection);
   renderInspector(
     ui.context_inspector,
@@ -511,24 +537,80 @@ async function hydrateHistoryRecord(recordOrId) {
   if (!id) throw new Error("Session History record is missing an ID.");
   const cached = historyRecords.find(item => item.id === id);
   if (cached && !cached.summary) return cached;
-  let record = await conversationHistory.get(id);
-  const objectId = record?.state?.sessionObjectId;
-  if (record?.phase === "complete" && objectId) {
-    const archive = await kweb.sessionArchive(objectId);
-    record = {
-      ...record,
-      started_at: archive?.header?.createdAt || archive?.startedAt || archive?.session?.createdAt || record.started_at,
-      state: {
-        ...record.state,
-        archive,
-        sessionType: record.state?.sessionType
-          || archive?.sessionType || archive?.session?.kind || "conversation",
-        sessionObjectId: objectId,
-      },
-    };
+  if (historyHydrationPromises.has(id)) return historyHydrationPromises.get(id);
+  const hydration = (async () => {
+    let record = await conversationHistory.get(id);
+    const objectId = record?.state?.sessionObjectId;
+    if (record?.phase === "complete" && objectId) {
+      const archive = await kweb.sessionArchive(objectId);
+      record = {
+        ...record,
+        started_at: archive?.header?.createdAt || archive?.startedAt || archive?.session?.createdAt || record.started_at,
+        state: {
+          ...record.state,
+          archive,
+          sessionType: record.state?.sessionType
+            || archive?.sessionType || archive?.session?.kind || "conversation",
+          sessionObjectId: objectId,
+        },
+      };
+    }
+    upsertHistory(record);
+    return record;
+  })();
+  historyHydrationPromises.set(id, hydration);
+  try {
+    return await hydration;
+  } finally {
+    if (historyHydrationPromises.get(id) === hydration) historyHydrationPromises.delete(id);
   }
-  upsertHistory(record);
-  return record;
+}
+
+function scheduleBackgroundHistoryRender() {
+  if (backgroundHistoryHydrationRenderTimer !== null) return;
+  backgroundHistoryHydrationRenderTimer = setTimeout(() => {
+    backgroundHistoryHydrationRenderTimer = null;
+    if (["audio", "memory"].includes(activeView)) return;
+    if (currentHistoryObservation() !== renderedHistoryObservation) renderConversationSidebar();
+  }, HISTORY_HYDRATION_RENDER_MS);
+}
+
+async function drainHistoryHydrationQueue() {
+  if (backgroundHistoryHydrationRunning) return;
+  backgroundHistoryHydrationRunning = true;
+  try {
+    while (historyHydrationQueue.length) {
+      const id = historyHydrationQueue.shift();
+      queuedHistoryHydrationIds.delete(id);
+      attemptedHistoryHydrationIds.add(id);
+      const record = historyRecords.find(item => item.id === id);
+      if (record?.phase === "complete" && record.summary) {
+        try {
+          await hydrateHistoryRecord(record);
+          scheduleBackgroundHistoryRender();
+        } catch (error) {
+          if (error?.code !== "not_found") {
+            console.warn(`Saved conversation ${id} could not be hydrated in the background.`, error);
+          }
+        }
+      }
+      if (historyHydrationQueue.length) {
+        await new Promise(resolve => setTimeout(resolve, HISTORY_HYDRATION_GAP_MS));
+      }
+    }
+  } finally {
+    backgroundHistoryHydrationRunning = false;
+  }
+}
+
+function queueCompletedHistoryHydration() {
+  for (const record of historyRecords) {
+    if (record.phase !== "complete" || !record.summary || record.id === selectedConversationId) continue;
+    if (attemptedHistoryHydrationIds.has(record.id) || queuedHistoryHydrationIds.has(record.id)) continue;
+    queuedHistoryHydrationIds.add(record.id);
+    historyHydrationQueue.push(record.id);
+  }
+  void drainHistoryHydrationQueue();
 }
 
 function saveDraft() {
@@ -733,33 +815,28 @@ function reconcileHistory(records) {
   }
 }
 
-async function refreshHistory() {
+async function refreshHistory(startedGeneration = historyMutationGeneration) {
   const [history, commands] = await Promise.all([
     conversationHistory.list(),
     conversationHistory.commandHeads(),
   ]);
+  if (!historyRefreshCanApply(
+    startedGeneration,
+    historyMutationGeneration,
+    creatingConversation,
+  )) return false;
   const records = history.conversations || [];
   conversationCommandHeads = new Map((commands.commands || []).map(command => [command.conversationId, command]));
   reconcileHistory(records);
-  const completedSummaries = historyRecords.filter(
-    record => record.phase === "complete" && record.summary,
-  );
-  if (completedSummaries.length) {
-    const results = await Promise.allSettled(
-      completedSummaries.map(record => hydrateHistoryRecord(record)),
-    );
-    const failure = results.find(
-      result => result.status === "rejected" && result.reason?.code !== "not_found",
-    );
-    if (failure) throw failure.reason;
-  }
   const selected = historyRecords.find(record => record.id === selectedConversationId);
   if (selected?.summary) {
     try { await hydrateHistoryRecord(selected); } catch (error) {
       if (error?.code !== "not_found") throw error;
     }
   }
-  update();
+  queueCompletedHistoryHydration();
+  if (currentHistoryObservation() !== renderedHistoryObservation) update();
+  return true;
 }
 
 async function loadAudioRecording(id, force = false) {
@@ -878,27 +955,29 @@ async function retryConversationIngress(record) {
 async function createNewConversation() {
   if (creatingConversation) return;
   if (!chatRuntimeReady()) throw new Error("A new conversation cannot start until Session History is available.");
+  historyMutationGeneration += 1;
   creatingConversation = true;
   saveDraft();
+  const start = conversationHistory.start({
+    idempotency_id: newIdempotencyId(),
+    started_at: new Date().toISOString(),
+    session_type: "conversation",
+  });
   update();
+  let record = null;
   try {
-    const record = await conversationHistory.start({
-      idempotency_id: newIdempotencyId(),
-      started_at: new Date().toISOString(),
-      session_type: "conversation",
-    });
+    record = await start;
     drafts.set(record.id, "");
     upsertHistory(record);
     selectedConversationId = record.id;
     selectedByView.conversation = record.id;
     restoreDraft();
-    update();
-    ui.transcript.scrollTop = ui.transcript.scrollHeight;
-    ui.message_input.focus();
   } finally {
     creatingConversation = false;
     update();
   }
+  ui.transcript.scrollTop = ui.transcript.scrollHeight;
+  ui.message_input.focus();
 }
 
 async function startFreeTime() {
@@ -1099,19 +1178,41 @@ function showView(view) {
     update();
   }
   if (memory && explorer && !explorer.currentNodeId) explorer.home();
-  if (!memory) void refreshObservedState();
+  if (!memory) void refreshObservedState(true);
 }
 
-async function refreshObservedState() {
+function observedWorkIsActive() {
+  const conversationWork = conversationCommandHeads.size > 0 || historyRecords.some(record =>
+    ["ingress_pending", "ingress_in_progress"].includes(record.phase)
+      || Boolean(record?.state?.pendingTurn)
+      || (record.phase === "active" && sessionTypeOf(record) === "free-time")
+  );
+  const audioWork = activeView === "audio" && audioRecords.some(record =>
+    !["complete", "failed", "ingress_failed"].includes(record.status)
+  );
+  return creatingConversation || freeTimeStarting || endingIds.size > 0
+    || retryingConversationIds.size > 0 || retryingAudioPieces.size > 0
+    || retryingAudioRecordings.size > 0 || conversationWork || audioWork;
+}
+
+async function refreshObservedState(force = false) {
   if (backgroundRefreshRunning) return;
+  const now = Date.now();
+  const refreshInterval = observedWorkIsActive()
+    ? ACTIVE_OBSERVED_REFRESH_MS : IDLE_OBSERVED_REFRESH_MS;
+  if (!force && now - lastObservedRefreshStartedAt < refreshInterval) return;
+  lastObservedRefreshStartedAt = now;
   backgroundRefreshRunning = true;
   try {
-    if (conversationHistoryReady) {
-      await refreshHistory();
+    if (conversationHistoryReady && !creatingConversation) {
+      const refreshGeneration = historyMutationGeneration;
+      const applied = await refreshHistory(refreshGeneration);
       const records = recordsForView();
-      if (!records.some(record => record.id === selectedConversationId)) {
+      if (applied && !records.some(record => record.id === selectedConversationId)) {
         selectedConversationId = records[0]?.id || null;
         selectedByView[activeView] = selectedConversationId;
+        restoreDraft();
+        update();
       }
     }
     if (audioIngressReady && activeView === "audio") {

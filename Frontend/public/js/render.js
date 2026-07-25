@@ -276,6 +276,37 @@ export function reconcileConversationHistory(cachedRecords, incomingRecords) {
   }));
 }
 
+export function historyRefreshCanApply(startedGeneration, currentGeneration, creating = false) {
+  return !creating && startedGeneration === currentGeneration;
+}
+
+export function historyObservationSignature(records, commands, selectedId = null) {
+  const commandList = commands instanceof Map ? [...commands.values()] : [...(commands || [])];
+  return JSON.stringify({
+    selectedId,
+    records: (records || []).map(record => [
+      record?.id || null,
+      Number(record?.version) || 0,
+      record?.phase || null,
+      record?.summary === true,
+      record?.updated_at || null,
+      record?.state?.sessionType || record?.state?.archive?.sessionType || null,
+      Boolean(record?.state?.archive),
+    ]),
+    commands: commandList
+      .map(command => [
+        command?.id || null,
+        command?.conversationId || null,
+        Number(command?.sequence) || 0,
+        command?.kind || null,
+        command?.status || null,
+        command?.cancelRequested === true,
+        command?.completedAt || null,
+      ])
+      .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+  });
+}
+
 function historyDate(value) {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.valueOf())) return "Saved";

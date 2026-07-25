@@ -217,6 +217,21 @@ canonical documents; this file is not an append-only log.
 
 ## Tools and Provider Execution
 
+- Give Kennedy model-callable enrichment tools for newly supplied staged
+  objects. The tools take the object's existing `pending:N` identifier and
+  return supplementary text without replacing or modifying the authoritative
+  original bytes.
+- Images may be annotated through OpenAI, Codex, or Gemini at Kennedy's
+  discretion. Native audio and video annotation uses Gemini. PDF, legacy DOC,
+  and DOCX inputs use local text conversion. These annotations and conversions
+  remain fallible source material in the ordinary Chatend tool history.
+- Every provider-backed media annotation call includes an explicit,
+  Kennedy-authored prompt describing what to inspect and the desired textual
+  result. Do not hide annotation behavior behind a fixed server-side prompt;
+  validate and bound the supplied prompt as part of the Ktool contract.
+- The initial model-readable document-conversion scope is PDF, DOC, and DOCX;
+  adding other document formats is a separate decision even when the underlying
+  upload path accepts arbitrary files.
 - Use the ChatGPT-authenticated Codex CLI, so Kennedy consumes Codex
   subscription limits rather than a billed
   OpenAI API key. On this deployment, invoke it only through the host's
@@ -334,6 +349,16 @@ canonical documents; this file is not an append-only log.
   successful `ConnectNodes` calls. Do not count failed tool attempts.
 - Show durable conversation history in a sidebar and allow completed
   transcripts to be reopened read-only.
+- Treat browser history refreshes as generation-scoped observations: a response
+  started before local conversation creation must not remove the new record or
+  change its selection, and any necessary fallback selection renders
+  immediately.
+- Do not rebuild the transcript and Chatend inspector when observed history and
+  command state is unchanged. Hydrate the selected archive immediately, hydrate
+  older summaries through a bounded background queue, and update only their
+  sidebar presentation as they arrive.
+- Poll Session History more slowly while idle and retain one-second observation
+  while commands, ingress, self time, retries, or audio processing are active.
 - When a conversation ends, keep that closed conversation selected while its
   history ingress unfolds. Never select or create a replacement conversation
   automatically; the user can select another existing chat or press `New`

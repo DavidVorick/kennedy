@@ -14,6 +14,8 @@ import {
   audioRecordingTitle,
   conversationIngressActivity,
   conversationTitle,
+  historyObservationSignature,
+  historyRefreshCanApply,
   inspectorText,
   mainViewEntries,
   reconcileConversationHistory,
@@ -350,6 +352,36 @@ test("session history reconciliation never regresses a hydrated record", () => {
     state: { transcript: [{ role: "user", content: "Complete history" }] },
   }];
   assert.equal(reconcileConversationHistory(hydrated, sameVersionSummary)[0], hydrated[0]);
+});
+
+test("history refreshes discard responses invalidated by local creation", () => {
+  assert.equal(historyRefreshCanApply(4, 4, false), true);
+  assert.equal(historyRefreshCanApply(4, 5, false), false);
+  assert.equal(historyRefreshCanApply(4, 4, true), false);
+});
+
+test("history observation signatures change only when rendered history state changes", () => {
+  const records = [{
+    id: "active", version: 5, phase: "active", summary: false,
+    updated_at: "2026-07-25T00:00:00Z", state: { sessionType: "conversation" },
+  }];
+  const pending = {
+    id: "command", conversationId: "active", sequence: 1,
+    kind: "message", status: "pending", cancelRequested: false,
+  };
+  const original = historyObservationSignature(records, [pending], "active");
+  assert.equal(original, historyObservationSignature([...records], new Map([["active", { ...pending }]]), "active"));
+  assert.notEqual(original, historyObservationSignature(
+    [{ ...records[0], version: 6 }],
+    [pending],
+    "active",
+  ));
+  assert.notEqual(original, historyObservationSignature(
+    records,
+    [{ ...pending, status: "processing" }],
+    "active",
+  ));
+  assert.notEqual(original, historyObservationSignature(records, [pending], "other"));
 });
 
 test("ingress activity is scoped to the selected record", () => {
