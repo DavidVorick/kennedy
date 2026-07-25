@@ -136,8 +136,14 @@ function transcriptEntry(entry) {
     content: box ? displayText(entry) : String(entry.event?.text || ""),
     boxId: entry.position + 1,
   };
+  if (box && Array.isArray(content.objects) && content.objects.length) {
+    item.objects = content.objects;
+  }
   for (const key of ["inputKind", "attachments", "externalEventId"]) {
     if (metadata[key] !== undefined) item[key] = metadata[key];
+  }
+  if (!item.attachments && metadata.media && typeof metadata.media === "object") {
+    item.attachments = [metadata.media];
   }
   return item;
 }

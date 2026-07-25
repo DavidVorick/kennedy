@@ -1140,6 +1140,7 @@ mod tests {
             intelligence_base: "http://127.0.0.1:1".into(),
             conversation_history_base: "http://127.0.0.1:1".into(),
             telegram_relay_base: "http://127.0.0.1:1".into(),
+            telegram_max_media_bytes: 1024,
             audio_ingress_base: "http://127.0.0.1:1".into(),
             telegram_web_user_handle: "@test".into(),
         })
@@ -1458,6 +1459,7 @@ mod tests {
             intelligence_base: base.clone(),
             conversation_history_base: base.clone(),
             telegram_relay_base: base.clone(),
+            telegram_max_media_bytes: 1024,
             audio_ingress_base: base,
             telegram_web_user_handle: "@test".into(),
         };

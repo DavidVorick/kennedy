@@ -94,6 +94,7 @@ operating instructions are system-prompt boxes.
 Read tools include:
 
 - `LoadNode`;
+- `EmitObject` in user-facing conversations;
 - box and history hydration/dehydration/summarization;
 - web search and fetch;
 - managed Rust library tools.
@@ -136,6 +137,12 @@ just loaded without duplicating it. A no-change reload and a failed load
 return short plain text. The journal retains only a compact completion receipt
 for the operation.
 
+`EmitObject` accepts one canonical eight-character Kweb object ID. A successful
+call creates an ordinary Kennedy message box containing that object reference
+and is itself a valid terminal response; no prose is required. Browser and
+Telegram adapters deliver the already-durable response afterward. The tool
+does not create a second object or attach it to a node.
+
 ## Temporary IDs and staged objects
 
 The ordered session transcript is the identity space. A pending node or object
@@ -144,9 +151,23 @@ array position. Event IDs and pending IDs are not serialized as separate
 session-log fields.
 
 Original object bytes are staged in one file per object before the matching
-`pending-object` event is appended. A later Kweb commit reads those bytes and
-obtains canonical object IDs. The Session History completion receipt records
-the pending-to-canonical mapping.
+`pending-object` event is appended. Browser uploads accept arbitrary files;
+document extraction is optional enrichment. Telegram accepts the relay's
+voice, document, photo, video, animation, audio, video-note, and sticker kinds.
+A later Kweb commit stores a versioned file envelope containing the safe
+filename, media type, transport kind, and exact original bytes, then obtains
+canonical object IDs. Exact known pending-object tokens in the session archive
+and staged node descriptive fields are replaced before that same transaction
+finalizes. The Session History completion receipt records the
+pending-to-canonical mapping.
+
+Active objects are readable through their session/pending-ID route. Committed
+objects are readable through `/api/v1/objects/{object_id}`. The browser renders
+images, video, audio, and PDFs inline and provides a download for every type.
+Telegram uses the relay's native media endpoint where applicable and retains
+the existing generic-document endpoint for deliberately document-shaped
+delivery. A failed native send is surfaced and is not silently retried as a
+document.
 
 Kweb owns its transaction and object limits. The `kcode-session-log` package does not
 interpret or duplicate those limits.

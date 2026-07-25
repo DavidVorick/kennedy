@@ -83,9 +83,14 @@ function combinedConversationAndIngressLog() {
       owner: { kind: "user" },
       content: {
         text: "Plan the release",
+        objects: ["pending:3"],
         metadata: {
           inputKind: "voice",
-          attachments: [{ fileName: "release.txt" }],
+          attachments: [{
+            pendingId: "pending:3",
+            fileName: "release.txt",
+            mimeType: "text/plain",
+          }],
         },
       },
     }),
@@ -232,6 +237,7 @@ test("session-log projection separates source conversation from history ingress"
     ],
   );
   assert.equal(projection.transcript[0].inputKind, "voice");
+  assert.deepEqual(projection.transcript[0].objects, ["pending:3"]);
   assert.equal(projection.transcript[0].attachments[0].fileName, "release.txt");
   assert.equal(projection.firstUserMessage, "Plan the release");
   assert.deepEqual(projection.boundaries, {

@@ -12,7 +12,7 @@ use super::chatend::{
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
-use kcode_kweb_db::NodeId;
+use kcode_kweb_db::{NodeId, ObjectId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -577,6 +577,12 @@ struct ToolCall {
     arguments: Value,
 }
 
+struct RecordedToolInvocation {
+    invocation_id: String,
+    tool_instance: String,
+    tool_name: String,
+}
+
 #[derive(Clone)]
 struct FreeformWriteRequest {
     name: String,
@@ -723,6 +729,40 @@ fn prospective_rust_lib_box_updates(
     BTreeMap::from([(box_id, rust_lib_box_content(&snapshot))])
 }
 
+fn prospective_rust_lib_snapshot_tokens(
+    journal: &SessionJournal,
+    snapshot: &LibrarySnapshot,
+) -> anyhow::Result<u64> {
+    let projection = if let Some(box_id) = rust_lib_box_id(journal, &snapshot.name) {
+        journal.state().projection_with_new_boxes_and_updates(
+            &[],
+            &BTreeMap::from([(box_id, rust_lib_box_content(snapshot))]),
+        )?
+    } else {
+        let current = journal
+            .state()
+            .tools
+            .get(RUST_LIB_TOOL_INSTANCE)
+            .cloned()
+            .unwrap_or_default();
+        let mut used_slots = current
+            .slots
+            .iter()
+            .map(|slot| slot.slot.clone())
+            .collect::<HashSet<_>>();
+        let slot = unique_kweb_slot(&snapshot.name, &mut used_slots);
+        journal.state().projection_with_new_boxes(&[(
+            format!("Managed Rust library {}", snapshot.name),
+            BoxOwner::Tool {
+                tool_instance: RUST_LIB_TOOL_INSTANCE.into(),
+                slot,
+            },
+            rust_lib_box_content(snapshot),
+        )])?
+    };
+    Ok(projection.estimated_tokens)
+}
+
 fn apply_rust_lib_snapshot(
     journal: &mut SessionJournal,
     snapshot: LibrarySnapshot,
@@ -795,6 +835,7 @@ struct ToolOutcome {
     ok: bool,
     end_session: bool,
     freeform_write: Option<FreeformWriteRequest>,
+    rust_lib_snapshot: Option<LibrarySnapshot>,
 }
 
 #[derive(Debug)]
@@ -997,6 +1038,9 @@ impl Session {
             fatal_persistence_error: None,
         };
 
+        if matches!(session.mode, AgentMode::Ingress { .. }) && !session.journal.is_sealed() {
+            session.journal.repair_unfinished_tools(now())?;
+        }
         if session.journal.is_sealed() {
             anyhow::ensure!(
                 !matches!(session.mode, AgentMode::Conversation),
@@ -1017,15 +1061,19 @@ impl Session {
                 BoxContent::text(&system_prompt),
             )?;
             let roots = session.root_node_ids.clone();
+            let mut invocations = Vec::with_capacity(roots.len());
             for root in &roots {
-                session.record_tool_invocation("LoadNode", json!({"identifier":root}))?;
+                invocations
+                    .push(session.record_tool_invocation("LoadNode", json!({"identifier":root}))?);
             }
             let result = session.context.load_durable_batch(&roots).await?;
             session.sync_kweb_boxes()?;
-            session.record_tool_completion(
-                "LoadNode",
-                json!({"ok":true,"automatic":true,"identifiers":roots,"result":result}),
-            )?;
+            for invocation in &invocations {
+                session.record_tool_completion(
+                    Some(invocation),
+                    json!({"ok":true,"automatic":true,"identifiers":roots,"result":result}),
+                )?;
+            }
         } else {
             session.sync_kweb_boxes()?;
         }
@@ -1317,10 +1365,30 @@ impl Session {
                 return Ok(InputStage::RejectedForCapacity);
             }
         }
+        let transcript_objects = content.objects.clone();
+        let mut transcript_attachments = content
+            .metadata
+            .get("attachments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(media) = content
+            .metadata
+            .get("media")
+            .filter(|value| value.is_object())
+        {
+            transcript_attachments.push(media.clone());
+        }
         for (name, owner, content) in prospective_boxes {
             self.journal.create_box(now(), name, owner, content)?;
         }
         let mut transcript = json!({"role":"user","content":visible});
+        if !transcript_objects.is_empty() {
+            transcript["objects"] = json!(transcript_objects);
+        }
+        if !transcript_attachments.is_empty() {
+            transcript["attachments"] = json!(transcript_attachments);
+        }
         if let Some(id) = metadata.get("externalEventId").and_then(Value::as_str) {
             transcript["externalEventId"] = json!(id);
         }
@@ -1373,6 +1441,18 @@ impl Session {
                 Some("kennedy" | "system")
             ) && entry.get("externalEventId").and_then(Value::as_str) == Some(id)
         })
+    }
+
+    pub(crate) fn responses_for_external_event(&self, id: &str) -> Vec<&Value> {
+        self.transcript
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.get("role").and_then(Value::as_str),
+                    Some("kennedy" | "system")
+                ) && entry.get("externalEventId").and_then(Value::as_str) == Some(id)
+            })
+            .collect()
     }
 
     fn record_live_capacity_error(
@@ -1594,9 +1674,7 @@ impl Session {
                         .pending_external_event_id
                         .as_deref()
                         .and_then(|id| self.answer_for_external_event(id))
-                        .is_some_and(|entry| {
-                            entry.get("role").and_then(Value::as_str) == Some("system")
-                        })
+                        .is_some()
                     {
                         self.pending_turn = false;
                         self.pending_external_event_id = None;
@@ -1681,6 +1759,7 @@ impl Session {
             let mut turn = self.api.start_agent_turn(operation_id, request).await?;
             let mut end_session = false;
             let mut used_tool = false;
+            let mut emitted_response = false;
             let mut pending_freeform_write = None;
             let completed = loop {
                 let event = turn
@@ -1704,10 +1783,7 @@ impl Session {
                             let text = format!(
                                 "{WRITE_FILE_FREEFORM_RUST_LIB_TOOL} is awaiting the complete file contents; no other Ktool can run before that output."
                             );
-                            self.record_tool_completion(
-                                "call_ktool",
-                                json!({"ok":false,"result":text}),
-                            )?;
+                            self.record_tool_completion(None, json!({"ok":false,"result":text}))?;
                             checkpoint(self.snapshot()?).await?;
                             turn.respond(
                                 &native.call_id,
@@ -1717,12 +1793,17 @@ impl Session {
                             continue;
                         }
                         let mut created_call_box_id = None;
+                        let mut recorded_invocation = None;
                         let call = native_ktool_call(&native);
                         let mut outcome = match call {
                             Ok(call) => {
                                 let call_name = format!("Kennedy tool call: {}", call.name);
                                 let call_content = tool_call_box_content(&call)?;
-                                self.record_tool_invocation(&call.name, call.arguments.clone())?;
+                                recorded_invocation =
+                                    Some(self.record_tool_invocation(
+                                        &call.name,
+                                        call.arguments.clone(),
+                                    )?);
                                 let prospective_updates =
                                     prospective_rust_lib_box_updates(&self.journal, &call);
                                 let prospective_projection =
@@ -1770,6 +1851,7 @@ impl Session {
                                         ok: false,
                                         end_session: false,
                                         freeform_write: None,
+                                        rust_lib_snapshot: None,
                                     }
                                 } else {
                                     created_call_box_id = Some(self.journal.create_box(
@@ -1792,16 +1874,23 @@ impl Session {
                                             ok: false,
                                             end_session: false,
                                             freeform_write: None,
+                                            rust_lib_snapshot: None,
                                         }
                                     } else {
                                         match self.execute_tool(&call, operation_id).await {
-                                            Ok(outcome) => outcome,
+                                            Ok(outcome) => {
+                                                if call.name == "EmitObject" && outcome.ok {
+                                                    emitted_response = true;
+                                                }
+                                                outcome
+                                            }
                                             Err(error) => ToolOutcome {
                                                 text: format!("{} failed: {error}", call.name),
                                                 store_result: call.name != "LoadNode",
                                                 ok: false,
                                                 end_session: false,
                                                 freeform_write: None,
+                                                rust_lib_snapshot: None,
                                             },
                                         }
                                     }
@@ -1813,8 +1902,52 @@ impl Session {
                                 ok: false,
                                 end_session: false,
                                 freeform_write: None,
+                                rust_lib_snapshot: None,
                             },
                         };
+                        if let Some(snapshot) = outcome.rust_lib_snapshot.take() {
+                            let prospective_tokens =
+                                prospective_rust_lib_snapshot_tokens(&self.journal, &snapshot)?;
+                            let ingress = matches!(self.mode, AgentMode::Ingress { .. });
+                            let limit = if ingress {
+                                self.journal.state().ingress_context_limit()
+                            } else {
+                                self.journal.state().live_context_limit()
+                            };
+                            if prospective_tokens > limit {
+                                let name = snapshot.name.clone();
+                                let text = if ingress {
+                                    self.request_ingress_force_commit(
+                                        "managed_rust_snapshot_exceeded_full_window",
+                                        prospective_tokens,
+                                    )?;
+                                    format!(
+                                        "The managed Rust library {name} was opened, but its source snapshot was not added because it exceeded the full context window; the staged transaction will now be committed."
+                                    )
+                                } else {
+                                    let external_event_id = self.pending_external_event_id.clone();
+                                    self.record_live_capacity_error(
+                                        &format!(
+                                            "Kennedy's managed Rust library snapshot for {name}"
+                                        ),
+                                        prospective_tokens,
+                                        limit,
+                                        external_event_id.as_deref(),
+                                    )?
+                                };
+                                outcome = ToolOutcome {
+                                    text,
+                                    store_result: false,
+                                    ok: false,
+                                    end_session: false,
+                                    freeform_write: None,
+                                    rust_lib_snapshot: None,
+                                };
+                            } else {
+                                apply_rust_lib_snapshot(&mut self.journal, snapshot)?;
+                                outcome.store_result = false;
+                            }
+                        }
                         if !matches!(self.mode, AgentMode::Ingress { .. }) {
                             let projection = if outcome.store_result {
                                 self.journal.state().projection_with_new_boxes(&[(
@@ -1839,6 +1972,7 @@ impl Session {
                                     ok: false,
                                     end_session: false,
                                     freeform_write: None,
+                                    rust_lib_snapshot: None,
                                 };
                             }
                         }
@@ -1859,7 +1993,7 @@ impl Session {
                         }
                         let provider_result = outcome.text.clone();
                         self.record_tool_completion(
-                            "call_ktool",
+                            recorded_invocation.as_ref(),
                             json!({"ok":outcome.ok,"result":outcome.text}),
                         )?;
                         end_session |= outcome.ok && outcome.end_session;
@@ -2023,6 +2157,9 @@ impl Session {
             if matches!(self.mode, AgentMode::Conversation) && !answer.is_empty() {
                 return Ok(Some(answer));
             }
+            if matches!(self.mode, AgentMode::Conversation) && emitted_response {
+                return Ok(None);
+            }
             let solo_ingress_response =
                 matches!(self.mode, AgentMode::Ingress { .. }) && !answer.is_empty();
             anyhow::ensure!(
@@ -2084,6 +2221,7 @@ impl Session {
                     ok: false,
                     end_session: false,
                     freeform_write: None,
+                    rust_lib_snapshot: None,
                 });
             }
         };
@@ -2114,6 +2252,7 @@ impl Session {
                     ok: false,
                     end_session: false,
                     freeform_write: None,
+                    rust_lib_snapshot: None,
                 });
             }
             let external_event_id = self.pending_external_event_id.clone();
@@ -2132,6 +2271,7 @@ impl Session {
                 ok: false,
                 end_session: false,
                 freeform_write: None,
+                rust_lib_snapshot: None,
             });
         }
 
@@ -2152,6 +2292,7 @@ impl Session {
                     ok: false,
                     end_session: false,
                     freeform_write: None,
+                    rust_lib_snapshot: None,
                 });
             }
         };
@@ -2165,6 +2306,7 @@ impl Session {
             ok: true,
             end_session: false,
             freeform_write: None,
+            rust_lib_snapshot: None,
         })
     }
 
@@ -2177,6 +2319,7 @@ impl Session {
         let mut end_session = false;
         let mut store_result = true;
         let mut freeform_write = None;
+        let mut rust_lib_snapshot = None;
         let text = match call.name.as_str() {
             "EndSession" => {
                 validate_arguments(&call.arguments, &[], &["message"])?;
@@ -2270,6 +2413,74 @@ impl Session {
                 store_result = false;
                 render_load_node_result(&self.journal, &changed)?
             }
+            "EmitObject" => {
+                validate_arguments(&call.arguments, &["objectId"], &[])?;
+                anyhow::ensure!(
+                    matches!(self.mode, AgentMode::Conversation),
+                    "EmitObject is only available in a conversation"
+                );
+                let object_id = nonempty_string(&call.arguments, "objectId", 8)?;
+                object_id
+                    .parse::<ObjectId>()
+                    .with_context(|| format!("{object_id:?} is not a canonical object ID"))?;
+                let file = self.api.kmap_file(&object_id)?;
+                if let Some(maximum) = self.channel.get("maxObjectBytes").and_then(Value::as_u64) {
+                    anyhow::ensure!(
+                        !file.bytes.is_empty(),
+                        "object {object_id} is empty and cannot be sent through this channel"
+                    );
+                    anyhow::ensure!(
+                        file.bytes.len() as u64 <= maximum,
+                        "object {object_id} is {} bytes, over this channel's {maximum}-byte limit",
+                        file.bytes.len()
+                    );
+                }
+                let descriptor = json!({
+                    "objectId":object_id,
+                    "fileName":file.file_name,
+                    "mediaType":file.media_type,
+                    "byteLength":file.bytes.len(),
+                });
+                let mut metadata = json!({
+                    "outputKind":"object",
+                    "attachments":[descriptor.clone()],
+                });
+                if let Some(external_event_id) = &self.pending_external_event_id {
+                    metadata["externalEventId"] = json!(external_event_id);
+                }
+                let content = BoxContent {
+                    text: String::new(),
+                    objects: vec![object_id.clone()],
+                    metadata,
+                };
+                let projected = self
+                    .journal
+                    .state()
+                    .projection_with_new_boxes(&[(
+                        "Kennedy message".into(),
+                        BoxOwner::Kennedy,
+                        content.clone(),
+                    )])?
+                    .estimated_tokens;
+                anyhow::ensure!(
+                    projected <= self.journal.state().live_context_limit(),
+                    "emitting object {object_id} would exceed the live context limit"
+                );
+                self.journal
+                    .create_box(now(), "Kennedy message", BoxOwner::Kennedy, content)?;
+                let mut transcript = json!({
+                    "role":"kennedy",
+                    "content":"",
+                    "objects":[object_id],
+                    "attachments":[descriptor],
+                });
+                if let Some(external_event_id) = &self.pending_external_event_id {
+                    transcript["externalEventId"] = json!(external_event_id);
+                }
+                self.transcript.push(transcript);
+                store_result = false;
+                "Object emitted to the user.".into()
+            }
             "WebSearch" => {
                 validate_arguments(&call.arguments, &["question", "mode"], &[])?;
                 let mode = nonempty_string(&call.arguments, "mode", 20)?;
@@ -2333,7 +2544,7 @@ impl Session {
                     .rust_lib_execute(&self.rust_lib_session_id, name, call.arguments.clone())
                     .await?;
                 if let Some(snapshot) = execution.snapshot {
-                    apply_rust_lib_snapshot(&mut self.journal, snapshot)?;
+                    rust_lib_snapshot = Some(snapshot);
                     store_result = false;
                 }
                 execution.text
@@ -2346,6 +2557,7 @@ impl Session {
             ok: true,
             end_session,
             freeform_write,
+            rust_lib_snapshot,
         })
     }
 
@@ -2714,24 +2926,49 @@ impl Session {
         })
     }
 
-    fn record_tool_invocation(&mut self, name: &str, arguments: Value) -> anyhow::Result<EventId> {
+    fn record_tool_invocation(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<RecordedToolInvocation> {
+        let invocation = RecordedToolInvocation {
+            invocation_id: Uuid::new_v4().to_string(),
+            tool_instance: tool_instance(name),
+            tool_name: name.into(),
+        };
         self.journal.record(
             now(),
             EventKind::ToolInvoked {
-                tool_instance: tool_instance(name),
-                tool_name: name.into(),
+                tool_instance: invocation.tool_instance.clone(),
+                tool_name: invocation.tool_name.clone(),
                 arguments,
+                invocation_id: Some(invocation.invocation_id.clone()),
             },
-        )
+        )?;
+        Ok(invocation)
     }
 
-    fn record_tool_completion(&mut self, name: &str, outcome: Value) -> anyhow::Result<EventId> {
+    fn record_tool_completion(
+        &mut self,
+        invocation: Option<&RecordedToolInvocation>,
+        outcome: Value,
+    ) -> anyhow::Result<EventId> {
+        let (tool_instance, tool_name, invocation_id) = invocation
+            .map(|invocation| {
+                (
+                    invocation.tool_instance.clone(),
+                    invocation.tool_name.clone(),
+                    Some(invocation.invocation_id.clone()),
+                )
+            })
+            .unwrap_or_else(|| ("call_ktool".into(), "call_ktool".into(), None));
         self.journal.record(
             now(),
             EventKind::ToolCompleted {
-                tool_instance: name.into(),
-                tool_name: name.into(),
+                tool_instance,
+                tool_name,
                 outcome,
+                invocation_id,
             },
         )
     }
@@ -2970,6 +3207,7 @@ impl Session {
         if self.commit_receipt.is_some() {
             return Ok(());
         }
+        self.journal.repair_unfinished_tools(now())?;
         self.journal.seal()?;
         let archive = serde_json::to_vec(&self.journal.session_log())?;
         let object_locations = self
@@ -2979,9 +3217,12 @@ impl Session {
             .map(|(id, location)| (id.clone(), location.clone()))
             .collect::<Vec<_>>();
         let mut objects = Vec::with_capacity(object_locations.len());
-        for (id, _) in object_locations {
+        for (id, location) in object_locations {
             objects.push(SessionObject {
                 pending_id: id.to_string(),
+                file_name: location.metadata.file_name,
+                media_type: location.metadata.media_type,
+                transport_kind: staged_object_transport_kind(&self.journal, &id),
                 bytes: self.journal.read_object(&id)?,
             });
         }
@@ -3219,12 +3460,72 @@ fn transcript_from_journal(journal: &SessionJournal) -> Vec<Value> {
                 "role":role,
                 "content":state.canonical.content.text,
             });
+            if !state.canonical.content.objects.is_empty() {
+                entry["objects"] = json!(state.canonical.content.objects);
+            }
+            if let Some(attachments) = state
+                .canonical
+                .content
+                .metadata
+                .get("attachments")
+                .filter(|value| value.is_array())
+            {
+                entry["attachments"] = attachments.clone();
+            } else if let Some(media) = state
+                .canonical
+                .content
+                .metadata
+                .get("media")
+                .filter(|value| value.is_object())
+            {
+                entry["attachments"] = json!([media]);
+            }
             if let Some(id) = state.canonical.content.metadata.get("externalEventId") {
                 entry["externalEventId"] = id.clone();
             }
             Some(entry)
         })
         .collect()
+}
+
+fn staged_object_transport_kind(
+    journal: &SessionJournal,
+    pending_id: &PendingId,
+) -> Option<String> {
+    let pending_id = pending_id.to_string();
+    for state in journal.state().boxes.values() {
+        let Some(index) = state
+            .canonical
+            .content
+            .objects
+            .iter()
+            .position(|object_id| object_id == &pending_id)
+        else {
+            continue;
+        };
+        let metadata = &state.canonical.content.metadata;
+        let descriptor = metadata
+            .get("attachments")
+            .and_then(Value::as_array)
+            .and_then(|attachments| {
+                attachments
+                    .iter()
+                    .find(|attachment| {
+                        attachment.get("pendingId").and_then(Value::as_str)
+                            == Some(pending_id.as_str())
+                    })
+                    .or_else(|| attachments.get(index))
+            })
+            .or_else(|| metadata.get("media").filter(|value| value.is_object()));
+        if let Some(kind) = descriptor
+            .and_then(|descriptor| descriptor.get("kind"))
+            .and_then(Value::as_str)
+            .filter(|kind| !kind.trim().is_empty())
+        {
+            return Some(kind.to_owned());
+        }
+    }
+    None
 }
 
 fn session_node_data(node: &Value) -> SessionNodeData {
@@ -3855,6 +4156,7 @@ mod tests {
                     tool_instance: "test-write".into(),
                     tool_name: call.name.clone(),
                     arguments: call.arguments.clone(),
+                    invocation_id: None,
                 },
             )
             .unwrap();
@@ -3934,6 +4236,27 @@ mod tests {
                 .count(),
             1
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_managed_rust_open_is_preflighted_without_mutating_chatend() {
+        let (path, journal) = test_journal("managed-rust-open-capacity", 1_000);
+        let snapshot = LibrarySnapshot {
+            name: "oversized-lib".into(),
+            text: format!(
+                "Rust library: oversized-lib\nFiles: 1\n\nFile: src/lib.rs\n{}",
+                "x".repeat(10_000)
+            ),
+        };
+        let event_count = journal.state().events.len();
+        let box_count = journal.state().boxes.len();
+        let projected = prospective_rust_lib_snapshot_tokens(&journal, &snapshot).unwrap();
+
+        assert!(projected > journal.state().live_context_limit());
+        assert_eq!(journal.state().events.len(), event_count);
+        assert_eq!(journal.state().boxes.len(), box_count);
+        assert!(rust_lib_box_id(&journal, "oversized-lib").is_none());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -4346,7 +4669,18 @@ mod tests {
                 "t1",
                 "User message",
                 BoxOwner::User,
-                BoxContent::text("please inspect the attachment"),
+                BoxContent {
+                    text: "please inspect the attachment".into(),
+                    objects: vec!["pending:3".into()],
+                    metadata: json!({
+                        "attachments":[{
+                            "pendingId":"pending:3",
+                            "kind":"document",
+                            "fileName":"notes.txt",
+                            "mimeType":"text/plain",
+                        }],
+                    }),
+                },
             )
             .unwrap();
         journal
@@ -4360,6 +4694,13 @@ mod tests {
         let transcript = transcript_from_journal(&journal);
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0]["content"], "please inspect the attachment");
+        assert_eq!(transcript[0]["objects"], json!(["pending:3"]));
+        assert_eq!(transcript[0]["attachments"][0]["fileName"], "notes.txt");
+        assert_eq!(
+            staged_object_transport_kind(&journal, &PendingId::parse("pending:3").unwrap())
+                .as_deref(),
+            Some("document")
+        );
         std::fs::remove_file(path).unwrap();
     }
 

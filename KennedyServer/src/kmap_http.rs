@@ -8,8 +8,9 @@ use std::{
 use anyhow::{Context, ensure};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::get,
@@ -28,6 +29,7 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EMBEDDED_PROVENANCE_BYTES: usize = 1024 * 1024;
 const PROVENANCE_MAGIC: &[u8; 8] = b"KPROV\0\x01\0";
+const FILE_MAGIC: &[u8; 8] = b"KFILE001";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SystemRoots {
@@ -150,6 +152,12 @@ impl Service {
         Ok(value)
     }
 
+    pub(crate) fn get_file(&self, id: &str) -> Result<StoredFile, ApiError> {
+        let id = parse_object_id(id)?;
+        let bytes = self.database.get_object(id)?;
+        decode_file_object(id, bytes)
+    }
+
     /// Commit all permanent effects of one completed Kennedy session in one
     /// Kweb transaction. Pending object and node IDs are allocated first;
     /// pending node creates are then resolved and materialized; canonical node
@@ -238,10 +246,18 @@ impl Service {
         })?;
         let mut object_ids = BTreeMap::new();
         for object in input.objects {
-            let id = transaction.create_object(object.bytes)?;
+            let bytes = encode_file_object(
+                &object.pending_id,
+                object.file_name.as_deref(),
+                &object.media_type,
+                object.transport_kind.as_deref(),
+                object.bytes,
+            )?;
+            let id = transaction.create_object(bytes)?;
             object_ids.insert(object.pending_id, id);
         }
-        let session_object_id = transaction.create_object(input.archive)?;
+        let archive = replace_pending_object_tokens(&input.archive, &object_ids);
+        let session_object_id = transaction.create_object(archive)?;
 
         let mut node_ids = BTreeMap::<String, NodeId>::new();
         for create in &input.creates {
@@ -377,6 +393,9 @@ impl Service {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct SessionObject {
     pub pending_id: String,
+    pub file_name: Option<String>,
+    pub media_type: String,
+    pub transport_kind: Option<String>,
     pub bytes: Vec<u8>,
 }
 
@@ -473,9 +492,12 @@ fn resolve_session_node_data(
         objects.push(session_object_id);
     }
     Ok(NodeData {
-        short_name: data.short_name.clone(),
-        short_description: data.short_description.clone(),
-        long_description: data.long_description.clone(),
+        short_name: replace_pending_object_tokens_in_text(&data.short_name, object_ids),
+        short_description: replace_pending_object_tokens_in_text(
+            &data.short_description,
+            object_ids,
+        ),
+        long_description: replace_pending_object_tokens_in_text(&data.long_description, object_ids),
         owner,
         fixed_connections: data
             .fixed_connections
@@ -489,6 +511,269 @@ fn resolve_session_node_data(
             .collect::<Result<_, _>>()?,
         objects,
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredFile {
+    pub object_id: ObjectId,
+    pub file_name: String,
+    pub media_type: String,
+    pub transport_kind: Option<String>,
+    pub bytes: Vec<u8>,
+    pub enveloped: bool,
+}
+
+fn encode_file_object(
+    pending_id: &str,
+    file_name: Option<&str>,
+    media_type: &str,
+    transport_kind: Option<&str>,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, ApiError> {
+    let file_name = safe_file_name(
+        file_name.unwrap_or_default(),
+        &format!("object-{}.bin", pending_id.trim_start_matches("pending:")),
+    );
+    let media_type = safe_media_type(media_type);
+    let transport_kind = transport_kind
+        .map(safe_transport_kind)
+        .filter(|value| !value.is_empty());
+    let file_name_len = u32::try_from(file_name.len())
+        .map_err(|_| ApiError::invalid("object filename is too large"))?;
+    let media_type_len = u32::try_from(media_type.len())
+        .map_err(|_| ApiError::invalid("object media type is too large"))?;
+    let transport_kind_len =
+        u32::try_from(transport_kind.as_deref().map(str::len).unwrap_or_default())
+            .map_err(|_| ApiError::invalid("object transport kind is too large"))?;
+    let content_len =
+        u64::try_from(bytes.len()).map_err(|_| ApiError::invalid("object content is too large"))?;
+    let mut encoded = Vec::with_capacity(
+        FILE_MAGIC.len()
+            + 4
+            + 4
+            + 4
+            + 8
+            + file_name.len()
+            + media_type.len()
+            + transport_kind.as_deref().map(str::len).unwrap_or_default()
+            + bytes.len(),
+    );
+    encoded.extend_from_slice(FILE_MAGIC);
+    encoded.extend_from_slice(&file_name_len.to_be_bytes());
+    encoded.extend_from_slice(&media_type_len.to_be_bytes());
+    encoded.extend_from_slice(&transport_kind_len.to_be_bytes());
+    encoded.extend_from_slice(&content_len.to_be_bytes());
+    encoded.extend_from_slice(file_name.as_bytes());
+    encoded.extend_from_slice(media_type.as_bytes());
+    if let Some(transport_kind) = transport_kind {
+        encoded.extend_from_slice(transport_kind.as_bytes());
+    }
+    encoded.extend_from_slice(&bytes);
+    Ok(encoded)
+}
+
+fn decode_file_object(id: ObjectId, bytes: Vec<u8>) -> Result<StoredFile, ApiError> {
+    if !bytes.starts_with(FILE_MAGIC) {
+        let (media_type, extension) = sniff_media_type(&bytes);
+        return Ok(StoredFile {
+            object_id: id,
+            file_name: format!("{id}.{extension}"),
+            media_type: media_type.into(),
+            transport_kind: None,
+            bytes,
+            enveloped: false,
+        });
+    }
+    if bytes.len() < FILE_MAGIC.len() + 4 + 4 + 4 + 8 {
+        return Err(ApiError::internal("file object header is truncated"));
+    }
+    let mut offset = FILE_MAGIC.len();
+    let file_name_len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    let media_type_len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    let transport_kind_len =
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    let content_len = usize::try_from(u64::from_be_bytes(
+        bytes[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| ApiError::internal("file object content length exceeds usize"))?;
+    offset += 8;
+    let metadata_end = offset
+        .checked_add(file_name_len)
+        .and_then(|value| value.checked_add(media_type_len))
+        .and_then(|value| value.checked_add(transport_kind_len))
+        .context("file object metadata length overflow")
+        .map_err(ApiError::internal)?;
+    let object_end = metadata_end
+        .checked_add(content_len)
+        .context("file object content length overflow")
+        .map_err(ApiError::internal)?;
+    if object_end != bytes.len() {
+        return Err(ApiError::internal(
+            "file object declared lengths differ from its payload",
+        ));
+    }
+    let file_name = std::str::from_utf8(&bytes[offset..offset + file_name_len])
+        .context("file object filename is not UTF-8")
+        .map_err(ApiError::internal)?;
+    offset += file_name_len;
+    let media_type = std::str::from_utf8(&bytes[offset..offset + media_type_len])
+        .context("file object media type is not UTF-8")
+        .map_err(ApiError::internal)?;
+    offset += media_type_len;
+    let transport_kind = std::str::from_utf8(&bytes[offset..offset + transport_kind_len])
+        .context("file object transport kind is not UTF-8")
+        .map_err(ApiError::internal)?;
+    if safe_file_name(file_name, "") != file_name || file_name.is_empty() {
+        return Err(ApiError::internal("file object filename is unsafe"));
+    }
+    if safe_media_type(media_type) != media_type {
+        return Err(ApiError::internal("file object media type is unsafe"));
+    }
+    if !transport_kind.is_empty() && safe_transport_kind(transport_kind) != transport_kind {
+        return Err(ApiError::internal("file object transport kind is unsafe"));
+    }
+    Ok(StoredFile {
+        object_id: id,
+        file_name: file_name.into(),
+        media_type: media_type.into(),
+        transport_kind: (!transport_kind.is_empty()).then(|| transport_kind.into()),
+        bytes: bytes[metadata_end..].to_vec(),
+        enveloped: true,
+    })
+}
+
+fn safe_file_name(value: &str, fallback: &str) -> String {
+    let basename = FilePath::new(value)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let mut output = basename
+        .chars()
+        .filter(|character| !character.is_control())
+        .map(|character| {
+            if matches!(character, '/' | '\\' | '"' | '\r' | '\n') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while output.len() > 255 {
+        output.pop();
+    }
+    if output.trim().is_empty() {
+        fallback.into()
+    } else {
+        output
+    }
+}
+
+fn safe_media_type(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 255
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || !value.contains('/')
+    {
+        "application/octet-stream".into()
+    } else {
+        value.into()
+    }
+}
+
+fn safe_transport_kind(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(64)
+        .collect()
+}
+
+fn sniff_media_type(bytes: &[u8]) -> (&'static str, &'static str) {
+    if bytes.starts_with(b"%PDF-") {
+        ("application/pdf", "pdf")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        ("image/png", "png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        ("image/jpeg", "jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        ("image/gif", "gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        ("image/webp", "webp")
+    } else if bytes.starts_with(b"OggS") {
+        ("audio/ogg", "ogg")
+    } else if bytes.starts_with(b"ID3") || bytes.starts_with(b"\xff\xfb") {
+        ("audio/mpeg", "mp3")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        ("audio/wav", "wav")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        ("video/mp4", "mp4")
+    } else if bytes.starts_with(b"\x1a\x45\xdf\xa3") {
+        ("video/webm", "webm")
+    } else {
+        ("application/octet-stream", "bin")
+    }
+}
+
+fn replace_pending_object_tokens(bytes: &[u8], object_ids: &BTreeMap<String, ObjectId>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    replace_pending_object_tokens_in_text(text, object_ids).into_bytes()
+}
+
+fn replace_pending_object_tokens_in_text(
+    text: &str,
+    object_ids: &BTreeMap<String, ObjectId>,
+) -> String {
+    if object_ids.is_empty() || !text.contains("pending:") {
+        return text.into();
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find("pending:") {
+        let start = cursor + relative;
+        let number_start = start + "pending:".len();
+        let number_len = text[number_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if number_len == 0 {
+            output.push_str(&text[cursor..number_start]);
+            cursor = number_start;
+            continue;
+        }
+        let end = number_start + number_len;
+        let token = &text[start..end];
+        let left_boundary = start == 0
+            || !text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        let right_boundary = text[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+        if left_boundary
+            && right_boundary
+            && let Some(id) = object_ids.get(token)
+        {
+            output.push_str(&text[cursor..start]);
+            output.push_str(&id.to_string());
+            cursor = end;
+            continue;
+        }
+        output.push_str(&text[cursor..end]);
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
 }
 
 #[derive(Debug)]
@@ -788,6 +1073,7 @@ pub(crate) async fn serve_with_listener(
             "/api/v1/session-history/{session_object_id}",
             get(get_session_archive),
         )
+        .route("/api/v1/objects/{object_id}", get(get_object_file))
         .with_state(state)
         .merge(merged_routers.intelligence)
         .merge(merged_routers.conversation_history)
@@ -874,6 +1160,62 @@ async fn get_session_archive(
         ))
     })?;
     Ok(Json(archive))
+}
+
+async fn get_object_file(
+    State(state): State<Service>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    stored_file_response(state.get_file(&id)?)
+}
+
+fn stored_file_response(file: StoredFile) -> Result<Response, ApiError> {
+    let content_type = HeaderValue::from_str(&file.media_type)
+        .map_err(|_| ApiError::internal("stored object has an invalid media type"))?;
+    let disposition = HeaderValue::from_str(&format!(
+        "inline; filename=\"{}\"",
+        ascii_response_file_name(&file.file_name)
+    ))
+    .map_err(|_| ApiError::internal("stored object has an invalid filename"))?;
+    let content_length = HeaderValue::from_str(&file.bytes.len().to_string())
+        .map_err(|_| ApiError::internal("stored object has an invalid content length"))?;
+    let mut response = Response::new(Body::from(file.bytes));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, disposition);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, content_length);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store, max-age=0"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
+}
+
+fn ascii_response_file_name(value: &str) -> String {
+    let output = safe_file_name(value, "object.bin")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() && !matches!(character, '"' | '\\' | '/' | ';') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if output.trim_matches('_').is_empty() {
+        "object.bin".into()
+    } else {
+        output
+    }
 }
 
 async fn create_node(
@@ -1374,6 +1716,43 @@ mod tests {
         assert_eq!(decoded.artifacts[0].sha256, value.artifacts[0].sha256);
     }
 
+    #[test]
+    fn file_envelope_preserves_original_bytes_and_safe_metadata() {
+        let object_id = ObjectId::from_bytes([0x80, 1, 2, 3, 4, 6]).unwrap();
+        let encoded = encode_file_object(
+            "pending:4",
+            Some("../résumé.pdf"),
+            "application/pdf",
+            Some("document"),
+            b"%PDF-original".to_vec(),
+        )
+        .unwrap();
+        let decoded = decode_file_object(object_id, encoded).unwrap();
+        assert_eq!(decoded.file_name, "résumé.pdf");
+        assert_eq!(decoded.media_type, "application/pdf");
+        assert_eq!(decoded.transport_kind.as_deref(), Some("document"));
+        assert_eq!(decoded.bytes, b"%PDF-original");
+        assert!(decoded.enveloped);
+        let response = stored_file_response(decoded).unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "inline; filename=\"r_sum_.pdf\""
+        );
+    }
+
+    #[test]
+    fn pending_object_replacement_respects_token_boundaries() {
+        let object_id = ObjectId::from_bytes([0x80, 1, 2, 3, 4, 7]).unwrap();
+        let ids = BTreeMap::from([("pending:12".into(), object_id)]);
+        assert_eq!(
+            replace_pending_object_tokens_in_text(
+                "object pending:12; keep pending:12abc and xpending:12",
+                &ids,
+            ),
+            format!("object {object_id}; keep pending:12abc and xpending:12")
+        );
+    }
+
     #[tokio::test]
     async fn application_idempotency_replays_without_duplicate_kweb_transactions() {
         let directory =
@@ -1463,9 +1842,13 @@ mod tests {
                 source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                archive: b"{\"session\":\"archive\"}".to_vec(),
+                archive: format!("{{\"session\":\"archive\",\"object\":\"{pending_object}\"}}")
+                    .into_bytes(),
                 objects: vec![SessionObject {
                     pending_id: pending_object.clone(),
+                    file_name: Some("attachment.txt".into()),
+                    media_type: "text/plain".into(),
+                    transport_kind: Some("document".into()),
                     bytes: b"attachment".to_vec(),
                 }],
                 creates: vec![
@@ -1474,7 +1857,9 @@ mod tests {
                         data: SessionNodeData {
                             short_name: "Created Memory".into(),
                             short_description: String::new(),
-                            long_description: "Created in one session transaction.".into(),
+                            long_description: format!(
+                                "Created in one session transaction with object {pending_object}."
+                            ),
                             owner: roots.user.to_string(),
                             fixed_connections: Vec::new(),
                             recent_connections: vec![roots.user.to_string(), circular_node.clone()],
@@ -1535,18 +1920,26 @@ mod tests {
                 .any(|id| id.to_string() == result.session_object_id)
         );
         assert_eq!(
-            service
-                .database
-                .get_object(result.object_ids[&pending_object].parse().unwrap())
-                .unwrap(),
-            b"attachment"
+            created.data.long_description,
+            format!(
+                "Created in one session transaction with object {}.",
+                result.object_ids[&pending_object]
+            )
         );
         assert_eq!(
             service
-                .database
-                .get_object(result.session_object_id.parse().unwrap())
-                .unwrap(),
-            b"{\"session\":\"archive\"}"
+                .get_file(&result.object_ids[&pending_object])
+                .unwrap()
+                .bytes,
+            b"attachment"
+        );
+        let archive = service
+            .database
+            .get_object(result.session_object_id.parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&archive).unwrap()["object"],
+            result.object_ids[&pending_object]
         );
         drop(service);
         std::fs::remove_dir_all(directory).unwrap();

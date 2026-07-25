@@ -1,0 +1,180 @@
+Objects, users, and file exchange
+================================
+
+Kennedy and a user can exchange arbitrary files in browser and Telegram
+conversations. An object is the durable Kweb form of one of those files.
+
+Objects are deliberately lightweight. There is no formal relationship between
+an object and a Kmap node, no object-ownership graph, and no special file node.
+If an object matters for future work, Kennedy records its object ID in ordinary
+node text, normally the node's long description.
+
+
+What Kennedy sees
+-----------------
+
+A user message that contains a file renders an object reference in its owning
+message box:
+
+    Object provided: pending:47
+
+The rest of the message may contain the user's caption, a voice transcription,
+or extracted document text. Those are useful enrichment, but the object
+reference names the original file. Extraction or transcription failure does
+not discard an accepted file.
+
+During the source conversation, a newly uploaded file has a session-local
+pending ID. The pending ID is stable within that session and may be used in
+history-ingress memory work.
+
+After the session transaction commits, the file has a canonical
+eight-character Kweb object ID, such as:
+
+    gAECAwQF
+
+Canonical object IDs are durable across sessions. Pending IDs are not.
+
+
+Remembering a user file
+-----------------------
+
+There is no AttachObjectToNode tool and Kennedy should not invent a formal
+relationship. To retain a useful file:
+
+1. Notice its exact `Object provided: pending:N` reference.
+2. Decide which existing or new memory node should explain the file.
+3. Include that exact pending ID in the node's long description.
+4. Explain what the object contains, why it matters, and when it should be
+   recalled.
+
+For example, a staged long description may say:
+
+    The signed venue agreement is stored as object pending:47. It covers the
+    October event, has the final cancellation terms, and should be returned
+    when the user asks for the signed agreement.
+
+At commit, Kennedy's transaction replaces exact known pending-object tokens in
+node descriptions with their canonical object IDs. The committed node might
+therefore say:
+
+    The signed venue agreement is stored as object gAECAwQF. It covers the
+    October event, has the final cancellation terms, and should be returned
+    when the user asks for the signed agreement.
+
+The replacement happens inside the same Kweb transaction as the file and node
+commit. Kennedy does not need to predict the canonical ID or perform a second
+node update.
+
+Only exact known pending-object tokens are replaced. Preserve the complete
+`pending:N` spelling when writing it into node text.
+
+
+Recalling a file
+----------------
+
+In a later conversation, Kennedy can recover a remembered file by loading the
+relevant node and reading the canonical object ID from its long description.
+
+To send that file to the user, call:
+
+    {
+      "name": "EmitObject",
+      "arguments": {
+        "objectId": "gAECAwQF"
+      }
+    }
+
+`EmitObject` accepts exactly one canonical eight-character object ID. It is
+available only in user-facing conversation sessions. It validates that the
+object exists and that the active channel can deliver it, then creates an
+ordinary Kennedy message containing the object.
+
+A successful `EmitObject` call is already a user-facing response. Kennedy may
+end the turn without adding prose. If context would benefit from explanation,
+Kennedy may also provide a normal text response. Kennedy may call EmitObject
+several times in one turn to return several files.
+
+Do not call EmitObject with `pending:N`. A pending object is not yet a
+canonical Kweb object and cannot be recalled by object ID in a later session.
+
+Do not copy the file into a new object merely to send it. EmitObject sends the
+existing immutable Kweb object and does not mutate the Kmap.
+
+
+What the user receives
+----------------------
+
+The response adapter decides how to present the durable Kennedy object
+message.
+
+In the browser:
+
+- images are shown as bounded image previews;
+- video and audio use controlled media players;
+- PDFs are shown in an inline viewer when the browser supports it;
+- every file has a download action;
+- unknown formats are safe named downloads.
+
+In Telegram:
+
+- supported media can be sent as native photos, videos, animations, audio,
+  video notes, or stickers;
+- documents and unknown formats are sent through Telegram's document/file
+  behavior;
+- each emitted object is a separate Telegram message;
+- an object-only response completes the Telegram event on the final file.
+
+Transport delivery happens after the object-bearing Kennedy message is
+durably recorded. EmitObject itself does not perform Telegram I/O.
+
+
+Telegram compatibility
+----------------------
+
+The workspace uses the native-media-capable Telegram relay. It accepts Telegram
+photos, videos, animations, audio, video notes, and stickers directly, retains
+their transport kind, and returns them with the matching native Telegram
+method. Generic documents and unknown formats continue to use Telegram's
+document/file behavior.
+
+Kennedy must not reinterpret a failed native send as a document send. The
+transport reports that failure so the native kind and user-visible behavior
+remain honest. Sending an object as a generic document is a separate deliberate
+choice, not an automatic fallback.
+
+
+Users, nodes, and ownership
+---------------------------
+
+A file being supplied by a user does not change Kmap node ownership. Node
+ownership continues to use the ordinary user, Kennedy, or group root rules.
+The object ID in a node description is a durable reference in prose, not an
+ownership declaration.
+
+In a group conversation, remember private or group-shared material only in the
+appropriate owned node, following the same memory and privacy judgment used
+for text messages. File transfer does not broaden Kennedy's authorization or
+make an object appropriate for every participant.
+
+The file envelope retains a safe filename, media type, source transport kind,
+and the exact original bytes. These properties help the adapter return the
+file correctly; they do not establish a user identity or access-control
+relationship.
+
+
+Practical rules
+---------------
+
+- Treat extracted text and transcriptions as aids, not as replacements for the
+  original object.
+- Record an object's purpose alongside its ID; an unexplained ID is difficult
+  to recall usefully.
+- Use the exact pending ID during the committing history-ingress session.
+- Use only the canonical eight-character ID with EmitObject.
+- Do not create a formal object-to-node relationship.
+- Do not duplicate an object just to send it.
+- Let EmitObject be the terminal response when the file itself fully answers
+  the user.
+- If EmitObject reports a missing object, invalid ID, context limit, empty
+  Telegram file, or channel size limit, treat it as an ordinary tool failure
+  and explain the limitation rather than claiming the file was sent.

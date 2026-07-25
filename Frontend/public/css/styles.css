@@ -103,6 +103,16 @@ h3 { margin-bottom: 8px; }
 .attachment-actions .secondary { padding: 6px 10px; }
 .voice-button.recording { border-color: var(--danger); background: #fff0ee; color: var(--danger); font-weight: 800; }
 .voice-note-badge { display: inline-flex; align-items: center; gap: 5px; margin-bottom: 7px; padding: 4px 8px; border-radius: 999px; background: #dceaf0; color: #28536a; font-size: 10px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.object-gallery { display: grid; gap: 10px; margin-top: 8px; }
+.object-attachment { min-width: 0; margin: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #f8f6f1; }
+.object-preview { display: block; width: 100%; border: 0; background: #151515; }
+.object-image { max-height: 520px; object-fit: contain; }
+.object-video { max-height: 520px; }
+.object-audio { min-height: 52px; padding: 8px; background: #f8f6f1; }
+.object-pdf { height: min(68vh,720px); background: white; }
+.object-caption { display: flex; gap: 10px; align-items: center; justify-content: space-between; padding: 8px 10px; font-size: 11px; }
+.object-download { min-width: 0; overflow-wrap: anywhere; color: var(--blue); font-weight: 750; }
+.object-media-type { flex: none; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
 .telegram-empty { max-width: 480px; margin: 18vh auto 0; color: var(--muted); text-align: center; }
 .audio-empty { max-width: 520px; margin: 18vh auto 0; color: var(--muted); text-align: center; }
 .audio-recording-header { position: relative; margin-bottom: 18px; padding-right: 120px; }

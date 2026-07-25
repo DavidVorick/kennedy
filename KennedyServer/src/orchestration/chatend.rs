@@ -257,11 +257,15 @@ pub enum EventKind {
         tool_instance: String,
         tool_name: String,
         arguments: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation_id: Option<String>,
     },
     ToolCompleted {
         tool_instance: String,
         tool_name: String,
         outcome: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation_id: Option<String>,
     },
     ToolLayoutChanged {
         tool_instance: String,
@@ -1171,6 +1175,12 @@ pub struct SessionJournal {
     objects: BTreeMap<PendingId, ObjectLocation>,
 }
 
+struct UnfinishedToolInvocation {
+    invocation_id: Option<String>,
+    tool_instance: String,
+    tool_name: String,
+}
+
 impl SessionJournal {
     pub fn create(path: impl AsRef<Path>, metadata: SessionMetadata) -> anyhow::Result<Self> {
         ensure!(
@@ -1293,22 +1303,112 @@ impl SessionJournal {
     }
 
     pub fn seal(&mut self) -> anyhow::Result<()> {
-        let mut unfinished_tools = Vec::new();
+        let unfinished_tools = self.unfinished_tool_invocations()?;
+        ensure!(
+            unfinished_tools.is_empty(),
+            "session ends with unfinished tools {}",
+            unfinished_tools
+                .iter()
+                .map(|tool| tool.tool_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.durable.seal()?;
+        Ok(())
+    }
+
+    pub fn repair_unfinished_tools(
+        &mut self,
+        recorded_at: impl Into<String>,
+    ) -> anyhow::Result<Vec<EventId>> {
+        let unfinished = self.unfinished_tool_invocations()?;
+        if unfinished.is_empty() {
+            return Ok(Vec::new());
+        }
+        let recorded_at = recorded_at.into();
+        let mut repaired = Vec::with_capacity(unfinished.len());
+        for tool in unfinished.iter().rev() {
+            let message = format!(
+                "{} was interrupted before a durable completion was recorded; the abandoned invocation was closed during session recovery.",
+                tool.tool_name
+            );
+            let kind = if let Some(invocation_id) = &tool.invocation_id {
+                EventKind::ToolCompleted {
+                    tool_instance: tool.tool_instance.clone(),
+                    tool_name: tool.tool_name.clone(),
+                    outcome: serde_json::json!({"ok":false,"recovered":true,"result":message}),
+                    invocation_id: Some(invocation_id.clone()),
+                }
+            } else {
+                // Historical native Ktool completions used one generic
+                // `call_ktool` event to close the most recent invocation.
+                EventKind::ToolCompleted {
+                    tool_instance: "call_ktool".into(),
+                    tool_name: "call_ktool".into(),
+                    outcome: serde_json::json!({"ok":false,"recovered":true,"result":message}),
+                    invocation_id: None,
+                }
+            };
+            repaired.push(self.record(recorded_at.clone(), kind)?);
+        }
+        ensure!(
+            self.unfinished_tool_invocations()?.is_empty(),
+            "session tool recovery left unfinished invocations"
+        );
+        Ok(repaired)
+    }
+
+    fn unfinished_tool_invocations(&self) -> anyhow::Result<Vec<UnfinishedToolInvocation>> {
+        let mut identified = BTreeMap::<String, UnfinishedToolInvocation>::new();
+        let mut legacy = Vec::<UnfinishedToolInvocation>::new();
         for event in &self.chatend.events {
             match &event.kind {
-                EventKind::ToolInvoked { tool_name, .. } => {
-                    unfinished_tools.push(tool_name.as_str());
+                EventKind::ToolInvoked {
+                    tool_instance,
+                    tool_name,
+                    invocation_id,
+                    ..
+                } => {
+                    let pending = UnfinishedToolInvocation {
+                        invocation_id: invocation_id.clone(),
+                        tool_instance: tool_instance.clone(),
+                        tool_name: tool_name.clone(),
+                    };
+                    if let Some(invocation_id) = invocation_id {
+                        ensure!(
+                            identified.insert(invocation_id.clone(), pending).is_none(),
+                            "duplicate tool invocation identity {invocation_id}"
+                        );
+                    } else {
+                        legacy.push(pending);
+                    }
                 }
-                EventKind::ToolCompleted { tool_name, .. } => {
-                    if tool_name == "call_ktool" {
+                EventKind::ToolCompleted {
+                    tool_instance,
+                    tool_name,
+                    invocation_id,
+                    ..
+                } => {
+                    if let Some(invocation_id) = invocation_id {
+                        let invoked = identified.remove(invocation_id).with_context(|| {
+                            format!(
+                                "tool {tool_name} completed without matching invocation {invocation_id}"
+                            )
+                        })?;
+                        ensure!(
+                            invoked.tool_instance.as_str() == tool_instance
+                                && invoked.tool_name.as_str() == tool_name,
+                            "tool completion {invocation_id} does not match its invocation"
+                        );
+                    } else if tool_name == "call_ktool" {
                         // An invalid native call still produces an error result
                         // even when it could not be decoded into ToolInvoked.
-                        unfinished_tools.pop();
+                        legacy.pop();
                     } else {
-                        let before = unfinished_tools.len();
-                        unfinished_tools.retain(|unfinished| *unfinished != tool_name);
+                        let before = legacy.len();
+                        legacy.retain(|unfinished| unfinished.tool_name.as_str() != tool_name);
                         ensure!(
-                            unfinished_tools.len() != before,
+                            legacy.len() != before,
                             "tool {tool_name} completed without a matching invocation"
                         );
                     }
@@ -1316,13 +1416,8 @@ impl SessionJournal {
                 _ => {}
             }
         }
-        ensure!(
-            unfinished_tools.is_empty(),
-            "session ends with unfinished tools {}",
-            unfinished_tools.join(", ")
-        );
-        self.durable.seal()?;
-        Ok(())
+        legacy.extend(identified.into_values());
+        Ok(legacy)
     }
 
     pub fn mark_completed(&mut self, session_object_id: String) {
@@ -1928,6 +2023,7 @@ mod tests {
                     tool_instance: "CreateNode:1".into(),
                     tool_name: "CreateNode".into(),
                     arguments: json!({}),
+                    invocation_id: None,
                 },
             )
             .unwrap();
@@ -1939,11 +2035,94 @@ mod tests {
                     tool_instance: "call_ktool".into(),
                     tool_name: "call_ktool".into(),
                     outcome: json!({"ok":true}),
+                    invocation_id: None,
                 },
             )
             .unwrap();
         journal.seal().unwrap();
         assert!(journal.is_sealed());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn interrupted_tools_are_recovered_by_identity_without_losing_legacy_journals() {
+        let path = path("repair-tools");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        journal
+            .record(
+                "t1",
+                EventKind::ToolInvoked {
+                    tool_instance: "WebSearch:legacy".into(),
+                    tool_name: "WebSearch".into(),
+                    arguments: json!({"question":"legacy"}),
+                    invocation_id: None,
+                },
+            )
+            .unwrap();
+        journal
+            .record(
+                "t2",
+                EventKind::ToolInvoked {
+                    tool_instance: "WebSearch:new".into(),
+                    tool_name: "WebSearch".into(),
+                    arguments: json!({"question":"identified"}),
+                    invocation_id: Some("call-1".into()),
+                },
+            )
+            .unwrap();
+        assert!(journal.seal().is_err());
+
+        let repaired = journal.repair_unfinished_tools("recovery").unwrap();
+        assert_eq!(repaired.len(), 2);
+        assert!(
+            journal
+                .state()
+                .events
+                .iter()
+                .rev()
+                .take(2)
+                .all(|event| matches!(
+                    &event.kind,
+                    EventKind::ToolCompleted { outcome, .. }
+                        if outcome.get("recovered").and_then(Value::as_bool) == Some(true)
+                ))
+        );
+        journal.seal().unwrap();
+        assert!(journal.is_sealed());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn identified_tool_completions_can_arrive_out_of_order() {
+        let path = path("tool-identity");
+        let mut journal = SessionJournal::create(&path, metadata()).unwrap();
+        for id in ["call-1", "call-2"] {
+            journal
+                .record(
+                    id,
+                    EventKind::ToolInvoked {
+                        tool_instance: format!("WebSearch:{id}"),
+                        tool_name: "WebSearch".into(),
+                        arguments: json!({"question":id}),
+                        invocation_id: Some(id.into()),
+                    },
+                )
+                .unwrap();
+        }
+        for id in ["call-1", "call-2"] {
+            journal
+                .record(
+                    format!("{id}-complete"),
+                    EventKind::ToolCompleted {
+                        tool_instance: format!("WebSearch:{id}"),
+                        tool_name: "WebSearch".into(),
+                        outcome: json!({"ok":true}),
+                        invocation_id: Some(id.into()),
+                    },
+                )
+                .unwrap();
+        }
+        journal.seal().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

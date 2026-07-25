@@ -288,6 +288,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let orchestration = orchestration::Config {
         system_prompts_directory: args.system_prompts_dir.clone(),
         telegram_relay_base: orchestration_telegram_base,
+        telegram_max_media_bytes: args.telegram_max_voice_bytes,
         #[cfg(test)]
         kweb_base: String::new(),
         #[cfg(test)]

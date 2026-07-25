@@ -9,10 +9,21 @@ VNOTE_LIMIT=5
 VNOTE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CHECKSUM_CACHE="$VNOTE_DIR/.vnote-ingress-sha256-cache-v1"
 STABILITY_SECONDS=2
+response_file=""
+fix_temp=""
 
 die() {
     printf 'vnote-ingress: %s\n' "$*" >&2
     exit 1
+}
+
+usage() {
+    printf 'Usage: %s [--fix FILE]\n' "$(basename -- "$0")"
+}
+
+cleanup() {
+    [[ -z "$response_file" ]] || rm -f -- "$response_file"
+    [[ -z "$fix_temp" ]] || rm -f -- "$fix_temp"
 }
 
 recorded_epoch() {
@@ -80,6 +91,96 @@ vnote_is_ready() {
     READY_SIGNATURE="$after"
 }
 
+fix_vnote() {
+    local vnote="$1"
+    local backup
+    local vnote_dir
+
+    [[ -f "$vnote" && ! -L "$vnote" ]] ||
+        die "file is not a regular file: $vnote"
+
+    for dependency in od stat; do
+        command -v "$dependency" >/dev/null 2>&1 ||
+            die "required command not found: $dependency"
+    done
+
+    if wav_is_finalized "$vnote"; then
+        printf 'Already finalized; no changes made: %s\n' "$vnote"
+        return
+    fi
+
+    backup="${vnote}.unfinalized"
+    [[ ! -e "$backup" && ! -L "$backup" ]] ||
+        die "refusing to overwrite existing recovery backup: $backup"
+
+    for dependency in ffmpeg chmod mktemp mv touch; do
+        command -v "$dependency" >/dev/null 2>&1 ||
+            die "required command not found: $dependency"
+    done
+
+    vnote_dir="$(cd -- "$(dirname -- "$vnote")" && pwd -P)" ||
+        die "could not inspect the directory containing $vnote"
+    fix_temp="$(mktemp --tmpdir="$vnote_dir" '.vnote-fix.XXXXXXXXXX.wav')" ||
+        die "could not create a temporary recovery file beside $vnote"
+
+    if ! ffmpeg -nostdin -hide_banner -loglevel warning \
+        -ignore_length 1 \
+        -i "$vnote" \
+        -map 0:a:0 \
+        -c:a pcm_s16le \
+        -f wav \
+        -y "$fix_temp"; then
+        die "ffmpeg could not recover $vnote; the original was not changed"
+    fi
+    wav_is_finalized "$fix_temp" ||
+        die "ffmpeg did not produce a finalized WAV; the original was not changed"
+    chmod --reference="$vnote" -- "$fix_temp" ||
+        die "could not preserve permissions while fixing $vnote"
+    touch --reference="$vnote" -- "$fix_temp" ||
+        die "could not preserve timestamps while fixing $vnote"
+
+    mv -- "$vnote" "$backup" ||
+        die "could not preserve the unfinalized recording at $backup"
+    if ! mv -- "$fix_temp" "$vnote"; then
+        if mv -- "$backup" "$vnote"; then
+            die "could not install the recovered WAV; the original was restored"
+        fi
+        die "could not install the recovered WAV; the original remains at $backup"
+    fi
+    fix_temp=""
+
+    printf 'Fixed: %s\nOriginal retained at: %s\n' "$vnote" "$backup"
+}
+
+trap cleanup EXIT
+
+case "$#" in
+    0)
+        ;;
+    1)
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --fix)
+                die "--fix requires a file"
+                ;;
+            *)
+                die "unknown argument: $1"
+                ;;
+        esac
+        ;;
+    2)
+        [[ "$1" == "--fix" ]] || die "unknown argument: $1"
+        fix_vnote "$2"
+        exit 0
+        ;;
+    *)
+        die "expected no arguments or --fix FILE"
+        ;;
+esac
+
 for dependency in curl sha256sum date find od sort stat; do
     command -v "$dependency" >/dev/null 2>&1 ||
         die "required command not found: $dependency"
@@ -88,8 +189,6 @@ done
 candidate_count=0
 ready_count=0
 uploaded_count=0
-response_file=""
-trap '[[ -z "$response_file" ]] || rm -f -- "$response_file"' EXIT
 
 declare -A cached_sha256s=()
 if [[ -L "$CHECKSUM_CACHE" || ( -e "$CHECKSUM_CACHE" && ! -f "$CHECKSUM_CACHE" ) ]]; then

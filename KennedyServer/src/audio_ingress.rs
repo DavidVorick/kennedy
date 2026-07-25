@@ -183,9 +183,10 @@ impl Service {
             .strip_prefix("/api/v1/audio-ingress/pieces/")
             .filter(|id| !id.contains('/'))
             .ok_or_else(ApiError::not_found)?;
+        let id = decode_piece_id(id)?;
         let job = self
             .queue
-            .get(id)
+            .get(&id)
             .map_err(ApiError::from)?
             .ok_or_else(ApiError::not_found)?;
         json_value(job)
@@ -200,23 +201,24 @@ impl Service {
             .strip_prefix("/api/v1/audio-ingress/pieces/")
             .ok_or_else(ApiError::not_found)?;
         let (id, action) = tail.split_once('/').ok_or_else(ApiError::not_found)?;
+        let id = decode_piece_id(id)?;
         let job = match action {
             "ingress-started" => {
                 let input: StartIngress = parse_body(body)?;
-                self.queue.start(id, &input)
+                self.queue.start(&id, &input)
             }
             "ingress-completed" => {
                 let input: VersionedTransition = parse_body(body)?;
-                self.queue.complete(id, input.expected_version)
+                self.queue.complete(&id, input.expected_version)
             }
             "ingress-failure" => {
                 let input: RecordIngressFailure = parse_body(body)?;
-                self.queue.fail(id, &input)
+                self.queue.fail(&id, &input)
             }
             "retry-ingress" => {
                 let input: RetryIngress = parse_body(body)?;
                 self.queue
-                    .retry(id, input.expected_version, input.state.as_ref())
+                    .retry(&id, input.expected_version, input.state.as_ref())
             }
             _ => return Err(ApiError::not_found().into()),
         }
@@ -229,8 +231,9 @@ impl Service {
             .strip_prefix("/api/v1/audio-ingress/pieces/")
             .and_then(|tail| tail.strip_suffix("/ingress-checkpoint"))
             .ok_or_else(ApiError::not_found)?;
+        let id = decode_piece_id(id)?;
         let input: CheckpointIngress = parse_body(body)?;
-        let job = self.queue.checkpoint(id, &input).map_err(ApiError::from)?;
+        let job = self.queue.checkpoint(&id, &input).map_err(ApiError::from)?;
         json_value(job)
     }
 
@@ -1176,6 +1179,15 @@ fn parse_body<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T, ServiceErr
         .map_err(Into::into)
 }
 
+// Local orchestration passes HTTP-shaped paths directly, without Axum decoding route parameters.
+fn decode_piece_id(encoded: &str) -> Result<String, ApiError> {
+    let decoded = urlencoding::decode(encoded).map_err(|_| ApiError::not_found())?;
+    if decoded.is_empty() || decoded.contains('/') {
+        return Err(ApiError::not_found());
+    }
+    Ok(decoded.into_owned())
+}
+
 fn json_value(value: impl Serialize) -> Result<Value, ServiceError> {
     serde_json::to_value(value)
         .map_err(ApiError::internal)
@@ -1349,5 +1361,13 @@ mod tests {
                 .all(|piece| estimate_tokens(piece) <= MAX_INGRESS_TOKENS)
         );
         assert!(!pieces.join("\n\n").contains("# Audio transcript"));
+    }
+
+    #[test]
+    fn internal_audio_paths_decode_generated_piece_ids() {
+        let id = format!("{}:0", Uuid::new_v4());
+        let encoded = urlencoding::encode(&id);
+        assert_eq!(decode_piece_id(&encoded).unwrap(), id);
+        assert!(decode_piece_id("recording%2F0").is_err());
     }
 }

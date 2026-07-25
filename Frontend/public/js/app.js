@@ -407,6 +407,13 @@ function update() {
     record?.phase === "ingress_failed"
       ? { retrying: retryingConversationIds.has(record.id), onRetry: () => retryConversationIngress(record) }
       : null,
+    {
+      sessionId: record?.state?.sessionId
+        || record?.state?.archive?.header?.sessionId
+        || record?.state?.commitReceipt?.sessionId
+        || record?.id,
+      objectIds: record?.state?.commitReceipt?.objectIds || {},
+    },
   );
   if (telegramView && !transcript.length && !ingressActivity?.diagnostic) {
     ui.transcript.replaceChildren(element("div", "telegram-empty", "Telegram conversations appear here as messages arrive. Kennedy's backend continues answering even when no browser is open."));
@@ -512,6 +519,7 @@ async function hydrateHistoryRecord(recordOrId) {
       ...record,
       started_at: archive?.header?.createdAt || archive?.startedAt || archive?.session?.createdAt || record.started_at,
       state: {
+        ...record.state,
         archive,
         sessionType: record.state?.sessionType
           || archive?.sessionType || archive?.session?.kind || "conversation",
@@ -571,6 +579,16 @@ function finishComposerResize(event) {
 }
 
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024 * 1024;
+const EXTRACTABLE_DOCUMENT_EXTENSIONS = new Set([
+  "pdf", "docx", "xlsx", "xls", "xlsb", "ods", "csv", "tsv",
+  "txt", "md", "json", "yaml", "yml", "xml",
+]);
+
+function shouldExtractDocument(file) {
+  const extension = String(file?.name || "").split(".").at(-1)?.toLowerCase();
+  return EXTRACTABLE_DOCUMENT_EXTENSIONS.has(extension)
+    || String(file?.type || "").startsWith("text/");
+}
 
 async function attachSelectedFiles() {
   const id = selectedConversationId;
@@ -590,33 +608,44 @@ async function attachSelectedFiles() {
   }
   extractingAttachments.add(id);
   update();
-  ui.activity.textContent = `Reading ${files.length === 1 ? files[0].name : `${files.length} files`}…`;
+  ui.activity.textContent = `Uploading ${files.length === 1 ? files[0].name : `${files.length} files`}…`;
+  const stagedAttachments = [];
   try {
-    const extracted = [];
     for (const file of files) {
       const started = performance.now();
-      const result = await intelligence.extractDocument({ file, fileName: file.name });
       const staged = await conversationHistory.stageObject(id, file, file.name);
-      extracted.push({
+      const attachment = {
         id: crypto.randomUUID(),
-        kind: "document",
-        fileName: result.file_name || file.name,
-        mimeType: file.type || result.content_type || "application/octet-stream",
+        kind: String(file.type || "").split("/")[0] || "file",
+        fileName: file.name,
+        mimeType: file.type || "application/octet-stream",
         sizeBytes: file.size,
         pendingId: staged.pendingId,
-        format: result.format,
-        text: result.text,
-        characters: result.characters,
-        truncated: Boolean(result.truncated),
         extractionDurationMs: Math.max(0, Math.round(performance.now() - started)),
-      });
-    }
-    if (selectedConversationId === id && selectedRecord()?.phase === "active") {
-      attachmentDrafts.set(id, [...existing, ...extracted]);
+      };
+      if (shouldExtractDocument(file)) {
+        try {
+          const result = await intelligence.extractDocument({ file, fileName: file.name });
+          attachment.kind = "document";
+          attachment.fileName = result.file_name || file.name;
+          attachment.mimeType = file.type || result.content_type || attachment.mimeType;
+          attachment.format = result.format;
+          attachment.text = result.text;
+          attachment.characters = result.characters;
+          attachment.truncated = Boolean(result.truncated);
+          attachment.extractionDurationMs = Math.max(0, Math.round(performance.now() - started));
+        } catch (error) {
+          attachment.extractionError = error.message || "Text extraction was unavailable.";
+        }
+      }
+      stagedAttachments.push(attachment);
     }
   } catch (error) {
-    showError(ui.error_banner, `Attachment could not be read: ${error.message}`);
+    showError(ui.error_banner, `File could not be uploaded: ${error.message}`);
   } finally {
+    if (stagedAttachments.length && selectedConversationId === id && selectedRecord()?.phase === "active") {
+      attachmentDrafts.set(id, [...existing, ...stagedAttachments]);
+    }
     extractingAttachments.delete(id);
     update();
   }

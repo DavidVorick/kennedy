@@ -488,8 +488,10 @@ canonical documents; this file is not an append-only log.
 - During history ingress, show Kennedy's final review normally but start
   Kennedy tool requests, memory tool results, and protocol-error details
   collapsed until the user expands them.
-- A failed Telegram document extraction must receive an error reply and finish
-  that relay event so one document cannot block all later messages for the user.
+- A failed Telegram document extraction must not discard an otherwise valid
+  accepted file. Stage the original object, present extraction unavailability
+  as bounded attachment context, and continue the relay event so one document
+  cannot block all later messages for the user.
 - A live conversation must expose a kill control while Kennedy is responding.
   It must stop the current model or web operation and prevent further agent-loop
   retries; the already-checkpointed user query remains preserved for an
@@ -1035,6 +1037,30 @@ canonical documents; this file is not an append-only log.
   transaction. Kennedy may attach the resulting object reference to any number
   of nodes, retrieve such references later, and ask a capable communication
   adapter to deliver the object to the user.
+- For the first bidirectional-file release, use `EmitObject` with exactly one
+  canonical object ID as its model-visible input. A successful call creates a
+  Kennedy object-response box and may end a turn without a prose response;
+  transport delivery happens afterward from that durable response.
+- Store new files as small, self-describing Kennedy file envelopes inside
+  ordinary Kweb objects so an object ID alone recovers filename, media type,
+  and original bytes. Do not add a Kweb metadata table or a formal file-to-node
+  relationship.
+- Resolve exact known pending-object tokens in completed session archives and
+  staged node descriptive text after the transaction builder allocates object
+  IDs but before it creates or updates nodes and finalizes. Keep this in the
+  same transaction; do not follow commit with a second node update.
+- Browser uploads accept arbitrary files and document extraction is
+  best-effort enrichment. Telegram accepts the relay's existing voice and
+  document kinds plus the additive photo, video, animation, audio, video-note,
+  and sticker kinds. Native and generic-document delivery remain deliberate,
+  distinct choices; a failed native send is not reinterpreted as a document.
+- Request an additive, nonbreaking Telegram-relay expansion for native photo,
+  video, animation, audio, video-note, and sticker ingress/egress. Kennedy
+  implements the cohesive API in the local 0.3.0 relay while retaining the
+  existing `/file` route unchanged for explicit generic-document delivery.
+- The pinned Kweb, session-log, Codex-runtime, and document-extraction releases
+  already provide the remaining primitives required by this feature and need
+  no upstream changes.
 - When `write-file-freeform` captures model output without a final newline,
   append one automatically before previewing and writing the file.
 

@@ -31,8 +31,9 @@ The UI calls the compatibility `/api/v1/conversations` routes through a client
 named `SessionHistoryAPI`.
 
 In-progress summaries come from the local `.session-log` transcript and
-Session History control journal. Completed
-summaries contain only a Kweb object ID. The browser loads the corresponding
+Session History control journal. Completed summaries contain the Kweb archive
+ID and structured commit receipt, but no second transcript copy. The browser
+loads the corresponding
 immutable archive from `/api/v1/session-history/{object_id}` before classifying
 it as conversation, self-time, Telegram, or audio history. Hydrated records
 never regress to a later summary response of the same or older version.
@@ -91,20 +92,29 @@ in-memory snapshot if the underlying write fails.
 
 ## Composer and objects
 
-The browser stages attachments before queueing a message:
+The browser stages arbitrary nonempty files before queueing a message:
 
-1. extract user-facing document or audio metadata as needed;
-2. upload the original `File` or `Blob` as multipart data;
-3. receive a shared temporary ID such as `pending:47`;
-4. place that ID in the queued message metadata.
+1. upload the original `File` or `Blob` as multipart data;
+2. receive a shared temporary ID such as `pending:47`;
+3. optionally extract readable document metadata as best-effort enrichment;
+4. place the ID and bounded metadata in the queued message.
 
 The browser does not base64-encode the object into JSON. The maximum individual
 and aggregate staged object payload is 32 GiB. Uploads are sequential and the
-composer is disabled while the session processes a command.
+composer is disabled while the session processes a command. Unsupported
+extraction formats remain valid uploaded objects.
 
 At final commit, the backend reads staged bytes and supplies them to
 `kcode-kweb-db`. This deliberately performs extra disk I/O in V1; a zero-copy
 prepared-object API is deferred.
+
+Transcript projections retain every message's object IDs and attachment
+metadata. Active objects load from
+`/api/v1/conversations/{session_id}/objects/{pending_id}`; completed objects
+load from `/api/v1/objects/{object_id}` after applying the commit receipt for
+older archives. Images, video, audio, and PDFs have bounded inline previews,
+and every object has a named download action. Rendering continues to use DOM
+properties and text nodes rather than injected markup.
 
 ## Context limits
 

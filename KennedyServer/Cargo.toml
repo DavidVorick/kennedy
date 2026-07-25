@@ -25,7 +25,7 @@ kcode-kweb-db.workspace = true
 kcode-openai-api.workspace = true
 kcode-rust-libs-v2.workspace = true
 kcode-web-fetch.workspace = true
-kcode-tg-kennedy-bot = "=0.2.0"
+kcode-tg-kennedy-bot = { path = "../kcode-tg-kennedy-bot", version = "=0.3.0" }
 rusqlite.workspace = true
 rand.workspace = true
 reqwest.workspace = true

@@ -1,0 +1,232 @@
+Native Telegram Media Expansion for kcode-tg-kennedy-bot
+=========================================================
+
+Status
+------
+
+This is the finalized additive contract after Kennedy reviewed the original
+proposal against the canonical 0.2.0 transport architecture. It supersedes the
+earlier draft. No breaking Rust or HTTP API change is allowed.
+
+Scope
+-----
+
+Add native Telegram photos, videos, animations, audio tracks, video notes, and
+stickers while keeping the relay a small Telegram transport and transport
+archive.
+
+The relay owns provider interaction, authorization, bounded temporary media
+retention, event/group association, binding fences, and provider message IDs.
+It does not own Kweb objects, Kmap roots, prompts, transcription/vision,
+semantic extraction, model execution, or long-term object-storage policy.
+
+Compatibility baseline
+----------------------
+
+- Keep every existing public Rust item and Config field.
+- Config.max_voice_bytes remains the nonzero limit for all inbound and outbound
+  media.
+- Keep GET /api/v1/events and existing RelayEvent fields compatible.
+- Keep GET /api/v1/events/{event_id}/media for all private event media.
+- Keep GET /api/v1/group-messages/{chat_id}/{message_id}/media for all group
+  media.
+- Keep POST /api/v1/events/{event_id}/file as explicit sendDocument behavior.
+- Keep all text, voice, document, reset, security, cursor, binding, completion,
+  edit, and group-session behavior.
+
+Required hardening
+------------------
+
+1. Never hold the shared SQLite mutex while calling IdentitySink, Telegram,
+   sleeping/backing off, downloading media, or doing other long work. Stage
+   short database reads/writes around external operations.
+
+2. Use one bounded transient retry helper:
+
+   - five total attempts including the first;
+   - RetryAfter honored;
+   - bounded backoff for timeout/connect/network/transient I/O failures;
+   - permanent API, invalid input, authorization, SQLite, and host failures stop
+     immediately;
+   - long polling remains a continuous loop;
+   - ambiguous sends may duplicate and no durable outbox/exactly-once promise
+     is added;
+   - log only safe operation/attempt/error classes, never raw provider errors,
+     URLs, tokens, captions, filenames, or bodies.
+
+3. Use one group-message JSON projection for recent context, group-session
+   updates, passive background-ingress creation, and edit refresh. It includes
+   the existing identity/text fields plus kind, mimeType, fileName,
+   durationSeconds, preparedText, preparationModel, documentFormat,
+   preparationTruncated, and hasMedia.
+
+Inbound kinds and metadata
+--------------------------
+
+Add exact kind strings:
+
+- photo
+- video
+- animation
+- audio
+- video_note
+- sticker
+
+Retain text, voice, document, and reset. A generic document remains document
+regardless of MIME type. Test native animation before its compatibility
+document field.
+
+Keep only essential existing metadata:
+
+- kind
+- text
+- mimeType
+- fileName
+- durationSeconds
+- hasMedia
+
+Do not add width, height, performer, title, emoji, isAnimated, isVideo, or a
+generic provider-metadata object.
+
+Text behavior:
+
+- photo/video/animation/audio: exact caption when present;
+- sticker: associated Telegram emoji as text when present;
+- video_note: no synthetic text;
+- group rows without provider text use an empty string;
+- existing voice/document behavior remains compatible.
+
+For photos select greatest checked pixel area, then greatest declared file
+size, then earliest stable provider order. Retain only that Telegram Bot API
+rendition and do not describe it as the sender's exact original.
+
+Use Telegram MIME and filename values when supplied. Fallback MIME rules:
+
+- photo: image/jpeg
+- video and video_note: video/mp4
+- static sticker: image/webp
+- animated sticker: application/x-tgsticker
+- video sticker: video/webm
+- animation/audio: recognized safe filename extension, otherwise
+  application/octet-stream
+
+Synthesize stable safe filenames from message identity when needed. Never
+expose Telegram's remote file path. Reuse the existing declared and streamed
+max_voice_bytes enforcement and bounded download path.
+
+Authorization and groups
+------------------------
+
+Native media is accepted for authorized private messages, allowed invoked group
+messages, and allowed passive group archives.
+
+Quarantined groups return before inspecting captions/content, selecting photo
+renditions, downloading files, storing bytes/content metadata, parsing
+invocation, or producing feedback. Sender and membership envelope processing
+needed for the security ledger remains allowed.
+
+Existing media retrieval routes return exact retained Bot API bytes with
+recorded/honest fallback Content-Type and the existing no-store, no-cache, and
+nosniff protections.
+
+Private transcription records accept voice, audio, and video_note. Group
+preparation accepts every retained media kind. The host supplies preparation;
+the relay performs no extraction or transcription.
+
+Outbound native route
+---------------------
+
+Add:
+
+POST /api/v1/events/{event_id}/media
+Content-Type: multipart/form-data
+
+Required fields:
+
+- conversationId: UUID matching the active event binding
+- kind: photo, video, animation, audio, video_note, or sticker
+- file: one nonempty bounded binary part
+
+Optional fields:
+
+- fileName
+- caption
+- complete
+
+No other fields are accepted. Caption is allowed for photo, video, animation,
+and audio, and rejected for video_note and sticker. Whitespace-only caption
+means absent; otherwise preserve it verbatim and enforce 1024 UTF-16 units.
+Use explicit fileName, then part filename, then a safe synthesized filename.
+Reuse existing path/control/length validation and multipart limits.
+
+Method mapping:
+
+- photo -> sendPhoto
+- video -> sendVideo
+- animation -> sendAnimation
+- audio -> sendAudio
+- video_note -> sendVideoNote
+- sticker -> sendSticker
+
+Use InputFile::memory with the effective safe filename. Preserve validated
+caller MIME in the local archive but do not claim teloxide transmits it
+unchanged. Never silently fall back to sendDocument; return
+telegram_send_failed and let the host deliberately choose /file.
+
+The native route shares /file event existence, incomplete-state, conversation
+binding, group reply, allow_sending_without_reply, complete=false,
+complete=true, and post-send compare-and-swap semantics. A Telegram success
+followed by archive/completion failure is surfaced as an ambiguous external
+side effect.
+
+Allowed-group outbound native messages are archived with exact kind, bytes,
+effective filename, recorded MIME, exact caption or empty text, returned
+message ID/date and duration when available, source conversation, stable group
+association, and invoking-message reply association. Private sends need no
+additional application-domain archive.
+
+Health capability discovery
+---------------------------
+
+Extend GET /health additively with:
+
+{
+  "capabilities": {
+    "inboundMediaKinds": [
+      "voice", "document", "photo", "video",
+      "animation", "audio", "video_note", "sticker"
+    ],
+    "outboundMediaKinds": [
+      "document", "photo", "video",
+      "animation", "audio", "video_note", "sticker"
+    ],
+    "maxMediaBytes": 20971520
+  }
+}
+
+Use the actual max_voice_bytes. Report capabilities even when telegram remains
+"disabled". Derive native kind lists from one internal source of truth.
+
+Storage and release
+-------------------
+
+Update fresh telegram_events creation to accept all kinds. Add an idempotent
+migration from the actual 0.2.0 schema by safely rebuilding only that
+CHECK-constrained table. Preserve every column and row, recreate every index,
+verify foreign keys, and retain the private voice_bytes compatibility name.
+telegram_group_messages has no kind constraint and does not need rebuilding.
+
+Create one cohesive internal native-media module rather than six copied
+pipelines. No new direct dependency should be needed with teloxide 0.17.
+
+Update Specification.md, Documentation.md, README.md, CHANGELOG.md, and
+DependencyAudit.md. Document provider photo renditions, bounded retention,
+transport-versus-semantics ownership, ambiguous send duplication, /file
+sendDocument semantics, /media no-fallback semantics, and the compatibility
+meaning of max_voice_bytes.
+
+Validate formatting, build, Clippy with warnings denied, unit/integration/doc
+tests, an actual-0.2.0 migration fixture, every native method mapping, bounded
+retry behavior, deterministic callback/SQLite overlap, group snapshot media
+fidelity, and existing regression behavior. Publication and deployment require
+separate authority.

@@ -523,8 +523,14 @@ impl Orchestrator {
 
     async fn session_for_record(&self, record: &Value) -> anyhow::Result<Session> {
         let runtime = self.runtime()?.clone();
-        let state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+        let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
         let session_type = session_type(record);
+        if matches!(session_type.as_str(), "telegram" | "telegram-group") {
+            if !state.get("channel").is_some_and(Value::is_object) {
+                state["channel"] = json!({});
+            }
+            state["channel"]["maxObjectBytes"] = json!(self.config.telegram_max_media_bytes);
+        }
         let roots = string_array(state.get("rootNodeIds"));
         let roots = if roots.is_empty() {
             vec![
@@ -630,13 +636,13 @@ impl Orchestrator {
             .await;
             return Ok(());
         }
-        if let Some(record) = histories
-            .iter()
-            .find(|record| {
-                matches!(
-                    record.get("phase").and_then(Value::as_str),
-                    Some("ingress_pending" | "ingress_in_progress")
-                )
+        let conversation = next_conversation_ingress(histories, Utc::now());
+        let audio = self.api.next_audio_ingress()?;
+        if let Some(record) = conversation
+            .filter(|record| {
+                audio
+                    .as_ref()
+                    .is_none_or(|piece| ingress_record_precedes(record, piece))
             })
             .cloned()
         {
@@ -648,7 +654,7 @@ impl Orchestrator {
             .await;
             return Ok(());
         }
-        let Some(piece) = self.api.next_audio_ingress()? else {
+        let Some(piece) = audio else {
             return Ok(());
         };
         self.launch_writer_job("audio ingress", move |worker| async move {
@@ -1384,7 +1390,19 @@ impl Orchestrator {
                     )
                     .await;
             }
-            if !excluded && matches!(kind.as_str(), "voice" | "document") {
+            if !excluded
+                && matches!(
+                    kind.as_str(),
+                    "voice"
+                        | "document"
+                        | "photo"
+                        | "video"
+                        | "animation"
+                        | "audio"
+                        | "video_note"
+                        | "sticker"
+                )
+            {
                 message["mediaRef"] = json!({"kind":kind,"source":"telegram-group","chatId":context.get("chatId").cloned().unwrap_or(Value::Null),"messageId":message.get("messageId").cloned().unwrap_or(Value::Null),"fileName":message.get("fileName").cloned().unwrap_or(Value::Null),"mimeType":message.get("mimeType").cloned().unwrap_or(Value::Null),"durationSeconds":message.get("durationSeconds").cloned().unwrap_or(Value::Null)});
                 let base = message.get("text").and_then(Value::as_str).unwrap_or("");
                 let prepared = message
@@ -1397,13 +1415,21 @@ impl Orchestrator {
                     });
                 message["text"] = json!(if kind == "voice" {
                     format!("[Voice note transcription]\n{prepared}")
-                } else {
+                } else if kind == "document" {
                     format!(
                         "{base}\n\n[Document: {}]\n{prepared}",
                         message
                             .get("fileName")
                             .and_then(Value::as_str)
                             .unwrap_or("telegram-document")
+                    )
+                } else {
+                    format!(
+                        "{base}\n\n[Telegram {kind} attached: {}]",
+                        message
+                            .get("fileName")
+                            .and_then(Value::as_str)
+                            .unwrap_or("media")
                     )
                 });
             }
@@ -1556,33 +1582,106 @@ impl Orchestrator {
                     json!({"owner":"backend","status":"ending","reason":"context-limit"});
                 persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
                 self.request_conversation_ingress(&record_arc, None).await?;
-                let notice = session
-                    .answer_for_external_event(&id)
-                    .and_then(|entry| entry.get("content"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(
-                        "This session reached its context limit and has been sent to history ingress.",
-                    );
-                self.api.telegram_post(
-                    &format!("/api/v1/events/{}/reply",encode_path(&id)),
-                    json!({
-                        "conversationId":conversation_id,
-                        "text":notice,
-                        "contextWarning":"session ended after crossing the 75% forced-ingress threshold"
-                    }),
-                ).await?;
+                self.deliver_telegram_responses(
+                    &session,
+                    &id,
+                    &conversation_id,
+                    Some("session ended after crossing the 75% forced-ingress threshold"),
+                )
+                .await?;
                 return Ok(());
             }
         }
-        let response = session
-            .answer_for_external_event(&id)
-            .context("Kennedy completed the turn without a recoverable Telegram response")?;
-        if let Some(text) = response
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            self.api.telegram_post(&format!("/api/v1/events/{}/reply",encode_path(&id)),json!({"conversationId":conversation_id,"text":text,"contextWarning":response.get("contextWarning").cloned().unwrap_or(Value::Null)})).await?;
+        self.deliver_telegram_responses(&session, &id, &conversation_id, None)
+            .await
+    }
+
+    async fn deliver_telegram_responses(
+        &self,
+        session: &Session,
+        event_id: &str,
+        conversation_id: &str,
+        forced_context_warning: Option<&str>,
+    ) -> anyhow::Result<()> {
+        enum Delivery {
+            Object(String),
+            Text(String, Value),
+        }
+
+        let mut deliveries = Vec::new();
+        for response in session.responses_for_external_event(event_id) {
+            if let Some(objects) = response.get("objects").and_then(Value::as_array) {
+                for object_id in objects.iter().filter_map(Value::as_str) {
+                    deliveries.push(Delivery::Object(object_id.to_owned()));
+                }
+            }
+            if let Some(text) = response
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                deliveries.push(Delivery::Text(
+                    text.to_owned(),
+                    response
+                        .get("contextWarning")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                ));
+            }
+        }
+        if let Some(warning) = forced_context_warning {
+            let has_text = deliveries
+                .iter()
+                .any(|delivery| matches!(delivery, Delivery::Text(_, _)));
+            if !has_text {
+                deliveries.push(Delivery::Text(
+                    "This session reached its context limit and has been sent to history ingress."
+                        .into(),
+                    json!(warning),
+                ));
+            }
+        }
+        anyhow::ensure!(
+            !deliveries.is_empty(),
+            "Kennedy completed the turn without a recoverable Telegram response"
+        );
+        let delivery_count = deliveries.len();
+        for (index, delivery) in deliveries.into_iter().enumerate() {
+            let complete = index + 1 == delivery_count;
+            match delivery {
+                Delivery::Object(object_id) => {
+                    let file = self.api.kmap_file(&object_id)?;
+                    anyhow::ensure!(
+                        file.bytes.len() <= self.config.telegram_max_media_bytes,
+                        "object {object_id} is {} bytes, over the configured {}-byte Telegram media limit",
+                        file.bytes.len(),
+                        self.config.telegram_max_media_bytes
+                    );
+                    self.api
+                        .telegram_send_object(
+                            &encode_path(event_id),
+                            conversation_id,
+                            &file,
+                            complete,
+                        )
+                        .await?;
+                }
+                Delivery::Text(text, response_warning) => {
+                    let warning = forced_context_warning
+                        .map(|warning| json!(warning))
+                        .unwrap_or(response_warning);
+                    self.api
+                        .telegram_post(
+                            &format!("/api/v1/events/{}/reply", encode_path(event_id)),
+                            json!({
+                                "conversationId":conversation_id,
+                                "text":text,
+                                "contextWarning":warning,
+                            }),
+                        )
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -1704,7 +1803,7 @@ impl Orchestrator {
         let user = self.directory_user(event).await?;
         let group = event.get("sessionKind").and_then(Value::as_str) == Some("group");
         let mut roots = vec![required_string(&user, "rootNodeId")?];
-        let mut channel = json!({"kind":if group{"telegram-group"}else{"telegram"},"telegramUserId":event.get("telegramUserId").cloned().unwrap_or(Value::Null),"chatId":event.get("chatId").cloned().unwrap_or(Value::Null),"groupId":event.get("groupId").cloned().unwrap_or(Value::Null),"username":event.get("username").cloned().unwrap_or(Value::Null),"displayName":event.get("displayName").cloned().unwrap_or(Value::Null)});
+        let mut channel = json!({"kind":if group{"telegram-group"}else{"telegram"},"telegramUserId":event.get("telegramUserId").cloned().unwrap_or(Value::Null),"chatId":event.get("chatId").cloned().unwrap_or(Value::Null),"groupId":event.get("groupId").cloned().unwrap_or(Value::Null),"username":event.get("username").cloned().unwrap_or(Value::Null),"displayName":event.get("displayName").cloned().unwrap_or(Value::Null),"maxObjectBytes":self.config.telegram_max_media_bytes});
         let mut references = Vec::new();
         if group {
             let group_id = required_string(event, "groupId")?;
@@ -1804,17 +1903,89 @@ impl Orchestrator {
                     .and_then(Value::as_str)
                     .unwrap_or("telegram-document")
                     .to_owned();
-                let result = self
+                let extraction = self
                     .api
                     .extract_document(bytes.clone(), filename.clone(), &mime)
-                    .await?;
+                    .await;
+                let mut attachment = json!({
+                    "id":format!("telegram:{id}"),
+                    "kind":"document",
+                    "source":"telegram",
+                    "fileName":filename,
+                    "mimeType":mime,
+                    "sizeBytes":bytes.len(),
+                    "dataUrl":data_url(&mime,&bytes),
+                });
+                match extraction {
+                    Ok(result) => {
+                        attachment["format"] = result.get("format").cloned().unwrap_or(Value::Null);
+                        attachment["text"] = result.get("text").cloned().unwrap_or(Value::Null);
+                        attachment["characters"] =
+                            result.get("characters").cloned().unwrap_or(Value::Null);
+                        attachment["truncated"] =
+                            result.get("truncated").cloned().unwrap_or(json!(false));
+                    }
+                    Err(error) => {
+                        attachment["extractionError"] = json!(error.to_string());
+                    }
+                }
                 Ok((
                     event
                         .get("text")
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .into(),
-                    json!({"externalEventId":id,"inputKind":"document","attachments":[{"id":format!("telegram:{id}"),"kind":"document","source":"telegram","fileName":filename,"mimeType":mime,"sizeBytes":bytes.len(),"dataUrl":data_url(&mime,&bytes),"format":result.get("format").cloned().unwrap_or(Value::Null),"text":result.get("text").cloned().unwrap_or(Value::Null),"characters":result.get("characters").cloned().unwrap_or(Value::Null),"truncated":result.get("truncated").cloned().unwrap_or(json!(false))}]}),
+                    json!({"externalEventId":id,"inputKind":"document","attachments":[attachment]}),
+                ))
+            }
+            kind @ ("photo" | "video" | "animation" | "audio" | "video_note" | "sticker") => {
+                let (bytes, downloaded_mime) = self
+                    .api
+                    .telegram_bytes(&format!("/api/v1/events/{}/media", encode_path(&id)))
+                    .await?;
+                let mime = event
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(&downloaded_mime)
+                    .to_owned();
+                let extension = match kind {
+                    "photo" => "jpg",
+                    "video" | "video_note" => "mp4",
+                    "animation" => "gif",
+                    "audio" => "mp3",
+                    "sticker" => "webp",
+                    _ => "bin",
+                };
+                let filename = event
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("telegram-{kind}.{extension}"));
+                let mut attachment = json!({
+                    "id":format!("telegram:{id}"),
+                    "kind":kind,
+                    "source":"telegram",
+                    "fileName":filename,
+                    "mimeType":mime,
+                    "sizeBytes":bytes.len(),
+                    "dataUrl":data_url(&mime,&bytes),
+                });
+                if let Some(value) = event.get("durationSeconds") {
+                    attachment["durationSeconds"] = value.clone();
+                }
+                Ok((
+                    event
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    json!({
+                        "externalEventId":id,
+                        "inputKind":kind,
+                        "attachments":[attachment],
+                    }),
                 ))
             }
             _ => Ok((
@@ -2227,6 +2398,57 @@ fn session_type(record: &Value) -> String {
         .unwrap_or("conversation")
         .into()
 }
+
+fn next_conversation_ingress(histories: &[Value], now: DateTime<Utc>) -> Option<&Value> {
+    histories
+        .iter()
+        .filter(|record| match record.get("phase").and_then(Value::as_str) {
+            Some("ingress_in_progress") => true,
+            Some("ingress_pending") => record
+                .get("ingress_next_attempt_at")
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .is_none_or(|next| next.with_timezone(&Utc) <= now),
+            _ => false,
+        })
+        .min_by(|left, right| ingress_record_order(left, right))
+}
+
+fn ingress_record_precedes(left: &Value, right: &Value) -> bool {
+    ingress_record_order(left, right).is_lt()
+}
+
+fn ingress_record_order(left: &Value, right: &Value) -> std::cmp::Ordering {
+    let rank = |record: &Value| {
+        if record.get("phase").and_then(Value::as_str) == Some("ingress_in_progress") {
+            0
+        } else {
+            1
+        }
+    };
+    rank(left)
+        .cmp(&rank(right))
+        .then_with(|| ingress_record_time(left).cmp(&ingress_record_time(right)))
+        .then_with(|| {
+            left.get("id")
+                .and_then(Value::as_str)
+                .cmp(&right.get("id").and_then(Value::as_str))
+        })
+}
+
+fn ingress_record_time(record: &Value) -> DateTime<Utc> {
+    ["updated_at", "source_created_at", "started_at"]
+        .into_iter()
+        .find_map(|field| {
+            record
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+        })
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
 fn is_browser_conversation(record: &Value) -> bool {
     session_type(record) == "conversation"
 }
@@ -2394,6 +2616,64 @@ mod tests {
             .unwrap(),
             MissingGroupSessionRecovery::CompleteSilentReset
         );
+    }
+
+    #[test]
+    fn conversation_ingress_scheduler_uses_due_oldest_work_not_newest_updates() {
+        let now = DateTime::parse_from_rfc3339("2026-07-25T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let histories = vec![
+            json!({
+                "id":"newest-not-due",
+                "phase":"ingress_pending",
+                "updated_at":"2026-07-25T02:59:00Z",
+                "ingress_next_attempt_at":"2026-07-25T03:01:00Z"
+            }),
+            json!({
+                "id":"newer-due",
+                "phase":"ingress_pending",
+                "updated_at":"2026-07-25T02:30:00Z",
+                "ingress_next_attempt_at":null
+            }),
+            json!({
+                "id":"oldest-due",
+                "phase":"ingress_pending",
+                "updated_at":"2026-07-25T01:30:00Z",
+                "ingress_next_attempt_at":"2026-07-25T02:00:00Z"
+            }),
+        ];
+        assert_eq!(
+            next_conversation_ingress(&histories, now)
+                .and_then(|record| record.get("id"))
+                .and_then(Value::as_str),
+            Some("oldest-due")
+        );
+    }
+
+    #[test]
+    fn claimed_writer_work_precedes_pending_work_across_ingress_sources() {
+        let conversation = json!({
+            "id":"conversation",
+            "phase":"ingress_pending",
+            "updated_at":"2026-07-25T01:00:00Z"
+        });
+        let audio = json!({
+            "id":"audio",
+            "phase":"ingress_in_progress",
+            "updated_at":"2026-07-25T02:00:00Z",
+            "source_created_at":"2026-07-25T00:00:00Z"
+        });
+        assert!(!ingress_record_precedes(&conversation, &audio));
+
+        let pending_audio = json!({
+            "id":"audio",
+            "phase":"ingress_pending",
+            "updated_at":"2026-07-25T00:30:00Z",
+            "source_created_at":"2026-07-25T00:00:00Z"
+        });
+        assert!(!ingress_record_precedes(&conversation, &pending_audio));
+        assert!(ingress_record_precedes(&pending_audio, &conversation));
     }
 
     #[tokio::test]

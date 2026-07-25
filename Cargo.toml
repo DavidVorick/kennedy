@@ -1,5 +1,5 @@
 [workspace]
-members = ["ConversationHistory", "KennedyServer"]
+members = ["ConversationHistory", "KennedyServer", "kcode-tg-kennedy-bot"]
 resolver = "2"
 
 [workspace.package]

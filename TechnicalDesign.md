@@ -144,17 +144,29 @@ string unchanged. An ordinary result box stores the same text directly,
 without a JSON envelope, Serde rendering, diagnostic wrapper, or
 pretty-printing. Its normal Chatend header is added only when Chatend projects
 the retained box in a later context. Multiple tool calls in one model response
-are recorded independently. Managed Rust library `create` and `open` install
-one stateful complete-source box per library. Successful writes revise that
-box in place and suppress a generic result copy. The durable invocation event
-retains the exact complete write arguments, while its active call box contains
-only bounded identifying metadata so a later provider request sees one
-complete source. Failed writes do not revise the source box. Kennedy-authored
-summaries and dehydration survive canonical source updates and become stale
-under the ordinary box rules. `LoadNode` is the other deliberate result
-exception: its invocation remains a box, but it updates the shared Kweb boxes
+are recorded independently. New invocation and completion events share one
+durable invocation ID, so parallel or out-of-order completion is unambiguous.
+When a process interruption leaves an invocation without a completion, session
+recovery appends an explicit failed completion before sealing; legacy journals
+without invocation IDs retain their historical LIFO compatibility.
+
+Managed Rust library `create` and `open` install one stateful complete-source
+box per library only after a non-mutating projection preview accepts the
+returned snapshot. An over-capacity result leaves Chatend unchanged and
+returns the bounded capacity error. Successful writes revise that box in place
+and suppress a generic result copy. The durable invocation event retains the
+exact complete write arguments, while its active call box contains only
+bounded identifying metadata so a later provider request sees one complete
+source. Failed writes do not revise the source box. Kennedy-authored summaries
+and dehydration survive canonical source updates and become stale under the
+ordinary box rules. `LoadNode` is the other deliberate result exception: its
+invocation remains a box, but it updates the shared Kweb boxes
 and returns the exact newly created or revised box renderings directly to the
 in-flight provider turn. It does not create a second generic result box.
+`EmitObject` is another deliberate exception: it validates one canonical Kweb
+object and creates a durable object-bearing Kennedy message box. That message
+is the adapter outbox and may terminally answer a conversational turn without
+assistant prose; no generic result box duplicates it.
 
 ## 7. Kweb context and writes
 
@@ -262,6 +274,24 @@ Kweb enforces its object and transaction payload limits. `kcode-session-log` doe
 not own application or database limits. The current boundary writes each
 pending object once into its session sidecar and again into Kweb at commit.
 Streaming and zero-copy handoff are future work.
+
+Accepted browser and Telegram bytes first enter that pending sidecar. The
+owning user message box references `pending:N`; extraction or transcription is
+supplementary and never replaces the original object. At history-ingress
+completion, Kmap wraps each file in a versioned binary envelope containing
+filename, MIME type, source transport kind, and exact bytes. It creates all
+objects first, then replaces exact known pending-object tokens in the immutable
+archive and staged node descriptive text before creating/updating nodes and
+finalizing the one transaction.
+
+Canonical object HTTP reads decode that envelope, while active-session reads
+serve the pending sidecar directly. Transcript projections retain object IDs
+and bounded attachment metadata. The browser selects inline
+image/video/audio/PDF presentation or a download card. Telegram sends native
+media through the additive relay `/media` multipart route and uses the
+existing `/file` route only for deliberate generic-document delivery. Native
+delivery failures remain native failures rather than triggering a semantic
+fallback. The final response part alone completes the relay event.
 
 Internal Kweb disk encodings are canonical binary and checksummed. Session-log
 headers and events use checksummed frames; pending objects have a fixed header,

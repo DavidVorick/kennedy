@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-#[cfg(test)]
 use reqwest::multipart;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
@@ -136,6 +135,21 @@ impl Api {
                 status: None,
                 code: "local_service_unavailable".into(),
                 message: "Session commits require the in-process Kweb service.".into(),
+            }),
+        }
+    }
+
+    pub(crate) fn kmap_file(
+        &self,
+        object_id: &str,
+    ) -> Result<crate::kmap_http::StoredFile, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local.kmap.get_file(object_id).map_err(kmap_error),
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "Object reads require the in-process Kweb service.".into(),
             }),
         }
     }
@@ -459,7 +473,6 @@ impl Api {
         Ok((bytes.to_vec(), content_type))
     }
 
-    #[cfg(test)]
     async fn multipart(
         &self,
         base: &str,
@@ -478,6 +491,32 @@ impl Api {
                 message: format!("Could not reach {base}."),
             })?;
         decode_response(response).await
+    }
+
+    pub async fn telegram_send_object(
+        &self,
+        event_id: &str,
+        conversation_id: &str,
+        file: &crate::kmap_http::StoredFile,
+        complete: bool,
+    ) -> Result<Value, ApiError> {
+        if let Some(kind) = telegram_native_kind(&file.media_type, file.transport_kind.as_deref()) {
+            let form = telegram_file_form(conversation_id, file, complete, Some(kind))?;
+            return self
+                .multipart(
+                    &self.telegram,
+                    &format!("/api/v1/events/{event_id}/media"),
+                    form,
+                )
+                .await;
+        }
+        let form = telegram_file_form(conversation_id, file, complete, None)?;
+        self.multipart(
+            &self.telegram,
+            &format!("/api/v1/events/{event_id}/file"),
+            form,
+        )
+        .await
     }
 
     pub async fn kmap_context(&self, node_id: &str) -> Result<Value, ApiError> {
@@ -948,6 +987,54 @@ fn normalize_kmap_mutation_response(mut response: Value) -> Value {
     response
 }
 
+fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Option<&'static str> {
+    match transport_kind {
+        Some("photo") => return Some("photo"),
+        Some("video") => return Some("video"),
+        Some("animation") => return Some("animation"),
+        Some("audio") => return Some("audio"),
+        Some("video_note") => return Some("video_note"),
+        Some("sticker") => return Some("sticker"),
+        _ => {}
+    }
+    if media_type == "image/gif" {
+        Some("animation")
+    } else if media_type.starts_with("image/") {
+        Some("photo")
+    } else if media_type.starts_with("video/") {
+        Some("video")
+    } else if media_type.starts_with("audio/") {
+        Some("audio")
+    } else {
+        None
+    }
+}
+
+fn telegram_file_form(
+    conversation_id: &str,
+    file: &crate::kmap_http::StoredFile,
+    complete: bool,
+    kind: Option<&str>,
+) -> Result<multipart::Form, ApiError> {
+    let part = multipart::Part::bytes(file.bytes.clone())
+        .file_name(file.file_name.clone())
+        .mime_str(&file.media_type)
+        .map_err(|error| ApiError {
+            status: None,
+            code: "invalid_object_metadata".into(),
+            message: format!("Could not encode the object's media type: {error}"),
+        })?;
+    let mut form = multipart::Form::new()
+        .text("conversationId", conversation_id.to_owned())
+        .text("fileName", file.file_name.clone())
+        .text("complete", complete.to_string())
+        .part("file", part);
+    if let Some(kind) = kind {
+        form = form.text("kind", kind.to_owned());
+    }
+    Ok(form)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,6 +1098,23 @@ mod tests {
             (0..8)
                 .map(|index| format!("recent-{index}"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn telegram_native_delivery_prefers_preserved_transport_kind() {
+        assert_eq!(
+            telegram_native_kind("image/webp", Some("sticker")),
+            Some("sticker")
+        );
+        assert_eq!(
+            telegram_native_kind("video/mp4", Some("video_note")),
+            Some("video_note")
+        );
+        assert_eq!(telegram_native_kind("image/gif", None), Some("animation"));
+        assert_eq!(
+            telegram_native_kind("application/pdf", Some("document")),
+            None
         );
     }
 }

@@ -17,13 +17,14 @@ use std::{
 use anyhow::{Context as _, ensure};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
-use kcode_session_log::{Role, Session as DurableSession, SessionLog, SessionStore};
+use chrono::{DateTime, Duration, Utc};
+use kcode_session_log::{EventPosition, Role, Session as DurableSession, SessionLog, SessionStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -32,6 +33,9 @@ use uuid::Uuid;
 const LIFECYCLE_SIDEBAND: &str = "session_lifecycle";
 const COMMAND_SIDEBAND: &str = "session_command";
 const CONTROL_EXTENSION: &str = "session-control";
+const INGRESS_FAILURE_LIMIT: i64 = 5;
+const INGRESS_RETRY_DELAY_SECONDS: i64 = 15;
+const RETAINED_INGRESS_FAILURES: usize = 5;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -500,12 +504,20 @@ pub fn router(service: Service) -> Router {
             post(stage_session_object),
         )
         .route(
+            "/api/v1/conversations/{session_id}/objects/{pending_id}",
+            get(get_session_object),
+        )
+        .route(
             "/api/v1/conversations/{session_id}/stop",
             post(request_session_stop),
         )
         .route(
             "/api/v1/conversations/{session_id}/retry-ingress",
             post(retry_ingress),
+        )
+        .route(
+            "/api/v1/conversations/ingress/repairs/release",
+            post(release_ingress_repairs),
         )
         .layer(DefaultBodyLimit::max(service.max_request_bytes))
         .with_state(service.state)
@@ -557,7 +569,8 @@ impl Service {
             return json_value(record);
         }
         if path == "/api/v1/conversations/ingress/repairs/release" {
-            return Ok(json!({"released":[]}));
+            let Json(value) = release_ingress_repairs(state).await?;
+            return Ok(value);
         }
         if let Some(command_id) = path
             .strip_prefix("/api/v1/conversation-commands/")
@@ -623,6 +636,11 @@ impl Service {
             "ingress-failure" => {
                 let input: RecordIngressFailure = parse_body(body)?;
                 let Json(record) = record_ingress_failure(state, id, input).await?;
+                json_value(record)
+            }
+            "retry-ingress" => {
+                let Json(record) =
+                    retry_ingress(state, Path(id.into()), Json(parse_body(body)?)).await?;
                 json_value(record)
             }
             _ => Err(ApiError::not_found().into()),
@@ -872,16 +890,17 @@ async fn list_session_summaries(State(state): State<AppState>) -> Result<Json<Va
     for receipt in
         read_completion_receipts(&state.config.completed_list).map_err(ApiError::internal)?
     {
-        let object_id = receipt.session_object_id;
+        let object_id = receipt.session_object_id.clone();
         sessions.push(SessionRecord {
             id: object_id.clone(),
             phase: "complete".into(),
             started_at: receipt.created_at.clone().unwrap_or_default(),
-            updated_at: receipt.committed_at.unwrap_or_default(),
+            updated_at: receipt.committed_at.clone().unwrap_or_default(),
             state: json!({
                 "sessionObjectId":object_id,
-                "sessionId":receipt.session_id,
-                "sessionType":receipt.session_type,
+                "sessionId":receipt.session_id.clone(),
+                "sessionType":receipt.session_type.clone(),
+                "commitReceipt":receipt,
             }),
             provenance_id: None,
             version: 1,
@@ -906,15 +925,17 @@ async fn get_session(
         .into_iter()
         .find(|receipt| receipt.session_object_id == id)
     {
+        let receipt_value = serde_json::to_value(&receipt).map_err(ApiError::internal)?;
         return Ok(Json(SessionRecord {
             id: id.clone(),
             phase: "complete".into(),
             started_at: receipt.created_at.clone().unwrap_or_default(),
-            updated_at: receipt.committed_at.unwrap_or_default(),
+            updated_at: receipt.committed_at.clone().unwrap_or_default(),
             state: json!({
                 "sessionObjectId":id,
                 "sessionId":receipt.session_id,
                 "sessionType":receipt.session_type,
+                "commitReceipt":receipt_value,
             }),
             provenance_id: None,
             version: 1,
@@ -929,6 +950,80 @@ async fn get_session(
     let journal = open_by_id(&state, &id)?;
     let record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     Ok(Json(materialize(record, &journal)))
+}
+
+async fn get_session_object(
+    State(state): State<AppState>,
+    Path((id, pending_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let number = pending_id
+        .strip_prefix("pending:")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ApiError::bad("Object ID must have the form pending:N."))?;
+    let journal = open_by_id(&state, &id)?;
+    let object = journal
+        .log
+        .read_pending_object(EventPosition(number - 1))
+        .map_err(|error| {
+            tracing::warn!(session_id=%id, pending_id, %error, "pending session object is unavailable");
+            ApiError::not_found()
+        })?;
+    let media_type = if object.media_type.trim().is_empty()
+        || object
+            .media_type
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || !object.media_type.contains('/')
+    {
+        "application/octet-stream"
+    } else {
+        &object.media_type
+    };
+    let file_name = object
+        .file_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() && !matches!(character, '"' | '\\' | '/' | ';') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(255)
+        .collect::<String>();
+    let content_type = HeaderValue::from_str(media_type)
+        .map_err(|_| ApiError::internal("pending object has an invalid media type"))?;
+    let disposition = HeaderValue::from_str(&format!(
+        "inline; filename=\"{}\"",
+        if file_name.is_empty() {
+            "uploaded-object"
+        } else {
+            &file_name
+        }
+    ))
+    .map_err(|_| ApiError::internal("pending object has an invalid filename"))?;
+    let content_length = HeaderValue::from_str(&object.bytes.len().to_string())
+        .map_err(|_| ApiError::internal("pending object has an invalid content length"))?;
+    let mut response = Response::new(Body::from(object.bytes));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, disposition);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, content_length);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store, max-age=0"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 
 async fn queue_session_command(
@@ -1154,6 +1249,9 @@ async fn transition_with_checkpoint(
     require_version(&record, input.expected_version)?;
     record.state = control_state(&input.state);
     record.phase = phase.into();
+    if phase == "ingress_pending" {
+        record.ingress_next_attempt_at = None;
+    }
     record.version += 1;
     record.updated_at = now();
     append_lifecycle(&mut journal, &record)?;
@@ -1174,6 +1272,9 @@ async fn transition(
     require_version(&record, expected_version)?;
     record.phase = phase.into();
     record.provenance_id = provenance_id;
+    if phase == "ingress_in_progress" {
+        record.ingress_next_attempt_at = None;
+    }
     record.version += 1;
     record.updated_at = now();
     append_lifecycle(&mut journal, &record)?;
@@ -1190,12 +1291,24 @@ async fn record_ingress_failure(
     let mut journal = open_by_id(&state, id)?;
     let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     require_version(&record, input.expected_version)?;
+    if !matches!(
+        record.phase.as_str(),
+        "ingress_pending" | "ingress_in_progress"
+    ) {
+        return Err(ApiError::conflict(
+            "Session History ingress is not in an active attempt.",
+        ));
+    }
+    let attempt = record.ingress_failure_count.saturating_add(1);
+    let terminal =
+        input.code.as_deref() == Some("input_too_large") || attempt >= INGRESS_FAILURE_LIMIT;
     let mut failures = record
         .ingress_failures
         .as_array()
         .cloned()
         .unwrap_or_default();
     failures.push(json!({
+        "attempt":attempt,
         "at":now(),
         "stage":input.stage,
         "code":input.code,
@@ -1204,10 +1317,21 @@ async fn record_ingress_failure(
         "contextTokens":input.context_tokens,
         "contextWindowTokens":input.context_window_tokens,
     }));
+    if failures.len() > RETAINED_INGRESS_FAILURES {
+        failures.drain(..failures.len() - RETAINED_INGRESS_FAILURES);
+    }
     record.ingress_failures = Value::Array(failures);
-    record.ingress_failure_count += 1;
+    record.ingress_failure_count = attempt;
+    record.phase = if terminal {
+        "ingress_failed".into()
+    } else {
+        "ingress_pending".into()
+    };
+    let updated_at = now();
+    record.ingress_next_attempt_at = (!terminal)
+        .then(|| (Utc::now() + Duration::seconds(INGRESS_RETRY_DELAY_SECONDS)).to_rfc3339());
     record.version += 1;
-    record.updated_at = now();
+    record.updated_at = updated_at;
     append_lifecycle(&mut journal, &record)?;
     Ok(Json(materialize(record, &journal)))
 }
@@ -1217,17 +1341,61 @@ async fn retry_ingress(
     Path(id): Path<String>,
     Json(input): Json<RetryIngress>,
 ) -> Result<Json<SessionRecord>, ApiError> {
-    transition_with_checkpoint(
-        State(state),
-        &id,
-        CheckpointSession {
-            expected_version: input.expected_version,
-            state: input.state,
-            user_activity: false,
-        },
-        "ingress_pending",
-    )
-    .await
+    let session_guard = session_mutation(&state, &id)?;
+    let _guard = session_guard.lock().map_err(ApiError::internal)?;
+    let mut journal = open_by_id(&state, &id)?;
+    let mut record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
+    require_version(&record, input.expected_version)?;
+    if record.phase != "ingress_failed" {
+        return Err(ApiError::conflict(
+            "Session History ingress is not in the failed state.",
+        ));
+    }
+    record.state = control_state(&input.state);
+    record.phase = "ingress_pending".into();
+    record.ingress_failure_count = 0;
+    record.ingress_next_attempt_at = None;
+    record.version += 1;
+    record.updated_at = now();
+    append_lifecycle(&mut journal, &record)?;
+    Ok(Json(materialize(record, &journal)))
+}
+
+async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let mut released = Vec::new();
+    for path in journal_paths(&state.config.directory)? {
+        let Some(id) = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let session_guard = session_mutation(&state, &id)?;
+        let _guard = session_guard.lock().map_err(ApiError::internal)?;
+        let mut journal = open_by_id(&state, &id)?;
+        let Some(mut record) = latest_lifecycle(&journal) else {
+            continue;
+        };
+        if record.phase != "ingress_in_progress" {
+            continue;
+        }
+        record.phase = "ingress_pending".into();
+        record.ingress_next_attempt_at = None;
+        if record.ingress_failure_count > INGRESS_FAILURE_LIMIT {
+            record.ingress_failure_count = 0;
+        }
+        if let Some(failures) = record.ingress_failures.as_array_mut()
+            && failures.len() > RETAINED_INGRESS_FAILURES
+        {
+            failures.drain(..failures.len() - RETAINED_INGRESS_FAILURES);
+        }
+        record.version += 1;
+        record.updated_at = now();
+        append_lifecycle(&mut journal, &record)?;
+        released.push(id);
+    }
+    Ok(Json(json!({"released":released})))
 }
 
 async fn complete_session(
@@ -1492,27 +1660,50 @@ fn role_name(role: Role) -> &'static str {
 }
 
 fn transcript_entry(position: usize, event: &kcode_session_log::SessionEvent) -> Option<Value> {
+    let kind = persisted_context_kind(event);
+    let box_content = kind
+        .as_ref()
+        .filter(|kind| kind.get("type").and_then(Value::as_str) == Some("box_created"))
+        .and_then(|kind| kind.get("content"));
+    let metadata = box_content
+        .and_then(|content| content.get("metadata"))
+        .filter(|value| value.is_object());
     let role = match event.role {
         Role::UserMessage => "user",
         Role::KennedyMessage => "kennedy",
         Role::SystemError => "system",
-        Role::SystemMessage => {
-            let kind = persisted_context_kind(event)?;
-            let content = kind.get("content")?;
-            (content
-                .get("metadata")
-                .and_then(|metadata| metadata.get("transcriptRole"))
-                .and_then(Value::as_str)
-                == Some("system"))
-            .then_some("system")?
-        }
+        Role::SystemMessage => (box_content?
+            .get("metadata")
+            .and_then(|metadata| metadata.get("transcriptRole"))
+            .and_then(Value::as_str)
+            == Some("system"))
+        .then_some("system")?,
         _ => return None,
     };
-    Some(json!({
+    let mut item = json!({
         "role":role,
         "content":display_text(event),
         "boxId":position + 1,
-    }))
+    });
+    if let Some(objects) = box_content
+        .and_then(|content| content.get("objects"))
+        .filter(|value| value.is_array())
+    {
+        item["objects"] = objects.clone();
+    }
+    if let Some(metadata) = metadata {
+        for key in ["inputKind", "externalEventId"] {
+            if let Some(value) = metadata.get(key) {
+                item[key] = value.clone();
+            }
+        }
+        if let Some(attachments) = metadata.get("attachments").filter(|value| value.is_array()) {
+            item["attachments"] = attachments.clone();
+        } else if let Some(media) = metadata.get("media").filter(|value| value.is_object()) {
+            item["attachments"] = json!([media]);
+        }
+    }
+    Some(item)
 }
 
 fn control_state(value: &Value) -> Value {
@@ -2229,6 +2420,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_pending_objects_are_streamed_with_original_metadata() {
+        let service = service("pending-object");
+        let record = service
+            .post_json(
+                "/api/v1/conversations/start",
+                json!({
+                    "idempotency_id":"pending-object-start",
+                    "started_at":"2026-07-23T00:00:00Z",
+                    "session_type":"conversation"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = record["id"].as_str().unwrap();
+        let mut journal = open_by_id(&service.state, id).unwrap();
+        let position = journal
+            .log
+            .add_pending_object(
+                "object event",
+                "photo.png",
+                "image/png",
+                b"\x89PNG\r\n\x1a\npayload",
+            )
+            .unwrap();
+        let response = get_session_object(
+            State(service.state.clone()),
+            Path((id.to_owned(), format!("pending:{}", position.index() + 1))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "inline; filename=\"photo.png\""
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"\x89PNG\r\n\x1a\npayload");
+    }
+
+    #[tokio::test]
+    async fn conversation_ingress_failures_back_off_then_stop_and_can_be_retried() {
+        let service = service("ingress-retries");
+        let created = service
+            .post_json(
+                "/api/v1/conversations/start",
+                json!({
+                    "idempotency_id":"ingress-retries-start",
+                    "started_at":"2026-07-23T00:00:00Z",
+                    "session_type":"conversation"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let mut record = service
+            .post_json(
+                &format!("/api/v1/conversations/{id}/request-ingress"),
+                json!({"expected_version":created["version"],"state":created["state"]}),
+            )
+            .await
+            .unwrap();
+
+        for attempt in 1..=INGRESS_FAILURE_LIMIT {
+            record = service
+                .post_json(
+                    &format!("/api/v1/conversations/{id}/ingress-started"),
+                    json!({
+                        "expected_version":record["version"],
+                        "provenance_id":format!("session:{id}"),
+                        "completion_protocol":"one-session-transaction-v1"
+                    }),
+                )
+                .await
+                .unwrap();
+            record = service
+                .post_json(
+                    &format!("/api/v1/conversations/{id}/ingress-failure"),
+                    json!({
+                        "expected_version":record["version"],
+                        "stage":"model_loop",
+                        "code":"ingress_error",
+                        "message":"transient failure"
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(record["ingress_failure_count"], attempt);
+            if attempt < INGRESS_FAILURE_LIMIT {
+                assert_eq!(record["phase"], "ingress_pending");
+                assert!(record["ingress_next_attempt_at"].is_string());
+            } else {
+                assert_eq!(record["phase"], "ingress_failed");
+                assert!(record["ingress_next_attempt_at"].is_null());
+            }
+        }
+        assert_eq!(
+            record["ingress_failures"].as_array().unwrap().len(),
+            RETAINED_INGRESS_FAILURES
+        );
+
+        let retried = service
+            .post_json(
+                &format!("/api/v1/conversations/{id}/retry-ingress"),
+                json!({"expected_version":record["version"],"state":record["state"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried["phase"], "ingress_pending");
+        assert_eq!(retried["ingress_failure_count"], 0);
+        assert!(retried["ingress_next_attempt_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn startup_releases_legacy_hot_loop_without_discarding_checkpoint_state() {
+        let service = service("ingress-release");
+        let created = service
+            .post_json(
+                "/api/v1/conversations/start",
+                json!({
+                    "idempotency_id":"ingress-release-start",
+                    "started_at":"2026-07-23T00:00:00Z",
+                    "session_type":"conversation"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let pending = service
+            .post_json(
+                &format!("/api/v1/conversations/{id}/request-ingress"),
+                json!({
+                    "expected_version":created["version"],
+                    "state":{
+                        "sessionType":"conversation",
+                        "journalPath":created["state"]["journalPath"],
+                        "historyIngress":{"kwebPlan":{"creates":[{"pendingId":"pending:9"}]}}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let started = service
+            .post_json(
+                &format!("/api/v1/conversations/{id}/ingress-started"),
+                json!({
+                    "expected_version":pending["version"],
+                    "provenance_id":format!("session:{id}"),
+                    "completion_protocol":"one-session-transaction-v1"
+                }),
+            )
+            .await
+            .unwrap();
+        let mut journal = open_by_id(&service.state, id).unwrap();
+        let mut legacy: SessionRecord = serde_json::from_value(started).unwrap();
+        legacy.ingress_failure_count = 150;
+        legacy.ingress_failures = Value::Array(
+            (1..=150)
+                .map(|attempt| json!({"attempt":attempt,"message":"legacy hot loop"}))
+                .collect(),
+        );
+        legacy.version += 1;
+        append_lifecycle(&mut journal, &legacy).unwrap();
+        drop(journal);
+
+        let released = service
+            .post_json("/api/v1/conversations/ingress/repairs/release", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(released["released"], json!([id]));
+        let repaired = service
+            .get_json(&format!("/api/v1/conversations/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(repaired["phase"], "ingress_pending");
+        assert_eq!(repaired["ingress_failure_count"], 0);
+        assert_eq!(
+            repaired["ingress_failures"].as_array().unwrap().len(),
+            RETAINED_INGRESS_FAILURES
+        );
+        assert_eq!(
+            repaired["state"]["historyIngress"]["kwebPlan"]["creates"][0]["pendingId"],
+            "pending:9"
+        );
+    }
+
+    #[tokio::test]
     async fn nested_history_ingress_receipt_completes_the_source_session() {
         let service = service("nested-completion");
         let record = service
@@ -2294,6 +2673,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             listed["conversations"][0]["state"]["sessionObjectId"],
+            "A1234567"
+        );
+        assert_eq!(
+            listed["conversations"][0]["state"]["commitReceipt"]["sessionObjectId"],
             "A1234567"
         );
         let stored = std::fs::read_to_string(&service.state.config.completed_list).unwrap();

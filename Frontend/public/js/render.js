@@ -105,7 +105,75 @@ function ingressRetryNotice(retrying, onRetry) {
   return notice;
 }
 
-export function renderTranscript(container, transcript, ingressActivity = null, viewKey = "transcript", retryAction = null) {
+function resolvedObjectId(objectId, objectContext) {
+  return objectContext?.objectIds?.[objectId] || objectId;
+}
+
+function objectHref(objectId, objectContext) {
+  const resolved = resolvedObjectId(objectId, objectContext);
+  if (String(resolved).startsWith("pending:")) {
+    const sessionId = objectContext?.sessionId;
+    return sessionId
+      ? `/api/v1/conversations/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(resolved)}`
+      : null;
+  }
+  return `/api/v1/objects/${encodeURIComponent(resolved)}`;
+}
+
+function renderObjectAttachment(objectId, descriptor, objectContext) {
+  const href = objectHref(objectId, objectContext);
+  if (!href) return null;
+  const mediaType = String(descriptor?.mediaType || descriptor?.mimeType || "application/octet-stream");
+  const fileName = String(descriptor?.fileName || `Object ${resolvedObjectId(objectId, objectContext)}`);
+  const attachment = element("figure", "object-attachment");
+  let preview;
+  if (mediaType.startsWith("image/")) {
+    preview = element("img", "object-preview object-image");
+    preview.src = href;
+    preview.alt = fileName;
+    preview.loading = "lazy";
+  } else if (mediaType.startsWith("video/")) {
+    preview = element("video", "object-preview object-video");
+    preview.src = href;
+    preview.controls = true;
+    preview.preload = "metadata";
+  } else if (mediaType.startsWith("audio/")) {
+    preview = element("audio", "object-preview object-audio");
+    preview.src = href;
+    preview.controls = true;
+    preview.preload = "metadata";
+  } else if (mediaType === "application/pdf") {
+    preview = element("iframe", "object-preview object-pdf");
+    preview.src = href;
+    preview.title = fileName;
+    preview.loading = "lazy";
+  }
+  if (preview) attachment.append(preview);
+  const caption = element("figcaption", "object-caption");
+  const link = element("a", "object-download", preview ? `Download ${fileName}` : fileName);
+  link.href = href;
+  link.download = fileName;
+  caption.append(link, element("span", "object-media-type", mediaType));
+  attachment.append(caption);
+  return attachment;
+}
+
+function appendObjectAttachments(message, item, objectContext) {
+  const objectIds = Array.isArray(item.objects) ? item.objects : [];
+  if (!objectIds.length) return;
+  const descriptors = Array.isArray(item.attachments) ? item.attachments : [];
+  const gallery = element("div", "object-gallery");
+  for (const [index, objectId] of objectIds.entries()) {
+    const descriptor = descriptors.find(candidate =>
+      [candidate?.objectId, candidate?.pendingId, candidate?.id].includes(objectId)
+    ) || descriptors[index] || {};
+    const attachment = renderObjectAttachment(objectId, descriptor, objectContext);
+    if (attachment) gallery.append(attachment);
+  }
+  if (gallery.childElementCount) message.append(gallery);
+}
+
+export function renderTranscript(container, transcript, ingressActivity = null, viewKey = "transcript", retryAction = null, objectContext = null) {
   const viewState = captureViewState(container, viewKey);
   container.replaceChildren();
   if (!transcript.length && !ingressActivity?.diagnostic) {
@@ -124,13 +192,14 @@ export function renderTranscript(container, transcript, ingressActivity = null, 
     const roleLabel =
       item.role === "kennedy" ? "Kennedy" : item.role === "system" ? "System" : "You";
     const message = element("article", `message ${messageClass}`);
-    const body = element("div", "body"); appendLinkedText(body, item.content);
+    const body = element("div", "body"); appendLinkedText(body, String(item.content || ""));
     message.append(element("span", "role", roleLabel));
     if (item.inputKind === "voice") message.append(element("span", "voice-note-badge", "Voice note · paid transcription"));
-    if (Array.isArray(item.attachments) && item.attachments.length) {
-      message.append(element("span", "voice-note-badge", `${item.attachments.length} document${item.attachments.length === 1 ? "" : "s"} · ${item.attachments.map(attachment => attachment.fileName).join(", ")}`));
+    if (Array.isArray(item.attachments) && item.attachments.length && !item.objects?.length) {
+      message.append(element("span", "voice-note-badge", `${item.attachments.length} file${item.attachments.length === 1 ? "" : "s"} · ${item.attachments.map(attachment => attachment.fileName || "object").join(", ")}`));
     }
-    message.append(body);
+    if (body.textContent) message.append(body);
+    appendObjectAttachments(message, item, objectContext);
     container.append(message);
   }
   if (ingressActivity?.diagnostic) {

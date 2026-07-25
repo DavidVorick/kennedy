@@ -53,6 +53,11 @@ The lifecycle projection uses these phases:
 
 ```text
 active -> ingress_pending -> ingress_in_progress -> complete
+             ^                    |  \
+             |                    |   -> ingress_failed
+             +--------------------+
+
+ingress_failed --manual retry--> ingress_pending
 ```
 
 An `active` session accepts ordered commands and staged browser objects.
@@ -62,7 +67,16 @@ history ingress remain parts of the same session log. A successful Kweb commit
 supplies a completion receipt; Session History synchronizes that receipt and
 then removes the session log, pending objects, and control file.
 
-Failures may return the record to `ingress_pending` with bounded diagnostics.
+Retryable failures return the record to `ingress_pending`, release the writer
+lane, and set a roughly 15-second `ingress_next_attempt_at`. The scheduler
+chooses claimed work first and otherwise the oldest due work across conversation
+and audio ingress. The fifth failed attempt, or an explicitly non-retryable
+input error, moves the record to terminal `ingress_failed`; manual retry grants
+a fresh attempt budget from the preserved checkpoint. The total consecutive
+failure count is retained while only the five latest concise diagnostics are
+embedded in lifecycle records. Startup requeues a process-interrupted
+`ingress_in_progress` record without discarding its checkpoint.
+
 If history ingress reaches its full context ceiling, Kennedy commits the work
 completed so far instead of reserving another output margin.
 
@@ -100,15 +114,20 @@ name does not change the Session History domain:
 - `POST /api/v1/conversations/{id}/commands`
 - `POST /api/v1/conversations/{id}/stop`
 - `POST /api/v1/conversations/{id}/objects`
+- `GET /api/v1/conversations/{id}/objects/{pending_id}`
 - `POST /api/v1/conversations/{id}/retry-ingress`
 
-Completed summary records intentionally contain only their permanent Kweb
-object ID. The frontend follows that ID through
+Completed summary records intentionally contain only permanent identifiers and
+their structured commit receipt, not a second transcript copy. The frontend
+follows the archive ID through
 `GET /api/v1/session-history/{object_id}` to classify and display the archive.
 
-The object route accepts exactly one multipart `file`. It writes one durable
+The object POST accepts exactly one multipart `file`. It writes one durable
 pending-object file, appends the corresponding event, and returns the
-event-position-derived temporary `pending:N` ID.
+event-position-derived temporary `pending:N` ID. The object GET verifies and
+streams that pending sidecar with its recorded media type, safe filename,
+length, no-store policy, and `nosniff`; it is available only while the local
+session remains active.
 
 ## Isolation and cutover
 
