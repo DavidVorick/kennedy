@@ -19,7 +19,9 @@ command -v "$podman" >/dev/null 2>&1 ||
     die "podman is not installed or CODEX_SAFE_PODMAN is invalid"
 
 umask 077
-mkdir -p "$state" "$catalog_dir" "$empty_workspace"
+mkdir -p "$state" "$catalog_dir"
+state_path=$(cd "$state" && pwd -P)
+catalog_path=$(cd "$catalog_dir" && pwd -P)
 
 interactive=0
 if [ -t 0 ] && [ -t 1 ]; then
@@ -43,14 +45,29 @@ elif [ "$interactive" -eq 1 ]; then
     if [ -n "$git_root" ]; then
         workspace=$(cd "$git_root" && pwd -P)
     else
-        printf '%s: %s is not inside a Git repository; no host workspace will be mounted.\n' \
-            "$program" "$cwd" >&2
-        printf '%s: set CODEX_SAFE_WORKSPACE to opt into a non-Git host directory.\n' \
-            "$program" >&2
+        workspace=$cwd
     fi
 fi
 
 if [ -z "$workspace" ]; then
+    mkdir -p "$empty_workspace"
+    empty_workspace=$(cd "$empty_workspace" && pwd -P)
+    case "$empty_workspace" in
+        /)
+            die "refusing to use / as CODEX_SAFE_EMPTY_WORKSPACE"
+            ;;
+    esac
+    case "$state_path/" in
+        "$empty_workspace/"*)
+            die "CODEX_SAFE_EMPTY_WORKSPACE must not contain the Codex state directory"
+            ;;
+    esac
+    case "$catalog_path/" in
+        "$empty_workspace/"*)
+            die "CODEX_SAFE_EMPTY_WORKSPACE must not contain the model catalog directory"
+            ;;
+    esac
+    find "$empty_workspace" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     workspace=$empty_workspace
 fi
 

@@ -478,7 +478,7 @@ test("production frontend is server-driven and uses the consolidated origin", as
   assert.doesNotMatch(app, /legacy_orchestration/);
 });
 
-test("codex-safe mounts the documented runtime catalog cache", async () => {
+test("codex-safe preserves its documented workspace and catalog boundaries", async () => {
   const [launcher, readme] = await Promise.all([
     readFile(new URL("../../scripts/codex-safe", import.meta.url), "utf8"),
     readFile(new URL("../../README.md", import.meta.url), "utf8"),
@@ -487,6 +487,12 @@ test("codex-safe mounts the documented runtime catalog cache", async () => {
   assert.ok(launcher.includes(`catalog_dir=\${CODEX_SAFE_CATALOG_DIR:-${defaultPath}}`));
   assert.ok(readme.includes(defaultPath));
   assert.doesNotMatch(launcher, /kennedy-codex-catalogs/);
+  assert.match(launcher, /else\s+workspace=\$cwd\s+fi/);
+  assert.match(
+    launcher,
+    /find "\$empty_workspace" -mindepth 1 -maxdepth 1 -exec rm -rf -- \{\} \+/,
+  );
+  assert.ok(readme.includes("/home/user/podman/codex-state-empty-workspace"));
 });
 
 test("native orchestration remains a Rust backend concern", async () => {

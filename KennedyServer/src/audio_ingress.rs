@@ -109,7 +109,7 @@ impl ApiError {
     }
 
     fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(%error, "Kennedy audio adapter failed");
+        tracing::warn!(%error, "Kennedy audio adapter failed");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -549,10 +549,10 @@ impl BrowserRecording {
     }
 }
 
-fn processing_stage(status: &kcode_audio_transcribe::TranscriptionStatus) -> &'static str {
+fn processing_stage(status: &kcode_audio_ingress::TranscriptionStatus) -> &'static str {
     let plan_complete = status.steps.iter().any(|entry| {
-        entry.step == kcode_audio_transcribe::Step::PlanChunks
-            && entry.state == kcode_audio_transcribe::StepState::Completed
+        entry.step == kcode_audio_ingress::Step::PlanChunks
+            && entry.state == kcode_audio_ingress::StepState::Completed
     });
     if !plan_complete {
         return "chunking";
@@ -563,10 +563,10 @@ fn processing_stage(status: &kcode_audio_transcribe::TranscriptionStatus) -> &'s
         .filter(|entry| {
             matches!(
                 entry.step,
-                kcode_audio_transcribe::Step::TranscribeChunk { .. }
+                kcode_audio_ingress::Step::TranscribeChunk { .. }
             )
         })
-        .all(|entry| entry.state == kcode_audio_transcribe::StepState::Completed);
+        .all(|entry| entry.state == kcode_audio_ingress::StepState::Completed);
     if chunks_complete {
         "reconciling"
     } else {
@@ -984,7 +984,23 @@ impl Queue {
         )
         .map_err(QueueError::internal)?;
         tx.commit().map_err(QueueError::internal)?;
-        fetch_job(&db, id)
+        let job = fetch_job(&db, id)?;
+        if terminal {
+            tracing::error!(
+                job_id = id,
+                recording_id = %existing.recording_id,
+                attempt,
+                stage = %input.stage,
+                code = input.code.as_deref().unwrap_or("ingress_error"),
+                terminal_reason = if input.code.as_deref() == Some("input_too_large") {
+                    "non_retryable"
+                } else {
+                    "retry_limit"
+                },
+                "Audio ingress stopped after a terminal failure"
+            );
+        }
+        Ok(job)
     }
 
     fn retry(
@@ -1135,7 +1151,7 @@ impl QueueError {
     }
 
     fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(%error, "Kennedy audio queue operation failed");
+        tracing::warn!(%error, "Kennedy audio queue operation failed");
         Self {
             kind: QueueErrorKind::Internal,
             message: "An unexpected Kennedy audio queue error occurred.".into(),

@@ -1,4 +1,0 @@
--- The Rust migration driver rebuilds telegram_events when its historical kind
--- CHECK constraint does not yet include every native-media kind. Keeping the
--- rebuild in Rust lets it preserve columns added by every supported prior
--- release while this marker keeps the managed migration chain explicit.

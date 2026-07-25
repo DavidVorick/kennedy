@@ -23,11 +23,10 @@ Kennedy is one Rust server with deliberately separated library domains:
    state, context limits, orchestration, provider calls, tool execution, graph
    policy, the one Kweb writer lane, Kweb HTTP routes, roots, the credential
    vault, and static assets.
-5. `kcode-audio-ingress` owns durable audio intake and automatic whole-job
-   recovery while `kcode-audio-transcribe` owns the transcription operation.
-   KennedyServer owns the Axum adapter and a separate prepared-transcript
-   memory-ingress queue; those downstream concepts are absent from the
-   standalone library.
+5. `kcode-audio-ingress` owns durable audio intake, transcription, and
+   automatic whole-job recovery. KennedyServer owns the Axum adapter and a
+   separate prepared-transcript memory-ingress queue; those downstream
+   concepts are absent from the standalone library.
 6. Conversational history ingress uses the same session log as its source
    session; KennedyServer serializes it with audio work through the global
    Kweb writer lane.

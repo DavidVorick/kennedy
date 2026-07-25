@@ -16,7 +16,6 @@ flate2.workspace = true
 hex.workspace = true
 kcode-audio-ingress.workspace = true
 kennedy-conversation-history = { path = "../ConversationHistory" }
-kcode-audio-transcribe.workspace = true
 kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true
 kcode-doc-extraction.workspace = true
@@ -25,7 +24,7 @@ kcode-kweb-db.workspace = true
 kcode-openai-api.workspace = true
 kcode-rust-libs-v2.workspace = true
 kcode-web-fetch.workspace = true
-kcode-tg-kennedy-bot = { path = "../kcode-tg-kennedy-bot", version = "=0.3.0" }
+kcode-tg-kennedy-bot = "=0.3.0"
 rusqlite.workspace = true
 rand.workspace = true
 reqwest.workspace = true

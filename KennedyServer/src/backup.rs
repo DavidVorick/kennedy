@@ -769,7 +769,7 @@ Each pending object is a separate `<session-id>-<event-position>.pending-object`
 
 ## Audio-ingress data format
 
-`data/audio-ingress/` is the standalone AudioIngress persistence root. `state.sqlite3` tracks submitted recordings by SHA-256, making renamed or recopied audio idempotent. `audio_recordings` owns source metadata, provider-model attribution, the latest serialized `kcode-audio-transcribe` progress snapshot, the fixed five-attempt retry budget, and the final canonical transcript. `originals/` contains the content-addressed input bytes. Upgraded databases can retain historical `audio_chunks` and `audio_ingress_pieces` tables, but the standalone library no longer reads or writes them.
+`data/audio-ingress/` is the standalone AudioIngress persistence root. `state.sqlite3` tracks submitted recordings by SHA-256, making renamed or recopied audio idempotent. `audio_recordings` owns source metadata, provider-model attribution, the latest serialized transcription progress snapshot, the fixed five-attempt retry budget, and the final canonical transcript. `originals/` contains the content-addressed input bytes. Upgraded databases can retain historical `audio_chunks` and `audio_ingress_pieces` tables, but the standalone library no longer reads or writes them.
 
 `data/audio-memory-ingress.sqlite3` is KennedyServer-owned persistence. It stores the transcript pieces, claims, retry scheduling, Kennedy ingress checkpoints, provenance identifiers, optimistic versions, and failure logs used to deliver completed AudioIngress transcripts into Kennedy's memory. This queue and its policies are not part of the AudioIngress library.
 

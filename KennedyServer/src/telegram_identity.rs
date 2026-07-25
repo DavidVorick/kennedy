@@ -77,7 +77,7 @@ impl ApiError {
     }
 
     fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(error=%error, "Telegram identity-directory request failed");
+        tracing::warn!(error=%error, "Telegram identity-directory request failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",

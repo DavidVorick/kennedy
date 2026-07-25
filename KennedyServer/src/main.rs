@@ -267,12 +267,12 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         "AudioIngress requires the gemini-api-key credential; configure it before starting Kennedy",
     )?;
     let mut config =
-        kcode_codex_runtime::CodexConfig::new(kcode_audio_transcribe::RECONCILIATION_MODEL);
+        kcode_codex_runtime::CodexConfig::new(kcode_audio_ingress::RECONCILIATION_MODEL);
     config.validation_reasoning_effort = kcode_codex_runtime::ReasoningEffort::XHigh;
     let codex = kcode_codex_runtime::Codex::open(config, codex_catalog_cache)
         .await
         .context("opening Codex audio-reconciliation runtime")?;
-    let audio_transcriber = kcode_audio_transcribe::AudioTranscriber::new(gemini, codex);
+    let audio_transcriber = kcode_audio_ingress::AudioTranscriber::new(gemini, codex);
     let audio_state_database = args.audio_ingress_directory.join("state.sqlite3");
     migrate_audio_ingress_database(&args.legacy_audio_ingress_database, &audio_state_database)?;
     let audio =

@@ -223,6 +223,10 @@ canonical documents; this file is not an append-only log.
   `codex-safe` launcher in `/home/user/podman`; that launcher keeps Codex in the
   same persistent Podman sandbox rather than installing or invoking Codex on
   the host. Keep `gpt-5.6-sol` with `xhigh` reasoning.
+- For an interactive `codex-safe` terminal launch, use the Git repository root
+  as the workspace when one exists and otherwise use the current directory.
+  Keep the noninteractive no-workspace failsafe separate, and wipe that
+  failsafe directory immediately before every fallback mount.
 - Register only the provider-native `call_ktool` function. Codex may request
   several calls before its next inference; execute them sequentially in
   provider order and return each result through its matching native call ID.

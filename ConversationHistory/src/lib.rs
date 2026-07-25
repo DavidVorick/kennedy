@@ -276,7 +276,7 @@ impl ApiError {
     }
 
     fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(error=%error, "Session History request failed");
+        tracing::warn!(error=%error, "Session History request failed");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -1333,6 +1333,20 @@ async fn record_ingress_failure(
     record.version += 1;
     record.updated_at = updated_at;
     append_lifecycle(&mut journal, &record)?;
+    if terminal {
+        tracing::error!(
+            session_id = id,
+            attempt,
+            stage = %input.stage,
+            code = input.code.as_deref().unwrap_or("ingress_error"),
+            terminal_reason = if input.code.as_deref() == Some("input_too_large") {
+                "non_retryable"
+            } else {
+                "retry_limit"
+            },
+            "Session History ingress stopped after a terminal failure"
+        );
+    }
     Ok(Json(materialize(record, &journal)))
 }
 

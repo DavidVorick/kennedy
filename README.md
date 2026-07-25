@@ -58,6 +58,13 @@ codex-safe login
 codex-safe login status
 ```
 
+For an interactive terminal launch, `codex-safe` mounts the Git repository root
+when the current directory is in a repository; otherwise it mounts the current
+directory itself. Noninteractive launches without `CODEX_SAFE_WORKSPACE` use
+the failsafe workspace at
+`/home/user/podman/codex-state-empty-workspace` by default and wipe it before
+each mount.
+
 Service calls use piped stdin/stdout, so the launcher must use `podman run -i`
 and must not require a TTY. Add `-t` only when the launcher's own stdin is a
 terminal.

@@ -785,7 +785,7 @@ pub(crate) struct ApiError {
 
 impl ApiError {
     fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(error=%error, "Kmap request failed");
+        tracing::warn!(error=%error, "Kmap request failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",

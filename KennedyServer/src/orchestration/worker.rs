@@ -85,7 +85,7 @@ impl Orchestrator {
                     let message = error.to_string();
                     let mut previous = self.last_poll_error.write().await;
                     if previous.as_deref() != Some(message.as_str()) {
-                        tracing::error!(error=%error, "Backend orchestration poll will retry");
+                        tracing::warn!(error=%error, "Backend orchestration poll will retry");
                         *previous = Some(message);
                     }
                 }
@@ -235,7 +235,7 @@ impl Orchestrator {
             let worker = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = worker.process_conversation_command(command).await {
-                    tracing::error!(command_id=%id, error=%error, "Browser conversation command will retry");
+                    tracing::warn!(command_id=%id, error=%error, "Browser conversation command will retry");
                 }
                 worker.commands_in_flight.lock().await.remove(&id);
             });
@@ -680,7 +680,7 @@ impl Orchestrator {
         tokio::spawn(async move {
             let _writer_guard = worker.writer.lock().await;
             if let Err(error) = task(worker.clone()).await {
-                tracing::error!(%label, error=%error, "Kmap writer job will retry");
+                tracing::warn!(%label, error=%error, "Kmap writer job will retry");
             }
             worker.writer_job_active.store(false, Ordering::Release);
         });
@@ -1107,7 +1107,7 @@ impl Orchestrator {
         drop(set);
         tokio::spawn(async move {
             if let Err(error) = worker.provision_directory().await {
-                tracing::error!(error=%error,"Telegram directory provisioning will retry");
+                tracing::warn!(error=%error,"Telegram directory provisioning will retry");
             }
             worker.directory_in_flight.lock().await.remove("directory");
         });
@@ -1493,7 +1493,7 @@ impl Orchestrator {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                tracing::error!(event_id=%id,error=%error,"Telegram event will retry")
+                tracing::warn!(event_id=%id,error=%error,"Telegram event will retry")
             }
             Err(_) => {
                 let _ = self
@@ -2047,7 +2047,7 @@ impl Orchestrator {
             let worker = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = worker.process_group_update(update).await {
-                    tracing::error!(conversation_id=%id,error=%error,"Telegram group context update will retry");
+                    tracing::warn!(conversation_id=%id,error=%error,"Telegram group context update will retry");
                 }
                 worker.group_updates_in_flight.lock().await.remove(&id);
             });
@@ -2198,7 +2198,7 @@ impl Orchestrator {
             let worker = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = worker.process_group_ingress(batch).await {
-                    tracing::error!(batch_id=%id,error=%error,"Telegram group ingress preparation will retry");
+                    tracing::warn!(batch_id=%id,error=%error,"Telegram group ingress preparation will retry");
                 }
                 worker.group_ingress_in_flight.lock().await.remove(&id);
             });
