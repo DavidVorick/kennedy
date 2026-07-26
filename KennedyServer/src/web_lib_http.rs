@@ -258,7 +258,7 @@ fn resolve_version(root: &FilePath, name: &str, selector: &str) -> Result<Resolu
 }
 
 fn published_module_root(root: &FilePath, name: &str) -> Result<PathBuf, RouteError> {
-    let published = real_directory(&root.join(".published"), "publication root")?;
+    let published = real_directory(root, "publication root")?;
     let modules = real_directory(&published.join("module"), "module publication root")?;
     real_directory(&modules.join(name), "published Web library")
 }
@@ -455,7 +455,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("kennedy-web-lib-http-test-{}", Uuid::new_v4()));
         for version in ["1.2.3", "1.8.0", "2.0.0"] {
-            let version_root = root.join(format!(".published/module/demo/v{version}"));
+            let version_root = root.join(format!("module/demo/v{version}"));
             fs::create_dir_all(&version_root).unwrap();
             fs::write(
                 version_root.join("kcode-web.json"),

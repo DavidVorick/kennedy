@@ -2022,9 +2022,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-dev-tools"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d7c0163304d353471f09b323b027c508637d44b94f981f6d02ab887212f640c"
+checksum = "8737fca4830f1b67c86ed57b37ffe3dcdcb3f6ca37612aff356b40b2872c07bc"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2182,9 +2182,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-web-libs"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91a8bceef50344d8852d47be1efd655fb572d0d515947306429b67d41d2e5262"
+checksum = "ed9dbb5a6cc5b846282968e11e129f59282faa1e0c504fff2d27070077fb5676"
 dependencies = [
  "fs2",
  "semver",

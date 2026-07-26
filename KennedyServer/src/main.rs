@@ -85,6 +85,8 @@ struct Args {
     rust_libs_root: PathBuf,
     #[arg(long, default_value = "./data/kcode/kcode-web-libs")]
     web_libs_root: PathBuf,
+    #[arg(long, default_value = "./data/kcode/kcode-web-libs-published")]
+    web_libs_published_root: PathBuf,
     #[arg(long, default_value = "./data/kcode/kcode-rust-bins")]
     rust_bins_root: PathBuf,
     #[arg(long, default_value = "./data/kcode/kcode-rust-bin-artifacts")]
@@ -225,6 +227,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let dev_tools = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
         rust_libraries_root: args.rust_libs_root.clone(),
         web_libraries_root: args.web_libs_root.clone(),
+        web_publications_root: args.web_libs_published_root.clone(),
         rust_binaries_root: args.rust_bins_root.clone(),
         rust_binary_publications_root: args.rust_bin_artifacts_root.clone(),
         crates_io_registry_token: crates_io_key,
@@ -240,7 +243,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 .display()
         )
     })?;
-    let web_lib_router = web_lib_http::router(dev_tools.web_libraries_root());
+    let web_lib_router = web_lib_http::router(dev_tools.web_publications_root());
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
@@ -341,6 +344,7 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.audio_ingress_directory,
         &args.rust_libs_root,
         &args.web_libs_root,
+        &args.web_libs_published_root,
         &args.rust_bins_root,
         &args.rust_bin_artifacts_root,
     ] {
@@ -650,6 +654,7 @@ mod tests {
             &args.audio_ingress_directory,
             &args.rust_libs_root,
             &args.web_libs_root,
+            &args.web_libs_published_root,
             &args.rust_bins_root,
             &args.rust_bin_artifacts_root,
         ] {
@@ -662,6 +667,7 @@ mod tests {
         for path in [
             &args.rust_libs_root,
             &args.web_libs_root,
+            &args.web_libs_published_root,
             &args.rust_bins_root,
             &args.rust_bin_artifacts_root,
         ] {
@@ -693,11 +699,13 @@ mod tests {
         ));
         let rust_libraries = directory.join("kcode-rust-libs");
         let web_libraries = directory.join("kcode-web-libs");
+        let web_publications = directory.join("kcode-web-libs-published");
         let rust_binaries = directory.join("kcode-rust-bins");
         let rust_binary_artifacts = directory.join("kcode-rust-bin-artifacts");
         let service = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
             rust_libraries_root: rust_libraries.clone(),
             web_libraries_root: web_libraries.clone(),
+            web_publications_root: web_publications.clone(),
             rust_binaries_root: rust_binaries.clone(),
             rust_binary_publications_root: rust_binary_artifacts.clone(),
             crates_io_registry_token: "test-token".into(),
@@ -709,9 +717,14 @@ mod tests {
             service.web_libraries_root(),
             std::fs::canonicalize(&web_libraries).unwrap()
         );
+        assert_eq!(
+            service.web_publications_root(),
+            std::fs::canonicalize(&web_publications).unwrap()
+        );
         for path in [
             rust_libraries,
             web_libraries,
+            web_publications,
             rust_binaries,
             rust_binary_artifacts,
         ] {
@@ -892,6 +905,7 @@ mod tests {
             audio_ingress_directory: audio_media.clone(),
             rust_libs_root: directory.join("rust-libs"),
             web_libs_root: directory.join("kcode-web-libs"),
+            web_libs_published_root: directory.join("kcode-web-libs-published"),
             rust_bins_root: directory.join("kcode-rust-bins"),
             rust_bin_artifacts_root: directory.join("kcode-rust-bin-artifacts"),
             frontend_dir: directory.join("frontend"),

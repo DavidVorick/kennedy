@@ -158,9 +158,9 @@ Defaults:
 - Kennedy's audio memory-ingress queue and the Telegram and user-directory
   SQLite files under `data/`;
 - managed Rust libraries: `data/kcode/kcode-rust-libs`;
-- managed Web libraries and immutable publications:
-  `data/kcode/kcode-web-libs` (published versions are created lazily beneath
-  `.published/module/<name>/v<version>/`);
+- managed Web-library source: `data/kcode/kcode-web-libs`;
+- immutable published Web libraries:
+  `data/kcode/kcode-web-libs-published/module/<name>/v<version>/`;
 - managed Rust-binary source: `data/kcode/kcode-rust-bins`;
 - immutable published Rust executables:
   `data/kcode/kcode-rust-bin-artifacts`;

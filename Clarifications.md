@@ -1151,10 +1151,11 @@ canonical documents; this file is not an append-only log.
   write, terminal-output `write-file-freeform`, delete-file, check, and
   publish. Rust and Web libraries retain independent stateful complete-source
   boxes.
-- Store managed Web source and immutable publications beneath
-  `./data/kcode/kcode-web-libs/`, relative to KennedyServer's process working
-  directory. The simplified whole-`data/` backup script covers this root; do
-  not add special backup-system integration.
+- Store managed Web source beneath `./data/kcode/kcode-web-libs/` and immutable
+  publications beneath the distinct
+  `./data/kcode/kcode-web-libs-published/` root, relative to KennedyServer's
+  process working directory. The simplified whole-`data/` backup script covers
+  both roots; do not add special backup-system integration.
 - Serve every file from immutable publications. A fileless
   `/lib/<name>/<selector>` request resolves and redirects to the selected
   publication's manifest-declared entry module. A file route preserves the
@@ -1178,7 +1179,8 @@ canonical documents; this file is not an append-only log.
 
 - Consolidate managed Kcode state beneath `./data/kcode/`. Use
   `kcode-rust-libs/` for Rust-library source, `kcode-web-libs/` for Web-library
-  source and publications, `kcode-rust-bins/` for Rust-binary source, and
+  source, `kcode-web-libs-published/` for immutable Web publications,
+  `kcode-rust-bins/` for Rust-binary source, and
   `kcode-rust-bin-artifacts/` for published executables.
 - Keep Rust-binary source and executable publications separate. Publish
   executables immutably by name and SemVer, reject a second publication of the

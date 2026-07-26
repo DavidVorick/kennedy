@@ -23,7 +23,7 @@ kcode-gemini-api = "=0.2.0"
 kcode-gemini-api-legacy = { package = "kcode-gemini-api", version = "=0.1.1" }
 kcode-kweb-db = "1.0"
 kcode-audio-ingress = "0.1.1"
-kcode-dev-tools = "=0.1.0"
+kcode-dev-tools = "=0.2.0"
 kcode-openai-api = "=0.1.2"
 kcode-session-history = "=0.1.0"
 kcode-web-fetch = "0.1.1"

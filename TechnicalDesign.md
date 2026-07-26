@@ -355,12 +355,12 @@ vault, recovery, or legacy formats. A small metadata member records the source
 commit and dirty status. Recovery uses those opaque bytes with the matching
 source version; format inspection and migration happen at recovery time.
 
-Managed Web publication shares the Web-library root by contract but is
-separated from editable source beneath
-`data/kcode/kcode-web-libs/.published/module/<name>/v<version>/`. The
-publication directory is created lazily on the first successful publish.
-Rust-binary publications use the distinct
-`data/kcode/kcode-rust-bin-artifacts` root.
+Managed Web source and immutable Web publications use distinct roots.
+Editable source lives beneath `data/kcode/kcode-web-libs/`; publications live
+beneath
+`data/kcode/kcode-web-libs-published/module/<name>/v<version>/`. The
+publication root is created lazily on first use. Rust-binary publications use
+the distinct `data/kcode/kcode-rust-bin-artifacts` root.
 
 Backup archives are written outside `data/` to prevent recursive inclusion.
 Codex authentication and original vnote source media are replaceable external
