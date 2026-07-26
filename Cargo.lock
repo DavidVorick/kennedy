@@ -2105,6 +2105,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbfcb2a46ce2ac2fe8ef732927501ae23a9849dc006fab3d82fd5b603a3fd743"
 
 [[package]]
+name = "kcode-session-history"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-session-log",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-session-log"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2168,22 +2183,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kennedy-conversation-history"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "kcode-session-log",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "kennedy-server"
 version = "0.2.1"
 dependencies = [
@@ -2205,10 +2204,9 @@ dependencies = [
  "kcode-kweb-db",
  "kcode-openai-api",
  "kcode-rust-libs-v2",
- "kcode-session-log",
+ "kcode-session-history",
  "kcode-tg-kennedy-bot",
  "kcode-web-fetch",
- "kennedy-conversation-history",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rpassword",

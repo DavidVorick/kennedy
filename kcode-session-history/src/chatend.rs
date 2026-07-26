@@ -1,4 +1,4 @@
-//! Kennedy's reconstructed, provider-independent session context.
+//! Kennedy's reconstructed, provider-independent durable session context.
 //!
 //! This module owns Kennedy's box model, context projection, context
 //! representations, token policy, and replay rules. Durable session history
@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use anyhow::{Context as _, ensure};
@@ -1168,8 +1168,7 @@ fn normalize_derived_identity(kind: &mut EventKind, id: EventId) -> anyhow::Resu
     Ok(())
 }
 
-pub struct SessionJournal {
-    path: PathBuf,
+pub struct Session {
     durable: DurableSession,
     chatend: Chatend,
     objects: BTreeMap<PendingId, ObjectLocation>,
@@ -1181,8 +1180,11 @@ struct UnfinishedToolInvocation {
     tool_name: String,
 }
 
-impl SessionJournal {
-    pub fn create(path: impl AsRef<Path>, metadata: SessionMetadata) -> anyhow::Result<Self> {
+impl Session {
+    pub(crate) fn create(
+        path: impl AsRef<Path>,
+        metadata: SessionMetadata,
+    ) -> anyhow::Result<Self> {
         ensure!(
             metadata.effective_context_tokens > 0,
             "effective context window must be positive"
@@ -1194,16 +1196,14 @@ impl SessionJournal {
             .unwrap_or_else(|| Path::new("."));
         let durable = DurableSessionStore::new(directory)
             .create_session(&metadata.session_id, &metadata.created_at)?;
-        let path = durable.path().to_path_buf();
         Ok(Self {
-            path,
             durable,
             chatend: Chatend::opened(metadata),
             objects: BTreeMap::new(),
         })
     }
 
-    pub fn open_with_metadata(
+    pub(crate) fn open_with_metadata(
         path: impl AsRef<Path>,
         metadata: SessionMetadata,
     ) -> anyhow::Result<Self> {
@@ -1275,15 +1275,14 @@ impl SessionJournal {
             }
         }
         Ok(Self {
-            path: durable.path().to_path_buf(),
             durable,
             chatend,
             objects,
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn id(&self) -> &str {
+        &self.chatend.metadata.session_id
     }
 
     pub fn state(&self) -> &Chatend {
@@ -1294,8 +1293,13 @@ impl SessionJournal {
         &self.objects
     }
 
-    pub fn session_log(&self) -> kcode_session_log::SessionLog {
+    #[cfg(test)]
+    fn session_log(&self) -> kcode_session_log::SessionLog {
         self.durable.list()
+    }
+
+    pub fn archive_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(&self.durable.list()).context("serializing the session archive")
     }
 
     pub fn is_sealed(&self) -> bool {
@@ -1913,7 +1917,11 @@ impl SessionJournal {
 }
 
 #[cfg(test)]
+type SessionJournal = Session;
+
+#[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;

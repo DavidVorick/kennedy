@@ -1036,19 +1036,19 @@ fn root_data(short_name: &str, short_description: &str, long_description: &str) 
 
 pub(crate) struct MergedRouters {
     intelligence: Router,
-    conversation_history: Router,
+    session_history: Router,
     audio_ingress: Router,
 }
 
 impl MergedRouters {
     pub(crate) fn new(
         intelligence: Router,
-        conversation_history: Router,
+        session_history: Router,
         audio_ingress: Router,
     ) -> Self {
         Self {
             intelligence,
-            conversation_history,
+            session_history,
             audio_ingress,
         }
     }
@@ -1076,7 +1076,7 @@ pub(crate) async fn serve_with_listener(
         .route("/api/v1/objects/{object_id}", get(get_object_file))
         .with_state(state)
         .merge(merged_routers.intelligence)
-        .merge(merged_routers.conversation_history)
+        .merge(merged_routers.session_history)
         .merge(merged_routers.audio_ingress)
         .fallback_service(ServeDir::new(frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))

@@ -121,7 +121,7 @@ impl Orchestrator {
         let (kweb, intelligence, history, telegram, audio) = tokio::join!(
             self.api.kmap_get("/api/v1/kmap/health"),
             self.api.intelligence_get("/health"),
-            self.api.history_get("/api/v1/conversations/health"),
+            self.api.history_health(),
             self.api.telegram_health(),
             self.api.audio_get("/api/v1/audio-ingress/health"),
         );
@@ -142,16 +142,12 @@ impl Orchestrator {
             kennedy_root_node_id: required_string(&roots, "kennedy_root_node_id")?,
         };
         let (history_repairs, audio_repairs) = tokio::join!(
-            self.api
-                .history_post("/api/v1/conversations/ingress/repairs/release", json!({}),),
+            self.api.history_release_interrupted_ingress(),
             self.api
                 .audio_post("/api/v1/audio-ingress/ingress/repairs/release", json!({}),),
         );
         history_repairs?;
         audio_repairs?;
-        self.api
-            .history_delete("/api/v1/conversations/unstarted", None)
-            .await?;
         Ok(runtime)
     }
 
@@ -175,7 +171,7 @@ impl Orchestrator {
     async fn list_history(&self) -> anyhow::Result<Vec<Value>> {
         Ok(self
             .api
-            .history_get("/api/v1/conversations/summaries")
+            .history_list()
             .await?
             .get("conversations")
             .and_then(Value::as_array)
@@ -195,7 +191,7 @@ impl Orchestrator {
     async fn sync_conversation_commands(self: &Arc<Self>) -> anyhow::Result<()> {
         let commands = self
             .api
-            .history_get("/api/v1/conversation-commands")
+            .history_command_heads()
             .await?
             .get("commands")
             .and_then(Value::as_array)
@@ -249,15 +245,7 @@ impl Orchestrator {
         let lock = self.conversation_lock(&conversation_id).await;
         let _conversation_guard = lock.lock().await;
         let command = if command.get("status").and_then(Value::as_str) == Some("pending") {
-            self.api
-                .history_post(
-                    &format!(
-                        "/api/v1/conversation-commands/{}/claim",
-                        encode_path(&command_id)
-                    ),
-                    json!({}),
-                )
-                .await?
+            self.api.history_claim_command(&command_id).await?
         } else {
             command
         };
@@ -587,12 +575,13 @@ impl Orchestrator {
             state.unwrap_or_else(|| locked.get("state").cloned().unwrap_or_else(|| json!({})));
         let response = self
             .api
-            .history_post(
-                &format!("/api/v1/conversations/{}/request-ingress", encode_path(&id)),
-                json!({
-                    "expected_version":version(&locked)?,
-                    "state":state,
-                }),
+            .history_request_ingress(
+                &id,
+                kcode_session_history::Checkpoint {
+                    expected_version: version(&locked)?,
+                    state,
+                    user_activity: false,
+                },
             )
             .await?;
         *locked = response.clone();
@@ -600,20 +589,12 @@ impl Orchestrator {
     }
 
     async fn complete_command(&self, id: &str, outcome: Value) -> anyhow::Result<()> {
-        self.api
-            .history_post(
-                &format!("/api/v1/conversation-commands/{}/complete", encode_path(id)),
-                json!({"outcome":outcome}),
-            )
-            .await?;
+        self.api.history_complete_command(id, outcome).await?;
         Ok(())
     }
 
     async fn get_conversation(&self, id: &str) -> anyhow::Result<Value> {
-        Ok(self
-            .api
-            .history_get(&format!("/api/v1/conversations/{}", encode_path(id)))
-            .await?)
+        Ok(self.api.history_get_session(id).await?)
     }
 
     async fn schedule_writer_job(self: &Arc<Self>, histories: &[Value]) -> anyhow::Result<()> {
@@ -694,19 +675,18 @@ impl Orchestrator {
             if record.get("phase").and_then(Value::as_str) == Some("ingress_pending") {
                 record
                     .get("state")
-                    .and_then(|state| state.get("journalPath"))
+                    .and_then(|state| state.get("sessionId"))
                     .and_then(Value::as_str)
-                    .context("The queued session has no authoritative session log")?;
+                    .context("The queued session has no Session History ID")?;
                 stage = "claim";
                 record = self
                     .api
-                    .history_post(
-                        &format!("/api/v1/conversations/{}/ingress-started", encode_path(&id)),
-                        json!({
-                            "expected_version":version(&record)?,
-                            "provenance_id":format!("session:{id}"),
-                            "completion_protocol":"one-session-transaction-v1"
-                        }),
+                    .history_start_ingress(
+                        &id,
+                        kcode_session_history::StartIngress {
+                            expected_version: version(&record)?,
+                            provenance_id: format!("session:{id}"),
+                        },
                     )
                     .await?;
             }
@@ -782,13 +762,7 @@ impl Orchestrator {
             let mut locked = record.lock().await;
             let completed = self
                 .api
-                .history_post(
-                    &format!(
-                        "/api/v1/conversations/{}/ingress-completed",
-                        encode_path(&id)
-                    ),
-                    json!({"expected_version":version(&locked)?}),
-                )
+                .history_complete_ingress(&id, version(&locked)?)
                 .await?;
             *locked = completed.clone();
             if let Some(batch) = completed
@@ -830,12 +804,18 @@ impl Orchestrator {
         ) {
             return Ok(());
         }
-        self.api.history_post(
-                &format!(
-                    "/api/v1/conversations/{}/ingress-failure",
-                    encode_path(id)
-                ),
-                json!({"expected_version":version(&latest)?,"stage":stage,"code":"ingress_error","message":bounded_error(error)}),
+        self.api
+            .history_fail_ingress(
+                id,
+                kcode_session_history::IngressFailure {
+                    expected_version: version(&latest)?,
+                    stage: stage.to_owned(),
+                    code: Some("ingress_error".into()),
+                    message: bounded_error(error),
+                    rounds_used: None,
+                    context_tokens: None,
+                    context_window_tokens: None,
+                },
             )
             .await?;
         Ok(())
@@ -892,17 +872,33 @@ impl Orchestrator {
             session.run_pending_turn(Uuid::new_v4(),move|session_state|{let api=api.clone();let piece=saved.clone();async move{persist_audio_ingress(&api,&piece,session_state).await?;Ok(())}}).await?;
             let completed_state = session.snapshot()?;
             persist_audio_ingress(&self.api,&piece,completed_state.clone()).await?;
-            self.api.history_post(
-                "/api/v1/session-history",
-                json!({
-                    "session_object_id":completed_state.get("sessionObjectId").and_then(Value::as_str).context("audio ingress session has no permanent object ID")?,
-                    "commit_receipt":completed_state.get("commitReceipt"),
-                    "session_id":completed_state.get("sessionId"),
-                    "session_type":completed_state.get("sessionType"),
-                    "created_at":completed_state.get("startedAt"),
-                    "journal_path":completed_state.get("journalPath"),
-                }),
-            ).await?;
+            self.api
+                .history_record_completion(kcode_session_history::RecordCompletion {
+                    session_object_id: completed_state
+                        .get("sessionObjectId")
+                        .and_then(Value::as_str)
+                        .context("audio ingress session has no permanent object ID")?
+                        .to_owned(),
+                    commit_receipt: completed_state
+                        .get("commitReceipt")
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?,
+                    session_id: completed_state
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    session_type: completed_state
+                        .get("sessionType")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    created_at: completed_state
+                        .get("startedAt")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                })
+                .await?;
             stage="completion";
             let locked=piece.lock().await;
             self.api.audio_post(&format!("/api/v1/audio-ingress/pieces/{}/ingress-completed",encode_path(&id)),json!({"expected_version":version(&locked)?})).await?;
@@ -1029,7 +1025,17 @@ impl Orchestrator {
         persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
         session.release_rust_libs().await;
         let mut locked = record_arc.lock().await;
-        let completed=self.api.history_post(&format!("/api/v1/conversations/{}/complete",encode_path(&id)),json!({"expected_version":version(&locked)?,"state":locked.get("state").cloned().unwrap_or(Value::Null)})).await?;
+        let completed = self
+            .api
+            .history_complete(
+                &id,
+                kcode_session_history::Checkpoint {
+                    expected_version: version(&locked)?,
+                    state: locked.get("state").cloned().unwrap_or(Value::Null),
+                    user_activity: false,
+                },
+            )
+            .await?;
         *locked = completed;
         if deadline - Utc::now() >= ChronoDuration::minutes(5) {
             self.create_next_self_time_slice(
@@ -1089,11 +1095,13 @@ impl Orchestrator {
         )
         .await?;
         session.stage_free_time_opening();
+        let state = session.snapshot()?;
         self.api
-            .history_post(
-                "/api/v1/conversations",
-                json!({"started_at":session.started_at,"state":session.snapshot()?}),
-            )
+            .history_register(kcode_session_history::RegisterSession {
+                id: required_string(&state, "sessionId")?,
+                started_at: session.started_at.clone(),
+                state,
+            })
             .await?;
         Ok(())
     }
@@ -1678,12 +1686,13 @@ impl Orchestrator {
         state["orchestration"] =
             json!({"owner":"backend","status":"stopped","reason":"telegram-timeout"});
         self.api
-            .history_post(
-                &format!(
-                    "/api/v1/conversations/{}/request-ingress",
-                    encode_path(conversation_id)
-                ),
-                json!({"expected_version":version(&record)?,"state":state}),
+            .history_request_ingress(
+                conversation_id,
+                kcode_session_history::Checkpoint {
+                    expected_version: version(&record)?,
+                    state: state.clone(),
+                    user_activity: false,
+                },
             )
             .await?;
         if let Some(session_id) = state.get("rustLibSessionId").and_then(Value::as_str) {
@@ -1809,12 +1818,14 @@ impl Orchestrator {
             None,
         )
         .await?;
+        let state = session.snapshot()?;
         let record = self
             .api
-            .history_post(
-                "/api/v1/conversations",
-                json!({"started_at":session.started_at,"state":session.snapshot()?}),
-            )
+            .history_register(kcode_session_history::RegisterSession {
+                id: required_string(&state, "sessionId")?,
+                started_at: session.started_at.clone(),
+                state,
+            })
             .await?;
         Ok((record, session))
     }
@@ -1971,7 +1982,16 @@ impl Orchestrator {
         }
         let session = self.session_for_record(&record).await?;
         session.release_rust_libs().await;
-        self.api.history_post(&format!("/api/v1/conversations/{}/request-ingress",encode_path(conversation_id)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
+        self.api
+            .history_request_ingress(
+                conversation_id,
+                kcode_session_history::Checkpoint {
+                    expected_version: version(&record)?,
+                    state: record.get("state").cloned().unwrap_or(Value::Null),
+                    user_activity: false,
+                },
+            )
+            .await?;
         self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session."})).await?;
         Ok(())
     }
@@ -2178,7 +2198,16 @@ impl Orchestrator {
                     let existing = self
                         .get_conversation(&required_string(&existing, "id")?)
                         .await?;
-                    self.api.history_post(&format!("/api/v1/conversations/{}/request-ingress",encode_path(required_string(&existing,"id")?)),json!({"expected_version":version(&existing)?,"state":existing.get("state").cloned().unwrap_or(Value::Null)})).await?;
+                    self.api
+                        .history_request_ingress(
+                            &required_string(&existing, "id")?,
+                            kcode_session_history::Checkpoint {
+                                expected_version: version(&existing)?,
+                                state: existing.get("state").cloned().unwrap_or(Value::Null),
+                                user_activity: false,
+                            },
+                        )
+                        .await?;
                 }
                 _ => {}
             }
@@ -2222,8 +2251,29 @@ impl Orchestrator {
                 message.clone(),
             )?;
         }
-        let record=self.api.history_post("/api/v1/conversations",json!({"started_at":batch.get("createdAt").cloned().unwrap_or(json!(Utc::now().to_rfc3339())),"state":session.snapshot()?})).await?;
-        self.api.history_post(&format!("/api/v1/conversations/{}/request-ingress",encode_path(required_string(&record,"id")?)),json!({"expected_version":version(&record)?,"state":record.get("state").cloned().unwrap_or(Value::Null)})).await?;
+        let state = session.snapshot()?;
+        let record = self
+            .api
+            .history_register(kcode_session_history::RegisterSession {
+                id: required_string(&state, "sessionId")?,
+                started_at: batch
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                state,
+            })
+            .await?;
+        self.api
+            .history_request_ingress(
+                &required_string(&record, "id")?,
+                kcode_session_history::Checkpoint {
+                    expected_version: version(&record)?,
+                    state: record.get("state").cloned().unwrap_or(Value::Null),
+                    user_activity: false,
+                },
+            )
+            .await?;
         Ok(())
     }
 }
@@ -2237,22 +2287,20 @@ async fn persist_record(
     let mut record = record.lock().await;
     let id = required_string(&record, "id")?;
     let result = match api
-        .history_put(
-            &format!(
-                "/api/v1/conversations/{}/checkpoint",
-                encode_path(&id)
-            ),
-            json!({"expected_version":version(&record)?,"state":state,"user_activity":user_activity}),
+        .history_checkpoint(
+            &id,
+            kcode_session_history::Checkpoint {
+                expected_version: version(&record)?,
+                state: state.clone(),
+                user_activity,
+            },
+            false,
         )
         .await
     {
         Ok(result) => result,
         Err(error) if error.code == "state_conflict" => {
-            let latest = api
-                .history_get(
-                    &format!("/api/v1/conversations/{}", encode_path(&id)),
-                )
-                .await?;
+            let latest = api.history_get_session(&id).await?;
             if latest.get("state") == Some(&state) {
                 latest
             } else {
@@ -2274,20 +2322,20 @@ async fn persist_ingress_record(
     let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
     state["historyIngress"] = archive;
     let result = match api
-        .history_put(
-            &format!(
-                "/api/v1/conversations/{}/ingress-checkpoint",
-                encode_path(&id)
-            ),
-            json!({"expected_version":version(&record)?,"state":state}),
+        .history_checkpoint(
+            &id,
+            kcode_session_history::Checkpoint {
+                expected_version: version(&record)?,
+                state: state.clone(),
+                user_activity: false,
+            },
+            true,
         )
         .await
     {
         Ok(result) => result,
         Err(error) if error.code == "state_conflict" => {
-            let latest = api
-                .history_get(&format!("/api/v1/conversations/{}", encode_path(&id)))
-                .await?;
+            let latest = api.history_get_session(&id).await?;
             if latest.get("state") == Some(&state) {
                 latest
             } else {

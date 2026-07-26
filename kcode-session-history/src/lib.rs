@@ -6,6 +6,9 @@
 //! Successfully committed sessions leave only one local line containing their
 //! immutable Kweb object ID; their details are loaded from Kweb on demand.
 
+pub mod chatend;
+pub use chatend::Session;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -15,14 +18,6 @@ use std::{
 };
 
 use anyhow::{Context as _, ensure};
-use axum::{
-    Json, Router,
-    body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::{HeaderName, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
 use chrono::{DateTime, Duration, Utc};
 use kcode_session_log::{EventPosition, Role, Session as DurableSession, SessionLog, SessionStore};
 use serde::{Deserialize, Serialize};
@@ -156,10 +151,6 @@ impl SessionJournal {
         })
     }
 
-    fn path(&self) -> &FilePath {
-        self.log.path()
-    }
-
     fn list(&self) -> SessionLog {
         self.log.list()
     }
@@ -206,7 +197,14 @@ fn hex_sha256(bytes: &[u8]) -> String {
 pub struct Config {
     pub directory: PathBuf,
     pub completed_list: PathBuf,
-    pub max_request_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewSession {
+    pub kind: chatend::SessionKind,
+    pub created_at: String,
+    pub effective_context_tokens: u64,
+    pub channel: Value,
 }
 
 #[derive(Clone)]
@@ -217,31 +215,47 @@ struct AppState {
 }
 
 #[derive(Clone)]
-pub struct Service {
+pub struct SessionHistory {
     state: AppState,
-    max_request_bytes: usize,
 }
 
 #[derive(Debug)]
-pub struct ServiceError {
-    pub status: u16,
-    pub code: &'static str,
+pub struct Error {
+    pub kind: ErrorKind,
     pub message: String,
 }
 
-impl std::fmt::Display for ServiceError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorKind {
+    InvalidInput,
+    NotFound,
+    Conflict,
+    Storage,
+}
+
+impl ErrorKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_request",
+            Self::NotFound => "not_found",
+            Self::Conflict => "state_conflict",
+            Self::Storage => "internal_error",
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl std::error::Error for ServiceError {}
+impl std::error::Error for Error {}
 
-impl From<ApiError> for ServiceError {
+impl From<ApiError> for Error {
     fn from(error: ApiError) -> Self {
         Self {
-            status: error.status.as_u16(),
-            code: error.code,
+            kind: error.kind,
             message: error.message,
         }
     }
@@ -249,455 +263,464 @@ impl From<ApiError> for ServiceError {
 
 #[derive(Debug)]
 struct ApiError {
-    status: StatusCode,
-    code: &'static str,
+    kind: ErrorKind,
     message: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
-            status,
-            code,
+            kind,
             message: message.into(),
         }
     }
 
     fn bad(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+        Self::new(ErrorKind::InvalidInput, message)
     }
 
     fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "not_found", "Session not found.")
+        Self::new(ErrorKind::NotFound, "Session not found.")
     }
 
     fn conflict(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::CONFLICT, "state_conflict", message)
+        Self::new(ErrorKind::Conflict, message)
     }
 
     fn internal(error: impl std::fmt::Display) -> Self {
         tracing::warn!(error=%error, "Session History request failed");
         Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
+            ErrorKind::Storage,
             "An unexpected Session History storage error occurred.",
         )
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({"error":{"code":self.code,"message":self.message}})),
-        )
-            .into_response()
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct SessionRecord {
-    id: String,
-    phase: String,
-    started_at: String,
-    updated_at: String,
-    state: Value,
-    provenance_id: Option<String>,
-    version: i64,
-    last_user_message_at: Option<String>,
-    ended_at: Option<String>,
-    ingress_failure_count: i64,
-    ingress_failures: Value,
-    ingress_next_attempt_at: Option<String>,
+pub struct SessionRecord {
+    pub id: String,
+    pub phase: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub state: Value,
+    pub provenance_id: Option<String>,
+    pub version: i64,
+    pub last_user_message_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub ingress_failure_count: i64,
+    pub ingress_failures: Value,
+    pub ingress_next_attempt_at: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
-    summary: bool,
+    pub summary: bool,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Deserialize)]
-struct CreateSession {
-    started_at: String,
-    state: Value,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RegisterSession {
+    pub id: String,
+    pub started_at: String,
+    pub state: Value,
 }
 
-#[derive(Deserialize)]
-struct StartManagedSession {
-    idempotency_id: String,
-    started_at: String,
-    session_type: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StartSession {
+    pub idempotency_id: String,
+    pub started_at: String,
+    pub session_type: String,
     #[serde(default)]
-    duration_minutes: Option<f64>,
+    pub duration_minutes: Option<f64>,
     #[serde(default)]
-    custom_prompt: Option<String>,
+    pub custom_prompt: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct QueueSessionCommand {
-    idempotency_id: String,
-    kind: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NewCommand {
+    pub idempotency_id: String,
+    pub kind: String,
     #[serde(default = "empty_object")]
-    payload: Value,
+    pub payload: Value,
 }
 
 fn empty_object() -> Value {
     json!({})
 }
 
-#[derive(Deserialize)]
-struct CompleteSessionCommand {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CommandOutcome {
     #[serde(default = "empty_object")]
-    outcome: Value,
+    pub outcome: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionCommand {
-    id: String,
-    conversation_id: String,
-    sequence: i64,
-    kind: String,
-    payload: Value,
-    status: String,
-    cancel_requested: bool,
-    outcome: Option<Value>,
-    created_at: String,
-    processing_started_at: Option<String>,
-    completed_at: Option<String>,
-    idempotency_id: String,
+pub struct SessionCommand {
+    pub id: String,
+    pub conversation_id: String,
+    pub sequence: i64,
+    pub kind: String,
+    pub payload: Value,
+    pub status: String,
+    pub cancel_requested: bool,
+    pub outcome: Option<Value>,
+    pub created_at: String,
+    pub processing_started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub idempotency_id: String,
 }
 
-#[derive(Deserialize)]
-struct CheckpointSession {
-    expected_version: i64,
-    state: Value,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Checkpoint {
+    pub expected_version: i64,
+    pub state: Value,
     #[serde(default)]
-    user_activity: bool,
+    pub user_activity: bool,
 }
 
-#[derive(Deserialize)]
-struct VersionedTransition {
-    expected_version: i64,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExpectedVersion {
+    pub expected_version: i64,
 }
 
-#[derive(Deserialize)]
-struct RetryIngress {
-    expected_version: i64,
-    state: Value,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RetryIngress {
+    pub expected_version: i64,
+    pub state: Value,
 }
 
-#[derive(Deserialize)]
-struct StartIngress {
-    expected_version: i64,
-    provenance_id: String,
-    completion_protocol: Option<String>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StartIngress {
+    pub expected_version: i64,
+    pub provenance_id: String,
 }
 
-#[derive(Deserialize)]
-struct RecordIngressFailure {
-    expected_version: i64,
-    stage: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IngressFailure {
+    pub expected_version: i64,
+    pub stage: String,
     #[serde(default)]
-    code: Option<String>,
-    message: String,
+    pub code: Option<String>,
+    pub message: String,
     #[serde(default)]
-    rounds_used: Option<u64>,
+    pub rounds_used: Option<u64>,
     #[serde(default)]
-    context_tokens: Option<u64>,
+    pub context_tokens: Option<u64>,
     #[serde(default)]
-    context_window_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
 }
 
-#[derive(Deserialize)]
-struct RecordCompletedSession {
-    session_object_id: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RecordCompletion {
+    pub session_object_id: String,
     #[serde(default)]
-    commit_receipt: Option<CompletionReceipt>,
+    pub commit_receipt: Option<CompletionReceipt>,
     #[serde(default)]
-    session_id: Option<String>,
+    pub session_id: Option<String>,
     #[serde(default)]
-    session_type: Option<String>,
+    pub session_type: Option<String>,
     #[serde(default)]
-    created_at: Option<String>,
-    #[serde(default)]
-    journal_path: Option<PathBuf>,
+    pub created_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CompletionReceipt {
+pub struct CompletionReceipt {
     #[serde(default)]
-    transaction_id: Option<String>,
-    session_object_id: String,
+    pub transaction_id: Option<String>,
+    pub session_object_id: String,
     #[serde(default)]
-    session_id: Option<String>,
+    pub session_id: Option<String>,
     #[serde(default)]
-    session_type: Option<String>,
+    pub session_type: Option<String>,
     #[serde(default)]
-    created_at: Option<String>,
+    pub created_at: Option<String>,
     #[serde(default)]
-    committed_at: Option<String>,
+    pub committed_at: Option<String>,
     #[serde(default)]
-    node_ids: BTreeMap<String, String>,
+    pub node_ids: BTreeMap<String, String>,
     #[serde(default)]
-    object_ids: BTreeMap<String, String>,
+    pub object_ids: BTreeMap<String, String>,
 }
 
-pub fn open(config: Config) -> anyhow::Result<Service> {
-    create_private_directory(&config.directory)?;
-    compact_control_journals(&config.directory)?;
-    if let Some(parent) = config
-        .completed_list
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        create_private_directory(parent)?;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Created<T> {
+    pub value: T,
+    pub created: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewObject {
+    pub file_name: Option<String>,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredObject {
+    pub file_name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl SessionHistory {
+    pub fn open(config: Config) -> anyhow::Result<Self> {
+        create_private_directory(&config.directory)?;
+        compact_control_journals(&config.directory)?;
+        if let Some(parent) = config
+            .completed_list
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            create_private_directory(parent)?;
+        }
+        if !config.completed_list.exists() {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&config.completed_list)
+                .with_context(|| format!("creating {}", config.completed_list.display()))?;
+            file.sync_all()?;
+            sync_directory(
+                config
+                    .completed_list
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| FilePath::new(".")),
+            )?;
+        }
+        Ok(Self {
+            state: AppState {
+                config,
+                catalog_mutation: Arc::new(Mutex::new(())),
+                session_mutations: Arc::new(Mutex::new(HashMap::new())),
+            },
+        })
     }
-    if !config.completed_list.exists() {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&config.completed_list)
-            .with_context(|| format!("creating {}", config.completed_list.display()))?;
-        file.sync_all()?;
-        sync_directory(
-            config
-                .completed_list
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| FilePath::new(".")),
-        )?;
-    }
-    let state = AppState {
-        config: config.clone(),
-        catalog_mutation: Arc::new(Mutex::new(())),
-        session_mutations: Arc::new(Mutex::new(HashMap::new())),
-    };
-    Ok(Service {
-        state,
-        max_request_bytes: config.max_request_bytes,
-    })
-}
 
-pub fn router(service: Service) -> Router {
-    Router::new()
-        .route("/api/v1/conversations/health", get(health))
-        .route("/api/v1/session-history", post(record_completed_session))
-        .route("/api/v1/conversations/start", post(start_managed_session))
-        .route("/api/v1/conversation-commands", get(list_command_heads))
-        .route(
-            "/api/v1/conversations/summaries",
-            get(list_session_summaries),
-        )
-        .route(
-            "/api/v1/conversations/{session_id}",
-            get(get_session).delete(purge_session),
-        )
-        .route(
-            "/api/v1/conversations/{session_id}/commands",
-            post(queue_session_command),
-        )
-        .route(
-            "/api/v1/conversations/{session_id}/objects",
-            post(stage_session_object),
-        )
-        .route(
-            "/api/v1/conversations/{session_id}/objects/{pending_id}",
-            get(get_session_object),
-        )
-        .route(
-            "/api/v1/conversations/{session_id}/stop",
-            post(request_session_stop),
-        )
-        .route(
-            "/api/v1/conversations/{session_id}/retry-ingress",
-            post(retry_ingress),
-        )
-        .route(
-            "/api/v1/conversations/ingress/repairs/release",
-            post(release_ingress_repairs),
-        )
-        .layer(DefaultBodyLimit::max(service.max_request_bytes))
-        .with_state(service.state)
-}
-
-impl Service {
-    pub fn health(&self) -> Result<Value, ServiceError> {
+    pub fn health(&self) -> Result<(), Error> {
         read_completed_ids(&self.state.config.completed_list).map_err(ApiError::internal)?;
-        Ok(json!({"service":"session-history","status":"ok"}))
+        Ok(())
     }
 
-    pub async fn get_json(&self, path: &str) -> Result<Value, ServiceError> {
-        let state = State(self.state.clone());
-        match path {
-            "/api/v1/conversations/health" => self.health(),
-            "/api/v1/conversations/summaries" => {
-                let Json(value) = list_session_summaries(state).await?;
-                Ok(value)
-            }
-            "/api/v1/conversation-commands" => {
-                let Json(value) = list_command_heads(state).await?;
-                Ok(value)
-            }
-            _ => {
-                let id = path
-                    .strip_prefix("/api/v1/conversations/")
-                    .filter(|id| !id.contains('/'))
-                    .ok_or_else(ApiError::not_found)?;
-                let Json(record) = get_session(state, Path(id.to_owned())).await?;
-                serde_json::to_value(record)
-                    .map_err(ApiError::internal)
-                    .map_err(Into::into)
-            }
-        }
+    pub fn create_session(&self, input: NewSession) -> anyhow::Result<Session> {
+        let metadata = chatend::SessionMetadata {
+            session_id: Uuid::new_v4().to_string(),
+            kind: input.kind,
+            created_at: input.created_at,
+            effective_context_tokens: input.effective_context_tokens,
+            channel: input.channel,
+        };
+        Session::create(
+            self.state
+                .config
+                .directory
+                .join(format!("{}.session-log", metadata.session_id)),
+            metadata,
+        )
     }
 
-    pub async fn post_json(&self, path: &str, body: Value) -> Result<Value, ServiceError> {
-        let state = State(self.state.clone());
-        if path == "/api/v1/conversations" {
-            let (_, Json(record)) = create_session(state, Json(parse_body(body)?)).await?;
-            return json_value(record);
-        }
-        if path == "/api/v1/session-history" {
-            let Json(value) = record_completed_session(state, Json(parse_body(body)?)).await?;
-            return Ok(value);
-        }
-        if path == "/api/v1/conversations/start" {
-            let (_, Json(record)) = start_managed_session(state, Json(parse_body(body)?)).await?;
-            return json_value(record);
-        }
-        if path == "/api/v1/conversations/ingress/repairs/release" {
-            let Json(value) = release_ingress_repairs(state).await?;
-            return Ok(value);
-        }
-        if let Some(command_id) = path
-            .strip_prefix("/api/v1/conversation-commands/")
-            .and_then(|tail| tail.strip_suffix("/claim"))
-        {
-            let Json(command) = claim_command(state, Path(command_id.into())).await?;
-            return json_value(command);
-        }
-        if let Some(command_id) = path
-            .strip_prefix("/api/v1/conversation-commands/")
-            .and_then(|tail| tail.strip_suffix("/complete"))
-        {
-            let Json(command) =
-                complete_command(state, Path(command_id.into()), Json(parse_body(body)?)).await?;
-            return json_value(command);
-        }
-        let tail = path
-            .strip_prefix("/api/v1/conversations/")
-            .ok_or_else(ApiError::not_found)?;
-        let (id, action) = tail.split_once('/').ok_or_else(ApiError::not_found)?;
-        match action {
-            "commands" => {
-                let (_, Json(command)) =
-                    queue_session_command(state, Path(id.into()), Json(parse_body(body)?)).await?;
-                json_value(command)
-            }
-            "stop" => {
-                let Json(value) = request_session_stop(state, Path(id.into())).await?;
-                Ok(value)
-            }
-            "request-ingress" => {
-                let Json(record) =
-                    transition_with_checkpoint(state, id, parse_body(body)?, "ingress_pending")
-                        .await?;
-                json_value(record)
-            }
-            "complete" => {
-                let input: CheckpointSession = parse_body(body)?;
-                let Json(record) =
-                    complete_session(state, id, input.expected_version, input.state).await?;
-                json_value(record)
-            }
-            "ingress-started" => {
-                let input: StartIngress = parse_body(body)?;
-                let _protocol = input.completion_protocol;
-                let Json(record) = transition(
-                    state,
-                    id,
-                    input.expected_version,
-                    "ingress_in_progress",
-                    Some(input.provenance_id),
-                )
-                .await?;
-                json_value(record)
-            }
-            "ingress-completed" => {
-                let input: VersionedTransition = parse_body(body)?;
-                let current = fetch_active(&state.0, id)?;
-                let Json(record) =
-                    complete_session(state, id, input.expected_version, current.state).await?;
-                json_value(record)
-            }
-            "ingress-failure" => {
-                let input: RecordIngressFailure = parse_body(body)?;
-                let Json(record) = record_ingress_failure(state, id, input).await?;
-                json_value(record)
-            }
-            "retry-ingress" => {
-                let Json(record) =
-                    retry_ingress(state, Path(id.into()), Json(parse_body(body)?)).await?;
-                json_value(record)
-            }
-            _ => Err(ApiError::not_found().into()),
-        }
+    pub fn open_session(&self, metadata: chatend::SessionMetadata) -> anyhow::Result<Session> {
+        validate_session_id(&metadata.session_id)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        Session::open_with_metadata(
+            self.state
+                .config
+                .directory
+                .join(format!("{}.session-log", metadata.session_id)),
+            metadata,
+        )
     }
 
-    pub async fn put_json(&self, path: &str, body: Value) -> Result<Value, ServiceError> {
-        let tail = path
-            .strip_prefix("/api/v1/conversations/")
-            .ok_or_else(ApiError::not_found)?;
-        let (id, action) = tail.split_once('/').ok_or_else(ApiError::not_found)?;
-        let input: CheckpointSession = parse_body(body)?;
-        if !matches!(action, "checkpoint" | "ingress-checkpoint") {
-            return Err(ApiError::not_found().into());
-        }
-        let Json(record) = checkpoint(
-            State(self.state.clone()),
+    pub async fn register(&self, input: RegisterSession) -> Result<SessionRecord, Error> {
+        create_session(self.state.clone(), input)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn start(&self, input: StartSession) -> Result<Created<SessionRecord>, Error> {
+        let (created, record) = start_managed_session(self.state.clone(), input).await?;
+        Ok(Created {
+            value: record,
+            created,
+        })
+    }
+
+    pub async fn list(&self) -> Result<Vec<SessionRecord>, Error> {
+        let value = list_session_summaries(self.state.clone()).await?;
+        serde_json::from_value(
+            value
+                .get("conversations")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(ApiError::internal)
+        .map_err(Into::into)
+    }
+
+    pub async fn get(&self, id: &str) -> Result<SessionRecord, Error> {
+        get_session(self.state.clone(), id.to_owned())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn enqueue(
+        &self,
+        id: &str,
+        input: NewCommand,
+    ) -> Result<Created<SessionCommand>, Error> {
+        let (created, command) =
+            queue_session_command(self.state.clone(), id.to_owned(), input).await?;
+        Ok(Created {
+            value: command,
+            created,
+        })
+    }
+
+    pub async fn command_heads(&self) -> Result<Vec<SessionCommand>, Error> {
+        let value = list_command_heads(self.state.clone()).await?;
+        serde_json::from_value(value.get("commands").cloned().unwrap_or_else(|| json!([])))
+            .map_err(ApiError::internal)
+            .map_err(Into::into)
+    }
+
+    pub async fn claim_command(&self, id: &str) -> Result<SessionCommand, Error> {
+        claim_command(self.state.clone(), id.to_owned())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn complete_command(
+        &self,
+        id: &str,
+        outcome: CommandOutcome,
+    ) -> Result<SessionCommand, Error> {
+        complete_command(self.state.clone(), id.to_owned(), outcome)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn stop(&self, id: &str) -> Result<SessionRecord, Error> {
+        let current = fetch_active(&self.state, id)?;
+        let record = transition(
+            self.state.clone(),
+            id,
+            current.version,
+            "ingress_pending",
+            None,
+        )
+        .await?;
+        Ok(record)
+    }
+
+    pub async fn stage_object(&self, id: &str, object: NewObject) -> Result<String, Error> {
+        stage_session_object(&self.state, id, object).map_err(Into::into)
+    }
+
+    pub fn object(&self, id: &str, pending_id: &str) -> Result<StoredObject, Error> {
+        get_session_object(&self.state, id, pending_id).map_err(Into::into)
+    }
+
+    pub async fn checkpoint(&self, id: &str, input: Checkpoint) -> Result<SessionRecord, Error> {
+        let record = checkpoint(
+            self.state.clone(),
             id,
             input.expected_version,
             input.state,
             input.user_activity,
         )
         .await?;
-        json_value(record)
+        Ok(record)
     }
 
-    pub async fn delete_json(
+    pub async fn request_ingress(
         &self,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, ServiceError> {
-        if path == "/api/v1/conversations/unstarted" {
-            return Ok(json!({"discarded":[]}));
-        }
-        let id = path
-            .strip_prefix("/api/v1/conversations/")
-            .filter(|id| !id.contains('/'))
-            .ok_or_else(ApiError::not_found)?;
-        let expected = body
-            .as_ref()
-            .and_then(|value| value.get("expected_version"))
-            .and_then(Value::as_i64);
-        let Json(value) =
-            purge_session(State(self.state.clone()), Path(id.into()), Json(expected)).await?;
-        Ok(value)
+        id: &str,
+        input: Checkpoint,
+    ) -> Result<SessionRecord, Error> {
+        let record =
+            transition_with_checkpoint(self.state.clone(), id, input, "ingress_pending").await?;
+        Ok(record)
+    }
+
+    pub async fn start_ingress(
+        &self,
+        id: &str,
+        input: StartIngress,
+    ) -> Result<SessionRecord, Error> {
+        let record = transition(
+            self.state.clone(),
+            id,
+            input.expected_version,
+            "ingress_in_progress",
+            Some(input.provenance_id),
+        )
+        .await?;
+        Ok(record)
+    }
+
+    pub async fn complete_ingress(
+        &self,
+        id: &str,
+        input: ExpectedVersion,
+    ) -> Result<SessionRecord, Error> {
+        let current = fetch_active(&self.state, id)?;
+        let record = complete_session(
+            self.state.clone(),
+            id,
+            input.expected_version,
+            current.state,
+        )
+        .await?;
+        Ok(record)
+    }
+
+    pub async fn fail_ingress(
+        &self,
+        id: &str,
+        input: IngressFailure,
+    ) -> Result<SessionRecord, Error> {
+        let record = record_ingress_failure(self.state.clone(), id, input).await?;
+        Ok(record)
+    }
+
+    pub async fn retry_ingress(
+        &self,
+        id: &str,
+        input: RetryIngress,
+    ) -> Result<SessionRecord, Error> {
+        retry_ingress(self.state.clone(), id.to_owned(), input)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn release_interrupted_ingress(&self) -> Result<Vec<String>, Error> {
+        let value = release_ingress_repairs(self.state.clone()).await?;
+        serde_json::from_value(value.get("released").cloned().unwrap_or_else(|| json!([])))
+            .map_err(ApiError::internal)
+            .map_err(Into::into)
+    }
+
+    pub async fn complete(&self, id: &str, input: Checkpoint) -> Result<SessionRecord, Error> {
+        let record =
+            complete_session(self.state.clone(), id, input.expected_version, input.state).await?;
+        Ok(record)
+    }
+
+    pub async fn record_completion(&self, input: RecordCompletion) -> Result<(), Error> {
+        record_completed_session(self.state.clone(), input).await?;
+        Ok(())
     }
 }
 
 async fn record_completed_session(
-    State(state): State<AppState>,
-    Json(input): Json<RecordCompletedSession>,
-) -> Result<Json<Value>, ApiError> {
+    state: AppState,
+    input: RecordCompletion,
+) -> Result<Value, ApiError> {
     let session_guard = input
-        .journal_path
-        .as_ref()
-        .and_then(|path| path.file_stem())
-        .and_then(|value| value.to_str())
+        .session_id
+        .as_deref()
         .map(|id| session_mutation(&state, id))
         .transpose()?;
     let _session_guard = session_guard
@@ -720,26 +743,22 @@ async fn record_completed_session(
             "completion receipt and requested session object differ",
         ));
     }
-    receipt.session_id = receipt.session_id.or(input.session_id);
+    receipt.session_id = receipt.session_id.or(input.session_id.clone());
     receipt.session_type = receipt.session_type.or(input.session_type);
     receipt.created_at = receipt.created_at.or(input.created_at);
     receipt.committed_at.get_or_insert_with(now);
     append_completion_receipt(&state.config.completed_list, &receipt)
         .map_err(ApiError::internal)?;
-    if let Some(path) = input.journal_path {
-        ensure_inside(&path, &state.config.directory)?;
+    if let Some(id) = input.session_id {
+        validate_session_id(&id)?;
+        let path = state.config.directory.join(format!("{id}.session-log"));
         if path.exists() {
-            let id = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .context("session-log filename is not valid UTF-8")
-                .map_err(ApiError::internal)?;
             SessionJournal::open(&path)
                 .map_err(ApiError::internal)?
                 .log
                 .delete_committed()
                 .map_err(ApiError::internal)?;
-            let control = control_path(&state.config.directory, id);
+            let control = control_path(&state.config.directory, &id);
             if control.exists() {
                 std::fs::remove_file(&control)
                     .with_context(|| format!("removing {}", control.display()))
@@ -748,51 +767,29 @@ async fn record_completed_session(
             }
         }
     }
-    Ok(Json(json!({
+    Ok(json!({
         "sessionObjectId":input.session_object_id,
         "recorded":true
-    })))
-}
-
-fn parse_body<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T, ServiceError> {
-    serde_json::from_value(body)
-        .map_err(|error| ApiError::bad(format!("Invalid internal request: {error}")))
-        .map_err(Into::into)
-}
-
-fn json_value(value: impl Serialize) -> Result<Value, ServiceError> {
-    serde_json::to_value(value)
-        .map_err(ApiError::internal)
-        .map_err(Into::into)
-}
-
-async fn health(State(state): State<AppState>) -> Response {
-    match read_completed_ids(&state.config.completed_list) {
-        Ok(_) => Json(json!({"service":"session-history","status":"ok"})).into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"service":"session-history","status":"unavailable"})),
-        )
-            .into_response(),
-    }
+    }))
 }
 
 async fn create_session(
-    State(state): State<AppState>,
-    Json(input): Json<CreateSession>,
-) -> Result<(StatusCode, Json<SessionRecord>), ApiError> {
+    state: AppState,
+    input: RegisterSession,
+) -> Result<SessionRecord, ApiError> {
     validate_started_at(&input.started_at)?;
-    let path = input
-        .state
-        .get("journalPath")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            ApiError::bad("A session created by the backend must provide its journalPath.")
-        })?;
-    ensure_inside(&path, &state.config.directory)?;
+    validate_session_id(&input.id)?;
+    let path = state
+        .config
+        .directory
+        .join(format!("{}.session-log", input.id));
     let journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
     let id = journal.list().header.session_id;
+    if id != input.id {
+        return Err(ApiError::bad(
+            "registered session ID does not match its durable session log",
+        ));
+    }
     drop(journal);
     let session_guard = session_mutation(&state, &id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
@@ -816,13 +813,13 @@ async fn create_session(
         summary: false,
     };
     append_lifecycle(&mut journal, &record)?;
-    Ok((StatusCode::CREATED, Json(materialize(record, &journal))))
+    Ok(materialize(record, &journal))
 }
 
 async fn start_managed_session(
-    State(state): State<AppState>,
-    Json(input): Json<StartManagedSession>,
-) -> Result<(StatusCode, Json<SessionRecord>), ApiError> {
+    state: AppState,
+    input: StartSession,
+) -> Result<(bool, SessionRecord), ApiError> {
     validate_started_at(&input.started_at)?;
     validate_idempotency(&input.idempotency_id)?;
     let _catalog_guard = state.catalog_mutation.lock().map_err(ApiError::internal)?;
@@ -835,17 +832,15 @@ async fn start_managed_session(
                 .and_then(Value::as_str)
                 == Some(&input.idempotency_id)
         {
-            return Ok((StatusCode::OK, Json(materialize(record, &journal))));
+            return Ok((false, materialize(record, &journal)));
         }
     }
     let id = Uuid::new_v4().to_string();
     let mut journal = SessionJournal::create(&state.config.directory, &id, &input.started_at)
         .map_err(ApiError::internal)?;
-    let path = journal.path().to_path_buf();
     let mut session_state = json!({
         "stateVersion":3,
         "sessionId":id,
-        "journalPath":path,
         "sessionType":input.session_type,
         "startedAt":input.started_at,
         "startIdempotencyId":input.idempotency_id,
@@ -874,10 +869,10 @@ async fn start_managed_session(
         summary: false,
     };
     append_lifecycle(&mut journal, &record)?;
-    Ok((StatusCode::CREATED, Json(materialize(record, &journal))))
+    Ok((true, materialize(record, &journal)))
 }
 
-async fn list_session_summaries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_session_summaries(state: AppState) -> Result<Value, ApiError> {
     let mut sessions = Vec::new();
     for path in journal_paths(&state.config.directory)? {
         let journal = SessionJournal::open(&path).map_err(ApiError::internal)?;
@@ -913,20 +908,17 @@ async fn list_session_summaries(State(state): State<AppState>) -> Result<Json<Va
         });
     }
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    Ok(Json(json!({"conversations":sessions})))
+    Ok(json!({"conversations":sessions}))
 }
 
-async fn get_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<SessionRecord>, ApiError> {
+async fn get_session(state: AppState, id: String) -> Result<SessionRecord, ApiError> {
     if let Some(receipt) = read_completion_receipts(&state.config.completed_list)
         .map_err(ApiError::internal)?
         .into_iter()
         .find(|receipt| receipt.session_object_id == id)
     {
         let receipt_value = serde_json::to_value(&receipt).map_err(ApiError::internal)?;
-        return Ok(Json(SessionRecord {
+        return Ok(SessionRecord {
             id: id.clone(),
             phase: "complete".into(),
             started_at: receipt.created_at.clone().unwrap_or_default(),
@@ -945,28 +937,29 @@ async fn get_session(
             ingress_failures: json!([]),
             ingress_next_attempt_at: None,
             summary: false,
-        }));
+        });
     }
     let journal = open_by_id(&state, &id)?;
     let record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
-    Ok(Json(materialize(record, &journal)))
+    Ok(materialize(record, &journal))
 }
 
-async fn get_session_object(
-    State(state): State<AppState>,
-    Path((id, pending_id)): Path<(String, String)>,
-) -> Result<Response, ApiError> {
+fn get_session_object(
+    state: &AppState,
+    id: &str,
+    pending_id: &str,
+) -> Result<StoredObject, ApiError> {
     let number = pending_id
         .strip_prefix("pending:")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .ok_or_else(|| ApiError::bad("Object ID must have the form pending:N."))?;
-    let journal = open_by_id(&state, &id)?;
+    let journal = open_by_id(state, id)?;
     let object = journal
         .log
         .read_pending_object(EventPosition(number - 1))
         .map_err(|error| {
-            tracing::warn!(session_id=%id, pending_id, %error, "pending session object is unavailable");
+            tracing::warn!(session_id=id, pending_id, %error, "pending session object is unavailable");
             ApiError::not_found()
         })?;
     let media_type = if object.media_type.trim().is_empty()
@@ -980,7 +973,7 @@ async fn get_session_object(
     } else {
         &object.media_type
     };
-    let file_name = object
+    let mut file_name = object
         .file_name
         .chars()
         .map(|character| {
@@ -992,45 +985,21 @@ async fn get_session_object(
         })
         .take(255)
         .collect::<String>();
-    let content_type = HeaderValue::from_str(media_type)
-        .map_err(|_| ApiError::internal("pending object has an invalid media type"))?;
-    let disposition = HeaderValue::from_str(&format!(
-        "inline; filename=\"{}\"",
-        if file_name.is_empty() {
-            "uploaded-object"
-        } else {
-            &file_name
-        }
-    ))
-    .map_err(|_| ApiError::internal("pending object has an invalid filename"))?;
-    let content_length = HeaderValue::from_str(&object.bytes.len().to_string())
-        .map_err(|_| ApiError::internal("pending object has an invalid content length"))?;
-    let mut response = Response::new(Body::from(object.bytes));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, content_type);
-    response
-        .headers_mut()
-        .insert(header::CONTENT_DISPOSITION, disposition);
-    response
-        .headers_mut()
-        .insert(header::CONTENT_LENGTH, content_length);
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store, max-age=0"),
-    );
-    response.headers_mut().insert(
-        HeaderName::from_static("x-content-type-options"),
-        HeaderValue::from_static("nosniff"),
-    );
-    Ok(response)
+    if file_name.is_empty() {
+        file_name = "uploaded-object".into();
+    }
+    Ok(StoredObject {
+        file_name,
+        media_type: media_type.to_owned(),
+        bytes: object.bytes,
+    })
 }
 
 async fn queue_session_command(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(input): Json<QueueSessionCommand>,
-) -> Result<(StatusCode, Json<SessionCommand>), ApiError> {
+    state: AppState,
+    id: String,
+    input: NewCommand,
+) -> Result<(bool, SessionCommand), ApiError> {
     validate_idempotency(&input.idempotency_id)?;
     let session_guard = session_mutation(&state, &id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
@@ -1044,7 +1013,7 @@ async fn queue_session_command(
         .values()
         .find(|command| command.idempotency_id == input.idempotency_id)
     {
-        return Ok((StatusCode::OK, Json(command.clone())));
+        return Ok((false, command.clone()));
     }
     let command = SessionCommand {
         id: Uuid::new_v4().to_string(),
@@ -1066,41 +1035,18 @@ async fn queue_session_command(
         idempotency_id: input.idempotency_id,
     };
     append_command(&mut journal, &command)?;
-    Ok((StatusCode::CREATED, Json(command)))
+    Ok((true, command))
 }
 
-async fn stage_session_object(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    mut multipart: Multipart,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let mut body = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::bad(error.to_string()))?
-    {
-        if field.name() != Some("file") {
-            continue;
-        }
-        let file_name = field.file_name().map(str::to_owned);
-        let media_type = field
-            .content_type()
-            .unwrap_or("application/octet-stream")
-            .to_owned();
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|error| ApiError::bad(error.to_string()))?;
-        if body.replace((file_name, media_type, bytes)).is_some() {
-            return Err(ApiError::bad("Upload exactly one object per request."));
-        }
-    }
-    let (file_name, media_type, bytes) =
-        body.ok_or_else(|| ApiError::bad("Multipart upload omitted the file field."))?;
-    let session_guard = session_mutation(&state, &id)?;
+fn stage_session_object(state: &AppState, id: &str, object: NewObject) -> Result<String, ApiError> {
+    let NewObject {
+        file_name,
+        media_type,
+        bytes,
+    } = object;
+    let session_guard = session_mutation(state, id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
-    let mut journal = open_by_id(&state, &id)?;
+    let mut journal = open_by_id(state, id)?;
     let record = latest_lifecycle(&journal).ok_or_else(ApiError::not_found)?;
     if record.phase != "active" {
         return Err(ApiError::conflict(
@@ -1118,13 +1064,10 @@ async fn stage_session_object(
     let pending_id = journal
         .stage_object(media_type, file_name, &bytes)
         .map_err(|error| ApiError::bad(error.to_string()))?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({"pendingId":pending_id,"bytes":bytes.len()})),
-    ))
+    Ok(pending_id)
 }
 
-async fn list_command_heads(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_command_heads(state: AppState) -> Result<Value, ApiError> {
     let mut heads = Vec::new();
     for path in journal_paths(&state.config.directory)? {
         let journal = SessionJournal::open(path).map_err(ApiError::internal)?;
@@ -1138,13 +1081,10 @@ async fn list_command_heads(State(state): State<AppState>) -> Result<Json<Value>
         }
     }
     heads.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    Ok(Json(json!({"commands":heads})))
+    Ok(json!({"commands":heads}))
 }
 
-async fn claim_command(
-    State(state): State<AppState>,
-    Path(command_id): Path<String>,
-) -> Result<Json<SessionCommand>, ApiError> {
+async fn claim_command(state: AppState, command_id: String) -> Result<SessionCommand, ApiError> {
     mutate_command(&state, &command_id, |command| {
         if command.status == "pending" {
             command.status = "processing".into();
@@ -1154,14 +1094,13 @@ async fn claim_command(
         }
         Ok(())
     })
-    .map(Json)
 }
 
 async fn complete_command(
-    State(state): State<AppState>,
-    Path(command_id): Path<String>,
-    Json(input): Json<CompleteSessionCommand>,
-) -> Result<Json<SessionCommand>, ApiError> {
+    state: AppState,
+    command_id: String,
+    input: CommandOutcome,
+) -> Result<SessionCommand, ApiError> {
     mutate_command(&state, &command_id, |command| {
         if command.status == "complete" {
             return Ok(());
@@ -1174,7 +1113,6 @@ async fn complete_command(
         command.completed_at = Some(now());
         Ok(())
     })
-    .map(Json)
 }
 
 fn mutate_command(
@@ -1202,25 +1140,13 @@ fn mutate_command(
     Ok(command)
 }
 
-async fn request_session_stop(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let current = fetch_active(&state, &id)?;
-    let Json(record) =
-        transition(State(state), &id, current.version, "ingress_pending", None).await?;
-    Ok(Json(
-        json!({"id":id,"phase":record.phase,"stopRequested":true}),
-    ))
-}
-
 async fn checkpoint(
-    State(state): State<AppState>,
+    state: AppState,
     id: &str,
     expected_version: i64,
     new_state: Value,
     user_activity: bool,
-) -> Result<Json<SessionRecord>, ApiError> {
+) -> Result<SessionRecord, ApiError> {
     let session_guard = session_mutation(&state, id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
@@ -1233,15 +1159,15 @@ async fn checkpoint(
         record.last_user_message_at = Some(record.updated_at.clone());
     }
     append_lifecycle(&mut journal, &record)?;
-    Ok(Json(materialize(record, &journal)))
+    Ok(materialize(record, &journal))
 }
 
 async fn transition_with_checkpoint(
-    State(state): State<AppState>,
+    state: AppState,
     id: &str,
-    input: CheckpointSession,
+    input: Checkpoint,
     phase: &str,
-) -> Result<Json<SessionRecord>, ApiError> {
+) -> Result<SessionRecord, ApiError> {
     let session_guard = session_mutation(&state, id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
@@ -1255,16 +1181,16 @@ async fn transition_with_checkpoint(
     record.version += 1;
     record.updated_at = now();
     append_lifecycle(&mut journal, &record)?;
-    Ok(Json(materialize(record, &journal)))
+    Ok(materialize(record, &journal))
 }
 
 async fn transition(
-    State(state): State<AppState>,
+    state: AppState,
     id: &str,
     expected_version: i64,
     phase: &str,
     provenance_id: Option<String>,
-) -> Result<Json<SessionRecord>, ApiError> {
+) -> Result<SessionRecord, ApiError> {
     let session_guard = session_mutation(&state, id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
@@ -1278,14 +1204,14 @@ async fn transition(
     record.version += 1;
     record.updated_at = now();
     append_lifecycle(&mut journal, &record)?;
-    Ok(Json(materialize(record, &journal)))
+    Ok(materialize(record, &journal))
 }
 
 async fn record_ingress_failure(
-    State(state): State<AppState>,
+    state: AppState,
     id: &str,
-    input: RecordIngressFailure,
-) -> Result<Json<SessionRecord>, ApiError> {
+    input: IngressFailure,
+) -> Result<SessionRecord, ApiError> {
     let session_guard = session_mutation(&state, id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, id)?;
@@ -1347,14 +1273,14 @@ async fn record_ingress_failure(
             "Session History ingress stopped after a terminal failure"
         );
     }
-    Ok(Json(materialize(record, &journal)))
+    Ok(materialize(record, &journal))
 }
 
 async fn retry_ingress(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(input): Json<RetryIngress>,
-) -> Result<Json<SessionRecord>, ApiError> {
+    state: AppState,
+    id: String,
+    input: RetryIngress,
+) -> Result<SessionRecord, ApiError> {
     let session_guard = session_mutation(&state, &id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let mut journal = open_by_id(&state, &id)?;
@@ -1372,10 +1298,10 @@ async fn retry_ingress(
     record.version += 1;
     record.updated_at = now();
     append_lifecycle(&mut journal, &record)?;
-    Ok(Json(materialize(record, &journal)))
+    Ok(materialize(record, &journal))
 }
 
-async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn release_ingress_repairs(state: AppState) -> Result<Value, ApiError> {
     let mut released = Vec::new();
     for path in journal_paths(&state.config.directory)? {
         let Some(id) = path
@@ -1409,15 +1335,15 @@ async fn release_ingress_repairs(State(state): State<AppState>) -> Result<Json<V
         append_lifecycle(&mut journal, &record)?;
         released.push(id);
     }
-    Ok(Json(json!({"released":released})))
+    Ok(json!({"released":released}))
 }
 
 async fn complete_session(
-    State(state): State<AppState>,
+    state: AppState,
     id: &str,
     expected_version: i64,
     new_state: Value,
-) -> Result<Json<SessionRecord>, ApiError> {
+) -> Result<SessionRecord, ApiError> {
     let session_guard = session_mutation(&state, id)?;
     let _guard = session_guard.lock().map_err(ApiError::internal)?;
     let journal = open_by_id(&state, id)?;
@@ -1488,29 +1414,7 @@ async fn complete_session(
             .map_err(ApiError::internal)?;
         sync_directory(&state.config.directory).map_err(ApiError::internal)?;
     }
-    Ok(Json(output))
-}
-
-async fn purge_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(expected_version): Json<Option<i64>>,
-) -> Result<Json<Value>, ApiError> {
-    if read_completed_ids(&state.config.completed_list)
-        .map_err(ApiError::internal)?
-        .contains(&id)
-    {
-        return Err(ApiError::conflict(
-            "Committed Session History is permanent and cannot be purged.",
-        ));
-    }
-    let record = fetch_active(&state, &id)?;
-    if let Some(expected) = expected_version {
-        require_version(&record, expected)?;
-    }
-    Err(ApiError::conflict(
-        "An in-progress session must be ended and committed, not purged.",
-    ))
+    Ok(output)
 }
 
 fn fetch_active(state: &AppState, id: &str) -> Result<SessionRecord, ApiError> {
@@ -1587,7 +1491,6 @@ fn append_command(journal: &mut SessionJournal, command: &SessionCommand) -> Res
 fn materialize(mut record: SessionRecord, journal: &SessionJournal) -> SessionRecord {
     let log = journal.list();
     record.state["sessionId"] = json!(log.header.session_id);
-    record.state["journalPath"] = json!(journal.path());
     if !record.state.get("transcript").is_some_and(Value::is_array) {
         record.state["transcript"] = Value::Array(
             log.events
@@ -1629,7 +1532,6 @@ fn summary_state(control: &Value, journal: &SessionJournal) -> Value {
         "channel":control.get("channel"),
         "freeTime":control.get("freeTime"),
         "orchestration":control.get("orchestration"),
-        "journalPath":journal.path(),
         "firstUserMessage":first_user,
         "boxCount":log.events.len(),
         "eventCount":log.events.len(),
@@ -1726,7 +1628,6 @@ fn control_state(value: &Value) -> Value {
         "version",
         "stateVersion",
         "sessionId",
-        "journalPath",
         "sessionType",
         "sourceSessionType",
         "channel",
@@ -2025,20 +1926,6 @@ fn sync_directory(path: &FilePath) -> anyhow::Result<()> {
         .with_context(|| format!("syncing directory {}", path.display()))
 }
 
-fn ensure_inside(path: &FilePath, directory: &FilePath) -> Result<(), ApiError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ApiError::bad("invalid journal path"))?;
-    let parent = std::fs::canonicalize(parent).map_err(ApiError::internal)?;
-    let directory = std::fs::canonicalize(directory).map_err(ApiError::internal)?;
-    if parent != directory {
-        return Err(ApiError::bad(
-            "session journal must be inside the configured in-progress directory",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_started_at(value: &str) -> Result<(), ApiError> {
     DateTime::parse_from_rfc3339(value)
         .map(|_| ())
@@ -2091,15 +1978,28 @@ mod tests {
         ))
     }
 
-    fn service(label: &str) -> Service {
+    fn service(label: &str) -> SessionHistory {
         let root = root(label);
         std::fs::create_dir_all(&root).unwrap();
-        open(Config {
+        SessionHistory::open(Config {
             directory: root.join("sessions"),
             completed_list: root.join("session-history.txt"),
-            max_request_bytes: 1024 * 1024,
         })
         .unwrap()
+    }
+
+    async fn start(service: &SessionHistory, idempotency_id: &str) -> SessionRecord {
+        service
+            .start(StartSession {
+                idempotency_id: idempotency_id.into(),
+                started_at: "2026-07-23T00:00:00Z".into(),
+                session_type: "conversation".into(),
+                duration_minutes: None,
+                custom_prompt: None,
+            })
+            .await
+            .unwrap()
+            .value
     }
 
     #[test]
@@ -2177,7 +2077,6 @@ mod tests {
             updated_at: "2026-07-24T00:00:00Z".into(),
             state: json!({
                 "sessionType":"conversation",
-                "journalPath":sessions.join(format!("{id}.session-log")),
                 "boxes":{"1":{"canonical":{"content":{"text":"x".repeat(20_000)}}}},
                 "events":[{"kind":"old presentation"}],
                 "context":{"estimatedTokens":5_000},
@@ -2264,10 +2163,9 @@ mod tests {
         drop(file);
         let original_bytes = std::fs::metadata(&control_path).unwrap().len();
 
-        let service = open(Config {
+        let service = SessionHistory::open(Config {
             directory: sessions.clone(),
             completed_list: root.join("session-history.txt"),
-            max_request_bytes: 1024 * 1024,
         })
         .unwrap();
         let compacted_bytes = std::fs::metadata(&control_path).unwrap().len();
@@ -2298,54 +2196,43 @@ mod tests {
     #[tokio::test]
     async fn managed_session_log_and_control_journal_remain_coordinated() {
         let service = service("commands");
-        let record = service
-            .post_json(
-                "/api/v1/conversations/start",
-                json!({
-                    "idempotency_id":"start-1",
-                    "started_at":"2026-07-23T00:00:00Z",
-                    "session_type":"conversation"
-                }),
-            )
-            .await
-            .unwrap();
-        let id = record["id"].as_str().unwrap();
-        let mut journal = open_by_id(&service.state, id).unwrap();
+        let record = start(&service, "start-1").await;
+        let id = record.id.clone();
+        let mut journal = open_by_id(&service.state, &id).unwrap();
         journal
             .log
             .add_event(Role::SystemError, "The message exceeded capacity.")
             .unwrap();
         drop(journal);
         let command = service
-            .post_json(
-                &format!("/api/v1/conversations/{id}/commands"),
-                json!({"idempotency_id":"message-1","kind":"message","payload":{"text":"hello"}}),
+            .enqueue(
+                &id,
+                NewCommand {
+                    idempotency_id: "message-1".into(),
+                    kind: "message".into(),
+                    payload: json!({"text":"hello"}),
+                },
             )
             .await
-            .unwrap();
-        assert_eq!(command["status"], "pending");
-        let materialized = service
-            .get_json(&format!("/api/v1/conversations/{id}"))
-            .await
-            .unwrap();
+            .unwrap()
+            .value;
+        assert_eq!(command.status, "pending");
+        let materialized = service.get(&id).await.unwrap();
         assert!(
-            materialized["state"]["chatendText"]
+            materialized.state["chatendText"]
                 .as_str()
                 .is_some_and(|text| text.contains("[system-error]"))
         );
         assert_eq!(
-            materialized["state"]["transcript"][0],
+            materialized.state["transcript"][0],
             json!({
                 "role":"system",
                 "content":"The message exceeded capacity.",
                 "boxId":1,
             })
         );
-        let listed = service
-            .get_json("/api/v1/conversation-commands")
-            .await
-            .unwrap();
-        assert_eq!(listed["commands"].as_array().unwrap().len(), 1);
+        let listed = service.command_heads().await.unwrap();
+        assert_eq!(listed.len(), 1);
         assert_eq!(
             std::fs::read_dir(&service.state.config.directory)
                 .unwrap()
@@ -2357,19 +2244,9 @@ mod tests {
     #[tokio::test]
     async fn checkpointed_presentation_is_rebuilt_from_the_session_log() {
         let service = service("live-ui");
-        let record = service
-            .post_json(
-                "/api/v1/conversations/start",
-                json!({
-                    "idempotency_id":"live-ui-start",
-                    "started_at":"2026-07-23T00:00:00Z",
-                    "session_type":"conversation"
-                }),
-            )
-            .await
-            .unwrap();
-        let id = record["id"].as_str().unwrap();
-        let mut journal = open_by_id(&service.state, id).unwrap();
+        let record = start(&service, "live-ui-start").await;
+        let id = record.id.clone();
+        let mut journal = open_by_id(&service.state, &id).unwrap();
         journal
             .log
             .add_event(Role::UserMessage, "hello from the log")
@@ -2386,49 +2263,46 @@ mod tests {
         });
         let context = json!({"items":[{"boxId":1,"text":"hello"}]});
         let checkpointed = service
-            .put_json(
-                &format!("/api/v1/conversations/{id}/checkpoint"),
-                json!({
-                    "expected_version":record["version"],
-                    "state":{
+            .checkpoint(
+                &id,
+                Checkpoint {
+                    expected_version: record.version,
+                    state: json!({
                         "sessionId":id,
-                        "journalPath":record["state"]["journalPath"],
                         "sessionType":"conversation",
                         "boxes":boxes,
                         "events":[],
                         "context":context,
                         "chatendText":"hello",
                         "historyIngress":{"format":"kennedy-chatend","version":1}
-                    }
-                }),
+                    }),
+                    user_activity: false,
+                },
             )
             .await
             .unwrap();
-        assert!(checkpointed["state"].get("boxes").is_none());
-        assert!(checkpointed["state"].get("context").is_none());
+        assert!(checkpointed.state.get("boxes").is_none());
+        assert!(checkpointed.state.get("context").is_none());
         assert_eq!(
-            checkpointed["state"]["transcript"][0]["content"],
+            checkpointed.state["transcript"][0]["content"],
             "hello from the log"
         );
-        assert_eq!(checkpointed["state"]["events"][0]["role"], "user-message");
+        assert_eq!(checkpointed.state["events"][0]["role"], "user-message");
         assert!(
-            checkpointed["state"]["chatendText"]
+            checkpointed.state["chatendText"]
                 .as_str()
                 .is_some_and(|text| text.contains("hello from the log"))
         );
         assert_eq!(
-            checkpointed["state"]["historyIngress"]["format"],
+            checkpointed.state["historyIngress"]["format"],
             "kennedy-chatend"
         );
 
-        let fetched = service
-            .get_json(&format!("/api/v1/conversations/{id}"))
-            .await
-            .unwrap();
-        assert!(fetched["state"].get("boxes").is_none());
-        assert!(fetched["state"].get("context").is_none());
+        let fetched = service.get(&id).await.unwrap();
+        assert!(fetched.state.get("boxes").is_none());
+        assert!(fetched.state.get("context").is_none());
         assert_eq!(
-            fetched["state"]["transcript"][0]["content"],
+            fetched.state["transcript"][0]["content"],
             "hello from the log"
         );
     }
@@ -2436,19 +2310,9 @@ mod tests {
     #[tokio::test]
     async fn active_pending_objects_are_streamed_with_original_metadata() {
         let service = service("pending-object");
-        let record = service
-            .post_json(
-                "/api/v1/conversations/start",
-                json!({
-                    "idempotency_id":"pending-object-start",
-                    "started_at":"2026-07-23T00:00:00Z",
-                    "session_type":"conversation"
-                }),
-            )
-            .await
-            .unwrap();
-        let id = record["id"].as_str().unwrap();
-        let mut journal = open_by_id(&service.state, id).unwrap();
+        let record = start(&service, "pending-object-start").await;
+        let id = record.id;
+        let mut journal = open_by_id(&service.state, &id).unwrap();
         let position = journal
             .log
             .add_pending_object(
@@ -2458,138 +2322,117 @@ mod tests {
                 b"\x89PNG\r\n\x1a\npayload",
             )
             .unwrap();
-        let response = get_session_object(
-            State(service.state.clone()),
-            Path((id.to_owned(), format!("pending:{}", position.index() + 1))),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
-        assert_eq!(
-            response.headers()[header::CONTENT_DISPOSITION],
-            "inline; filename=\"photo.png\""
-        );
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
+        let object = service
+            .object(&id, &format!("pending:{}", position.index() + 1))
             .unwrap();
-        assert_eq!(&bytes[..], b"\x89PNG\r\n\x1a\npayload");
+        assert_eq!(object.media_type, "image/png");
+        assert_eq!(object.file_name, "photo.png");
+        assert_eq!(object.bytes, b"\x89PNG\r\n\x1a\npayload");
     }
 
     #[tokio::test]
     async fn conversation_ingress_failures_back_off_then_stop_and_can_be_retried() {
         let service = service("ingress-retries");
-        let created = service
-            .post_json(
-                "/api/v1/conversations/start",
-                json!({
-                    "idempotency_id":"ingress-retries-start",
-                    "started_at":"2026-07-23T00:00:00Z",
-                    "session_type":"conversation"
-                }),
-            )
-            .await
-            .unwrap();
-        let id = created["id"].as_str().unwrap();
+        let created = start(&service, "ingress-retries-start").await;
+        let id = created.id.clone();
         let mut record = service
-            .post_json(
-                &format!("/api/v1/conversations/{id}/request-ingress"),
-                json!({"expected_version":created["version"],"state":created["state"]}),
+            .request_ingress(
+                &id,
+                Checkpoint {
+                    expected_version: created.version,
+                    state: created.state,
+                    user_activity: false,
+                },
             )
             .await
             .unwrap();
 
         for attempt in 1..=INGRESS_FAILURE_LIMIT {
             record = service
-                .post_json(
-                    &format!("/api/v1/conversations/{id}/ingress-started"),
-                    json!({
-                        "expected_version":record["version"],
-                        "provenance_id":format!("session:{id}"),
-                        "completion_protocol":"one-session-transaction-v1"
-                    }),
+                .start_ingress(
+                    &id,
+                    StartIngress {
+                        expected_version: record.version,
+                        provenance_id: format!("session:{id}"),
+                    },
                 )
                 .await
                 .unwrap();
             record = service
-                .post_json(
-                    &format!("/api/v1/conversations/{id}/ingress-failure"),
-                    json!({
-                        "expected_version":record["version"],
-                        "stage":"model_loop",
-                        "code":"ingress_error",
-                        "message":"transient failure"
-                    }),
+                .fail_ingress(
+                    &id,
+                    IngressFailure {
+                        expected_version: record.version,
+                        stage: "model_loop".into(),
+                        code: Some("ingress_error".into()),
+                        message: "transient failure".into(),
+                        rounds_used: None,
+                        context_tokens: None,
+                        context_window_tokens: None,
+                    },
                 )
                 .await
                 .unwrap();
-            assert_eq!(record["ingress_failure_count"], attempt);
+            assert_eq!(record.ingress_failure_count, attempt);
             if attempt < INGRESS_FAILURE_LIMIT {
-                assert_eq!(record["phase"], "ingress_pending");
-                assert!(record["ingress_next_attempt_at"].is_string());
+                assert_eq!(record.phase, "ingress_pending");
+                assert!(record.ingress_next_attempt_at.is_some());
             } else {
-                assert_eq!(record["phase"], "ingress_failed");
-                assert!(record["ingress_next_attempt_at"].is_null());
+                assert_eq!(record.phase, "ingress_failed");
+                assert!(record.ingress_next_attempt_at.is_none());
             }
         }
         assert_eq!(
-            record["ingress_failures"].as_array().unwrap().len(),
+            record.ingress_failures.as_array().unwrap().len(),
             RETAINED_INGRESS_FAILURES
         );
 
         let retried = service
-            .post_json(
-                &format!("/api/v1/conversations/{id}/retry-ingress"),
-                json!({"expected_version":record["version"],"state":record["state"]}),
+            .retry_ingress(
+                &id,
+                RetryIngress {
+                    expected_version: record.version,
+                    state: record.state,
+                },
             )
             .await
             .unwrap();
-        assert_eq!(retried["phase"], "ingress_pending");
-        assert_eq!(retried["ingress_failure_count"], 0);
-        assert!(retried["ingress_next_attempt_at"].is_null());
+        assert_eq!(retried.phase, "ingress_pending");
+        assert_eq!(retried.ingress_failure_count, 0);
+        assert!(retried.ingress_next_attempt_at.is_none());
     }
 
     #[tokio::test]
     async fn startup_releases_legacy_hot_loop_without_discarding_checkpoint_state() {
         let service = service("ingress-release");
-        let created = service
-            .post_json(
-                "/api/v1/conversations/start",
-                json!({
-                    "idempotency_id":"ingress-release-start",
-                    "started_at":"2026-07-23T00:00:00Z",
-                    "session_type":"conversation"
-                }),
-            )
-            .await
-            .unwrap();
-        let id = created["id"].as_str().unwrap();
+        let created = start(&service, "ingress-release-start").await;
+        let id = created.id.clone();
         let pending = service
-            .post_json(
-                &format!("/api/v1/conversations/{id}/request-ingress"),
-                json!({
-                    "expected_version":created["version"],
-                    "state":{
+            .request_ingress(
+                &id,
+                Checkpoint {
+                    expected_version: created.version,
+                    state: json!({
                         "sessionType":"conversation",
-                        "journalPath":created["state"]["journalPath"],
                         "historyIngress":{"kwebPlan":{"creates":[{"pendingId":"pending:9"}]}}
-                    }
-                }),
+                    }),
+                    user_activity: false,
+                },
             )
             .await
             .unwrap();
         let started = service
-            .post_json(
-                &format!("/api/v1/conversations/{id}/ingress-started"),
-                json!({
-                    "expected_version":pending["version"],
-                    "provenance_id":format!("session:{id}"),
-                    "completion_protocol":"one-session-transaction-v1"
-                }),
+            .start_ingress(
+                &id,
+                StartIngress {
+                    expected_version: pending.version,
+                    provenance_id: format!("session:{id}"),
+                },
             )
             .await
             .unwrap();
-        let mut journal = open_by_id(&service.state, id).unwrap();
-        let mut legacy: SessionRecord = serde_json::from_value(started).unwrap();
+        let mut journal = open_by_id(&service.state, &id).unwrap();
+        let mut legacy = started;
         legacy.ingress_failure_count = 150;
         legacy.ingress_failures = Value::Array(
             (1..=150)
@@ -2600,23 +2443,17 @@ mod tests {
         append_lifecycle(&mut journal, &legacy).unwrap();
         drop(journal);
 
-        let released = service
-            .post_json("/api/v1/conversations/ingress/repairs/release", json!({}))
-            .await
-            .unwrap();
-        assert_eq!(released["released"], json!([id]));
-        let repaired = service
-            .get_json(&format!("/api/v1/conversations/{id}"))
-            .await
-            .unwrap();
-        assert_eq!(repaired["phase"], "ingress_pending");
-        assert_eq!(repaired["ingress_failure_count"], 0);
+        let released = service.release_interrupted_ingress().await.unwrap();
+        assert_eq!(released, vec![id.clone()]);
+        let repaired = service.get(&id).await.unwrap();
+        assert_eq!(repaired.phase, "ingress_pending");
+        assert_eq!(repaired.ingress_failure_count, 0);
         assert_eq!(
-            repaired["ingress_failures"].as_array().unwrap().len(),
+            repaired.ingress_failures.as_array().unwrap().len(),
             RETAINED_INGRESS_FAILURES
         );
         assert_eq!(
-            repaired["state"]["historyIngress"]["kwebPlan"]["creates"][0]["pendingId"],
+            repaired.state["historyIngress"]["kwebPlan"]["creates"][0]["pendingId"],
             "pending:9"
         );
     }
@@ -2624,19 +2461,9 @@ mod tests {
     #[tokio::test]
     async fn nested_history_ingress_receipt_completes_the_source_session() {
         let service = service("nested-completion");
-        let record = service
-            .post_json(
-                "/api/v1/conversations/start",
-                json!({
-                    "idempotency_id":"nested-completion-start",
-                    "started_at":"2026-07-23T00:00:00Z",
-                    "session_type":"conversation"
-                }),
-            )
-            .await
-            .unwrap();
-        let id = record["id"].as_str().unwrap().to_owned();
-        let mut state = record["state"].clone();
+        let record = start(&service, "nested-completion-start").await;
+        let id = record.id.clone();
+        let mut state = record.state.clone();
         state["historyIngress"] = json!({
             "sessionType":"history-ingress",
             "completed":true,
@@ -2649,16 +2476,20 @@ mod tests {
             }
         });
         let completed = service
-            .post_json(
-                &format!("/api/v1/conversations/{id}/complete"),
-                json!({"expected_version":record["version"],"state":state}),
+            .complete(
+                &id,
+                Checkpoint {
+                    expected_version: record.version,
+                    state,
+                    user_activity: false,
+                },
             )
             .await
             .unwrap();
-        assert_eq!(completed["phase"], "complete");
-        assert_eq!(completed["state"]["sessionObjectId"], "A1234567");
+        assert_eq!(completed.phase, "complete");
+        assert_eq!(completed.state["sessionObjectId"], "A1234567");
         assert_eq!(
-            completed["state"]["commitReceipt"]["transactionId"],
+            completed.state["commitReceipt"]["transactionId"],
             "T1234567"
         );
         assert!(
@@ -2681,16 +2512,10 @@ mod tests {
     async fn committed_history_records_a_structured_receipt() {
         let service = service("completed");
         append_completed_id(&service.state.config.completed_list, "A1234567").unwrap();
-        let listed = service
-            .get_json("/api/v1/conversations/summaries")
-            .await
-            .unwrap();
+        let listed = service.list().await.unwrap();
+        assert_eq!(listed[0].state["sessionObjectId"], "A1234567");
         assert_eq!(
-            listed["conversations"][0]["state"]["sessionObjectId"],
-            "A1234567"
-        );
-        assert_eq!(
-            listed["conversations"][0]["state"]["commitReceipt"]["sessionObjectId"],
+            listed[0].state["commitReceipt"]["sessionObjectId"],
             "A1234567"
         );
         let stored = std::fs::read_to_string(&service.state.config.completed_list).unwrap();

@@ -1,18 +1,22 @@
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
     collections::{BTreeMap, HashSet},
     future::Future,
-    path::PathBuf,
     time::Duration,
 };
 
-use super::chatend::{
-    BoxContent, BoxId, BoxOwner, BoxRepresentation, EventId, EventKind, ObjectMetadata, PendingId,
-    Representation, SessionJournal, SessionKind, SessionMetadata, ToolSlotInput,
-};
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use kcode_kweb_db::{NodeId, ObjectId};
+use kcode_session_history::{
+    NewSession, Session as HistorySession,
+    chatend::{
+        BoxContent, BoxId, BoxOwner, BoxRepresentation, BoxState, Chatend, EventId, EventKind,
+        ObjectMetadata, PendingId, Representation, SessionKind, SessionMetadata, ToolSlotInput,
+    },
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -119,7 +123,7 @@ struct KwebPlan {
 }
 
 impl KwebPlan {
-    fn restore(restored: Option<&Value>, journal: &SessionJournal) -> anyhow::Result<Self> {
+    fn restore(restored: Option<&Value>, journal: &HistorySession) -> anyhow::Result<Self> {
         if let Some(plan) = restored.and_then(|state| state.get("kwebPlan")) {
             return serde_json::from_value(plan.clone()).context("decoding the staged Kweb plan");
         }
@@ -157,7 +161,7 @@ impl KwebPlan {
 pub(crate) struct Session {
     api: Api,
     runtime: RuntimeModel,
-    journal: SessionJournal,
+    journal: HistorySession,
     plan: KwebPlan,
     pub session_type: String,
     pub channel: Value,
@@ -238,7 +242,7 @@ fn mark_kweb_content(content: &mut BoxContent, logical_slot: &str, role: &str) {
     content.metadata["kwebRole"] = json!(role);
 }
 
-fn kweb_logical_slot(state: &super::chatend::BoxState, actual_slot: &str) -> String {
+fn kweb_logical_slot(state: &BoxState, actual_slot: &str) -> String {
     state
         .canonical
         .content
@@ -249,7 +253,7 @@ fn kweb_logical_slot(state: &super::chatend::BoxState, actual_slot: &str) -> Str
         .to_owned()
 }
 
-fn kweb_node_identifier(state: &super::chatend::BoxState) -> Option<&str> {
+fn kweb_node_identifier(state: &BoxState) -> Option<&str> {
     state
         .canonical
         .content
@@ -268,7 +272,7 @@ fn kweb_node_identifier(state: &super::chatend::BoxState) -> Option<&str> {
 
 type KwebBoxVersions = BTreeMap<BoxId, (String, EventId)>;
 
-fn kweb_box_versions(journal: &SessionJournal) -> KwebBoxVersions {
+fn kweb_box_versions(journal: &HistorySession) -> KwebBoxVersions {
     journal
         .state()
         .tool_layouts
@@ -284,7 +288,7 @@ fn kweb_box_versions(journal: &SessionJournal) -> KwebBoxVersions {
         .collect()
 }
 
-fn changed_kweb_box_ids(journal: &SessionJournal, previous: &KwebBoxVersions) -> Vec<BoxId> {
+fn changed_kweb_box_ids(journal: &HistorySession, previous: &KwebBoxVersions) -> Vec<BoxId> {
     journal
         .state()
         .tool_layouts
@@ -304,7 +308,7 @@ fn changed_kweb_box_ids(journal: &SessionJournal, previous: &KwebBoxVersions) ->
 }
 
 fn render_load_node_result(
-    journal: &SessionJournal,
+    journal: &HistorySession,
     changed_box_ids: &[BoxId],
 ) -> anyhow::Result<String> {
     if changed_box_ids.is_empty() {
@@ -502,7 +506,7 @@ struct HistoryIngressRepresentationPlan {
 }
 
 fn history_ingress_representation_plan(
-    state: &super::chatend::Chatend,
+    state: &Chatend,
 ) -> anyhow::Result<HistoryIngressRepresentationPlan> {
     let mut desired = state
         .active_boxes()
@@ -576,7 +580,7 @@ fn history_ingress_representation_plan(
 }
 
 fn reduce_history_ingress_boxes(
-    state: &super::chatend::Chatend,
+    state: &Chatend,
     desired: &mut BTreeMap<BoxId, BoxRepresentation>,
     candidates: &mut Vec<(BoxId, BoxRepresentation)>,
     limit: u64,
@@ -613,7 +617,7 @@ fn reduce_history_ingress_boxes(
         <= limit)
 }
 
-fn history_ingress_box_is_protected(state: &super::chatend::BoxState) -> bool {
+fn history_ingress_box_is_protected(state: &BoxState) -> bool {
     if matches!(state.owner, BoxOwner::System)
         || matches!(state.owner, BoxOwner::User) && state.name == "User message"
         || matches!(state.owner, BoxOwner::Kennedy) && state.name == "Kennedy message"
@@ -634,7 +638,7 @@ fn history_ingress_box_is_protected(state: &super::chatend::BoxState) -> bool {
         .is_some_and(|(_, characters)| characters <= INLINE_TOOL_INVOCATION_CHARACTERS)
 }
 
-fn tool_invocation(state: &super::chatend::BoxState) -> Option<(&str, usize)> {
+fn tool_invocation(state: &BoxState) -> Option<(&str, usize)> {
     let BoxOwner::Kennedy = &state.owner else {
         return None;
     };
@@ -786,7 +790,7 @@ fn rust_lib_box_content(snapshot: &LibrarySnapshot) -> BoxContent {
     }
 }
 
-fn rust_lib_logical_name(state: &super::chatend::BoxState, fallback: &str) -> String {
+fn rust_lib_logical_name(state: &BoxState, fallback: &str) -> String {
     state
         .canonical
         .content
@@ -797,7 +801,7 @@ fn rust_lib_logical_name(state: &super::chatend::BoxState, fallback: &str) -> St
         .to_owned()
 }
 
-fn rust_lib_box_id(journal: &SessionJournal, name: &str) -> Option<BoxId> {
+fn rust_lib_box_id(journal: &HistorySession, name: &str) -> Option<BoxId> {
     journal
         .state()
         .tools
@@ -814,7 +818,7 @@ fn rust_lib_box_id(journal: &SessionJournal, name: &str) -> Option<BoxId> {
 }
 
 fn prospective_rust_lib_box_updates(
-    journal: &SessionJournal,
+    journal: &HistorySession,
     call: &ToolCall,
 ) -> BTreeMap<BoxId, BoxContent> {
     if call.name != WRITE_RUST_LIB_TOOL {
@@ -830,7 +834,7 @@ fn prospective_rust_lib_box_updates(
 }
 
 fn prospective_rust_lib_snapshot_tokens(
-    journal: &SessionJournal,
+    journal: &HistorySession,
     snapshot: &LibrarySnapshot,
 ) -> anyhow::Result<u64> {
     let projection = if let Some(box_id) = rust_lib_box_id(journal, &snapshot.name) {
@@ -864,7 +868,7 @@ fn prospective_rust_lib_snapshot_tokens(
 }
 
 fn apply_rust_lib_snapshot(
-    journal: &mut SessionJournal,
+    journal: &mut HistorySession,
     snapshot: LibrarySnapshot,
 ) -> anyhow::Result<BoxId> {
     let current = journal
@@ -997,10 +1001,10 @@ impl Session {
             .map(str::to_owned)
             .or(options.rust_lib_session_id.clone())
             .unwrap_or_else(|| format!("kennedy:{}", Uuid::new_v4()));
-        let journal_path = restored
-            .and_then(|state| state.get("journalPath"))
+        let history_session_id = restored
+            .and_then(|state| state.get("sessionId"))
             .and_then(Value::as_str)
-            .map(PathBuf::from);
+            .map(str::to_owned);
         let source_session_type = options.source_session_type.clone().or_else(|| {
             restored
                 .and_then(|state| state.get("sourceSessionType"))
@@ -1024,51 +1028,30 @@ impl Session {
             manuals.compose_conversation(&runtime, &options.session_type, &session_context)?
         };
 
-        let (mut journal, _new_journal) = if let Some(path) = journal_path {
-            let session_id = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .context("session-log filename is not valid UTF-8")?
-                .to_owned();
-            (
-                SessionJournal::open_with_metadata(
-                    &path,
-                    SessionMetadata {
-                        session_id,
-                        kind: session_kind(&options.session_type, &options.mode),
-                        created_at: started_at.clone(),
-                        effective_context_tokens: runtime.context_window_tokens,
-                        channel: options.channel.clone(),
-                    },
-                )
+        let session_id = history_session_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let metadata = SessionMetadata {
+            session_id: session_id.clone(),
+            kind: session_kind(&options.session_type, &options.mode),
+            created_at: started_at.clone(),
+            effective_context_tokens: runtime.context_window_tokens,
+            channel: options.channel.clone(),
+        };
+        let mut journal = if history_session_id.is_some() {
+            api.history_session(metadata)
                 .with_context(|| {
                     format!(
-                        "opening authoritative session log {} (legacy snapshots are intentionally unsupported)",
-                        path.display()
+                        "opening authoritative session {session_id} (legacy snapshots are intentionally unsupported)"
                     )
-                })?,
-                false,
-            )
+                })?
         } else {
-            let session_id = Uuid::new_v4().to_string();
-            #[cfg(test)]
-            let root = std::env::temp_dir().join("kennedy-session-log-tests");
-            #[cfg(not(test))]
-            let root = PathBuf::from("./data/sessions/in-progress");
-            let path = root.join(format!("{session_id}.session-log"));
-            (
-                SessionJournal::create(
-                    &path,
-                    SessionMetadata {
-                        session_id,
-                        kind: session_kind(&options.session_type, &options.mode),
-                        created_at: started_at.clone(),
-                        effective_context_tokens: runtime.context_window_tokens,
-                        channel: options.channel.clone(),
-                    },
-                )?,
-                true,
-            )
+            api.create_history_session(NewSession {
+                kind: metadata.kind,
+                created_at: metadata.created_at,
+                effective_context_tokens: metadata.effective_context_tokens,
+                channel: metadata.channel,
+            })?
         };
         let mut context = KmapContext::new(api.clone(), options.root_node_ids.clone())?;
         restore_kweb_context(&journal, &mut context)?;
@@ -3432,7 +3415,7 @@ impl Session {
         }
         self.journal.repair_unfinished_tools(now())?;
         self.journal.seal()?;
-        let archive = serde_json::to_vec(&self.journal.session_log())?;
+        let archive = self.journal.archive_bytes()?;
         let object_locations = self
             .journal
             .objects()
@@ -3559,7 +3542,6 @@ impl Session {
             "version":1,
             "stateVersion":3,
             "sessionId":self.journal.state().metadata.session_id,
-            "journalPath":self.journal.path(),
             "sessionType":self.session_type,
             "sourceSessionType":self.source_session_type,
             "channel":self.channel,
@@ -3593,7 +3575,7 @@ impl Session {
     }
 }
 
-fn restore_kweb_context(journal: &SessionJournal, context: &mut KmapContext) -> anyhow::Result<()> {
+fn restore_kweb_context(journal: &HistorySession, context: &mut KmapContext) -> anyhow::Result<()> {
     let Some(tool) = journal.state().tools.get(KWEB_TOOL_INSTANCE) else {
         return Ok(());
     };
@@ -3657,7 +3639,7 @@ fn restore_kweb_context(journal: &SessionJournal, context: &mut KmapContext) -> 
     context.restore_roles(direct, fixed, active)
 }
 
-fn transcript_from_journal(journal: &SessionJournal) -> Vec<Value> {
+fn transcript_from_journal(journal: &HistorySession) -> Vec<Value> {
     journal
         .state()
         .boxes
@@ -3712,7 +3694,7 @@ fn transcript_from_journal(journal: &SessionJournal) -> Vec<Value> {
 }
 
 fn staged_object_transport_kind(
-    journal: &SessionJournal,
+    journal: &HistorySession,
     pending_id: &PendingId,
 ) -> Option<String> {
     let pending_id = pending_id.to_string();
@@ -3809,7 +3791,7 @@ fn tool_instance(name: &str) -> String {
 }
 
 fn read_pending_object(
-    journal: &mut SessionJournal,
+    journal: &mut HistorySession,
     object_id: &str,
 ) -> anyhow::Result<(PendingId, ObjectMetadata, Vec<u8>)> {
     let pending_id = PendingId::parse(object_id.to_owned())?;
@@ -3881,7 +3863,7 @@ fn telegram_group_media_reference(group_context: &Value, message_id: i64) -> any
 }
 
 fn staged_telegram_group_media(
-    journal: &SessionJournal,
+    journal: &HistorySession,
     chat_id: i64,
     message_id: i64,
 ) -> Option<(PendingId, ObjectMetadata, u64)> {
@@ -4314,27 +4296,31 @@ mod tests {
 
     use super::*;
 
-    fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, SessionJournal) {
-        let path = std::env::temp_dir().join(format!(
-            "kennedy-ingress-context-{label}-{}-{}.session-log",
+    fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, HistorySession) {
+        let root = std::env::temp_dir().join(format!(
+            "kennedy-ingress-context-{label}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let journal = SessionJournal::create(
-            &path,
-            SessionMetadata {
-                session_id: label.into(),
+        let history = kcode_session_history::SessionHistory::open(kcode_session_history::Config {
+            directory: root.join("sessions"),
+            completed_list: root.join("completed.jsonl"),
+        })
+        .unwrap();
+        let journal = history
+            .create_session(NewSession {
                 kind: SessionKind::Conversation,
                 created_at: "2026-07-23T00:00:00Z".into(),
                 effective_context_tokens,
                 channel: Value::Null,
-            },
-        )
-        .unwrap();
-        let path = journal.path().to_path_buf();
+            })
+            .unwrap();
+        let path = root
+            .join("sessions")
+            .join(format!("{}.session-log", journal.id()));
         (path, journal)
     }
 
@@ -4388,7 +4374,11 @@ mod tests {
                 .unwrap(),
             "  inspect exactly\n"
         );
-        std::fs::remove_file(path.with_file_name(format!("{label}-0.pending-object"))).unwrap();
+        std::fs::remove_file(path.with_file_name(format!(
+            "{}-0.pending-object",
+            path.file_stem().unwrap().to_string_lossy()
+        )))
+        .unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -4455,7 +4445,11 @@ mod tests {
         assert!(rendered.contains(&format!("Object: {pending_id}")));
         assert!(staged_telegram_group_media(&journal, -100123, 78).is_none());
 
-        std::fs::remove_file(path.with_file_name(format!("{label}-0.pending-object"))).unwrap();
+        std::fs::remove_file(path.with_file_name(format!(
+            "{}-0.pending-object",
+            path.file_stem().unwrap().to_string_lossy()
+        )))
+        .unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

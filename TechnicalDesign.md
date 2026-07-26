@@ -16,13 +16,13 @@ Kennedy is one Rust server with deliberately separated library domains:
    transaction log, current-node files, WAL, and duplicate/dependency rules.
 2. `kcode-session-log` 0.2.1 owns append-ordered role/text history, pending-object
    files, recovery, integrity validation, sealing, and exact cleanup.
-3. `kennedy-conversation-history` implements the Session History lifecycle and
-   browser adapter. Its package name is historical; it owns no conversation
-   SQLite database.
-4. `kennedy-server` owns the reconstructed Chatend, box and representation
-   state, context limits, orchestration, provider calls, tool execution, graph
-   policy, the one Kweb writer lane, Kweb HTTP routes, roots, the credential
-   vault, and static assets.
+3. `kcode-session-history` is a private standalone library. It is the only
+   consumer of `kcode-session-log` and owns opaque active `Session` handles,
+   reconstructed Chatend and box state, lifecycle and command journals,
+   pending objects, and completion receipts. It has no Axum or HTTP API.
+4. `kennedy-server` owns context-policy decisions, orchestration, provider
+   calls, tool execution, graph policy, the one Kweb writer lane, all browser
+   HTTP adapters, roots, the credential vault, and static assets.
 5. `kcode-audio-ingress` owns durable audio intake, transcription, and
    automatic whole-job recovery. KennedyServer owns the Axum adapter and a
    separate prepared-transcript memory-ingress queue; those downstream

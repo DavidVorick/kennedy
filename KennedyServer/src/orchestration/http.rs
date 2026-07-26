@@ -20,7 +20,7 @@ const ACTIVE_CONNECTION_LIMIT: usize = 8;
 pub(crate) struct LocalServices {
     pub kmap: crate::kmap_http::Service,
     pub intelligence: crate::intelligence::Service,
-    pub history: kennedy_conversation_history::Service,
+    pub history: kcode_session_history::SessionHistory,
     pub audio: crate::audio_ingress::Service,
     pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
     pub rust_lib_tools: crate::rust_lib_tools::RustLibToolService,
@@ -46,6 +46,7 @@ impl std::error::Error for ApiError {}
 pub(crate) struct Api {
     client: Client,
     services: ServiceBackend,
+    history_sessions: kcode_session_history::SessionHistory,
     telegram: String,
 }
 
@@ -83,14 +84,25 @@ impl Api {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("building reqwest client")?;
+        let history_root = std::env::temp_dir().join(format!(
+            "kennedy-orchestration-history-tests-{}",
+            Uuid::new_v4()
+        ));
+        let history_sessions =
+            kcode_session_history::SessionHistory::open(kcode_session_history::Config {
+                directory: history_root.join("sessions"),
+                completed_list: history_root.join("completed.jsonl"),
+            })
+            .context("opening test Session History")?;
         Ok(Self {
             client,
             services: ServiceBackend::Http(TestBases {
                 kweb: trim_base(&config.kweb_base),
                 intelligence: trim_base(&config.intelligence_base),
-                history: trim_base(&config.conversation_history_base),
+                history: trim_base(&config.session_history_base),
                 audio: trim_base(&config.audio_ingress_base),
             }),
+            history_sessions,
             telegram: trim_base(&config.telegram_relay_base),
         })
     }
@@ -100,11 +112,27 @@ impl Api {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("building Telegram relay HTTP client")?;
+        let history_sessions = services.history.clone();
         Ok(Self {
             client,
             services: ServiceBackend::Local(std::sync::Arc::new(services)),
+            history_sessions,
             telegram: trim_base(telegram_base),
         })
+    }
+
+    pub(crate) fn create_history_session(
+        &self,
+        input: kcode_session_history::NewSession,
+    ) -> anyhow::Result<kcode_session_history::Session> {
+        self.history_sessions.create_session(input)
+    }
+
+    pub(crate) fn history_session(
+        &self,
+        metadata: kcode_session_history::chatend::SessionMetadata,
+    ) -> anyhow::Result<kcode_session_history::Session> {
+        self.history_sessions.open_session(metadata)
     }
 
     pub async fn kmap_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
@@ -267,24 +295,366 @@ impl Api {
         }
     }
 
-    pub async fn history_get(&self, path: &str) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::History, Method::GET, path, None)
-            .await
+    pub async fn history_health(&self) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                local.history.health().map_err(history_error)?;
+                Ok(json!({"service":"session-history","status":"ok"}))
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::GET,
+                    &bases.history,
+                    "/api/v1/conversations/health",
+                    None,
+                )
+                .await
+            }
+        }
     }
 
-    pub async fn history_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::History, Method::POST, path, Some(body))
-            .await
+    pub async fn history_list(&self) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let conversations = local.history.list().await.map_err(history_error)?;
+                Ok(json!({"conversations":conversations}))
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::GET,
+                    &bases.history,
+                    "/api/v1/conversations/summaries",
+                    None,
+                )
+                .await
+            }
+        }
     }
 
-    pub async fn history_put(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::History, Method::PUT, path, Some(body))
-            .await
+    pub async fn history_get_session(&self, id: &str) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let path = format!("/api/v1/conversations/{}", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .get(id)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(Method::GET, &bases.history, &path, None).await
+            }
+        }
     }
 
-    pub async fn history_delete(&self, path: &str, body: Option<Value>) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::History, Method::DELETE, path, body)
-            .await
+    pub async fn history_register(
+        &self,
+        input: kcode_session_history::RegisterSession,
+    ) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .register(input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    "/api/v1/conversations",
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_command_heads(&self) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let commands = local.history.command_heads().await.map_err(history_error)?;
+                Ok(json!({"commands":commands}))
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::GET,
+                    &bases.history,
+                    "/api/v1/conversation-commands",
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_claim_command(&self, id: &str) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let path = format!("/api/v1/conversation-commands/{}/claim", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .claim_command(id)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(Method::POST, &bases.history, &path, Some(json!({})))
+                    .await
+            }
+        }
+    }
+
+    pub async fn history_complete_command(
+        &self,
+        id: &str,
+        outcome: Value,
+    ) -> Result<Value, ApiError> {
+        let input = kcode_session_history::CommandOutcome { outcome };
+        #[cfg(test)]
+        let path = format!("/api/v1/conversation-commands/{}/complete", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .complete_command(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_checkpoint(
+        &self,
+        id: &str,
+        input: kcode_session_history::Checkpoint,
+        _ingress: bool,
+    ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let action = if _ingress {
+            "ingress-checkpoint"
+        } else {
+            "checkpoint"
+        };
+        #[cfg(test)]
+        let path = format!("/api/v1/conversations/{}/{action}", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .checkpoint(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(Method::PUT, &bases.history, &path, Some(json_value(input)?))
+                    .await
+            }
+        }
+    }
+
+    pub async fn history_request_ingress(
+        &self,
+        id: &str,
+        input: kcode_session_history::Checkpoint,
+    ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let path = format!("/api/v1/conversations/{}/request-ingress", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .request_ingress(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_start_ingress(
+        &self,
+        id: &str,
+        input: kcode_session_history::StartIngress,
+    ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let path = format!("/api/v1/conversations/{}/ingress-started", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .start_ingress(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_complete_ingress(
+        &self,
+        id: &str,
+        expected_version: i64,
+    ) -> Result<Value, ApiError> {
+        let input = kcode_session_history::ExpectedVersion { expected_version };
+        #[cfg(test)]
+        let path = format!(
+            "/api/v1/conversations/{}/ingress-completed",
+            encode_path(id)
+        );
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .complete_ingress(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_fail_ingress(
+        &self,
+        id: &str,
+        input: kcode_session_history::IngressFailure,
+    ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let path = format!("/api/v1/conversations/{}/ingress-failure", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .fail_ingress(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_complete(
+        &self,
+        id: &str,
+        input: kcode_session_history::Checkpoint,
+    ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let path = format!("/api/v1/conversations/{}/complete", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .complete(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_record_completion(
+        &self,
+        input: kcode_session_history::RecordCompletion,
+    ) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let object_id = input.session_object_id.clone();
+                local
+                    .history
+                    .record_completion(input)
+                    .await
+                    .map_err(history_error)?;
+                Ok(json!({"sessionObjectId":object_id,"recorded":true}))
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    "/api/v1/session-history",
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_release_interrupted_ingress(&self) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let released = local
+                    .history
+                    .release_interrupted_ingress()
+                    .await
+                    .map_err(history_error)?;
+                Ok(json!({"released":released}))
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    "/api/v1/conversations/ingress/repairs/release",
+                    Some(json!({})),
+                )
+                .await
+            }
+        }
     }
 
     pub async fn audio_get(&self, path: &str) -> Result<Value, ApiError> {
@@ -729,14 +1099,6 @@ impl Api {
                         )),
                     }
                     .map_err(intelligence_error),
-                    ServiceKind::History => match method {
-                        Method::GET => services.history.get_json(path).await,
-                        Method::POST => services.history.post_json(path, body).await,
-                        Method::PUT => services.history.put_json(path, body).await,
-                        Method::DELETE => services.history.delete_json(path, Some(body)).await,
-                        _ => unreachable!(),
-                    }
-                    .map_err(history_error),
                     ServiceKind::Audio => match method {
                         Method::GET => services.audio.get_json(path).await,
                         Method::POST => services.audio.post_json(path, body).await,
@@ -765,7 +1127,6 @@ impl Api {
                 let base = match service {
                     ServiceKind::Kmap | ServiceKind::Directory => &bases.kweb,
                     ServiceKind::Intelligence => &bases.intelligence,
-                    ServiceKind::History => &bases.history,
                     ServiceKind::Audio => &bases.audio,
                 };
                 self.request(method, base, path, body).await
@@ -808,7 +1169,6 @@ impl AgentTurn {
 enum ServiceKind {
     Kmap,
     Intelligence,
-    History,
     Audio,
     Directory,
 }
@@ -845,12 +1205,25 @@ fn rust_lib_error(error: crate::rust_lib_tools::ToolError) -> ApiError {
     }
 }
 
-fn history_error(error: kennedy_conversation_history::ServiceError) -> ApiError {
+fn history_error(error: kcode_session_history::Error) -> ApiError {
     ApiError {
-        status: StatusCode::from_u16(error.status).ok(),
-        code: error.code.into(),
+        status: Some(history_status(error.kind)),
+        code: error.kind.code().into(),
         message: error.message,
     }
+}
+
+fn history_status(kind: kcode_session_history::ErrorKind) -> StatusCode {
+    match kind {
+        kcode_session_history::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        kcode_session_history::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        kcode_session_history::ErrorKind::Conflict => StatusCode::CONFLICT,
+        kcode_session_history::ErrorKind::Storage => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn json_value(value: impl serde::Serialize) -> Result<Value, ApiError> {
+    serde_json::to_value(value).map_err(local_api_error)
 }
 
 fn audio_error(error: crate::audio_ingress::ServiceError) -> ApiError {
@@ -865,7 +1238,6 @@ fn trim_base(value: &str) -> String {
     value.trim_end_matches('/').to_owned()
 }
 
-#[cfg(test)]
 fn local_api_error(error: impl std::fmt::Display) -> ApiError {
     ApiError {
         status: None,

@@ -1,12 +1,19 @@
-# Session History Specification
+# kcode Session History Specification
 
 ## Purpose
 
-Session History is the local lifecycle and discovery service for Kennedy
-sessions. The Rust crate retains its historical package name
-`kennedy-conversation-history`, but Conversation History is no longer the
-application-domain name and the runtime no longer uses a conversation SQLite
-database.
+`kcode-session-history` is Kennedy's local session-history library. It owns
+active session history, lifecycle and command records, pending session objects,
+and the completed-session index. The package and Rust crate are named
+`kcode-session-history` and `kcode_session_history`; the old
+ConversationHistory name is retired. The runtime does not use a conversation
+SQLite database.
+
+The library exposes two primary handles. `SessionHistory` is the long-lived
+store and catalog. `Session` is an opaque handle to one active session. A
+caller creates a `Session` with a library-assigned ID or reopens one through
+`SessionHistory` using typed metadata; storage paths never cross the library
+boundary. There is no `SessionLease`.
 
 An in-progress session has one authoritative append-only `.session-log` file
 plus a separate `.session-control` file for lifecycle and browser commands.
@@ -37,9 +44,10 @@ The `.session-log` format and its recovery rules are owned by
 Session History writes only lifecycle and command records to
 `.session-control`; it does not add storage-specific sidebands to the
 transcript. Transcript entries, box events, tool events, and pending objects
-come from `kcode-session-log`. KennedyServer rebuilds Chatend from that ordered
-log, and the browser falls back to the same events rather than requiring a
-durable presentation snapshot. Successful completion deletes the control file.
+come from `kcode-session-log`. The library rebuilds Chatend from that ordered
+log, and the browser projection falls back to the same events rather than
+requiring a durable presentation snapshot. Successful completion deletes the
+control file.
 
 At startup, Session History compacts active control journals. It retains the
 latest lifecycle record and the latest state of every command, removes
@@ -101,10 +109,13 @@ session controller's shared temporary-ID allocator.
 Start and command idempotency IDs are validated. Replaying the same ID returns
 the existing record.
 
-## Browser API
+## KennedyServer HTTP adapter
 
-The compatibility route prefix remains `/api/v1/conversations`; that transport
-name does not change the Session History domain:
+The library has no Axum dependency and exposes no routes, multipart types,
+HTTP statuses, or response bodies. KennedyServer adapts the typed library API
+to the browser's compatibility routes. The live route prefix remains
+`/api/v1/conversations`; that transport name does not change the Session
+History domain:
 
 - `GET /api/v1/conversations/health`
 - `GET /api/v1/conversations/summaries`
@@ -122,18 +133,20 @@ their structured commit receipt, not a second transcript copy. The frontend
 follows the archive ID through
 `GET /api/v1/session-history/{object_id}` to classify and display the archive.
 
-The object POST accepts exactly one multipart `file`. It writes one durable
+KennedyServer's object POST accepts exactly one multipart `file` and gives its
+owned bytes and metadata to the library. The library writes one durable
 pending-object file, appends the corresponding event, and returns the
-event-position-derived temporary `pending:N` ID. The object GET verifies and
-streams that pending sidecar with its recorded media type, safe filename,
-length, no-store policy, and `nosniff`; it is available only while the local
-session remains active.
+event-position-derived temporary `pending:N` ID. KennedyServer's object GET
+adds transport headers to the verified bytes and metadata returned by the
+library.
 
 ## Isolation and cutover
 
-Session History owns no graph policy and does not commit Kweb transactions.
-The orchestration worker owns those actions. The old conversation SQLite
-database is an offline archive and has no runtime loader.
+Session History owns no graph policy, HTTP policy, or Kweb transaction commit.
+KennedyServer's orchestration worker owns those actions. KennedyServer depends
+on the typed API and does not depend directly on `kcode-session-log`, open
+session storage paths, or send path-shaped JSON calls into the library. The old
+conversation SQLite database is an offline archive and has no runtime loader.
 
 At the 2026-07-23 cutover, all unfinished legacy sessions were exported one per
 text file, the full legacy conversation database was moved under
@@ -144,4 +157,4 @@ mixed memory-ingress database before deletion.
 
 Tests cover coordinated transcript/control creation, durable commands,
 structured completion receipts, pending objects, control-journal compaction,
-and immutable completed-history behavior.
+immutable completed-history behavior, and the typed non-HTTP boundary.

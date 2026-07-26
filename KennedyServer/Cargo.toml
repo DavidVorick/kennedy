@@ -15,7 +15,7 @@ ed25519-dalek.workspace = true
 flate2.workspace = true
 hex.workspace = true
 kcode-audio-ingress.workspace = true
-kennedy-conversation-history = { path = "../ConversationHistory" }
+kcode-session-history = { path = "../kcode-session-history" }
 kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true
 kcode-doc-extraction.workspace = true
@@ -33,7 +33,6 @@ rustls.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-kcode-session-log.workspace = true
 sha2.workspace = true
 tar.workspace = true
 tokio.workspace = true

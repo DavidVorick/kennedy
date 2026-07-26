@@ -9,7 +9,7 @@ fn main() {
     for path in [
         "../Cargo.toml",
         "../Cargo.lock",
-        "../ConversationHistory/src",
+        "../kcode-session-history/src",
         "../Frontend/public/js",
         "../Frontend/SystemPrompts",
     ] {

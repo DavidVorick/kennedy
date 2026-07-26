@@ -6,7 +6,7 @@ Chatend, ResetContext, context-budget, and Kweb-persistence statements are not
 current requirements.
 
 Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
-`Frontend/Specification.md`, `ConversationHistory/Specification.md`,
+`Frontend/Specification.md`, `kcode-session-history/Specification.md`,
 `chatend-overhaul/chatend-overhaul-clarifications.md`, and
 `chatend-overhaul/chatend-discussion-review.txt`.
 
@@ -30,6 +30,15 @@ Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
   failures, recovery checkpoints, staged Kweb plans, and commit receipts. The
   UI must not substitute source-phase events when ingress event activity is
   absent.
+
+## Session History Component Boundary
+
+- When separating and cleaning up Session History, prefer one small typed
+  library boundary and err toward moving session/history ownership out of
+  KennedyServer. KennedyServer and Session History should not both directly
+  manage `kcode-session-log`; the Session History component should present the
+  session operations Kennedy needs without exposing storage paths or
+  path-shaped JSON service calls.
 
 # Original Project Clarifications
 

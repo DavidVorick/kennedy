@@ -1,4 +1,3 @@
-mod chatend;
 mod context;
 mod http;
 mod prompts;
@@ -19,7 +18,7 @@ pub(crate) struct Config {
     #[cfg(test)]
     pub intelligence_base: String,
     #[cfg(test)]
-    pub conversation_history_base: String,
+    pub session_history_base: String,
     pub telegram_relay_base: String,
     pub telegram_max_media_bytes: usize,
     #[cfg(test)]

@@ -9,13 +9,15 @@ orchestrator; the browser does not run Kennedy.
 - `kcode-kweb-db` 1.0 owns canonical binary Kweb nodes, immutable objects,
   histories, signed transactions, the append-only transaction log, and WAL.
 - `kcode-session-log` 0.2.1 owns one append-only, checksummed transcript per
-  in-progress session and one durable file per pending object.
-- `ConversationHistory` retains its historical crate/package name but
-  implements the Session History domain: lifecycle and commands in a separate
-  control journal, plus durable completion receipts.
-- `KennedyServer` owns Chatend reconstruction, context policy, provider
-  orchestration, Ktools, Kweb graph policy, credential handling, the global
-  Kweb writer lane, HTTP adapters, and static frontend serving.
+  in-progress session and one durable file per pending object. Only
+  `kcode-session-history` depends on it.
+- `kcode-session-history` owns opaque active `Session` handles, Chatend
+  reconstruction, lifecycle and commands in a separate control journal,
+  pending objects, and durable completion receipts. Its standalone private
+  library manifest has no Axum dependency.
+- `KennedyServer` owns context and orchestration policy, provider calls,
+  Ktools, Kweb graph policy, credential handling, the global Kweb writer lane,
+  Session History's HTTP adapter, and static frontend serving.
 - `Frontend/public` is a browser-native observer and command client.
 - `kcode-audio-ingress` is a standalone library that owns durable audio intake,
   automatic transcription state, and completed transcripts. `KennedyServer`

@@ -7,6 +7,7 @@ mod kmap_size;
 mod kweb_writer;
 mod orchestration;
 mod rust_lib_tools;
+mod session_history_http;
 mod telegram_identity;
 
 use std::{
@@ -133,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "kennedy_server=info,kcode_kweb_db=info,kcode_codex_runtime=info,kennedy_conversation_history=info,kcode_tg_kennedy_bot=info,tower_http=info".into()
+                "kennedy_server=info,kcode_kweb_db=info,kcode_codex_runtime=info,kcode_session_history=info,kcode_tg_kennedy_bot=info,tower_http=info".into()
             }),
         )
         .init();
@@ -254,12 +255,11 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.telegram_bootstrap_username,
     )?);
     let history_service =
-        kennedy_conversation_history::open(kennedy_conversation_history::Config {
+        kcode_session_history::SessionHistory::open(kcode_session_history::Config {
             directory: args.session_directory,
             completed_list: args.session_history_file,
-            max_request_bytes: 32 * 1024 * 1024 * 1024,
         })?;
-    let history_router = kennedy_conversation_history::router(history_service.clone());
+    let history_router = session_history_http::router(history_service.clone());
     let intelligence_service =
         intelligence::open(openai_api_key, gemini.clone(), codex_catalog_cache.clone()).await?;
     let intelligence_router = intelligence::router(intelligence_service.clone());
@@ -302,7 +302,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         #[cfg(test)]
         intelligence_base: String::new(),
         #[cfg(test)]
-        conversation_history_base: String::new(),
+        session_history_base: String::new(),
         #[cfg(test)]
         audio_ingress_base: String::new(),
         telegram_web_user_handle: args.telegram_bootstrap_username,
