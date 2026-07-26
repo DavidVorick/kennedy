@@ -2195,6 +2195,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-web-semver-routing"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30c9f224d48dd15088478a2124f984375ef101cda23882542be1a2c8befdb2ae"
+dependencies = [
+ "axum",
+ "semver",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2233,12 +2247,12 @@ dependencies = [
  "kcode-kweb-db",
  "kcode-session-history",
  "kcode-tg-kennedy-bot",
+ "kcode-web-semver-routing",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rpassword",
  "rusqlite",
  "rustls",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

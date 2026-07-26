@@ -20,8 +20,9 @@ orchestrator; the browser does not run Kennedy.
   receipt for every call.
 - `KennedyServer` owns context and orchestration policy, Ktools, Kweb graph
   policy, credential handling, the global Kweb writer lane, Session History's
-  HTTP adapter, the tiny root UI loader page, and immutable Web-publication
-  serving.
+  HTTP adapter, the tiny root UI loader page, and HTTP router assembly.
+- `kcode-web-semver-routing` owns immutable Web-publication selection and the
+  `/lib` and `/module` Axum subrouter that Kennedy mounts.
 - `kcode-kui-loader` and `kcode-kennedy-ui` are managed, published Web
   libraries. The browser application remains an observer and command client.
 - `kcode-audio-ingress` is a standalone library that owns durable audio intake,

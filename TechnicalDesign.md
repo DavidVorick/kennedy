@@ -25,14 +25,16 @@ Kennedy is one Rust server with deliberately separated library domains:
    source snapshots, and backend calls for managed Rust libraries, Web
    libraries, and Rust binaries. `kcode-rust-bins` keeps editable source and
    immutable local executable publications in separate roots.
+   `kcode-web-semver-routing` owns the read-only Axum subrouter for immutable
+   Web-library publications.
 5. `kcode-intelligence-router` owns all Gemini, OpenAI, and Codex model calls,
    exact-model routing, cancellation, error normalization, and per-user
    per-call usage receipts. It is a typed in-process library with no HTTP API.
 6. `kennedy-server` owns context-policy decisions, orchestration, Ktool
    authorization and Chatend integration, graph policy, the one Kweb writer
-   lane, all browser HTTP adapters, roots, the credential vault, and the tiny
-   root UI loader page. It adapts canonical Kweb objects for Rust-binary call
-   inputs and outputs and serves immutable Web publications.
+   lane, browser HTTP assembly and Kennedy-domain adapters, roots, the
+   credential vault, and the tiny root UI loader page. It adapts canonical
+   Kweb objects for Rust-binary call inputs and outputs.
 7. `kcode-audio-ingress` owns durable audio intake, chunking, transcript
    workflow, and automatic whole-job recovery. It delegates every model call
    through typed callbacks backed by `kcode-intelligence-router`. KennedyServer
@@ -183,12 +185,14 @@ object and creates a durable object-bearing Kennedy message box. That message
 is the adapter outbox and may terminally answer a conversational turn without
 assistant prose; no generic result box duplicates it.
 
-Published Web-library trees are immutable. `/lib/<name>/<selector>` resolves
-Cargo-compatible SemVer requirements and redirects to the highest matching
-exact publication's manifest entry; file routes preserve the requested
-relative path. Exact files are immutable-cacheable and floating redirects are
-uncached. `/module/<name>/v<exact>/<file>` remains an alias for the dependency
-URLs used by the library's Chromium checker.
+`kcode-web-semver-routing` owns the read-only Axum subrouter for immutable
+Web-library trees. `/lib/<name>/<selector>` resolves Cargo-compatible SemVer
+requirements and redirects to the highest matching exact publication's
+manifest entry; file routes preserve the requested relative path. Exact files
+are immutable-cacheable and floating redirects are uncached.
+`/module/<name>/v<exact>/<file>` remains an alias for the dependency URLs used
+by the Web-library Chromium checker. Kennedy configures the publication root
+and merges this subrouter into its main listener.
 
 ## 7. Kweb context and writes
 

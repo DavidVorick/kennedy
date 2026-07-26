@@ -23,6 +23,7 @@ kcode-audio-ingress = "=0.3.1"
 kcode-dev-tools = "=0.2.0"
 kcode-session-history = "=0.1.0"
 kcode-intelligence-router = "=0.1.0"
+kcode-web-semver-routing = "0.1.0"
 rand = "0.9"
 rpassword = "7.5.4"
 reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "multipart", "rustls-no-provider"] }
@@ -30,7 +31,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-semver = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "limit", "trace"] }

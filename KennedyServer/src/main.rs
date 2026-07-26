@@ -6,7 +6,6 @@ mod kweb_writer;
 mod orchestration;
 mod session_history_http;
 mod telegram_identity;
-mod web_lib_http;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -233,7 +232,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 .display()
         )
     })?;
-    let web_lib_router = web_lib_http::router(dev_tools.web_publications_root());
+    let web_lib_router = kcode_web_semver_routing::router(dev_tools.web_publications_root());
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
@@ -763,6 +762,82 @@ mod tests {
         let session = include_str!("orchestration/session.rs");
         assert!(worker.contains("Native Rust orchestration worker ready"));
         assert!(session.contains("struct Session"));
+    }
+
+    #[tokio::test]
+    async fn published_router_serves_the_floating_html_ui_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "kennedy-web-routing-integration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for version in ["0.1.0", "0.1.2"] {
+            let version_root = root.join(format!("module/kcode-kui-loader/v{version}"));
+            std::fs::create_dir_all(&version_root).unwrap();
+            std::fs::write(
+                version_root.join("kcode-web.json"),
+                format!(
+                    r#"{{"name":"kcode-kui-loader","version":"{version}","entry":"index.js","tests":"tests.js"}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                version_root.join("index.html"),
+                format!("<!doctype html><title>Kennedy {version}</title>\n"),
+            )
+            .unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router_root = root.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, kcode_web_semver_routing::router(router_root))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let floating = client
+            .get(format!(
+                "http://{address}/lib/kcode-kui-loader/v0.1/index.html"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(floating.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            floating.headers()[reqwest::header::LOCATION],
+            "/lib/kcode-kui-loader/v0.1.2/index.html"
+        );
+        assert_eq!(
+            floating.headers()[reqwest::header::CACHE_CONTROL],
+            "no-store, max-age=0"
+        );
+
+        let exact = client
+            .get(format!(
+                "http://{address}/lib/kcode-kui-loader/v0.1.2/index.html"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exact.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            exact.headers()[reqwest::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            exact.headers()[reqwest::header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(exact.text().await.unwrap().contains("Kennedy 0.1.2"));
+
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
