@@ -6,8 +6,8 @@ use std::{
 };
 
 use super::chatend::{
-    BoxContent, BoxId, BoxOwner, BoxRepresentation, EventId, EventKind, PendingId, Representation,
-    SessionJournal, SessionKind, SessionMetadata, ToolSlotInput,
+    BoxContent, BoxId, BoxOwner, BoxRepresentation, EventId, EventKind, ObjectMetadata, PendingId,
+    Representation, SessionJournal, SessionKind, SessionMetadata, ToolSlotInput,
 };
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -44,6 +44,7 @@ const MIN_NODE_SHORT_NAME_CHARACTERS: usize = 4;
 const MAX_NODE_SHORT_NAME_CHARACTERS: usize = 50;
 const MAX_NODE_SHORT_DESCRIPTION_CHARACTERS: usize = 200;
 const MAX_NODE_LONG_DESCRIPTION_CHARACTERS: usize = 5_000;
+const MAX_MEDIA_ENRICHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const KWEB_TOOL_INSTANCE: &str = "kweb";
 const HISTORY_TOOL_INSTANCE: &str = "history";
 const RUST_LIB_TOOL_INSTANCE: &str = "managed-rust-libraries";
@@ -394,6 +395,105 @@ fn render_web_fetch_result(result: &Value) -> anyhow::Result<String> {
     text.push_str("\n\n");
     text.push_str(content);
     Ok(text)
+}
+
+fn render_media_annotation_result(object_id: &PendingId, result: &Value) -> anyhow::Result<String> {
+    let text = result
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("media annotation response has no text")?;
+    let provider = result
+        .get("provider")
+        .and_then(Value::as_str)
+        .context("media annotation response has no provider")?;
+    let model = result
+        .get("model")
+        .and_then(Value::as_str)
+        .context("media annotation response has no model")?;
+    let file_name = result
+        .get("file_name")
+        .and_then(Value::as_str)
+        .context("media annotation response has no filename")?;
+    let content_type = result
+        .get("content_type")
+        .and_then(Value::as_str)
+        .context("media annotation response has no content type")?;
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("complete");
+    let mut rendered = format!(
+        "Annotation for {object_id}\nFile: {file_name}\nContent type: {content_type}\nProvider: {provider}\nModel: {model}\nStatus: {status}"
+    );
+    if let Some(reason) = result
+        .get("incomplete_reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        rendered.push_str("\nIncomplete reason: ");
+        rendered.push_str(reason);
+    }
+    rendered.push_str("\n\n");
+    rendered.push_str(text);
+    Ok(rendered)
+}
+
+fn render_audio_transcription_result(
+    object_id: &PendingId,
+    file_name: &str,
+    content_type: &str,
+    result: &Value,
+) -> anyhow::Result<String> {
+    let text = result
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("audio transcription response has no text")?;
+    let provider = result
+        .get("provider")
+        .and_then(Value::as_str)
+        .context("audio transcription response has no provider")?;
+    let model = result
+        .get("transcription_model")
+        .and_then(Value::as_str)
+        .context("audio transcription response has no model")?;
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("complete");
+    Ok(format!(
+        "Transcription for {object_id}\nFile: {file_name}\nContent type: {content_type}\nProvider: {provider}\nModel: {model}\nStatus: {status}\n\n{text}"
+    ))
+}
+
+fn render_document_extraction_result(
+    object_id: &PendingId,
+    result: &Value,
+) -> anyhow::Result<String> {
+    let text = result
+        .get("text")
+        .and_then(Value::as_str)
+        .context("document extraction response has no text")?;
+    let file_name = result
+        .get("file_name")
+        .and_then(Value::as_str)
+        .context("document extraction response has no filename")?;
+    let format = result
+        .get("format")
+        .and_then(Value::as_str)
+        .context("document extraction response has no format")?;
+    let characters = result
+        .get("characters")
+        .and_then(Value::as_u64)
+        .context("document extraction response has no character count")?;
+    let truncated = result
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(format!(
+        "Extracted text for {object_id}\nFile: {file_name}\nFormat: {format}\nCharacters: {characters}\nTruncated: {truncated}\n\n{text}"
+    ))
 }
 
 struct HistoryIngressRepresentationPlan {
@@ -872,6 +972,13 @@ impl Session {
                 .get("orchestration")
                 .cloned()
                 .unwrap_or(options.orchestration);
+        }
+        if options.group_context.is_null() {
+            options.group_context = options
+                .channel
+                .get("groupContext")
+                .cloned()
+                .unwrap_or(Value::Null);
         }
         options
             .reference_root_node_ids
@@ -2517,6 +2624,122 @@ impl Session {
                     .await?;
                 render_web_fetch_result(&result)?
             }
+            "StageTelegramGroupMedia" => {
+                validate_arguments(&call.arguments, &["messageId"], &[])?;
+                let message_id = positive_integer(&call.arguments, "messageId")?;
+                let message_id = i64::try_from(message_id)
+                    .context("messageId exceeds Telegram's supported integer range")?;
+                let media_ref = telegram_group_media_reference(&self.group_context, message_id)?;
+                let chat_id = media_ref
+                    .get("chatId")
+                    .and_then(Value::as_i64)
+                    .context("Telegram group media reference has no numeric chatId")?;
+                if let Some((pending_id, metadata, size_bytes)) =
+                    staged_telegram_group_media(&self.journal, chat_id, message_id)
+                {
+                    render_staged_telegram_group_media(
+                        &pending_id,
+                        &metadata,
+                        size_bytes,
+                        message_id,
+                        true,
+                    )
+                } else {
+                    let (bytes, downloaded_media_type) = self
+                        .api
+                        .telegram_bytes(&format!(
+                            "/api/v1/group-messages/{chat_id}/{message_id}/media"
+                        ))
+                        .await?;
+                    anyhow::ensure!(
+                        !bytes.is_empty(),
+                        "Telegram group media message {message_id} is empty"
+                    );
+                    anyhow::ensure!(
+                        bytes.len() as u64 <= MAX_MEDIA_ENRICHMENT_BYTES,
+                        "Telegram group media message {message_id} is {} bytes, over the {}-byte enrichment limit",
+                        bytes.len(),
+                        MAX_MEDIA_ENRICHMENT_BYTES
+                    );
+                    let media_type = normalized_media_type(&downloaded_media_type);
+                    let file_name =
+                        telegram_group_media_filename(&media_ref, &media_type, message_id);
+                    let pending_id = self.journal.stage_object(
+                        now(),
+                        media_type.clone(),
+                        Some(file_name),
+                        media_ref,
+                        &bytes,
+                    )?;
+                    let metadata = self
+                        .journal
+                        .objects()
+                        .get(&pending_id)
+                        .context("newly staged Telegram group media is missing")?
+                        .metadata
+                        .clone();
+                    render_staged_telegram_group_media(
+                        &pending_id,
+                        &metadata,
+                        bytes.len() as u64,
+                        message_id,
+                        false,
+                    )
+                }
+            }
+            "TranscribeAudio" => {
+                validate_arguments(&call.arguments, &["objectId", "prompt"], &[])?;
+                let prompt = bounded_nonempty_string(&call.arguments, "prompt", 4_000)?;
+                let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
+                let (pending_id, metadata, bytes) =
+                    read_pending_object(&mut self.journal, &object_id)?;
+                let media_type = normalized_media_type(&metadata.media_type);
+                validate_transcribable_audio(&media_type)?;
+                let file_name = pending_object_filename(&metadata);
+                let result = self
+                    .api
+                    .transcribe_audio(&prompt, bytes, file_name.clone(), &media_type, operation_id)
+                    .await?;
+                render_audio_transcription_result(&pending_id, &file_name, &media_type, &result)?
+            }
+            "AnnotateMedia" => {
+                validate_arguments(&call.arguments, &["objectId", "provider", "prompt"], &[])?;
+                let provider = nonempty_string(&call.arguments, "provider", 20)?;
+                let prompt = bounded_nonempty_string(&call.arguments, "prompt", 4_000)?;
+                let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
+                let (pending_id, metadata, bytes) =
+                    read_pending_object(&mut self.journal, &object_id)?;
+                let media_type = normalized_media_type(&metadata.media_type);
+                validate_annotation_media(&provider, &media_type)?;
+                let result = self
+                    .api
+                    .annotate_media(
+                        &provider,
+                        &prompt,
+                        bytes,
+                        pending_object_filename(&metadata),
+                        &media_type,
+                        operation_id,
+                    )
+                    .await?;
+                render_media_annotation_result(&pending_id, &result)?
+            }
+            "ExtractDocumentText" => {
+                validate_arguments(&call.arguments, &["objectId"], &[])?;
+                let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
+                let (pending_id, metadata, bytes) =
+                    read_pending_object(&mut self.journal, &object_id)?;
+                validate_extractable_document(&metadata)?;
+                let result = self
+                    .api
+                    .extract_document(
+                        bytes,
+                        pending_object_filename(&metadata),
+                        &normalized_media_type(&metadata.media_type),
+                    )
+                    .await?;
+                render_document_extraction_result(&pending_id, &result)?
+            }
             "ConnectNodes" => self.connect_nodes(&call.arguments)?,
             "ConsolidateFanout" => self.consolidate_fanout(&call.arguments)?,
             "SetFixedConnection" => self.set_fixed_connection(&call.arguments)?,
@@ -3585,6 +3808,220 @@ fn tool_instance(name: &str) -> String {
     format!("{name}:{}", Uuid::new_v4())
 }
 
+fn read_pending_object(
+    journal: &mut SessionJournal,
+    object_id: &str,
+) -> anyhow::Result<(PendingId, ObjectMetadata, Vec<u8>)> {
+    let pending_id = PendingId::parse(object_id.to_owned())?;
+    let location = journal
+        .objects()
+        .get(&pending_id)
+        .cloned()
+        .with_context(|| format!("staged object {pending_id} does not exist in this session"))?;
+    anyhow::ensure!(
+        location.payload_len > 0,
+        "staged object {pending_id} is empty"
+    );
+    anyhow::ensure!(
+        location.payload_len <= MAX_MEDIA_ENRICHMENT_BYTES,
+        "staged object {pending_id} is {} bytes, over the {}-byte enrichment limit",
+        location.payload_len,
+        MAX_MEDIA_ENRICHMENT_BYTES
+    );
+    let bytes = journal.read_object(&pending_id)?;
+    Ok((pending_id, location.metadata, bytes))
+}
+
+fn pending_object_filename(metadata: &ObjectMetadata) -> String {
+    metadata
+        .file_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("object-{}", metadata.pending_id.number()))
+}
+
+fn telegram_group_media_reference(group_context: &Value, message_id: i64) -> anyhow::Result<Value> {
+    let chat_id = group_context
+        .get("chatId")
+        .and_then(Value::as_i64)
+        .context("this session has no numeric Telegram group chatId")?;
+    let message = group_context
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|message| message.get("messageId").and_then(Value::as_i64) == Some(message_id))
+        .with_context(|| {
+            format!(
+                "Telegram message {message_id} is not present in this session's current group context"
+            )
+        })?;
+    let media_ref = message
+        .get("mediaRef")
+        .filter(|value| value.is_object())
+        .with_context(|| {
+            format!(
+                "Telegram message {message_id} has no retained media in this session's current group context"
+            )
+        })?;
+    anyhow::ensure!(
+        media_ref.get("source").and_then(Value::as_str) == Some("telegram-group"),
+        "Telegram message {message_id} has an invalid media source"
+    );
+    anyhow::ensure!(
+        media_ref.get("chatId").and_then(Value::as_i64) == Some(chat_id),
+        "Telegram message {message_id} belongs to a different group"
+    );
+    anyhow::ensure!(
+        media_ref.get("messageId").and_then(Value::as_i64) == Some(message_id),
+        "Telegram message {message_id} has inconsistent media identity"
+    );
+    Ok(media_ref.clone())
+}
+
+fn staged_telegram_group_media(
+    journal: &SessionJournal,
+    chat_id: i64,
+    message_id: i64,
+) -> Option<(PendingId, ObjectMetadata, u64)> {
+    journal.objects().iter().find_map(|(pending_id, location)| {
+        let transport = &location.metadata.transport;
+        (transport.get("source").and_then(Value::as_str) == Some("telegram-group")
+            && transport.get("chatId").and_then(Value::as_i64) == Some(chat_id)
+            && transport.get("messageId").and_then(Value::as_i64) == Some(message_id))
+        .then(|| {
+            (
+                pending_id.clone(),
+                location.metadata.clone(),
+                location.payload_len,
+            )
+        })
+    })
+}
+
+fn telegram_group_media_filename(media_ref: &Value, media_type: &str, message_id: i64) -> String {
+    if let Some(file_name) = media_ref
+        .get("fileName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return file_name.to_owned();
+    }
+    let kind = media_ref
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("media");
+    let extension = match media_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "audio/ogg" | "audio/opus" | "application/ogg" => "ogg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "video/mp4" => "mp4",
+        "audio/webm" | "video/webm" => "webm",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    };
+    format!("telegram-group-{kind}-{message_id}.{extension}")
+}
+
+fn render_staged_telegram_group_media(
+    pending_id: &PendingId,
+    metadata: &ObjectMetadata,
+    size_bytes: u64,
+    message_id: i64,
+    reused: bool,
+) -> String {
+    format!(
+        "{} Telegram group media\nMessage ID: {message_id}\nObject: {pending_id}\nKind: {}\nFile: {}\nContent type: {}\nSize: {size_bytes} bytes\n\nUse Object {pending_id} with AnnotateMedia, TranscribeAudio, or ExtractDocumentText as appropriate.",
+        if reused {
+            "Reused already-staged"
+        } else {
+            "Staged"
+        },
+        metadata
+            .transport
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("media"),
+        pending_object_filename(metadata),
+        normalized_media_type(&metadata.media_type),
+    )
+}
+
+fn normalized_media_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn validate_annotation_media(provider: &str, media_type: &str) -> anyhow::Result<()> {
+    match provider {
+        "openai" | "codex" => anyhow::ensure!(
+            media_type.starts_with("image/"),
+            "{provider} annotations accept images only"
+        ),
+        "gemini" => anyhow::ensure!(
+            media_type.starts_with("image/")
+                || media_type.starts_with("audio/")
+                || media_type.starts_with("video/")
+                || media_type == "application/ogg",
+            "gemini annotations accept images, audio, or video only"
+        ),
+        _ => anyhow::bail!("provider must be exactly openai, codex, or gemini"),
+    }
+    Ok(())
+}
+
+fn validate_transcribable_audio(media_type: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(
+            media_type,
+            "audio/flac"
+                | "audio/x-flac"
+                | "audio/m4a"
+                | "audio/mp3"
+                | "audio/mp4"
+                | "audio/mpeg"
+                | "audio/mpga"
+                | "audio/ogg"
+                | "audio/opus"
+                | "audio/wav"
+                | "audio/x-wav"
+                | "audio/webm"
+                | "application/ogg"
+        ),
+        "TranscribeAudio accepts a supported FLAC, MP3, MP4, M4A, OGG, WAV, or WebM audio object only"
+    );
+    Ok(())
+}
+
+fn validate_extractable_document(metadata: &ObjectMetadata) -> anyhow::Result<()> {
+    let media_type = normalized_media_type(&metadata.media_type);
+    let extension = metadata
+        .file_name
+        .as_deref()
+        .and_then(|value| value.rsplit_once('.').map(|(_, extension)| extension))
+        .map(str::to_ascii_lowercase);
+    anyhow::ensure!(
+        matches!(
+            media_type.as_str(),
+            "application/pdf"
+                | "application/msword"
+                | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ) || matches!(extension.as_deref(), Some("pdf" | "doc" | "docx")),
+        "ExtractDocumentText accepts PDF, DOC, or DOCX objects only"
+    );
+    Ok(())
+}
+
 fn decode_data_url(value: &str) -> anyhow::Result<(String, Vec<u8>)> {
     let value = value
         .strip_prefix("data:")
@@ -3787,6 +4224,15 @@ fn nonempty_string(value: &Value, key: &str, max: usize) -> anyhow::Result<Strin
     Ok(trimmed.into())
 }
 
+fn bounded_nonempty_string(value: &Value, key: &str, max: usize) -> anyhow::Result<String> {
+    let value = string_value(value, key)?;
+    anyhow::ensure!(
+        !value.trim().is_empty() && value.chars().count() <= max,
+        "{key} must contain between 1 and {max} characters"
+    );
+    Ok(value)
+}
+
 fn codex_reasoning_effort(value: &str) -> anyhow::Result<kcode_codex_runtime_v2::ReasoningEffort> {
     use kcode_codex_runtime_v2::ReasoningEffort;
     Ok(match value {
@@ -3836,7 +4282,10 @@ fn free_time_opening(value: &Value) -> String {
 }
 
 fn format_telegram_group_context(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".into())
+    let context = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".into());
+    format!(
+        "{context}\n\nRetained Telegram group media access: any message above with a mediaRef can be staged on demand with StageTelegramGroupMedia using exactly {{\"messageId\":MESSAGE_ID}}. The message does not need to mention or reply to Kennedy. The tool returns a pending:N object for the ordinary media enrichment tools."
+    )
 }
 
 fn controller_box_name(mode: &AgentMode) -> &'static str {
@@ -3896,6 +4345,194 @@ mod tests {
             "pending:47".to_owned()
         );
         assert!(parse_resource_id("km:47").is_err());
+    }
+
+    #[test]
+    fn media_enrichment_reads_exact_staged_bytes_and_validates_provider_matrix() {
+        let label = format!(
+            "media-enrichment-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (path, mut journal) = test_journal(&label, 10_000);
+        let expected = b"\x89PNG\r\nexact-original".to_vec();
+        let staged = journal
+            .stage_object(
+                "t1",
+                "image/png",
+                Some("diagram.png".into()),
+                json!({"source":"test"}),
+                &expected,
+            )
+            .unwrap();
+        let (object_id, metadata, bytes) =
+            read_pending_object(&mut journal, &staged.to_string()).unwrap();
+        assert_eq!(object_id, staged);
+        assert_eq!(metadata.file_name.as_deref(), Some("diagram.png"));
+        assert_eq!(bytes, expected);
+        assert!(validate_annotation_media("openai", "image/png").is_ok());
+        assert!(validate_annotation_media("codex", "image/webp").is_ok());
+        assert!(validate_annotation_media("gemini", "audio/mpeg").is_ok());
+        assert!(validate_annotation_media("gemini", "video/mp4").is_ok());
+        assert!(validate_annotation_media("openai", "audio/mpeg").is_err());
+        assert!(validate_annotation_media("codex", "video/mp4").is_err());
+        assert!(validate_transcribable_audio("audio/ogg").is_ok());
+        assert!(validate_transcribable_audio("audio/webm").is_ok());
+        assert!(validate_transcribable_audio("image/png").is_err());
+        assert!(validate_transcribable_audio("audio/aiff").is_err());
+        assert_eq!(
+            bounded_nonempty_string(&json!({"prompt":"  inspect exactly\n"}), "prompt", 4_000)
+                .unwrap(),
+            "  inspect exactly\n"
+        );
+        std::fs::remove_file(path.with_file_name(format!("{label}-0.pending-object"))).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn telegram_group_media_staging_is_context_bound_and_idempotently_discoverable() {
+        let context = json!({
+            "chatId":-100123,
+            "messages":[
+                {
+                    "messageId":77,
+                    "kind":"photo",
+                    "mediaRef":{
+                        "source":"telegram-group",
+                        "chatId":-100123,
+                        "messageId":77,
+                        "kind":"photo",
+                        "fileName":"thread-photo.jpg",
+                        "mimeType":"image/jpeg"
+                    }
+                },
+                {"messageId":78,"kind":"text","text":"No media"}
+            ]
+        });
+        let media_ref = telegram_group_media_reference(&context, 77).unwrap();
+        assert_eq!(media_ref["kind"], "photo");
+        assert!(telegram_group_media_reference(&context, 78).is_err());
+        assert!(telegram_group_media_reference(&context, 79).is_err());
+        let mut wrong_group = context.clone();
+        wrong_group["messages"][0]["mediaRef"]["chatId"] = json!(-999);
+        assert!(telegram_group_media_reference(&wrong_group, 77).is_err());
+        assert!(
+            format_telegram_group_context(&context)
+                .contains("The message does not need to mention or reply to Kennedy.")
+        );
+
+        let label = format!(
+            "telegram-group-media-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (path, mut journal) = test_journal(&label, 10_000);
+        let pending_id = journal
+            .stage_object(
+                "t1",
+                "image/jpeg",
+                Some("thread-photo.jpg".into()),
+                media_ref,
+                b"exact-thread-photo",
+            )
+            .unwrap();
+        let (found, metadata, size_bytes) =
+            staged_telegram_group_media(&journal, -100123, 77).unwrap();
+        assert_eq!(found, pending_id);
+        assert_eq!(size_bytes, 18);
+        assert_eq!(
+            telegram_group_media_filename(&metadata.transport, "image/jpeg", 77),
+            "thread-photo.jpg"
+        );
+        let rendered = render_staged_telegram_group_media(&found, &metadata, size_bytes, 77, true);
+        assert!(rendered.contains("Reused already-staged Telegram group media"));
+        assert!(rendered.contains(&format!("Object: {pending_id}")));
+        assert!(staged_telegram_group_media(&journal, -100123, 78).is_none());
+
+        std::fs::remove_file(path.with_file_name(format!("{label}-0.pending-object"))).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn document_enrichment_accepts_only_pdf_doc_and_docx() {
+        let metadata = |media_type: &str, file_name: &str| ObjectMetadata {
+            pending_id: PendingId::parse("pending:1").unwrap(),
+            event_id: EventId(1),
+            recorded_at: "t1".into(),
+            media_type: media_type.into(),
+            file_name: Some(file_name.into()),
+            transport: Value::Null,
+        };
+        assert!(validate_extractable_document(&metadata("application/pdf", "file.bin")).is_ok());
+        assert!(
+            validate_extractable_document(&metadata("application/octet-stream", "legacy.doc"))
+                .is_ok()
+        );
+        assert!(
+            validate_extractable_document(&metadata(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "file"
+            ))
+            .is_ok()
+        );
+        assert!(validate_extractable_document(&metadata("text/plain", "notes.txt")).is_err());
+    }
+
+    #[test]
+    fn media_and_document_tool_results_are_plain_provenanced_text() {
+        let pending = PendingId::parse("pending:47").unwrap();
+        let annotation = render_media_annotation_result(
+            &pending,
+            &json!({
+                "status":"complete",
+                "provider":"openai",
+                "model":"gpt-5.6",
+                "file_name":"scene.png",
+                "content_type":"image/png",
+                "text":"A sign reads \"Kennedy\"."
+            }),
+        )
+        .unwrap();
+        assert!(annotation.contains("Annotation for pending:47"));
+        assert!(annotation.contains("Provider: openai"));
+        assert!(annotation.ends_with("A sign reads \"Kennedy\"."));
+
+        let transcription = render_audio_transcription_result(
+            &pending,
+            "voice-note.ogg",
+            "audio/ogg",
+            &json!({
+                "status":"complete",
+                "provider":"openai",
+                "transcription_model":"gpt-4o-transcribe",
+                "text":"The exact spoken words."
+            }),
+        )
+        .unwrap();
+        assert!(transcription.contains("Transcription for pending:47"));
+        assert!(transcription.contains("Provider: openai"));
+        assert!(transcription.contains("Model: gpt-4o-transcribe"));
+        assert!(transcription.ends_with("The exact spoken words."));
+
+        let extraction = render_document_extraction_result(
+            &pending,
+            &json!({
+                "file_name":"brief.doc",
+                "format":"doc",
+                "text":"Original body",
+                "characters":13,
+                "truncated":false
+            }),
+        )
+        .unwrap();
+        assert!(extraction.contains("Format: doc"));
+        assert!(extraction.ends_with("Original body"));
     }
 
     #[test]

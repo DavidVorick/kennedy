@@ -275,8 +275,12 @@ pending object once into its session sidecar and again into Kweb at commit.
 Streaming and zero-copy handoff are future work.
 
 Accepted browser and Telegram bytes first enter that pending sidecar. The
-owning user message box references `pending:N`; extraction or transcription is
-supplementary and never replaces the original object. At history-ingress
+owning user message box references `pending:N`; extraction, transcription, or
+annotation is supplementary and never replaces the original object. Browser
+recordings and current Telegram voice messages are not eagerly transcribed.
+The transport stages the original audio and leaves both tool choice and prompt
+to Kennedy. Older Telegram group voice context is likewise not silently
+pre-transcribed. At history-ingress
 completion, Kmap wraps each file in a versioned binary envelope containing
 filename, MIME type, source transport kind, and exact bytes. It creates all
 objects first, then replaces exact known pending-object tokens in the immutable
@@ -291,6 +295,29 @@ media through the additive relay `/media` multipart route and uses the
 existing `/file` route only for deliberate generic-document delivery. Native
 delivery failures remain native failures rather than triggering a semantic
 fallback. The final response part alone completes the relay event.
+
+Three model-callable read tools consume only active-session pending objects.
+An additional `StageTelegramGroupMedia(messageId)` read tool resolves retained
+media metadata from the session's current bounded Telegram group context,
+validates the exact group/message identity, fetches the already-local relay
+bytes, enforces the 20 MiB limit, and stages them idempotently. This keeps raw
+bytes out of model context and avoids eagerly duplicating every group
+attachment into every active participant session. A group message need not
+invoke Kennedy for its retained media to be eligible; invocation controls turn
+creation only.
+`TranscribeAudio` checks the 20 MiB limit and supported audio MIME types, then
+sends the exact original audio and Kennedy's required 4,000-character-bounded
+prompt to OpenAI GPT-4o Transcribe. The call joins the active parent
+operation's cancellation scope.
+`AnnotateMedia` reads the exact sidecar bytes after checking the 20 MiB
+enrichment limit, media/provider matrix, and Kennedy-authored 4,000-character
+prompt. Intelligence maps the request to OpenAI single-image analysis, a
+fresh ephemeral tool-free Codex image turn, or Gemini Pro multimodal
+inference. All calls join the active parent operation's cancellation scope.
+Codex's media-bearing provider-input event is consumed without journaling it.
+`ExtractDocumentText` passes PDF, DOC, or DOCX bytes to the in-memory document
+extractor. All paths render provenance plus returned text as an ordinary
+Ktool result, leaving the original pending object unchanged.
 
 Internal Kweb disk encodings are canonical binary and checksummed. Session-log
 headers and events use checksummed frames; pending objects have a fixed header,

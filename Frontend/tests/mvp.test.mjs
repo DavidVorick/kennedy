@@ -510,6 +510,34 @@ test("production frontend is server-driven and uses the consolidated origin", as
   assert.doesNotMatch(app, /legacy_orchestration/);
 });
 
+test("voice recordings are staged for Kennedy without browser transcription", async () => {
+  const [app, api, render, worker] = await Promise.all([
+    readFile(new URL("../public/js/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/api.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/js/render.js", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
+  ]);
+  assert.match(app, /Saving original voice note/);
+  assert.match(app, /conversationHistory\.stageObject\(id, blob, fileName\)/);
+  assert.doesNotMatch(app, /intelligence\.transcribe/);
+  assert.doesNotMatch(api, /audio\/transcriptions/);
+  assert.match(render, /Voice note · original audio/);
+  assert.doesNotMatch(worker, /\.transcribe\(/);
+  assert.match(worker, /Telegram voice note attached; it was not automatically transcribed/);
+});
+
+test("Telegram group media remains model-addressable without eager byte embedding", async () => {
+  const [worker, session, tools] = await Promise.all([
+    readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
+    readFile(new URL("../../KennedyServer/src/orchestration/session.rs", import.meta.url), "utf8"),
+    readFile(new URL("../SystemPrompts/ReadTools.txt", import.meta.url), "utf8"),
+  ]);
+  assert.match(worker, /message\["mediaRef"\]/);
+  assert.match(session, /"StageTelegramGroupMedia"/);
+  assert.match(session, /telegram_group_media_reference\(&self\.group_context, message_id\)/);
+  assert.match(tools, /Media messages do not need to mention Kennedy or reply to her/);
+});
+
 test("codex-safe preserves its documented workspace and catalog boundaries", async () => {
   const [launcher, readme] = await Promise.all([
     readFile(new URL("../../scripts/codex-safe", import.meta.url), "utf8"),

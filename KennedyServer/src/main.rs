@@ -211,18 +211,30 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         tracing::warn!(path=%vault_path.display(), "Kennedy credential vault does not exist; secret-backed features are unavailable");
         CredentialVault::empty()
     };
-    let transcription_api_key =
-        resolve_optional_secret(&vault, OPENAI_API_KEY_SECRET, "OpenAI transcription")?;
+    let openai_api_key = resolve_optional_secret(
+        &vault,
+        OPENAI_API_KEY_SECRET,
+        "OpenAI transcription and media annotation",
+    )?;
     let gemini_api_key = resolve_optional_secret(
         &vault,
         GEMINI_API_KEY_SECRET,
-        "Gemini search and audio transcription",
+        "Gemini search, media annotation, and audio transcription",
     )?;
     let gemini = gemini_api_key
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(kcode_gemini_api::Gemini::open)
         .transpose()
         .context("opening shared Gemini client")?;
+    // AudioIngress still publishes a Gemini 0.1 constructor. Keep its
+    // compatibility client isolated until that library adopts Gemini 0.2.
+    let audio_gemini = gemini_api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(kcode_gemini_api_legacy::Gemini::open)
+        .transpose()
+        .context("opening AudioIngress Gemini compatibility client")?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?
             .map(kcode_tg_kennedy_bot::BotToken::new)
@@ -248,12 +260,8 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             max_request_bytes: 32 * 1024 * 1024 * 1024,
         })?;
     let history_router = kennedy_conversation_history::router(history_service.clone());
-    let intelligence_service = intelligence::open(
-        transcription_api_key,
-        gemini.clone(),
-        codex_catalog_cache.clone(),
-    )
-    .await?;
+    let intelligence_service =
+        intelligence::open(openai_api_key, gemini.clone(), codex_catalog_cache.clone()).await?;
     let intelligence_router = intelligence::router(intelligence_service.clone());
     let telegram = kcode_tg_kennedy_bot::Config {
         bind: args.telegram_bind,
@@ -263,7 +271,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         identity_sink: telegram_identity.clone(),
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
-    let gemini = gemini.context(
+    let audio_gemini = audio_gemini.context(
         "AudioIngress requires the gemini-api-key credential; configure it before starting Kennedy",
     )?;
     let mut config =
@@ -272,7 +280,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let codex = kcode_codex_runtime::Codex::open(config, codex_catalog_cache)
         .await
         .context("opening Codex audio-reconciliation runtime")?;
-    let audio_transcriber = kcode_audio_ingress::AudioTranscriber::new(gemini, codex);
+    let audio_transcriber = kcode_audio_ingress::AudioTranscriber::new(audio_gemini, codex);
     let audio_state_database = args.audio_ingress_directory.join("state.sqlite3");
     migrate_audio_ingress_database(&args.legacy_audio_ingress_database, &audio_state_database)?;
     let audio =

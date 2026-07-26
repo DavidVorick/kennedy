@@ -10,6 +10,9 @@ pub(crate) const CODEX_PROVIDER_KIND: &str = "codex";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const GENERATION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
 pub(crate) const GENERATION_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const MEDIA_ANNOTATION_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const MAX_MEDIA_ANNOTATION_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_MEDIA_ANNOTATION_PROMPT_CHARACTERS: usize = 4_000;
 pub(crate) const KENNEDY_CODEX_BASE_INSTRUCTION: &str = concat!(
     "Use call_ktool for Kennedy application tools. ",
     "Each call invokes one Ktool."

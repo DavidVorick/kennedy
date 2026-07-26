@@ -21,10 +21,15 @@ use kcode_codex_runtime::{
 };
 use kcode_doc_extraction::{DocumentExtractor, DocumentInput, ErrorKind as DocumentErrorKind};
 use kcode_gemini_api::{
-    Error as GeminiError, Gemini, GroundedSearchRequest, TokenUsage as GeminiUsage,
+    CompletionStatus as GeminiCompletionStatus, Error as GeminiError, Gemini,
+    GroundedSearchRequest, MediaInput as GeminiMediaInput, MultimodalRequest,
+    TokenUsage as GeminiUsage,
 };
 use kcode_openai_api::{
-    AudioInput, Error as OpenAiError, OpenAi, TranscriptionRequest, TranscriptionUsage,
+    AudioInput, Error as OpenAiError, ImageAnalysisRequest,
+    ImageAnalysisStatus as OpenAiImageStatus, ImageAnalysisUsage as OpenAiImageUsage,
+    ImageInput as OpenAiImageInput, ImageMediaType as OpenAiImageMediaType, OpenAi,
+    TranscriptionRequest, TranscriptionUsage,
 };
 use kcode_web_fetch::{ErrorKind as WebFetchErrorKind, WebFetcher};
 use serde::{Deserialize, Serialize};
@@ -436,6 +441,19 @@ struct DocumentExtractionResponse {
 }
 
 #[derive(Serialize)]
+struct MediaAnnotationResponse {
+    status: String,
+    provider: String,
+    model: String,
+    file_name: String,
+    content_type: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete_reason: Option<String>,
+    usage: Option<Usage>,
+}
+
+#[derive(Serialize)]
 struct NormalizedResponse {
     status: String,
     message: Message,
@@ -480,6 +498,36 @@ impl From<GeminiUsage> for Usage {
             cached_tokens: value.cached_tokens,
             cache_write_tokens: 0,
             reasoning_tokens: value.thought_tokens,
+            cumulative: false,
+            last_input_tokens: None,
+            last_output_tokens: None,
+        }
+    }
+}
+
+impl From<kcode_codex_runtime_v2::TokenUsage> for Usage {
+    fn from(value: kcode_codex_runtime_v2::TokenUsage) -> Self {
+        Self {
+            input_tokens: value.input_tokens,
+            output_tokens: value.output_tokens,
+            cached_tokens: value.cached_input_tokens,
+            cache_write_tokens: 0,
+            reasoning_tokens: value.reasoning_output_tokens,
+            cumulative: true,
+            last_input_tokens: value.last_input_tokens,
+            last_output_tokens: value.last_output_tokens,
+        }
+    }
+}
+
+impl From<OpenAiImageUsage> for Usage {
+    fn from(value: OpenAiImageUsage) -> Self {
+        Self {
+            input_tokens: value.input_tokens,
+            output_tokens: value.output_tokens,
+            cached_tokens: value.cached_input_tokens.unwrap_or(0),
+            cache_write_tokens: value.cache_write_input_tokens.unwrap_or(0),
+            reasoning_tokens: value.reasoning_output_tokens.unwrap_or(0),
             cumulative: false,
             last_input_tokens: None,
             last_output_tokens: None,
@@ -547,6 +595,7 @@ pub(crate) fn router(state: Service) -> Router {
         .route("/health", get(health))
         .route("/api/v1/providers", get(list_providers))
         .route("/api/v1/audio/transcriptions", post(transcribe_audio))
+        .route("/api/v1/media/annotations", post(annotate_media))
         .route("/api/v1/documents/extract", post(extract_document))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
@@ -667,23 +716,50 @@ impl Service {
             .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
     }
 
-    pub(crate) async fn transcribe_bytes(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn transcribe_audio_with_prompt_bytes(
         &self,
-        provider: &str,
-        model: &str,
+        prompt: &str,
         bytes: Vec<u8>,
         filename: String,
         mime: &str,
+        parent_operation_id: Option<Uuid>,
     ) -> Result<Value, ApiError> {
         let request_id = Uuid::new_v4();
         let response = self
-            .transcribe_input(
-                Some(provider),
-                Some(model),
+            .transcribe_audio_with_prompt_input(
+                prompt,
                 bytes,
                 safe_audio_filename(Some(&filename), mime),
                 mime.to_ascii_lowercase(),
                 request_id,
+                parent_operation_id,
+            )
+            .await?;
+        serde_json::to_value(response)
+            .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn annotate_media_bytes(
+        &self,
+        provider: &str,
+        prompt: &str,
+        bytes: Vec<u8>,
+        filename: String,
+        mime: &str,
+        parent_operation_id: Option<Uuid>,
+    ) -> Result<Value, ApiError> {
+        let request_id = Uuid::new_v4();
+        let response = self
+            .annotate_media_input(
+                provider,
+                prompt,
+                bytes,
+                filename,
+                mime,
+                request_id,
+                parent_operation_id,
             )
             .await?;
         serde_json::to_value(response)
@@ -770,6 +846,282 @@ impl Service {
             text: transcription.text,
             usage: transcription.usage.map(transcription_usage_json),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transcribe_audio_with_prompt_input(
+        &self,
+        prompt: &str,
+        bytes: Vec<u8>,
+        file_name: String,
+        content_type: String,
+        request_id: Uuid,
+        parent_operation_id: Option<Uuid>,
+    ) -> Result<TranscriptionResponse, ApiError> {
+        if prompt.trim().is_empty()
+            || prompt.chars().count() > MAX_MEDIA_ANNOTATION_PROMPT_CHARACTERS
+        {
+            return Err(ApiError::invalid(format!(
+                "prompt must contain between 1 and {MAX_MEDIA_ANNOTATION_PROMPT_CHARACTERS} characters."
+            ))
+            .with_request_id(request_id));
+        }
+        let openai = self.openai.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transcription_unavailable",
+                "OpenAI audio transcription is not configured.",
+            )
+            .with_request_id(request_id)
+        })?;
+        let input = AudioInput::new(file_name, content_type, bytes)
+            .map_err(|error| openai_error(error, request_id))?;
+        let mut request = TranscriptionRequest::new(input);
+        request.prompt = Some(prompt.to_owned());
+        let mut operation = self
+            .active_operations
+            .register_request(request_id, parent_operation_id)?;
+        let started = Instant::now();
+        let transcription = tokio::select! {
+            _ = operation.cancelled() => Err(ApiError::cancelled(request_id)),
+            result = tokio::time::timeout(
+                MEDIA_ANNOTATION_TIMEOUT,
+                openai.transcribe(request),
+            ) => result
+                .map_err(|_| ApiError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "provider_timeout",
+                    "OpenAI audio transcription timed out.",
+                ).with_request_id(request_id))?
+                .map_err(|error| openai_error(error, request_id)),
+        }?;
+        tracing::info!(
+            %request_id,
+            action = "transcribe",
+            provider = "openai",
+            model = TRANSCRIPTION_MODEL,
+            duration_ms = started.elapsed().as_millis(),
+            "LLM call"
+        );
+        Ok(TranscriptionResponse {
+            status: "complete".into(),
+            provider: "openai".into(),
+            input_model: TRANSCRIPTION_MODEL.into(),
+            transcription_model: TRANSCRIPTION_MODEL.into(),
+            text: transcription.text,
+            usage: transcription.usage.map(transcription_usage_json),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn annotate_media_input(
+        &self,
+        provider: &str,
+        prompt: &str,
+        bytes: Vec<u8>,
+        file_name: String,
+        content_type: &str,
+        request_id: Uuid,
+        parent_operation_id: Option<Uuid>,
+    ) -> Result<MediaAnnotationResponse, ApiError> {
+        if prompt.trim().is_empty()
+            || prompt.chars().count() > MAX_MEDIA_ANNOTATION_PROMPT_CHARACTERS
+        {
+            return Err(ApiError::invalid(format!(
+                "prompt must contain between 1 and {MAX_MEDIA_ANNOTATION_PROMPT_CHARACTERS} characters."
+            ))
+            .with_request_id(request_id));
+        }
+        if bytes.is_empty() || bytes.len() > MAX_MEDIA_ANNOTATION_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "media_too_large",
+                format!("media must contain between 1 and {MAX_MEDIA_ANNOTATION_BYTES} bytes."),
+            )
+            .with_request_id(request_id));
+        }
+        let content_type = normalized_content_type(content_type);
+        let mut operation = self
+            .active_operations
+            .register_request(request_id, parent_operation_id)?;
+        let started = Instant::now();
+        let result = match provider {
+            "openai" => {
+                let openai = self.openai.as_ref().ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "provider_not_configured",
+                        "OpenAI media annotation is not configured.",
+                    )
+                    .with_request_id(request_id)
+                })?;
+                let media_type = openai_image_media_type(&content_type, request_id)?;
+                let image = OpenAiImageInput::new(media_type, bytes)
+                    .map_err(|error| openai_image_error(error, request_id))?;
+                let analysis = tokio::select! {
+                    _ = operation.cancelled() => Err(ApiError::cancelled(request_id)),
+                    result = tokio::time::timeout(
+                        MEDIA_ANNOTATION_TIMEOUT,
+                        openai.analyze_image(ImageAnalysisRequest::new(image, prompt)),
+                    ) => result
+                        .map_err(|_| ApiError::new(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "provider_timeout",
+                            "OpenAI media annotation timed out.",
+                        ).with_request_id(request_id))?
+                        .map_err(|error| openai_image_error(error, request_id)),
+                }?;
+                let (status, incomplete_reason) = match analysis.status {
+                    OpenAiImageStatus::Completed => ("complete", None),
+                    OpenAiImageStatus::Incomplete { reason } => ("incomplete", reason),
+                };
+                MediaAnnotationResponse {
+                    status: status.into(),
+                    provider: "openai".into(),
+                    model: analysis.model,
+                    file_name,
+                    content_type,
+                    text: analysis.text,
+                    incomplete_reason,
+                    usage: analysis.usage.map(Usage::from),
+                }
+            }
+            "gemini" => {
+                let gemini = self.gemini.as_ref().ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "provider_not_configured",
+                        "Gemini media annotation is not configured.",
+                    )
+                    .with_request_id(request_id)
+                })?;
+                let media = gemini_media_input(&content_type, bytes)
+                    .map_err(|error| gemini_error(error, request_id))?;
+                let inference = tokio::select! {
+                    _ = operation.cancelled() => Err(ApiError::cancelled(request_id)),
+                    result = tokio::time::timeout(
+                        MEDIA_ANNOTATION_TIMEOUT,
+                        gemini.infer_pro_multimodal(MultimodalRequest::new(prompt, vec![media])),
+                    ) => result
+                        .map_err(|_| ApiError::new(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "provider_timeout",
+                            "Gemini media annotation timed out.",
+                        ).with_request_id(request_id))?
+                        .map_err(|error| gemini_error(error, request_id)),
+                }?;
+                let text = inference
+                    .text
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            StatusCode::BAD_GATEWAY,
+                            "empty_annotation",
+                            "Gemini returned no annotation text.",
+                        )
+                        .with_request_id(request_id)
+                    })?;
+                MediaAnnotationResponse {
+                    status: match inference.status {
+                        GeminiCompletionStatus::Completed => "complete",
+                        GeminiCompletionStatus::Incomplete => "incomplete",
+                    }
+                    .into(),
+                    provider: "gemini".into(),
+                    model: inference.model,
+                    file_name,
+                    content_type,
+                    text,
+                    incomplete_reason: None,
+                    usage: Some(Usage::from(inference.usage)),
+                }
+            }
+            "codex" => {
+                let media_type = codex_image_media_type(&content_type, request_id)?;
+                let image = kcode_codex_runtime_v2::ImageInput::new(media_type, bytes)
+                    .map_err(|error| codex_v2_error(error, request_id))?;
+                let request = kcode_codex_runtime_v2::ImageTurnRequest::new(
+                    prompt,
+                    DEFAULT_MODEL,
+                    vec![image],
+                );
+                let mut turn = self
+                    .agent
+                    .start_image_turn(request)
+                    .await
+                    .map_err(|error| codex_v2_error(error, request_id))?;
+                let completed = loop {
+                    let event = tokio::select! {
+                        _ = operation.cancelled() => {
+                            turn.cancel();
+                            return Err(ApiError::cancelled(request_id));
+                        }
+                        event = turn.next_event() => event,
+                    };
+                    match event {
+                        Some(Ok(kcode_codex_runtime_v2::AgentEvent::ProviderInput(_))) => {
+                            // Image turns contain base64 provider input. It is intentionally
+                            // neither logged nor copied into the Kennedy session.
+                        }
+                        Some(Ok(kcode_codex_runtime_v2::AgentEvent::ToolCall(_))) => {
+                            turn.cancel();
+                            return Err(ApiError::new(
+                                StatusCode::BAD_GATEWAY,
+                                "provider_error",
+                                "A tool-free Codex image turn requested a tool.",
+                            )
+                            .with_request_id(request_id));
+                        }
+                        Some(Ok(kcode_codex_runtime_v2::AgentEvent::Completed(completed))) => {
+                            break completed;
+                        }
+                        Some(Err(error)) => return Err(codex_v2_error(error, request_id)),
+                        None => {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_GATEWAY,
+                                "empty_annotation",
+                                "Codex ended without annotation text.",
+                            )
+                            .with_request_id(request_id));
+                        }
+                    }
+                };
+                if completed.answer.trim().is_empty() {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "empty_annotation",
+                        "Codex returned no annotation text.",
+                    )
+                    .with_request_id(request_id));
+                }
+                MediaAnnotationResponse {
+                    status: "complete".into(),
+                    provider: "codex".into(),
+                    model: DEFAULT_MODEL.into(),
+                    file_name,
+                    content_type,
+                    text: completed.answer,
+                    incomplete_reason: None,
+                    usage: completed.usage.map(Usage::from),
+                }
+            }
+            _ => {
+                return Err(ApiError::invalid(
+                    "provider must be exactly openai, codex, or gemini.",
+                )
+                .with_request_id(request_id));
+            }
+        };
+        tracing::info!(
+            %request_id,
+            action = "annotate_media",
+            provider = %result.provider,
+            model = %result.model,
+            content_type = %result.content_type,
+            duration_ms = started.elapsed().as_millis(),
+            "LLM call"
+        );
+        Ok(result)
     }
 }
 
@@ -1169,21 +1521,33 @@ async fn transcribe_audio(
     let request_id = Uuid::new_v4();
     let mut requested_provider = None;
     let mut requested_model = None;
+    let mut prompt = None;
+    let mut parent_operation_id = None;
     let mut audio = None;
     while let Some(field) = multipart.next_field().await.map_err(|_| {
         ApiError::invalid("The multipart audio request could not be read.")
             .with_request_id(request_id)
     })? {
         let name = field.name().unwrap_or("").to_owned();
-        if name == "provider" || name == "model" {
+        if matches!(
+            name.as_str(),
+            "provider" | "model" | "prompt" | "parent_operation_id"
+        ) {
             let value = field.text().await.map_err(|_| {
                 ApiError::invalid("An audio request field was not valid text.")
                     .with_request_id(request_id)
             })?;
-            if name == "provider" {
-                requested_provider = Some(value);
-            } else {
-                requested_model = Some(value);
+            match name.as_str() {
+                "provider" => requested_provider = Some(value),
+                "model" => requested_model = Some(value),
+                "prompt" => prompt = Some(value),
+                "parent_operation_id" => {
+                    parent_operation_id = Some(Uuid::parse_str(&value).map_err(|_| {
+                        ApiError::invalid("parent_operation_id must be a UUID.")
+                            .with_request_id(request_id)
+                    })?)
+                }
+                _ => unreachable!(),
             }
             continue;
         }
@@ -1210,7 +1574,18 @@ async fn transcribe_audio(
         ApiError::invalid("One audio file field named 'file' is required.")
             .with_request_id(request_id)
     })?;
-    Ok(Json(
+    let response = if let Some(prompt) = prompt {
+        state
+            .transcribe_audio_with_prompt_input(
+                &prompt,
+                bytes,
+                file_name,
+                content_type,
+                request_id,
+                parent_operation_id,
+            )
+            .await?
+    } else {
         state
             .transcribe_input(
                 requested_provider.as_deref(),
@@ -1220,8 +1595,168 @@ async fn transcribe_audio(
                 content_type,
                 request_id,
             )
+            .await?
+    };
+    Ok(Json(response))
+}
+
+async fn annotate_media(
+    State(state): State<Service>,
+    mut multipart: Multipart,
+) -> Result<Json<MediaAnnotationResponse>, ApiError> {
+    let request_id = Uuid::new_v4();
+    let mut provider = None;
+    let mut prompt = None;
+    let mut parent_operation_id = None;
+    let mut media = None;
+    while let Some(field) = multipart.next_field().await.map_err(|_| {
+        ApiError::invalid("The multipart media annotation request could not be read.")
+            .with_request_id(request_id)
+    })? {
+        let name = field.name().unwrap_or("").to_owned();
+        if matches!(name.as_str(), "provider" | "prompt" | "parent_operation_id") {
+            let value = field.text().await.map_err(|_| {
+                ApiError::invalid("A media annotation field was not valid text.")
+                    .with_request_id(request_id)
+            })?;
+            match name.as_str() {
+                "provider" => provider = Some(value),
+                "prompt" => prompt = Some(value),
+                "parent_operation_id" => {
+                    parent_operation_id = Some(Uuid::parse_str(&value).map_err(|_| {
+                        ApiError::invalid("Invalid parent operation ID.")
+                            .with_request_id(request_id)
+                    })?)
+                }
+                _ => unreachable!(),
+            }
+            continue;
+        }
+        if name != "file" {
+            continue;
+        }
+        if media.is_some() {
+            return Err(ApiError::invalid("Exactly one media file is required.")
+                .with_request_id(request_id));
+        }
+        let content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let file_name = safe_media_filename(field.file_name());
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|_| {
+                ApiError::invalid("The media file could not be read.").with_request_id(request_id)
+            })?
+            .to_vec();
+        media = Some((bytes, file_name, content_type));
+    }
+    let provider = provider.ok_or_else(|| {
+        ApiError::invalid("A provider field is required.").with_request_id(request_id)
+    })?;
+    let prompt = prompt.ok_or_else(|| {
+        ApiError::invalid("A prompt field is required.").with_request_id(request_id)
+    })?;
+    let (bytes, file_name, content_type) = media.ok_or_else(|| {
+        ApiError::invalid("One media file field named 'file' is required.")
+            .with_request_id(request_id)
+    })?;
+    Ok(Json(
+        state
+            .annotate_media_input(
+                &provider,
+                &prompt,
+                bytes,
+                file_name,
+                &content_type,
+                request_id,
+                parent_operation_id,
+            )
             .await?,
     ))
+}
+
+fn normalized_content_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn safe_media_filename(value: Option<&str>) -> String {
+    let cleaned = value
+        .unwrap_or("")
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+        .take(120)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        "media".into()
+    } else {
+        cleaned
+    }
+}
+
+fn openai_image_media_type(
+    content_type: &str,
+    request_id: Uuid,
+) -> Result<OpenAiImageMediaType, ApiError> {
+    let media_type = match content_type {
+        "image/png" => OpenAiImageMediaType::Png,
+        "image/jpeg" => OpenAiImageMediaType::Jpeg,
+        "image/webp" => OpenAiImageMediaType::WebP,
+        "image/gif" => OpenAiImageMediaType::Gif,
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media",
+                "OpenAI annotations require a PNG, JPEG, WebP, or GIF image.",
+            )
+            .with_request_id(request_id));
+        }
+    };
+    Ok(media_type)
+}
+
+fn codex_image_media_type(
+    content_type: &str,
+    request_id: Uuid,
+) -> Result<kcode_codex_runtime_v2::ImageMediaType, ApiError> {
+    let media_type = match content_type {
+        "image/png" => kcode_codex_runtime_v2::ImageMediaType::Png,
+        "image/jpeg" => kcode_codex_runtime_v2::ImageMediaType::Jpeg,
+        "image/webp" => kcode_codex_runtime_v2::ImageMediaType::Webp,
+        "image/gif" => kcode_codex_runtime_v2::ImageMediaType::Gif,
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media",
+                "Codex annotations require a PNG, JPEG, WebP, or GIF image.",
+            )
+            .with_request_id(request_id));
+        }
+    };
+    Ok(media_type)
+}
+
+fn gemini_media_input(content_type: &str, bytes: Vec<u8>) -> Result<GeminiMediaInput, GeminiError> {
+    if content_type.starts_with("image/") {
+        GeminiMediaInput::image(content_type, bytes)
+    } else if content_type.starts_with("audio/") || content_type == "application/ogg" {
+        GeminiMediaInput::audio(content_type, bytes)
+    } else if content_type.starts_with("video/") {
+        GeminiMediaInput::video(content_type, bytes)
+    } else {
+        Err(GeminiError::InvalidInput(
+            "Gemini annotations require a supported image, audio, or video MIME type.".into(),
+        ))
+    }
 }
 
 fn safe_audio_filename(value: Option<&str>, content_type: &str) -> String {
@@ -1243,7 +1778,16 @@ fn safe_audio_filename(value: Option<&str>, content_type: &str) -> String {
         })
         .take(120)
         .collect::<String>();
-    if cleaned.is_empty() {
+    let supported_extension = cleaned
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "flac" | "mp3" | "mp4" | "mpeg" | "mpga" | "m4a" | "ogg" | "wav" | "webm"
+            )
+        });
+    if cleaned.is_empty() || !supported_extension {
         format!("voice-note.{extension}")
     } else {
         cleaned
@@ -1339,6 +1883,24 @@ fn openai_error(error: OpenAiError, request_id: Uuid) -> ApiError {
             "transcription_failed",
         ),
         OpenAiError::Protocol(_) => (StatusCode::BAD_GATEWAY, "transcription_failed"),
+    };
+    ApiError::new(status, code, error.to_string()).with_request_id(request_id)
+}
+
+fn openai_image_error(error: OpenAiError, request_id: Uuid) -> ApiError {
+    let (status, code) = match &error {
+        OpenAiError::InvalidApiKey => (StatusCode::SERVICE_UNAVAILABLE, "provider_not_configured"),
+        OpenAiError::InvalidInput(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+        OpenAiError::Transport(message) if message.contains("timed out") => {
+            (StatusCode::GATEWAY_TIMEOUT, "provider_timeout")
+        }
+        OpenAiError::Transport(_) | OpenAiError::Protocol(_) => {
+            (StatusCode::BAD_GATEWAY, "provider_error")
+        }
+        OpenAiError::Provider { status, .. } => (
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+            "provider_error",
+        ),
     };
     ApiError::new(status, code, error.to_string()).with_request_id(request_id)
 }
@@ -1460,6 +2022,19 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.code, "parent_operation_not_running");
+    }
+
+    #[test]
+    fn audio_filenames_are_safe_and_usable_by_the_transcription_provider() {
+        assert_eq!(
+            safe_audio_filename(Some("voice note?.ogg"), "audio/ogg"),
+            "voicenote.ogg"
+        );
+        assert_eq!(
+            safe_audio_filename(Some("telegram-voice.bin"), "audio/ogg"),
+            "voice-note.ogg"
+        );
+        assert_eq!(safe_audio_filename(None, "audio/webm"), "voice-note.webm");
     }
 
     #[test]

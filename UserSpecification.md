@@ -154,12 +154,35 @@ Original object bytes are staged in one file per object before the matching
 `pending-object` event is appended. Browser uploads accept arbitrary files;
 document extraction is optional enrichment. Telegram accepts the relay's
 voice, document, photo, video, animation, audio, video-note, and sticker kinds.
+Browser voice recordings and current Telegram voice notes are staged without
+an automatic transcript, including voice notes that cause a Telegram group
+turn. Kennedy receives the original object and decides whether and how to
+inspect it. Older voice notes present only in Telegram group background
+context are labeled as untranscribed instead of being silently prepared.
+Any retained media message in the current bounded Telegram group context
+remains available regardless of whether that message invoked Kennedy.
+Kennedy can stage one such message idempotently by its visible Telegram
+message ID; the server validates the current group boundary and keeps bytes
+out of model-readable context until requested.
 A later Kweb commit stores a versioned file envelope containing the safe
 filename, media type, transport kind, and exact original bytes, then obtains
 canonical object IDs. Exact known pending-object tokens in the session archive
 and staged node descriptive fields are replaced before that same transaction
 finalizes. The Session History completion receipt records the
 pending-to-canonical mapping.
+
+Kennedy may enrich one staged object without changing it. `TranscribeAudio`
+accepts supported audio plus Kennedy's explicit bounded prompt and uses
+OpenAI's dedicated speech-transcription service. `AnnotateMedia`
+accepts a session-local `pending:N`, an explicit `openai`, `codex`, or `gemini`
+provider, and Kennedy's explicit bounded prompt. OpenAI and Codex accept
+supported images; Gemini accepts supported images, audio, and video. Kennedy
+therefore chooses between focused OpenAI transcription and Gemini native audio
+understanding instead of inheriting a transport-selected provider or prompt.
+`ExtractDocumentText` locally extracts PDF, DOC, or DOCX text. Enrichment
+results are ordinary durable tool-result boxes with normal context-capacity
+enforcement. Provider input containing raw media is never copied into a
+session box.
 
 Active objects are readable through their session/pending-ID route. Committed
 objects are readable through `/api/v1/objects/{object_id}`. The browser renders

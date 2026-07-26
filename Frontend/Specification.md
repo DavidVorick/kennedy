@@ -19,6 +19,11 @@ The browser:
 It does not compose provider prompts, execute tools, mutate Kweb directly, or
 manage box representations on the user's behalf.
 
+The browser recorder stages its original audio blob and may attach typed user
+text, but it never transcribes the recording. Kennedy chooses any
+transcription or annotation tool and writes that tool's prompt after the
+message reaches the backend.
+
 ## Addresses
 
 The main origin, normally `http://127.0.0.1:4321`, serves static files and all
@@ -103,6 +108,14 @@ The browser does not base64-encode the object into JSON. The maximum individual
 and aggregate staged object payload is 32 GiB. Uploads are sequential and the
 composer is disabled while the session processes a command. Unsupported
 extraction formats remain valid uploaded objects.
+
+The persisted read-tool prompt explains three optional enrichments over these
+same temporary IDs. Kennedy can call `TranscribeAudio` with her exact prompt
+for OpenAI speech transcription, call `AnnotateMedia` with an explicit
+provider and her exact prompt for supported image, audio, or video media, or
+call `ExtractDocumentText` for PDF, DOC, and DOCX files. The browser does not
+offer provider controls: tool selection and prompting remain model-callable
+backend concerns.
 
 At final commit, the backend reads staged bytes and supplies them to
 `kcode-kweb-db`. This deliberately performs extra disk I/O in V1; a zero-copy

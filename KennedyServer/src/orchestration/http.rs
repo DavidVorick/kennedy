@@ -574,18 +574,25 @@ impl Api {
         .await
     }
 
-    pub async fn transcribe(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transcribe_audio(
         &self,
-        provider: &str,
-        model: &str,
+        prompt: &str,
         bytes: Vec<u8>,
         filename: String,
         mime: &str,
+        parent_operation_id: Uuid,
     ) -> Result<Value, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local
                 .intelligence
-                .transcribe_bytes(provider, model, bytes, filename, mime)
+                .transcribe_audio_with_prompt_bytes(
+                    prompt,
+                    bytes,
+                    filename,
+                    mime,
+                    Some(parent_operation_id),
+                )
                 .await
                 .map_err(intelligence_error),
             #[cfg(test)]
@@ -598,8 +605,8 @@ impl Api {
                     &bases.intelligence,
                     "/api/v1/audio/transcriptions",
                     multipart::Form::new()
-                        .text("provider", provider.to_owned())
-                        .text("model", model.to_owned())
+                        .text("prompt", prompt.to_owned())
+                        .text("parent_operation_id", parent_operation_id.to_string())
                         .part("file", part),
                 )
                 .await
@@ -629,6 +636,49 @@ impl Api {
                     &bases.intelligence,
                     "/api/v1/documents/extract",
                     multipart::Form::new().part("file", part),
+                )
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn annotate_media(
+        &self,
+        provider: &str,
+        prompt: &str,
+        bytes: Vec<u8>,
+        filename: String,
+        mime: &str,
+        parent_operation_id: Uuid,
+    ) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .intelligence
+                .annotate_media_bytes(
+                    provider,
+                    prompt,
+                    bytes,
+                    filename,
+                    mime,
+                    Some(parent_operation_id),
+                )
+                .await
+                .map_err(intelligence_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let part = multipart::Part::bytes(bytes)
+                    .file_name(filename)
+                    .mime_str(mime)
+                    .map_err(local_api_error)?;
+                self.multipart(
+                    &bases.intelligence,
+                    "/api/v1/media/annotations",
+                    multipart::Form::new()
+                        .text("provider", provider.to_owned())
+                        .text("prompt", prompt.to_owned())
+                        .text("parent_operation_id", parent_operation_id.to_string())
+                        .part("file", part),
                 )
                 .await
             }

@@ -75,13 +75,6 @@ export const IntelligenceAPI = (base) => ({
     form.append("file", file, fileName);
     return requestFormJSON(base, "/api/v1/documents/extract", form);
   },
-  transcribe: ({ provider, model, file, fileName = "voice-note.webm" }) => {
-    const form = new FormData();
-    if (provider) form.append("provider", provider);
-    if (model) form.append("model", model);
-    form.append("file", file, fileName);
-    return requestFormJSON(base, "/api/v1/audio/transcriptions", form);
-  },
 });
 
 export const SessionHistoryAPI = (base) => ({

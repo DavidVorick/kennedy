@@ -20,6 +20,7 @@ kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true
 kcode-doc-extraction.workspace = true
 kcode-gemini-api.workspace = true
+kcode-gemini-api-legacy.workspace = true
 kcode-kweb-db.workspace = true
 kcode-openai-api.workspace = true
 kcode-rust-libs-v2.workspace = true

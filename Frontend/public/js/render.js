@@ -194,7 +194,7 @@ export function renderTranscript(container, transcript, ingressActivity = null, 
     const message = element("article", `message ${messageClass}`);
     const body = element("div", "body"); appendLinkedText(body, String(item.content || ""));
     message.append(element("span", "role", roleLabel));
-    if (item.inputKind === "voice") message.append(element("span", "voice-note-badge", "Voice note · paid transcription"));
+    if (item.inputKind === "voice") message.append(element("span", "voice-note-badge", "Voice note · original audio"));
     if (Array.isArray(item.attachments) && item.attachments.length && !item.objects?.length) {
       message.append(element("span", "voice-note-badge", `${item.attachments.length} file${item.attachments.length === 1 ? "" : "s"} · ${item.attachments.map(attachment => attachment.fileName || "object").join(", ")}`));
     }

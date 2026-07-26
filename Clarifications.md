@@ -229,6 +229,18 @@ canonical documents; this file is not an append-only log.
   Kennedy-authored prompt describing what to inspect and the desired textual
   result. Do not hide annotation behavior behind a fixed server-side prompt;
   validate and bound the supplied prompt as part of the Ktool contract.
+- User-sent audio, including browser voice recordings and current Telegram
+  voice notes, must reach Kennedy as its original staged object without an
+  eager transport-generated transcript. Kennedy decides whether to use
+  OpenAI's dedicated transcription tool, Gemini native audio annotation, or no
+  enrichment, and supplies the exact bounded prompt for either provider call.
+  Background Telegram group voice notes must not be silently pre-transcribed.
+- In Telegram groups, invocation controls when Kennedy takes a turn, not which
+  retained thread media she can inspect. Media posted anywhere in the bounded
+  group context must remain available to Kennedy even when its original
+  message neither mentioned her nor replied to her; keep raw bytes out of
+  model-readable context and expose them through staged or equivalently
+  bounded tool-addressable objects.
 - The initial model-readable document-conversion scope is PDF, DOC, and DOCX;
   adding other document formats is a separate decision even when the underlying
   upload path accepts arbitrary files.

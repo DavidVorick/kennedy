@@ -1,6 +1,6 @@
-import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260723.2";
+import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260725.1";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260723.1";
-import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, historyRefreshCanApply, historyObservationSignature, element } from "./render.js?v=20260725.1";
+import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, historyRefreshCanApply, historyObservationSignature, element } from "./render.js?v=20260725.2";
 import { isSessionLogArchive, projectSessionRecord } from "./session_log_view.js?v=20260724.1";
 import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, parseFreeTimeMinutes, parseSelfTimePrompt } from "./self_time.js?v=20260720.2";
 
@@ -30,8 +30,6 @@ const audioIngress = AudioIngressAPI(CONFIG.audioIngressBase);
 let rootNodeIds = null;
 let provider = null;
 let model = null;
-let inputModalities = ["text"];
-let transcriptionAvailable = false;
 let explorer = null;
 let historyRecords = [];
 let conversationCommandHeads = new Map();
@@ -494,14 +492,19 @@ function update() {
   ui.stop_button.textContent = "Stop Kennedy";
   ui.new_conversation.disabled = creatingConversation || !chatRuntimeReady();
   ui.new_conversation.classList.toggle("hidden", telegramView || selfTimeView);
-  ui.voice_button.disabled = !activeConversation || busy || transitionBusy || !transcriptionAvailable
+  ui.voice_button.disabled = !activeConversation || busy || transitionBusy
     || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function";
   const attachments = attachmentDrafts.get(selectedConversationId) || [];
+  const voiceDraft = voiceDrafts.get(selectedConversationId);
   ui.attach_button.disabled = !activeConversation || busy || transitionBusy || extractingAttachment;
-  ui.attachment_status.textContent = attachments.length
-    ? `${attachments.length} attached: ${attachments.map(item => item.fileName).join(", ")}`
+  const draftMediaNames = [
+    ...(voiceDraft?.media ? [voiceDraft.media.fileName || "voice note"] : []),
+    ...attachments.map(item => item.fileName),
+  ];
+  ui.attachment_status.textContent = draftMediaNames.length
+    ? `${draftMediaNames.length} attached: ${draftMediaNames.join(", ")}`
     : "PDF, Word, spreadsheet, or text";
-  ui.clear_attachments.classList.toggle("hidden", !attachments.length);
+  ui.clear_attachments.classList.toggle("hidden", !draftMediaNames.length);
   ui.clear_attachments.disabled = !activeConversation || busy || transitionBusy || extractingAttachment;
   ui.history_eyebrow.textContent = telegramView ? "TELEGRAM SESSIONS" : selfTimeView ? "SELF-TIME SESSIONS" : "YOUR CONVERSATIONS";
   ui.history_title.textContent = telegramView ? "Bot chats" : selfTimeView ? "Self time" : "History";
@@ -735,6 +738,7 @@ async function attachSelectedFiles() {
 
 function clearAttachmentDraft(id = selectedConversationId) {
   attachmentDrafts.delete(id);
+  voiceDrafts.delete(id);
   update();
 }
 
@@ -758,26 +762,18 @@ async function finishVoiceRecording() {
   ui.voice_button.setAttribute("aria-pressed", "false");
   ui.voice_button.textContent = "Record voice";
   if (!blob.size || selectedConversationId !== id) return;
-  ui.activity.textContent = "Transcribing voice note with OpenAI…";
+  ui.activity.textContent = "Saving original voice note…";
   ui.voice_button.disabled = true;
   try {
-    if (inputModalities.includes("audio")) throw new Error("The selected native-audio transport is not enabled in this UI build.");
     const fileName = `voice-note.${audioExtension(mimeType)}`;
-    const transcriptionStarted = performance.now();
-    const result = await intelligence.transcribe({ provider, model, file: blob, fileName });
-    const transcriptionDurationMs = Math.max(0, Math.round(performance.now() - transcriptionStarted));
     const staged = await conversationHistory.stageObject(id, blob, fileName);
     voiceDrafts.set(id, {
       inputKind: "voice",
-      transcriptionModel: result.transcription_model,
-      transcriptionDurationMs,
       media: { id: crypto.randomUUID(), kind: "voice", mimeType, fileName, pendingId: staged.pendingId, sizeBytes: blob.size },
     });
-    ui.message_input.value = result.text;
-    drafts.set(id, result.text);
     ui.message_input.focus();
   } catch (error) {
-    showError(ui.error_banner, `Voice note could not be transcribed: ${error.message}`);
+    showError(ui.error_banner, `Voice note could not be saved: ${error.message}`);
   }
   update();
 }
@@ -1040,10 +1036,11 @@ async function submitMessage(event) {
   if (!record || record.phase !== "active" || endingIds.has(id) || extractingAttachments.has(id)) return;
   const text = ui.message_input.value;
   const attachments = attachmentDrafts.get(id) || [];
-  if (!text.trim() && !attachments.length) return;
+  const voiceDraft = voiceDrafts.get(id);
+  if (!text.trim() && !attachments.length && !voiceDraft?.media) return;
   ui.message_input.value = "";
   drafts.set(id, "");
-  const metadata = { ...(voiceDrafts.get(id) || {}), attachments };
+  const metadata = { ...(voiceDraft || {}), attachments };
   voiceDrafts.delete(id);
   attachmentDrafts.delete(id);
   conversationErrors.delete(id);
@@ -1129,8 +1126,9 @@ async function sendAndEndConversation() {
   if (!record || record.phase !== "active" || record.state?.pendingTurn || endingIds.has(id) || extractingAttachments.has(id)) return;
   const text = ui.message_input.value;
   const attachments = attachmentDrafts.get(id) || [];
-  if (!text.trim() && !attachments.length) return;
-  const metadata = { ...(voiceDrafts.get(id) || {}), attachments };
+  const voiceDraft = voiceDrafts.get(id);
+  if (!text.trim() && !attachments.length && !voiceDraft?.media) return;
+  const metadata = { ...(voiceDraft || {}), attachments };
   endingIds.add(id);
   update();
   try {
@@ -1283,9 +1281,6 @@ async function initialize() {
     const selected = providers.providers.find(item => item.name === provider);
     if (!selected) throw new Error("The intelligence service did not provide its configured default provider.");
     model = selected.default_model;
-    const modelCapabilities = selected.model_capabilities?.[model] || {};
-    inputModalities = modelCapabilities.input_modalities || selected.input_modalities || ["text"];
-    transcriptionAvailable = Boolean(selected.transcription_available);
   } catch (error) {
     showError(ui.error_banner, `Kennedy's model service is unavailable: ${error.message}`);
   }
@@ -1324,7 +1319,6 @@ ui.start_self_time.addEventListener("click", () => startFreeTime().catch(error =
 ui.message_input.addEventListener("input", () => {
   if (activeView !== "conversation" || selectedRecord()?.phase !== "active") return;
   drafts.set(selectedConversationId, ui.message_input.value);
-  if (!ui.message_input.value.trim()) voiceDrafts.delete(selectedConversationId);
 });
 ui.message_input.addEventListener("keydown", event => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {

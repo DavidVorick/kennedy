@@ -1293,7 +1293,7 @@ impl Orchestrator {
                 .to_owned();
             if !excluded
                 && message.get("sentByKennedy").and_then(Value::as_bool) != Some(true)
-                && matches!(kind.as_str(), "voice" | "document")
+                && kind == "document"
                 && message
                     .get("preparedText")
                     .and_then(Value::as_str)
@@ -1309,66 +1309,36 @@ impl Orchestrator {
                             encode_path(&message_id)
                         ))
                         .await?;
-                    if kind == "voice" {
-                        let result = self
-                            .api
-                            .transcribe(
-                                &self.runtime()?.model.provider,
-                                &self.runtime()?.model.model,
-                                bytes,
-                                message
-                                    .get("fileName")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("telegram-group-voice.ogg")
-                                    .to_owned(),
-                                &mime,
-                            )
-                            .await?;
-                        Ok::<_, anyhow::Error>((
-                            required_string(&result, "text")?,
-                            Some(required_string(&result, "transcription_model")?),
-                            None,
-                            false,
-                        ))
-                    } else {
-                        let result = self
-                            .api
-                            .extract_document(
-                                bytes,
-                                message
-                                    .get("fileName")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("telegram-document")
-                                    .to_owned(),
-                                &mime,
-                            )
-                            .await?;
-                        Ok((
-                            required_string(&result, "text")?,
-                            None,
-                            result
-                                .get("format")
+                    let result = self
+                        .api
+                        .extract_document(
+                            bytes,
+                            message
+                                .get("fileName")
                                 .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            result
-                                .get("truncated")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                        ))
-                    }
+                                .unwrap_or("telegram-document")
+                                .to_owned(),
+                            &mime,
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>((
+                        required_string(&result, "text")?,
+                        None::<String>,
+                        result
+                            .get("format")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        result
+                            .get("truncated")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    ))
                 }
                 .await;
                 let (text, model, format, truncated) = match prepared {
                     Ok(value) => value,
                     Err(error) => (
-                        format!(
-                            "{} failed: {error}",
-                            if kind == "voice" {
-                                "Voice transcription"
-                            } else {
-                                "Document extraction"
-                            }
-                        ),
+                        format!("Document extraction failed: {error}"),
                         Some("preparation-error".into()),
                         None,
                         false,
@@ -1403,18 +1373,18 @@ impl Orchestrator {
                         | "sticker"
                 )
             {
-                message["mediaRef"] = json!({"kind":kind,"source":"telegram-group","chatId":context.get("chatId").cloned().unwrap_or(Value::Null),"messageId":message.get("messageId").cloned().unwrap_or(Value::Null),"fileName":message.get("fileName").cloned().unwrap_or(Value::Null),"mimeType":message.get("mimeType").cloned().unwrap_or(Value::Null),"durationSeconds":message.get("durationSeconds").cloned().unwrap_or(Value::Null)});
+                if message.get("hasMedia").and_then(Value::as_bool) == Some(true) {
+                    message["mediaRef"] = json!({"kind":kind,"source":"telegram-group","chatId":context.get("chatId").cloned().unwrap_or(Value::Null),"messageId":message.get("messageId").cloned().unwrap_or(Value::Null),"fileName":message.get("fileName").cloned().unwrap_or(Value::Null),"mimeType":message.get("mimeType").cloned().unwrap_or(Value::Null),"durationSeconds":message.get("durationSeconds").cloned().unwrap_or(Value::Null)});
+                }
                 let base = message.get("text").and_then(Value::as_str).unwrap_or("");
                 let prepared = message
                     .get("preparedText")
                     .and_then(Value::as_str)
-                    .unwrap_or(if kind == "voice" {
-                        "Voice note transcription unavailable."
-                    } else {
-                        "Document text extraction unavailable."
-                    });
+                    .unwrap_or("Document text extraction unavailable.");
                 message["text"] = json!(if kind == "voice" {
-                    format!("[Voice note transcription]\n{prepared}")
+                    format!(
+                        "{base}\n\n[Telegram voice note attached; it was not automatically transcribed.]"
+                    )
                 } else if kind == "document" {
                     format!(
                         "{base}\n\n[Document: {}]\n{prepared}",
@@ -1857,40 +1827,18 @@ impl Orchestrator {
                     .api
                     .telegram_bytes(&format!("/api/v1/events/{}/media", encode_path(&id)))
                     .await?;
-                let existing = event.get("transcription").and_then(Value::as_str);
-                let (text, model) = if let Some(text) = existing {
-                    (
-                        text.to_owned(),
-                        event
-                            .get("transcriptionModel")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_owned(),
-                    )
-                } else {
-                    let result = self
-                        .api
-                        .transcribe(
-                            &self.runtime()?.model.provider,
-                            &self.runtime()?.model.model,
-                            bytes.clone(),
-                            "telegram-voice.ogg".into(),
-                            &mime,
-                        )
-                        .await?;
-                    let text = required_string(&result, "text")?;
-                    let model = required_string(&result, "transcription_model")?;
-                    self.api
-                        .telegram_post(
-                            &format!("/api/v1/events/{}/transcription", encode_path(&id)),
-                            json!({"text":text,"transcriptionModel":model}),
-                        )
-                        .await?;
-                    (text, model)
-                };
+                let filename = event
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("telegram-voice.ogg");
                 Ok((
-                    text.clone(),
-                    json!({"externalEventId":id,"inputKind":"voice","transcriptionModel":model,"media":{"id":format!("telegram:{id}"),"kind":"voice","source":"telegram","mimeType":mime,"fileName":"telegram-voice.ogg","dataUrl":data_url(&mime,&bytes),"sizeBytes":bytes.len(),"durationSeconds":event.get("durationSeconds").cloned().unwrap_or(Value::Null)}}),
+                    event
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    json!({"externalEventId":id,"inputKind":"voice","media":{"id":format!("telegram:{id}"),"kind":"voice","source":"telegram","mimeType":mime,"fileName":filename,"dataUrl":data_url(&mime,&bytes),"sizeBytes":bytes.len(),"durationSeconds":event.get("durationSeconds").cloned().unwrap_or(Value::Null)}}),
                 ))
             }
             "document" => {
