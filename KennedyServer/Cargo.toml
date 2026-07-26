@@ -23,6 +23,7 @@ kcode-gemini-api-legacy.workspace = true
 kcode-kweb-db.workspace = true
 kcode-openai-api.workspace = true
 kcode-rust-libs-v2.workspace = true
+kcode-web-libs.workspace = true
 kcode-web-fetch.workspace = true
 kcode-tg-kennedy-bot = "=0.3.0"
 rusqlite.workspace = true
@@ -32,6 +33,7 @@ rustls.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tower-http.workspace = true

@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PROGRAM="${0##*/}"
+PODMAN="${CODEX_SAFE_PODMAN:-podman}"
+BASE_IMAGE="${CODEX_SAFE_BASE_IMAGE:-local/codex}"
+TARGET_IMAGE="${CODEX_SAFE_RUNTIME_IMAGE:-local/codex-dev}"
+RUST_TOOLCHAIN="${CODEX_SAFE_RUST_TOOLCHAIN:-stable}"
+
+die() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM [BASE_IMAGE [TARGET_IMAGE]]
+
+Build the reusable Podman image used by codex-safe. The image contains:
+  - the selected Rust toolchain;
+  - rustfmt, Clippy, rust-src, and rust-analyzer;
+  - Chromium and common native Rust build dependencies.
+
+Defaults:
+  BASE_IMAGE    $BASE_IMAGE
+  TARGET_IMAGE  $TARGET_IMAGE
+
+Environment overrides:
+  CODEX_SAFE_PODMAN          Podman executable
+  CODEX_SAFE_BASE_IMAGE      source Codex image
+  CODEX_SAFE_RUNTIME_IMAGE   resulting development image
+  CODEX_SAFE_RUST_TOOLCHAIN  rustup toolchain selector
+
+The tracked codex-safe launcher defaults to TARGET_IMAGE and persists Cargo's
+download cache separately from the image and workspace.
+EOF
+}
+
+if (( $# > 2 )); then
+    usage >&2
+    exit 2
+fi
+if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+if (( $# >= 1 )); then
+    BASE_IMAGE="$1"
+fi
+if (( $# == 2 )); then
+    TARGET_IMAGE="$2"
+fi
+
+command -v "$PODMAN" >/dev/null 2>&1 ||
+    die "podman is not installed or CODEX_SAFE_PODMAN is invalid"
+
+[[ "$BASE_IMAGE" =~ ^[a-zA-Z0-9._/@:+-]+$ ]] ||
+    die "base image has an unsupported name: $BASE_IMAGE"
+[[ "$TARGET_IMAGE" =~ ^[a-zA-Z0-9._/:+-]+$ ]] ||
+    die "target image has an unsupported name: $TARGET_IMAGE"
+[[ "$RUST_TOOLCHAIN" =~ ^[a-zA-Z0-9._:+-]+$ ]] ||
+    die "Rust toolchain has an unsupported selector: $RUST_TOOLCHAIN"
+[[ "$BASE_IMAGE" != "$TARGET_IMAGE" ]] ||
+    die "base and target images must differ to avoid recursively layering the runtime"
+
+"$PODMAN" image exists "$BASE_IMAGE" ||
+    die "base image does not exist: $BASE_IMAGE"
+
+if ! "$PODMAN" run --rm --entrypoint sh "$BASE_IMAGE" -c \
+    '. /etc/os-release && test "$ID" = debian && command -v apt-get >/dev/null'
+then
+    die "base image must be Debian-based and provide apt-get"
+fi
+
+image_user="$(
+    "$PODMAN" image inspect --format '{{.Config.User}}' "$BASE_IMAGE"
+)" || die "could not determine the base image user"
+image_user="${image_user:-0}"
+[[ "$image_user" =~ ^[a-zA-Z0-9_.:-]+$ ]] ||
+    die "base image has an unsupported user value: $image_user"
+
+build_dir="$(mktemp -d)" ||
+    die "could not create a temporary build directory"
+trap 'rm -rf -- "$build_dir"' EXIT
+
+{
+    printf 'ARG BASE_IMAGE\n'
+    printf 'FROM ${BASE_IMAGE}\n'
+    printf 'ARG FINAL_USER\n'
+    printf 'ARG RUST_TOOLCHAIN\n'
+    printf 'USER 0\n'
+    printf '%s\n' \
+        'RUN apt-get update \' \
+        '    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \' \
+        '        build-essential \' \
+        '        ca-certificates \' \
+        '        chromium \' \
+        '        clang \' \
+        '        cmake \' \
+        '        curl \' \
+        '        fonts-liberation \' \
+        '        git \' \
+        '        libssl-dev \' \
+        '        pkg-config \' \
+        '        python3 \' \
+        '        xz-utils \' \
+        '    && rm -rf /var/lib/apt/lists/*'
+    printf 'ENV RUSTUP_HOME=/opt/rustup\n'
+    printf 'RUN mkdir -p /opt/rustup /opt/rust-cargo \\\n'
+    printf '    && curl --proto "=https" --tlsv1.2 --fail --silent --show-error \\\n'
+    printf '        https://sh.rustup.rs -o /tmp/rustup-init.sh \\\n'
+    printf '    && CARGO_HOME=/opt/rust-cargo sh /tmp/rustup-init.sh \\\n'
+    printf '        -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN" \\\n'
+    printf '    && CARGO_HOME=/opt/rust-cargo /opt/rust-cargo/bin/rustup component add \\\n'
+    printf '        clippy rust-analyzer rust-src rustfmt \\\n'
+    printf '    && for tool in cargo cargo-clippy cargo-fmt clippy-driver rust-analyzer rustc rustdoc rustfmt rustup; do \\\n'
+    printf '        ln -sf "/opt/rust-cargo/bin/$tool" "/usr/local/bin/$tool"; \\\n'
+    printf '    done \\\n'
+    printf '    && rm -f /tmp/rustup-init.sh \\\n'
+    printf '    && rm -rf /opt/rustup/downloads/* /opt/rustup/tmp/* \\\n'
+    printf '    && chmod -R a+rX /opt/rustup /opt/rust-cargo\n'
+    printf 'ENV CARGO_HOME=/tmp/codex-cargo\n'
+    printf 'LABEL io.kennedy.codex-safe.runtime="rust-chromium"\n'
+    printf 'USER ${FINAL_USER}\n'
+} >"$build_dir/Containerfile"
+
+printf 'Building %s from %s with Rust %s and Chromium...\n' \
+    "$TARGET_IMAGE" "$BASE_IMAGE" "$RUST_TOOLCHAIN"
+"$PODMAN" build \
+    --no-cache \
+    --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+    --build-arg "FINAL_USER=$image_user" \
+    --build-arg "RUST_TOOLCHAIN=$RUST_TOOLCHAIN" \
+    --tag "$TARGET_IMAGE" \
+    --file "$build_dir/Containerfile" \
+    "$build_dir"
+
+printf 'Verifying the toolchain under the codex-safe container restrictions...\n'
+"$PODMAN" run --rm \
+    --userns=keep-id \
+    --user 1000:1000 \
+    --security-opt=no-new-privileges \
+    --cap-drop=all \
+    --cap-add=SYS_CHROOT \
+    --pids-limit=512 \
+    --memory=8g \
+    --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+    --entrypoint sh \
+    "$TARGET_IMAGE" \
+    -ceu '
+        codex --version
+        rustc --version
+        cargo --version
+        rustfmt --version
+        cargo clippy --version
+        rust-analyzer --version
+        chromium --version
+        chromium \
+            --headless \
+            --disable-gpu \
+            --disable-background-networking \
+            --disable-component-update \
+            --disable-default-apps \
+            --disable-extensions \
+            --disable-sync \
+            --metrics-recording-only \
+            --mute-audio \
+            --no-default-browser-check \
+            --no-first-run \
+            --dump-dom \
+            about:blank >/dev/null
+    '
+
+printf 'Built and verified %s.\n' "$TARGET_IMAGE"
+printf 'The tracked codex-safe launcher uses this image by default.\n'

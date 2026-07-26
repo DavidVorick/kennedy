@@ -41,7 +41,8 @@ write session creates one Kweb transaction and one immutable session archive
 object.
 
 See [TechnicalDesign.md](TechnicalDesign.md),
-[UserSpecification.md](UserSpecification.md), and
+[UserSpecification.md](UserSpecification.md),
+[web-libs-education.txt](web-libs-education.txt), and
 [chatend-overhaul/chatend-discussion-review.txt](chatend-overhaul/chatend-discussion-review.txt).
 
 ## Requirements
@@ -59,6 +60,22 @@ Kennedy should use:
 codex-safe login
 codex-safe login status
 ```
+
+Build the reusable development runtime on the Podman host, then install the
+tracked launcher at the deployment path:
+
+```sh
+scripts/build-codex-safe-runtime
+install -m 0755 scripts/codex-safe /home/user/podman/codex-safe
+```
+
+The build derives `local/codex-dev` from `local/codex` and installs stable
+Rust, rustfmt, Clippy, rust-src, rust-analyzer, native build dependencies, and
+Chromium. It verifies the Rust tools and a headless Chromium launch under the
+same outer Podman restrictions as `codex-safe`. Re-run it when the development
+toolchain should be refreshed. Set `CODEX_SAFE_BASE_IMAGE`,
+`CODEX_SAFE_RUNTIME_IMAGE`, or `CODEX_SAFE_RUST_TOOLCHAIN` to override its
+defaults.
 
 For an interactive terminal launch, `codex-safe` mounts the Git repository root
 when the current directory is in a repository; otherwise it mounts the current
@@ -80,6 +97,12 @@ ${TMPDIR:-/tmp}/kcode-codex-catalogs
 The launcher must mount that directory at the same absolute path inside the
 Codex container, read-only. `scripts/codex-safe` documents and implements the
 expected mount.
+
+The launcher uses `local/codex-dev` by default and keeps Cargo's download cache
+under `/home/user/podman/codex-state-cargo-cache` on the host. Override that
+location with `CODEX_SAFE_CARGO_CACHE_DIR`. The cache is mounted at
+`/tmp/codex-cargo`, which remains writable to Codex's `workspace-write`
+sandbox, and does not expose the host user's personal Cargo credentials.
 
 ## Build and verify
 
@@ -130,7 +153,9 @@ Defaults:
   derived `state.sqlite3` and `originals/`);
 - Kennedy's audio memory-ingress queue and the Telegram and user-directory
   SQLite files under `data/`;
-- managed Rust libraries: `data/rust-libs`;
+- managed Rust libraries: `data/kcode/kcode-rust-libs`;
+- managed Web libraries and immutable publications:
+  `data/kcode/kcode-web-libs`;
 - frontend assets: `Frontend/public`;
 - system-prompt boxes: `Frontend/SystemPrompts`.
 

@@ -24,6 +24,7 @@ pub(crate) struct LocalServices {
     pub audio: crate::audio_ingress::Service,
     pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
     pub rust_lib_tools: crate::rust_lib_tools::RustLibToolService,
+    pub web_lib_tools: crate::web_lib_tools::WebLibToolService,
 }
 
 #[derive(Debug, Clone)]
@@ -760,11 +761,96 @@ impl Api {
         }
     }
 
+    pub async fn web_lib_execute(
+        &self,
+        session_id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<crate::rust_lib_tools::ToolExecution, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .web_lib_tools
+                .execute_detailed(session_id.to_owned(), name.to_owned(), arguments)
+                .await
+                .map_err(rust_lib_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let payload = self
+                    .request(
+                        Method::POST,
+                        &bases.kweb,
+                        "/api/v1/web-libs/execute",
+                        Some(json!({
+                            "session_id":session_id,
+                            "name":name,
+                            "arguments":arguments,
+                        })),
+                    )
+                    .await?;
+                let text = payload
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| ApiError {
+                        status: None,
+                        code: "invalid_tool_result".into(),
+                        message: "Web library tool returned a non-text result.".into(),
+                    })?;
+                let snapshot = payload
+                    .get("snapshot")
+                    .and_then(Value::as_str)
+                    .map(|snapshot| crate::rust_lib_tools::LibrarySnapshot {
+                        name: arguments
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        text: snapshot.to_owned(),
+                    })
+                    .or_else(|| {
+                        if name == crate::web_lib_tools::WRITE_WEB_LIB_TOOL {
+                            crate::web_lib_tools::proposed_write_snapshot(&arguments)
+                        } else if name == crate::web_lib_tools::PREVIEW_WRITE_FILE_WEB_LIB_TOOL {
+                            Some(crate::rust_lib_tools::LibrarySnapshot {
+                                name: arguments
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                text: text.clone(),
+                            })
+                        } else if matches!(
+                            name,
+                            crate::web_lib_tools::CREATE_WEB_LIB_TOOL
+                                | crate::web_lib_tools::OPEN_WEB_LIB_TOOL
+                        ) {
+                            arguments.get("name").and_then(Value::as_str).map(|name| {
+                                crate::rust_lib_tools::LibrarySnapshot {
+                                    name: name.to_owned(),
+                                    text: text.clone(),
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                Ok(crate::rust_lib_tools::ToolExecution { text, snapshot })
+            }
+        }
+    }
+
     pub async fn release_rust_libs(&self, session_id: &str) {
         match &self.services {
             ServiceBackend::Local(local) => {
-                if let Err(error) = local.rust_lib_tools.release(session_id.to_owned()).await {
+                let (rust_result, web_result) = tokio::join!(
+                    local.rust_lib_tools.release(session_id.to_owned()),
+                    local.web_lib_tools.release(session_id.to_owned()),
+                );
+                if let Err(error) = rust_result {
                     tracing::warn!(error=%error.message, "Rust library session release failed");
+                }
+                if let Err(error) = web_result {
+                    tracing::warn!(error=%error.message, "Web library session release failed");
                 }
             }
             #[cfg(test)]

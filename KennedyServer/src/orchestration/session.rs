@@ -31,6 +31,10 @@ use crate::{
         LibrarySnapshot, PREVIEW_WRITE_FILE_RUST_LIB_TOOL, RUST_LIB_TOOLS,
         WRITE_FILE_FREEFORM_RUST_LIB_TOOL, WRITE_RUST_LIB_TOOL, proposed_write_snapshot,
     },
+    web_lib_tools::{
+        PREVIEW_WRITE_FILE_WEB_LIB_TOOL, WEB_LIB_TOOLS, WRITE_FILE_FREEFORM_WEB_LIB_TOOL,
+        WRITE_WEB_LIB_TOOL, proposed_write_snapshot as proposed_web_write_snapshot,
+    },
 };
 
 use super::{
@@ -52,6 +56,7 @@ const MAX_MEDIA_ENRICHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const KWEB_TOOL_INSTANCE: &str = "kweb";
 const HISTORY_TOOL_INSTANCE: &str = "history";
 const RUST_LIB_TOOL_INSTANCE: &str = "managed-rust-libraries";
+const WEB_LIB_TOOL_INSTANCE: &str = "managed-web-libraries";
 const CAPACITY_ERROR_BOX_NAME: &str = "Context capacity error";
 const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
 
@@ -687,8 +692,59 @@ struct RecordedToolInvocation {
     tool_name: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedLibraryKind {
+    Rust,
+    Web,
+}
+
+impl ManagedLibraryKind {
+    fn tool_instance(self) -> &'static str {
+        match self {
+            Self::Rust => RUST_LIB_TOOL_INSTANCE,
+            Self::Web => WEB_LIB_TOOL_INSTANCE,
+        }
+    }
+
+    fn metadata_key(self) -> &'static str {
+        match self {
+            Self::Rust => "managedRustLibrary",
+            Self::Web => "managedWebLibrary",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Web => "Web",
+        }
+    }
+
+    fn freeform_write_tool(self) -> &'static str {
+        match self {
+            Self::Rust => WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+            Self::Web => WRITE_FILE_FREEFORM_WEB_LIB_TOOL,
+        }
+    }
+
+    fn preview_write_tool(self) -> &'static str {
+        match self {
+            Self::Rust => PREVIEW_WRITE_FILE_RUST_LIB_TOOL,
+            Self::Web => PREVIEW_WRITE_FILE_WEB_LIB_TOOL,
+        }
+    }
+
+    fn open_tool(self) -> &'static str {
+        match self {
+            Self::Rust => crate::rust_lib_tools::OPEN_RUST_LIB_TOOL,
+            Self::Web => crate::web_lib_tools::OPEN_WEB_LIB_TOOL,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FreeformWriteRequest {
+    kind: ManagedLibraryKind,
     name: String,
     path: String,
     update_description: String,
@@ -699,7 +755,10 @@ struct PendingFreeformWrite {
     call_box_id: BoxId,
 }
 
-fn freeform_write_request(arguments: &Value) -> anyhow::Result<FreeformWriteRequest> {
+fn freeform_write_request_for(
+    arguments: &Value,
+    kind: ManagedLibraryKind,
+) -> anyhow::Result<FreeformWriteRequest> {
     validate_arguments(arguments, &["name", "path", "updateDescription"], &[])?;
     let name = nonempty_string(arguments, "name", 255)?;
     let path = nonempty_string(arguments, "path", 4_096)?;
@@ -713,10 +772,16 @@ fn freeform_write_request(arguments: &Value) -> anyhow::Result<FreeformWriteRequ
         "updateDescription must contain exactly one line"
     );
     Ok(FreeformWriteRequest {
+        kind,
         name,
         path,
         update_description,
     })
+}
+
+#[cfg(test)]
+fn freeform_write_request(arguments: &Value) -> anyhow::Result<FreeformWriteRequest> {
+    freeform_write_request_for(arguments, ManagedLibraryKind::Rust)
 }
 
 fn captured_write_box_content(request: &FreeformWriteRequest, contents: String) -> BoxContent {
@@ -725,7 +790,7 @@ fn captured_write_box_content(request: &FreeformWriteRequest, contents: String) 
         objects: Vec::new(),
         metadata: json!({
             "capturedFreeformOutput":true,
-            "toolName":WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+            "toolName":request.kind.freeform_write_tool(),
             "arguments":{
                 "name":request.name,
                 "path":request.path,
@@ -750,7 +815,7 @@ fn captured_write_summary(request: &FreeformWriteRequest) -> String {
 }
 
 fn tool_call_box_content(call: &ToolCall) -> anyhow::Result<BoxContent> {
-    if call.name == WRITE_RUST_LIB_TOOL {
+    if matches!(call.name.as_str(), WRITE_RUST_LIB_TOOL | WRITE_WEB_LIB_TOOL) {
         let name = call
             .arguments
             .get("name")
@@ -782,30 +847,34 @@ fn tool_call_box_content(call: &ToolCall) -> anyhow::Result<BoxContent> {
     )?))
 }
 
-fn rust_lib_box_content(snapshot: &LibrarySnapshot) -> BoxContent {
+fn managed_lib_box_content(kind: ManagedLibraryKind, snapshot: &LibrarySnapshot) -> BoxContent {
     BoxContent {
         text: snapshot.text.clone(),
         objects: Vec::new(),
-        metadata: json!({"managedRustLibrary":snapshot.name}),
+        metadata: json!({kind.metadata_key():snapshot.name}),
     }
 }
 
-fn rust_lib_logical_name(state: &BoxState, fallback: &str) -> String {
+fn managed_lib_logical_name(kind: ManagedLibraryKind, state: &BoxState, fallback: &str) -> String {
     state
         .canonical
         .content
         .metadata
-        .get("managedRustLibrary")
+        .get(kind.metadata_key())
         .and_then(Value::as_str)
         .unwrap_or(fallback)
         .to_owned()
 }
 
-fn rust_lib_box_id(journal: &HistorySession, name: &str) -> Option<BoxId> {
+fn managed_lib_box_id(
+    journal: &HistorySession,
+    kind: ManagedLibraryKind,
+    name: &str,
+) -> Option<BoxId> {
     journal
         .state()
         .tools
-        .get(RUST_LIB_TOOL_INSTANCE)?
+        .get(kind.tool_instance())?
         .slots
         .iter()
         .find_map(|slot| {
@@ -813,40 +882,51 @@ fn rust_lib_box_id(journal: &HistorySession, name: &str) -> Option<BoxId> {
                 return None;
             }
             let state = journal.state().box_state(slot.box_id)?;
-            (rust_lib_logical_name(state, &slot.slot) == name).then_some(slot.box_id)
+            (managed_lib_logical_name(kind, state, &slot.slot) == name).then_some(slot.box_id)
         })
 }
 
-fn prospective_rust_lib_box_updates(
+fn prospective_managed_lib_box_updates(
     journal: &HistorySession,
     call: &ToolCall,
 ) -> BTreeMap<BoxId, BoxContent> {
-    if call.name != WRITE_RUST_LIB_TOOL {
-        return BTreeMap::new();
-    }
-    let Some(snapshot) = proposed_write_snapshot(&call.arguments) else {
+    let (kind, snapshot) = if call.name == WRITE_RUST_LIB_TOOL {
+        (
+            ManagedLibraryKind::Rust,
+            proposed_write_snapshot(&call.arguments),
+        )
+    } else if call.name == WRITE_WEB_LIB_TOOL {
+        (
+            ManagedLibraryKind::Web,
+            proposed_web_write_snapshot(&call.arguments),
+        )
+    } else {
         return BTreeMap::new();
     };
-    let Some(box_id) = rust_lib_box_id(journal, &snapshot.name) else {
+    let Some(snapshot) = snapshot else {
         return BTreeMap::new();
     };
-    BTreeMap::from([(box_id, rust_lib_box_content(&snapshot))])
+    let Some(box_id) = managed_lib_box_id(journal, kind, &snapshot.name) else {
+        return BTreeMap::new();
+    };
+    BTreeMap::from([(box_id, managed_lib_box_content(kind, &snapshot))])
 }
 
-fn prospective_rust_lib_snapshot_tokens(
+fn prospective_managed_lib_snapshot_tokens(
     journal: &HistorySession,
+    kind: ManagedLibraryKind,
     snapshot: &LibrarySnapshot,
 ) -> anyhow::Result<u64> {
-    let projection = if let Some(box_id) = rust_lib_box_id(journal, &snapshot.name) {
+    let projection = if let Some(box_id) = managed_lib_box_id(journal, kind, &snapshot.name) {
         journal.state().projection_with_new_boxes_and_updates(
             &[],
-            &BTreeMap::from([(box_id, rust_lib_box_content(snapshot))]),
+            &BTreeMap::from([(box_id, managed_lib_box_content(kind, snapshot))]),
         )?
     } else {
         let current = journal
             .state()
             .tools
-            .get(RUST_LIB_TOOL_INSTANCE)
+            .get(kind.tool_instance())
             .cloned()
             .unwrap_or_default();
         let mut used_slots = current
@@ -856,25 +936,26 @@ fn prospective_rust_lib_snapshot_tokens(
             .collect::<HashSet<_>>();
         let slot = unique_kweb_slot(&snapshot.name, &mut used_slots);
         journal.state().projection_with_new_boxes(&[(
-            format!("Managed Rust library {}", snapshot.name),
+            format!("Managed {} library {}", kind.label(), snapshot.name),
             BoxOwner::Tool {
-                tool_instance: RUST_LIB_TOOL_INSTANCE.into(),
+                tool_instance: kind.tool_instance().into(),
                 slot,
             },
-            rust_lib_box_content(snapshot),
+            managed_lib_box_content(kind, snapshot),
         )])?
     };
     Ok(projection.estimated_tokens)
 }
 
-fn apply_rust_lib_snapshot(
+fn apply_managed_lib_snapshot(
     journal: &mut HistorySession,
+    kind: ManagedLibraryKind,
     snapshot: LibrarySnapshot,
 ) -> anyhow::Result<BoxId> {
     let current = journal
         .state()
         .tools
-        .get(RUST_LIB_TOOL_INSTANCE)
+        .get(kind.tool_instance())
         .cloned()
         .unwrap_or_default();
     let mut selected_slot = None;
@@ -888,16 +969,16 @@ fn apply_rust_lib_snapshot(
         let state = journal
             .state()
             .box_state(slot.box_id)
-            .context("managed Rust library slot box is missing")?;
+            .with_context(|| format!("managed {} library slot box is missing", kind.label()))?;
         let selected = selected_slot.is_none()
             && !slot.retired
-            && rust_lib_logical_name(state, &slot.slot) == snapshot.name;
+            && managed_lib_logical_name(kind, state, &slot.slot) == snapshot.name;
         if selected {
             selected_slot = Some(slot.slot.clone());
             slots.push(ToolSlotInput {
                 slot: slot.slot.clone(),
-                name: format!("Managed Rust library {}", snapshot.name),
-                content: rust_lib_box_content(&snapshot),
+                name: format!("Managed {} library {}", kind.label(), snapshot.name),
+                content: managed_lib_box_content(kind, &snapshot),
                 retired: false,
             });
         } else {
@@ -913,24 +994,58 @@ fn apply_rust_lib_snapshot(
         let slot = unique_kweb_slot(&snapshot.name, &mut used_slots);
         slots.push(ToolSlotInput {
             slot: slot.clone(),
-            name: format!("Managed Rust library {}", snapshot.name),
-            content: rust_lib_box_content(&snapshot),
+            name: format!("Managed {} library {}", kind.label(), snapshot.name),
+            content: managed_lib_box_content(kind, &snapshot),
             retired: false,
         });
         slot
     });
-    journal.apply_tool_slots(now(), RUST_LIB_TOOL_INSTANCE, slots)?;
+    journal.apply_tool_slots(now(), kind.tool_instance(), slots)?;
     journal
         .state()
         .tools
-        .get(RUST_LIB_TOOL_INSTANCE)
+        .get(kind.tool_instance())
         .and_then(|tool| {
             tool.slots
                 .iter()
                 .find(|slot| slot.slot == selected_slot && !slot.retired)
         })
         .map(|slot| slot.box_id)
-        .context("managed Rust library box was not installed")
+        .with_context(|| format!("managed {} library box was not installed", kind.label()))
+}
+
+#[cfg(test)]
+fn rust_lib_box_id(journal: &HistorySession, name: &str) -> Option<BoxId> {
+    managed_lib_box_id(journal, ManagedLibraryKind::Rust, name)
+}
+
+#[cfg(test)]
+fn prospective_rust_lib_box_updates(
+    journal: &HistorySession,
+    call: &ToolCall,
+) -> BTreeMap<BoxId, BoxContent> {
+    prospective_managed_lib_box_updates(journal, call)
+}
+
+#[cfg(test)]
+fn prospective_rust_lib_snapshot_tokens(
+    journal: &HistorySession,
+    snapshot: &LibrarySnapshot,
+) -> anyhow::Result<u64> {
+    prospective_managed_lib_snapshot_tokens(journal, ManagedLibraryKind::Rust, snapshot)
+}
+
+#[cfg(test)]
+fn apply_rust_lib_snapshot(
+    journal: &mut HistorySession,
+    snapshot: LibrarySnapshot,
+) -> anyhow::Result<BoxId> {
+    apply_managed_lib_snapshot(journal, ManagedLibraryKind::Rust, snapshot)
+}
+
+struct ManagedLibrarySnapshot {
+    kind: ManagedLibraryKind,
+    snapshot: LibrarySnapshot,
 }
 
 struct ToolOutcome {
@@ -939,7 +1054,7 @@ struct ToolOutcome {
     ok: bool,
     end_session: bool,
     freeform_write: Option<FreeformWriteRequest>,
-    rust_lib_snapshot: Option<LibrarySnapshot>,
+    managed_lib_snapshot: Option<ManagedLibrarySnapshot>,
 }
 
 #[derive(Debug)]
@@ -1850,7 +1965,7 @@ impl Session {
             let mut end_session = false;
             let mut used_tool = false;
             let mut emitted_response = false;
-            let mut pending_freeform_write = None;
+            let mut pending_freeform_write: Option<PendingFreeformWrite> = None;
             let completed = loop {
                 let event = turn
                     .next_event()
@@ -1869,9 +1984,10 @@ impl Session {
                     }
                     kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
                         used_tool = true;
-                        if pending_freeform_write.is_some() {
+                        if let Some(pending) = &pending_freeform_write {
                             let text = format!(
-                                "{WRITE_FILE_FREEFORM_RUST_LIB_TOOL} is awaiting the complete file contents; no other Ktool can run before that output."
+                                "{} is awaiting the complete file contents; no other Ktool can run before that output.",
+                                pending.request.kind.freeform_write_tool()
                             );
                             self.record_tool_completion(None, json!({"ok":false,"result":text}))?;
                             checkpoint(self.snapshot()?).await?;
@@ -1895,7 +2011,7 @@ impl Session {
                                         call.arguments.clone(),
                                     )?);
                                 let prospective_updates =
-                                    prospective_rust_lib_box_updates(&self.journal, &call);
+                                    prospective_managed_lib_box_updates(&self.journal, &call);
                                 let prospective_projection =
                                     self.journal.state().projection_with_new_boxes_and_updates(
                                         &[(
@@ -1941,7 +2057,7 @@ impl Session {
                                         ok: false,
                                         end_session: false,
                                         freeform_write: None,
-                                        rust_lib_snapshot: None,
+                                        managed_lib_snapshot: None,
                                     }
                                 } else {
                                     created_call_box_id = Some(self.journal.create_box(
@@ -1964,7 +2080,7 @@ impl Session {
                                             ok: false,
                                             end_session: false,
                                             freeform_write: None,
-                                            rust_lib_snapshot: None,
+                                            managed_lib_snapshot: None,
                                         }
                                     } else {
                                         match self.execute_tool(&call, operation_id).await {
@@ -1980,7 +2096,7 @@ impl Session {
                                                 ok: false,
                                                 end_session: false,
                                                 freeform_write: None,
-                                                rust_lib_snapshot: None,
+                                                managed_lib_snapshot: None,
                                             },
                                         }
                                     }
@@ -1992,12 +2108,17 @@ impl Session {
                                 ok: false,
                                 end_session: false,
                                 freeform_write: None,
-                                rust_lib_snapshot: None,
+                                managed_lib_snapshot: None,
                             },
                         };
-                        if let Some(snapshot) = outcome.rust_lib_snapshot.take() {
-                            let prospective_tokens =
-                                prospective_rust_lib_snapshot_tokens(&self.journal, &snapshot)?;
+                        if let Some(managed) = outcome.managed_lib_snapshot.take() {
+                            let kind = managed.kind;
+                            let snapshot = managed.snapshot;
+                            let prospective_tokens = prospective_managed_lib_snapshot_tokens(
+                                &self.journal,
+                                kind,
+                                &snapshot,
+                            )?;
                             let ingress = matches!(self.mode, AgentMode::Ingress { .. });
                             let limit = if ingress {
                                 self.journal.state().ingress_context_limit()
@@ -2008,17 +2129,26 @@ impl Session {
                                 let name = snapshot.name.clone();
                                 let text = if ingress {
                                     self.request_ingress_force_commit(
-                                        "managed_rust_snapshot_exceeded_full_window",
+                                        match kind {
+                                            ManagedLibraryKind::Rust => {
+                                                "managed_rust_snapshot_exceeded_full_window"
+                                            }
+                                            ManagedLibraryKind::Web => {
+                                                "managed_web_snapshot_exceeded_full_window"
+                                            }
+                                        },
                                         prospective_tokens,
                                     )?;
                                     format!(
-                                        "The managed Rust library {name} was opened, but its source snapshot was not added because it exceeded the full context window; the staged transaction will now be committed."
+                                        "The managed {} library {name} was opened, but its source snapshot was not added because it exceeded the full context window; the staged transaction will now be committed.",
+                                        kind.label()
                                     )
                                 } else {
                                     let external_event_id = self.pending_external_event_id.clone();
                                     self.record_live_capacity_error(
                                         &format!(
-                                            "Kennedy's managed Rust library snapshot for {name}"
+                                            "Kennedy's managed {} library snapshot for {name}",
+                                            kind.label()
                                         ),
                                         prospective_tokens,
                                         limit,
@@ -2031,10 +2161,10 @@ impl Session {
                                     ok: false,
                                     end_session: false,
                                     freeform_write: None,
-                                    rust_lib_snapshot: None,
+                                    managed_lib_snapshot: None,
                                 };
                             } else {
-                                apply_rust_lib_snapshot(&mut self.journal, snapshot)?;
+                                apply_managed_lib_snapshot(&mut self.journal, kind, snapshot)?;
                                 outcome.store_result = false;
                             }
                         }
@@ -2062,7 +2192,7 @@ impl Session {
                                     ok: false,
                                     end_session: false,
                                     freeform_write: None,
-                                    rust_lib_snapshot: None,
+                                    managed_lib_snapshot: None,
                                 };
                             }
                         }
@@ -2162,7 +2292,7 @@ impl Session {
                     EventKind::Note {
                         label: "write_file_freeform_result".into(),
                         value: json!({
-                            "tool":WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+                            "tool":result_metadata.kind.freeform_write_tool(),
                             "name":result_metadata.name,
                             "path":result_metadata.path,
                             "updateDescription":result_metadata.update_description,
@@ -2280,6 +2410,8 @@ impl Session {
         contents: String,
     ) -> anyhow::Result<ToolOutcome> {
         let request = pending.request;
+        let kind = request.kind;
+        let freeform_tool = kind.freeform_write_tool();
         let contents = ensure_final_newline(contents);
         self.journal.update_box(
             now(),
@@ -2294,35 +2426,52 @@ impl Session {
             "path":request.path,
             "contents":contents,
         });
-        let preview = match self
-            .api
-            .rust_lib_execute(
-                &self.rust_lib_session_id,
-                PREVIEW_WRITE_FILE_RUST_LIB_TOOL,
-                backend_arguments.clone(),
-            )
-            .await
-        {
+        let preview_result = match kind {
+            ManagedLibraryKind::Rust => {
+                self.api
+                    .rust_lib_execute(
+                        &self.rust_lib_session_id,
+                        kind.preview_write_tool(),
+                        backend_arguments.clone(),
+                    )
+                    .await
+            }
+            ManagedLibraryKind::Web => {
+                self.api
+                    .web_lib_execute(
+                        &self.rust_lib_session_id,
+                        kind.preview_write_tool(),
+                        backend_arguments.clone(),
+                    )
+                    .await
+            }
+        };
+        let preview = match preview_result {
             Ok(preview) => preview,
             Err(error) => {
                 return Ok(ToolOutcome {
-                    text: format!("{WRITE_FILE_FREEFORM_RUST_LIB_TOOL} failed: {error}"),
+                    text: format!("{freeform_tool} failed: {error}"),
                     store_result: true,
                     ok: false,
                     end_session: false,
                     freeform_write: None,
-                    rust_lib_snapshot: None,
+                    managed_lib_snapshot: None,
                 });
             }
         };
         let preview = preview
             .snapshot
             .context("freeform write preview omitted the resulting library snapshot")?;
-        let source_box_id = rust_lib_box_id(&self.journal, &request.name)
-            .context("the managed Rust library box disappeared during freeform capture")?;
+        let source_box_id =
+            managed_lib_box_id(&self.journal, kind, &request.name).with_context(|| {
+                format!(
+                    "the managed {} library box disappeared during freeform capture",
+                    kind.label()
+                )
+            })?;
         let prospective = self.journal.state().projection_with_new_boxes_and_updates(
             &[],
-            &BTreeMap::from([(source_box_id, rust_lib_box_content(&preview))]),
+            &BTreeMap::from([(source_box_id, managed_lib_box_content(kind, &preview))]),
         )?;
         let prospective_tokens = prospective.estimated_tokens;
         let limit = if matches!(self.mode, AgentMode::Ingress { .. }) {
@@ -2342,15 +2491,12 @@ impl Session {
                     ok: false,
                     end_session: false,
                     freeform_write: None,
-                    rust_lib_snapshot: None,
+                    managed_lib_snapshot: None,
                 });
             }
             let external_event_id = self.pending_external_event_id.clone();
             let text = self.record_live_capacity_error(
-                &format!(
-                    "Kennedy's {WRITE_FILE_FREEFORM_RUST_LIB_TOOL} output for {}",
-                    request.path
-                ),
+                &format!("Kennedy's {freeform_tool} output for {}", request.path),
                 prospective_tokens,
                 limit,
                 external_event_id.as_deref(),
@@ -2361,42 +2507,46 @@ impl Session {
                 ok: false,
                 end_session: false,
                 freeform_write: None,
-                rust_lib_snapshot: None,
+                managed_lib_snapshot: None,
             });
         }
 
-        let execution = match self
-            .api
-            .rust_lib_execute(
-                &self.rust_lib_session_id,
-                WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
-                backend_arguments,
-            )
-            .await
-        {
+        let execution_result = match kind {
+            ManagedLibraryKind::Rust => {
+                self.api
+                    .rust_lib_execute(&self.rust_lib_session_id, freeform_tool, backend_arguments)
+                    .await
+            }
+            ManagedLibraryKind::Web => {
+                self.api
+                    .web_lib_execute(&self.rust_lib_session_id, freeform_tool, backend_arguments)
+                    .await
+            }
+        };
+        let execution = match execution_result {
             Ok(execution) => execution,
             Err(error) => {
                 return Ok(ToolOutcome {
-                    text: format!("{WRITE_FILE_FREEFORM_RUST_LIB_TOOL} failed: {error}"),
+                    text: format!("{freeform_tool} failed: {error}"),
                     store_result: true,
                     ok: false,
                     end_session: false,
                     freeform_write: None,
-                    rust_lib_snapshot: None,
+                    managed_lib_snapshot: None,
                 });
             }
         };
         let snapshot = execution
             .snapshot
             .context("freeform write omitted the resulting library snapshot")?;
-        apply_rust_lib_snapshot(&mut self.journal, snapshot)?;
+        apply_managed_lib_snapshot(&mut self.journal, kind, snapshot)?;
         Ok(ToolOutcome {
             text: execution.text,
             store_result: false,
             ok: true,
             end_session: false,
             freeform_write: None,
-            rust_lib_snapshot: None,
+            managed_lib_snapshot: None,
         })
     }
 
@@ -2409,7 +2559,7 @@ impl Session {
         let mut end_session = false;
         let mut store_result = true;
         let mut freeform_write = None;
-        let mut rust_lib_snapshot = None;
+        let mut managed_lib_snapshot = None;
         let text = match call.name.as_str() {
             "EndSession" => {
                 validate_arguments(&call.arguments, &[], &["message"])?;
@@ -2728,13 +2878,19 @@ impl Session {
             "SetFixedConnection" => self.set_fixed_connection(&call.arguments)?,
             "CreateNode" => self.create_node(&call.arguments)?,
             "UpdateNode" => self.update_node(&call.arguments)?,
-            WRITE_FILE_FREEFORM_RUST_LIB_TOOL => {
-                let request = freeform_write_request(&call.arguments)?;
+            WRITE_FILE_FREEFORM_RUST_LIB_TOOL | WRITE_FILE_FREEFORM_WEB_LIB_TOOL => {
+                let kind = if call.name == WRITE_FILE_FREEFORM_RUST_LIB_TOOL {
+                    ManagedLibraryKind::Rust
+                } else {
+                    ManagedLibraryKind::Web
+                };
+                let request = freeform_write_request_for(&call.arguments, kind)?;
                 anyhow::ensure!(
-                    rust_lib_box_id(&self.journal, &request.name).is_some(),
-                    "Rust library {:?} is not open in this Kennedy session. Call {} first.",
+                    managed_lib_box_id(&self.journal, kind, &request.name).is_some(),
+                    "{} library {:?} is not open in this Kennedy session. Call {} first.",
+                    kind.label(),
                     request.name,
-                    crate::rust_lib_tools::OPEN_RUST_LIB_TOOL
+                    kind.open_tool()
                 );
                 store_result = false;
                 let acknowledgement = format!(
@@ -2750,7 +2906,24 @@ impl Session {
                     .rust_lib_execute(&self.rust_lib_session_id, name, call.arguments.clone())
                     .await?;
                 if let Some(snapshot) = execution.snapshot {
-                    rust_lib_snapshot = Some(snapshot);
+                    managed_lib_snapshot = Some(ManagedLibrarySnapshot {
+                        kind: ManagedLibraryKind::Rust,
+                        snapshot,
+                    });
+                    store_result = false;
+                }
+                execution.text
+            }
+            name if WEB_LIB_TOOLS.contains(&name) => {
+                let execution = self
+                    .api
+                    .web_lib_execute(&self.rust_lib_session_id, name, call.arguments.clone())
+                    .await?;
+                if let Some(snapshot) = execution.snapshot {
+                    managed_lib_snapshot = Some(ManagedLibrarySnapshot {
+                        kind: ManagedLibraryKind::Web,
+                        snapshot,
+                    });
                     store_result = false;
                 }
                 execution.text
@@ -2763,7 +2936,7 @@ impl Session {
             ok: true,
             end_session,
             freeform_write,
-            rust_lib_snapshot,
+            managed_lib_snapshot,
         })
     }
 
@@ -4821,6 +4994,55 @@ mod tests {
     }
 
     #[test]
+    fn managed_web_write_uses_a_separate_stable_source_box() {
+        let (path, mut journal) = test_journal("managed-web-write", 10_000);
+        let rust_box = apply_managed_lib_snapshot(
+            &mut journal,
+            ManagedLibraryKind::Rust,
+            LibrarySnapshot {
+                name: "shared-name".into(),
+                text: "Rust library source".into(),
+            },
+        )
+        .unwrap();
+        let web_box = apply_managed_lib_snapshot(
+            &mut journal,
+            ManagedLibraryKind::Web,
+            LibrarySnapshot {
+                name: "shared-name".into(),
+                text: "Web library source".into(),
+            },
+        )
+        .unwrap();
+        assert_ne!(rust_box, web_box);
+
+        let call = ToolCall {
+            name: WRITE_WEB_LIB_TOOL.into(),
+            arguments: json!({
+                "name":"shared-name",
+                "files":[{
+                    "path":"index.js",
+                    "contents":"export const current = true;\n"
+                }]
+            }),
+        };
+        let compact = tool_call_box_content(&call).unwrap();
+        assert!(!compact.text.contains("export const current"));
+        let updates = prospective_managed_lib_box_updates(&journal, &call);
+        assert_eq!(updates.len(), 1);
+        assert!(updates.contains_key(&web_box));
+        assert!(!updates.contains_key(&rust_box));
+
+        let snapshot = proposed_web_write_snapshot(&call.arguments).unwrap();
+        let same_web_box =
+            apply_managed_lib_snapshot(&mut journal, ManagedLibraryKind::Web, snapshot).unwrap();
+        assert_eq!(same_web_box, web_box);
+        assert_eq!(journal.state().tools[WEB_LIB_TOOL_INSTANCE].slots.len(), 1);
+        assert_eq!(journal.state().tools[RUST_LIB_TOOL_INSTANCE].slots.len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn managed_rust_write_capacity_previews_replacement_instead_of_duplication() {
         let (path, mut journal) = test_journal("managed-rust-capacity", 1_200);
         let initial = LibrarySnapshot {
@@ -4951,6 +5173,28 @@ mod tests {
             "pub fn example() {}\n\n"
         );
         assert_eq!(ensure_final_newline(String::new()), "\n");
+    }
+
+    #[test]
+    fn web_freeform_write_capture_records_the_web_tool_contract() {
+        let request = freeform_write_request_for(
+            &json!({
+                "name":"example-ui",
+                "path":"index.js",
+                "updateDescription":"Replace the entry module",
+            }),
+            ManagedLibraryKind::Web,
+        )
+        .unwrap();
+        let content = captured_write_box_content(&request, "export {};\n".into());
+        assert_eq!(
+            content.metadata["toolName"],
+            WRITE_FILE_FREEFORM_WEB_LIB_TOOL
+        );
+        assert_eq!(
+            content.metadata["arguments"]["updateDescription"],
+            "Replace the entry module"
+        );
     }
 
     #[test]

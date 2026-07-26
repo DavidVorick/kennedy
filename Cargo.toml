@@ -25,6 +25,7 @@ kcode-kweb-db = "1.0"
 kcode-audio-ingress = "0.1.1"
 kcode-openai-api = "=0.1.2"
 kcode-rust-libs-v2 = "=1.1.0"
+kcode-web-libs = "=0.1.0"
 kcode-session-history = "=0.1.0"
 kcode-web-fetch = "0.1.1"
 rand = "0.9"
@@ -34,6 +35,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "fs", "limit", "trace"] }

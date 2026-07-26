@@ -1038,6 +1038,7 @@ pub(crate) struct MergedRouters {
     intelligence: Router,
     session_history: Router,
     audio_ingress: Router,
+    web_libraries: Router,
 }
 
 impl MergedRouters {
@@ -1045,11 +1046,13 @@ impl MergedRouters {
         intelligence: Router,
         session_history: Router,
         audio_ingress: Router,
+        web_libraries: Router,
     ) -> Self {
         Self {
             intelligence,
             session_history,
             audio_ingress,
+            web_libraries,
         }
     }
 }
@@ -1078,6 +1081,7 @@ pub(crate) async fn serve_with_listener(
         .merge(merged_routers.intelligence)
         .merge(merged_routers.session_history)
         .merge(merged_routers.audio_ingress)
+        .merge(merged_routers.web_libraries)
         .fallback_service(ServeDir::new(frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -1088,10 +1092,12 @@ pub(crate) async fn serve_with_listener(
 }
 
 async fn prevent_stale_frontend_assets(mut response: Response) -> Response {
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
+    if !response.headers().contains_key(header::CACHE_CONTROL) {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+    }
     response
 }
 

@@ -539,8 +539,9 @@ test("Telegram group media remains model-addressable without eager byte embeddin
 });
 
 test("codex-safe preserves its documented workspace and catalog boundaries", async () => {
-  const [launcher, readme] = await Promise.all([
+  const [launcher, runtimeBuilder, readme] = await Promise.all([
     readFile(new URL("../../scripts/codex-safe", import.meta.url), "utf8"),
+    readFile(new URL("../../scripts/build-codex-safe-runtime", import.meta.url), "utf8"),
     readFile(new URL("../../README.md", import.meta.url), "utf8"),
   ]);
   const defaultPath = "${TMPDIR:-/tmp}/kcode-codex-catalogs";
@@ -553,6 +554,18 @@ test("codex-safe preserves its documented workspace and catalog boundaries", asy
     /find "\$empty_workspace" -mindepth 1 -maxdepth 1 -exec rm -rf -- \{\} \+/,
   );
   assert.ok(readme.includes("/home/user/podman/codex-state-empty-workspace"));
+  assert.match(launcher, /CODEX_IMAGE:-local\/codex-dev/);
+  assert.match(launcher, /CODEX_SAFE_CARGO_CACHE_DIR/);
+  assert.equal(launcher.match(/dst=\/tmp\/codex-cargo,rw/g)?.length, 2);
+  assert.match(runtimeBuilder, /TARGET_IMAGE="\$\{CODEX_SAFE_RUNTIME_IMAGE:-local\/codex-dev\}"/);
+  assert.match(runtimeBuilder, /chromium/);
+  assert.match(runtimeBuilder, /rustup component add/);
+  assert.match(runtimeBuilder, /--security-opt=no-new-privileges/);
+  assert.match(runtimeBuilder, /--cap-drop=all/);
+  assert.match(runtimeBuilder, /--cap-add=SYS_CHROOT/);
+  assert.equal(launcher.match(/--cap-add=SYS_CHROOT/g)?.length, 2);
+  assert.ok(readme.includes("scripts/build-codex-safe-runtime"));
+  assert.ok(readme.includes("CODEX_SAFE_CARGO_CACHE_DIR"));
 });
 
 test("native orchestration remains a Rust backend concern", async () => {

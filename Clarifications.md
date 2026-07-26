@@ -78,8 +78,9 @@ canonical documents; this file is not an append-only log.
   defaults to locations under `./data/` while retaining those existing flags as
   overrides. Store live databases and their WAL/SHM companions directly in
   `data/`, audio originals in `data/audio-ingress-media/`, the transactional
-  Kweb root in `data/kweb/`, managed Rust libraries in `data/rust-libs/`, the
-  encrypted vault in `data/`, and manual recovery material in `data/recovery/`.
+  Kweb root in `data/kweb/`, managed Kcode sources and publications beneath
+  `data/kcode/`, the encrypted vault in `data/`, and manual recovery material
+  in `data/recovery/`.
   Generated whole-tree backup archives live outside `data/` so they cannot
   recursively include themselves.
 
@@ -1142,3 +1143,55 @@ canonical documents; this file is not an append-only log.
   transcript-piece memory ingress, Chatend/Kweb checkpoints, downstream
   failures, completion, and idempotency; those concepts do not appear in the
   standalone library API.
+
+## Managed Web Libraries
+
+- Consume the published `kcode-web-libs` crate and expose a Ktool family as
+  identical to `kcode-rust-libs-v2` as practical: create, open, docs, complete
+  write, terminal-output `write-file-freeform`, delete-file, check, and
+  publish. Rust and Web libraries retain independent stateful complete-source
+  boxes.
+- Store managed Web source and immutable publications beneath
+  `./data/kcode/kcode-web-libs/`, relative to KennedyServer's process working
+  directory. The simplified whole-`data/` backup script covers this root; do
+  not add special backup-system integration.
+- Serve every file from immutable publications. A fileless
+  `/lib/<name>/<selector>` request resolves and redirects to the selected
+  publication's manifest-declared entry module. A file route preserves the
+  requested relative path.
+- Treat `v<major>.<minor>.<patch>` as exact. Treat abbreviated `v` selectors
+  and unprefixed selectors as Cargo-compatible SemVer requirements, support
+  the major `semver::VersionReq` expression forms, and select the highest
+  published stable matching version. Unprefixed `1.2.3` therefore has Cargo
+  caret semantics.
+- Redirect floating routes to exact routes. Keep floating redirects uncached
+  and exact published files immutable-cacheable. The expected consumers share
+  the KennedyServer origin, so no Web-library-specific CORS policy is needed.
+- Retain `/module/<name>/v<exact>/<file>` as a production compatibility alias
+  for exact cross-library dependency URLs accepted by the crate's Chromium
+  checker; `/lib` remains the documented public selection API.
+- Maintain `web-libs-education.txt` as Kennedy's complete operational guide to
+  the crate API, Ktool contracts, publication workflow, route/version
+  behavior, and source constraints.
+
+## Managed Kcode Development Tools and Rust Binaries
+
+- Consolidate managed Kcode state beneath `./data/kcode/`. Use
+  `kcode-rust-libs/` for Rust-library source, `kcode-web-libs/` for Web-library
+  source and publications, `kcode-rust-bins/` for Rust-binary source, and
+  `kcode-rust-bin-artifacts/` for published executables.
+- Keep Rust-binary source and executable publications separate. Publish
+  executables immutably by name and SemVer, reject a second publication of the
+  same name and version, and resolve calls with the Cargo-style SemVer behavior
+  used for Web libraries. Do not add checksums, quotas, or retained build
+  artifacts beyond the published executable.
+- Permit runtime networking. Do not impose build or call concurrency limits.
+  Give calls a two-minute default timeout while allowing Kennedy to request a
+  different timeout.
+- Preserve a binary's text output exactly. Store binary output objects in
+  Kennedy's object store and show their object IDs without wrapping text or
+  object IDs in pretty JSON.
+- Put the Rust-library, Web-library, and Rust-binary Ktool adapters and their
+  shared session/lease behavior in the managed `kcode-dev-tools` Rust library.
+  Kennedy consumes that library rather than retaining parallel adapter
+  implementations in KennedyServer.

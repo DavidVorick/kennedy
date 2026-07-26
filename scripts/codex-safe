@@ -4,8 +4,9 @@ set -eu
 
 program=${0##*/}
 podman=${CODEX_SAFE_PODMAN:-podman}
-image=${CODEX_SAFE_IMAGE:-${CODEX_IMAGE:-local/codex}}
+image=${CODEX_SAFE_IMAGE:-${CODEX_IMAGE:-local/codex-dev}}
 state=${CODEX_SAFE_STATE_DIR:-/home/user/podman/codex-state}
+cargo_cache=${CODEX_SAFE_CARGO_CACHE_DIR:-${state}-cargo-cache}
 catalog_dir=${CODEX_SAFE_CATALOG_DIR:-${TMPDIR:-/tmp}/kcode-codex-catalogs}
 empty_workspace=${CODEX_SAFE_EMPTY_WORKSPACE:-${state}-empty-workspace}
 container_user=${CODEX_SAFE_CONTAINER_USER:-1000:1000}
@@ -19,9 +20,16 @@ command -v "$podman" >/dev/null 2>&1 ||
     die "podman is not installed or CODEX_SAFE_PODMAN is invalid"
 
 umask 077
-mkdir -p "$state" "$catalog_dir"
+mkdir -p "$state" "$cargo_cache" "$catalog_dir"
 state_path=$(cd "$state" && pwd -P)
+cargo_cache_path=$(cd "$cargo_cache" && pwd -P)
 catalog_path=$(cd "$catalog_dir" && pwd -P)
+
+case "$cargo_cache_path" in
+    /)
+        die "refusing to use / as CODEX_SAFE_CARGO_CACHE_DIR"
+        ;;
+esac
 
 interactive=0
 if [ -t 0 ] && [ -t 1 ]; then
@@ -67,10 +75,17 @@ if [ -z "$workspace" ]; then
             die "CODEX_SAFE_EMPTY_WORKSPACE must not contain the model catalog directory"
             ;;
     esac
+    case "$cargo_cache_path/" in
+        "$empty_workspace/"*)
+            die "CODEX_SAFE_EMPTY_WORKSPACE must not contain the Cargo cache directory"
+            ;;
+    esac
     find "$empty_workspace" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     workspace=$empty_workspace
 fi
 
+# Cargo writes through /tmp because Codex's workspace-write sandbox permits
+# temporary directories; the bind mount keeps downloads between --rm runs.
 # The catalog must appear at the same absolute path inside the container. The
 # intelligence backend probes this read-only mount before using its slim model
 # catalog. Codex authentication and persisted threads live in the state mount.
@@ -80,9 +95,11 @@ if [ "$interactive" -eq 1 ]; then
         --user "$container_user" \
         --security-opt=no-new-privileges \
         --cap-drop=all \
+        --cap-add=SYS_CHROOT \
         --pids-limit=512 \
         --memory=8g \
         --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+        --mount "type=bind,src=$cargo_cache_path,dst=/tmp/codex-cargo,rw" \
         --mount "type=bind,src=$workspace,dst=/workspace,rw" \
         --mount "type=bind,src=$state,dst=/home/node/.codex,rw" \
         --mount "type=bind,src=$catalog_dir,dst=$catalog_dir,ro" \
@@ -100,9 +117,11 @@ exec "$podman" run --rm -i \
     --user "$container_user" \
     --security-opt=no-new-privileges \
     --cap-drop=all \
+    --cap-add=SYS_CHROOT \
     --pids-limit=512 \
     --memory=8g \
     --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+    --mount "type=bind,src=$cargo_cache_path,dst=/tmp/codex-cargo,rw" \
     --mount "type=bind,src=$workspace,dst=/workspace,rw" \
     --mount "type=bind,src=$state,dst=/home/node/.codex,rw" \
     --mount "type=bind,src=$catalog_dir,dst=$catalog_dir,ro" \

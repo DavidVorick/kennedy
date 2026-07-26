@@ -150,16 +150,17 @@ When a process interruption leaves an invocation without a completion, session
 recovery appends an explicit failed completion before sealing; legacy journals
 without invocation IDs retain their historical LIFO compatibility.
 
-Managed Rust library `create` and `open` install one stateful complete-source
-box per library only after a non-mutating projection preview accepts the
-returned snapshot. An over-capacity result leaves Chatend unchanged and
-returns the bounded capacity error. Successful writes revise that box in place
-and suppress a generic result copy. The durable invocation event retains the
-exact complete write arguments, while its active call box contains only
-bounded identifying metadata so a later provider request sees one complete
-source. Failed writes do not revise the source box. Kennedy-authored summaries
-and dehydration survive canonical source updates and become stale under the
-ordinary box rules. `LoadNode` is the other deliberate result exception: its
+Managed Rust and Web library `create` and `open` operations install one
+stateful complete-source box per name and library kind only after a
+non-mutating projection preview accepts the returned snapshot. An
+over-capacity result leaves Chatend unchanged and returns the bounded capacity
+error. Successful writes revise that box in place and suppress a generic
+result copy. The durable invocation event retains the exact complete write
+arguments, while its active call box contains only bounded identifying
+metadata so a later provider request sees one complete source. Failed writes
+do not revise the source box. Kennedy-authored summaries and dehydration
+survive canonical source updates and become stale under the ordinary box
+rules. `LoadNode` is the other deliberate result exception: its
 invocation remains a box, but it updates the shared Kweb boxes
 and returns the exact newly created or revised box renderings directly to the
 in-flight provider turn. It does not create a second generic result box.
@@ -167,6 +168,13 @@ in-flight provider turn. It does not create a second generic result box.
 object and creates a durable object-bearing Kennedy message box. That message
 is the adapter outbox and may terminally answer a conversational turn without
 assistant prose; no generic result box duplicates it.
+
+Published Web-library trees are immutable. `/lib/<name>/<selector>` resolves
+Cargo-compatible SemVer requirements and redirects to the highest matching
+exact publication's manifest entry; file routes preserve the requested
+relative path. Exact files are immutable-cacheable and floating redirects are
+uncached. `/module/<name>/v<exact>/<file>` remains an alias for the dependency
+URLs used by the library's Chromium checker.
 
 ## 7. Kweb context and writes
 
@@ -333,7 +341,7 @@ Kennedy never receives it. The server passes it directly to `kcode-kweb-db`
 after a human unlocks the vault.
 
 All Kennedy-owned runtime paths default beneath the repository-local `data/`
-tree, including managed Rust libraries. `scripts/backup` is an offline,
+tree, including managed Rust and Web libraries. `scripts/backup` is an offline,
 format-agnostic backup: after verifying that Kennedy is stopped, it archives
 the complete tree without interpreting SQLite, Kweb, Session History, audio,
 vault, recovery, or legacy formats. A small metadata member records the source

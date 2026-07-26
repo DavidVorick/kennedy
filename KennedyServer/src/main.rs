@@ -8,6 +8,8 @@ mod orchestration;
 mod rust_lib_tools;
 mod session_history_http;
 mod telegram_identity;
+mod web_lib_http;
+mod web_lib_tools;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -81,8 +83,10 @@ struct Args {
         help = "AudioIngress-owned persistence root (database and original audio)"
     )]
     audio_ingress_directory: PathBuf,
-    #[arg(long, default_value = "./data/rust-libs")]
+    #[arg(long, default_value = "./data/kcode/kcode-rust-libs")]
     rust_libs_root: PathBuf,
+    #[arg(long, default_value = "./data/kcode/kcode-web-libs")]
+    web_libs_root: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
     frontend_dir: PathBuf,
     #[arg(long, default_value = "./Frontend/SystemPrompts")]
@@ -224,6 +228,14 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 )
             },
         )?;
+    let web_lib_tools =
+        web_lib_tools::WebLibToolService::new(&args.web_libs_root).with_context(|| {
+            format!(
+                "opening managed Web libraries root {}",
+                args.web_libs_root.display()
+            )
+        })?;
+    let web_lib_router = web_lib_http::router(web_lib_tools.root());
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
@@ -290,6 +302,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             audio: audio_service,
             directory: telegram_identity.clone(),
             rust_lib_tools,
+            web_lib_tools,
         },
     )?;
     tokio::try_join!(
@@ -300,6 +313,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 intelligence_router,
                 history_router,
                 audio_ingress_router,
+                web_lib_router,
             ),
             kweb_listener,
         ),
@@ -322,6 +336,7 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.audio_memory_ingress_database,
         &args.audio_ingress_directory,
         &args.rust_libs_root,
+        &args.web_libs_root,
     ] {
         let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) else {
             continue;
@@ -628,6 +643,7 @@ mod tests {
             &args.audio_memory_ingress_database,
             &args.audio_ingress_directory,
             &args.rust_libs_root,
+            &args.web_libs_root,
         ] {
             assert!(
                 path.starts_with("./data"),
@@ -750,6 +766,7 @@ mod tests {
             audio_memory_ingress_database: memory_ingress.clone(),
             audio_ingress_directory: audio_media.clone(),
             rust_libs_root: directory.join("rust-libs"),
+            web_libs_root: directory.join("kcode-web-libs"),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
             telegram_bootstrap_username: "@test".to_owned(),
