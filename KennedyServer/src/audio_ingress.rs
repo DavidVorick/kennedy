@@ -63,6 +63,7 @@ pub(crate) struct Service {
     audio: AudioIngress,
     queue: Queue,
     max_upload_bytes: usize,
+    user_id: String,
 }
 
 #[derive(Debug)]
@@ -144,8 +145,13 @@ impl Service {
         queue_database: &Path,
         legacy_audio_database: Option<&Path>,
         max_upload_bytes: usize,
+        user_id: String,
     ) -> anyhow::Result<Self> {
         ensure!(max_upload_bytes > 0, "audio upload limit must be positive");
+        ensure!(
+            !user_id.trim().is_empty(),
+            "audio user ID must not be empty"
+        );
         let queue = Queue::open(queue_database)?;
         if let Some(path) = legacy_audio_database.filter(|path| path.exists()) {
             queue.import_audio_ingress_database(path).with_context(|| {
@@ -156,6 +162,7 @@ impl Service {
             audio,
             queue,
             max_upload_bytes,
+            user_id,
         };
         service
             .synchronize_completed_transcripts()
@@ -361,6 +368,7 @@ async fn upload_recording(
     let submission = service
         .audio
         .submit(AudioInput {
+            user_id: service.user_id.clone(),
             bytes,
             recorded_at,
             original_filename,
@@ -1342,6 +1350,7 @@ mod tests {
         let queue = queue();
         let recording = RecordingStatus {
             id: Uuid::new_v4(),
+            user_id: "test-user".into(),
             sha256: "a".repeat(64),
             original_filename: "note.wav".into(),
             size_bytes: 4,

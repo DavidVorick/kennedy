@@ -7,7 +7,7 @@ mod worker;
 use std::{path::PathBuf, sync::Arc};
 
 pub(crate) use http::{Api, ApiError, LocalServices};
-pub(crate) use prompts::{Manuals, RuntimeModel};
+pub(crate) use prompts::{Manuals, RuntimeModel, human_utc_datetime, runtime_description};
 pub(crate) use session::{AgentMode, Session};
 
 #[derive(Clone, Debug)]
@@ -24,6 +24,7 @@ pub(crate) struct Config {
     #[cfg(test)]
     pub audio_ingress_base: String,
     pub telegram_web_user_handle: String,
+    pub runtime_model: RuntimeModel,
 }
 
 /// Run Kennedy's native backend coordinator for the lifetime of the server.

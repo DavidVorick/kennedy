@@ -67,16 +67,6 @@ export const KwebAPI = (base) => ({
   sessionArchive: (id) => requestJSON(base, `/api/v1/session-history/${id}`),
 });
 
-export const IntelligenceAPI = (base) => ({
-  health: () => requestJSON(base, "/health"),
-  providers: () => requestJSON(base, "/api/v1/providers"),
-  extractDocument: ({ file, fileName = "document" }) => {
-    const form = new FormData();
-    form.append("file", file, fileName);
-    return requestFormJSON(base, "/api/v1/documents/extract", form);
-  },
-});
-
 export const SessionHistoryAPI = (base) => ({
   health: () => requestJSON(base, "/api/v1/conversations/health"),
   list: () => requestJSON(base, "/api/v1/conversations/summaries"),

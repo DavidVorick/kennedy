@@ -19,7 +19,7 @@ const ACTIVE_CONNECTION_LIMIT: usize = 8;
 #[derive(Clone)]
 pub(crate) struct LocalServices {
     pub kmap: crate::kmap_http::Service,
-    pub intelligence: crate::intelligence::Service,
+    pub intelligence: kcode_intelligence_router::Intelligence,
     pub history: kcode_session_history::SessionHistory,
     pub audio: crate::audio_ingress::Service,
     pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
@@ -58,7 +58,7 @@ enum ServiceBackend {
 }
 
 pub(crate) enum AgentTurn {
-    Local(crate::intelligence::AgentTurn),
+    Local(kcode_intelligence_router::AgentTurn),
     #[cfg(test)]
     Http(HttpAgentTurn),
 }
@@ -182,24 +182,17 @@ impl Api {
         }
     }
 
-    pub async fn intelligence_get(&self, path: &str) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Intelligence, Method::GET, path, None)
-            .await
-    }
-
-    pub async fn intelligence_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Intelligence, Method::POST, path, Some(body))
-            .await
-    }
-
     pub async fn start_agent_turn(
         &self,
+        user_id: &str,
         operation_id: Uuid,
         request: kcode_codex_runtime_v2::AgentRequest,
     ) -> Result<AgentTurn, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local
                 .intelligence
+                .for_user(user_id)
+                .map_err(intelligence_error)?
                 .start_agent_turn(operation_id, request)
                 .await
                 .map(AgentTurn::Local)
@@ -291,6 +284,84 @@ impl Api {
                     },
                 )));
                 Ok(AgentTurn::Http(HttpAgentTurn { events }))
+            }
+        }
+    }
+
+    pub fn cancel_intelligence(&self, operation_id: Uuid) -> Result<bool, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .intelligence
+                .cancel(operation_id)
+                .map_err(intelligence_error),
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Ok(false),
+        }
+    }
+
+    pub async fn search(
+        &self,
+        user_id: &str,
+        request: kcode_intelligence_router::SearchRequest,
+    ) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let response = local
+                    .intelligence
+                    .for_user(user_id)
+                    .map_err(intelligence_error)?
+                    .search(request)
+                    .await
+                    .map_err(intelligence_error)?;
+                serde_json::to_value(response).map_err(local_api_error)
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.intelligence,
+                    "/api/v1/web/search",
+                    Some(json!({
+                        "question": request.question,
+                        "model": request.model,
+                        "operation_id": request.operation_id,
+                        "parent_operation_id": request.parent_operation_id,
+                    })),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn fetch(
+        &self,
+        user_id: &str,
+        request: kcode_intelligence_router::FetchRequest,
+    ) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let response = local
+                    .intelligence
+                    .for_user(user_id)
+                    .map_err(intelligence_error)?
+                    .fetch(request)
+                    .await
+                    .map_err(intelligence_error)?;
+                serde_json::to_value(response).map_err(local_api_error)
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.intelligence,
+                    "/api/v1/web/fetch",
+                    Some(json!({
+                        "url": request.url,
+                        "operation_id": request.operation_id,
+                        "parent_operation_id": request.parent_operation_id,
+                    })),
+                )
+                .await
             }
         }
     }
@@ -972,6 +1043,8 @@ impl Api {
     #[allow(clippy::too_many_arguments)]
     pub async fn transcribe_audio(
         &self,
+        user_id: &str,
+        model: &str,
         prompt: &str,
         bytes: Vec<u8>,
         filename: String,
@@ -981,15 +1054,19 @@ impl Api {
         match &self.services {
             ServiceBackend::Local(local) => local
                 .intelligence
-                .transcribe_audio_with_prompt_bytes(
-                    prompt,
-                    bytes,
-                    filename,
-                    mime,
-                    Some(parent_operation_id),
-                )
+                .for_user(user_id)
+                .map_err(intelligence_error)?
+                .transcribe(kcode_intelligence_router::TranscriptionRequest {
+                    prompt: prompt.to_owned(),
+                    model: model.to_owned(),
+                    media: kcode_intelligence_router::Media::audio(bytes, filename, mime)
+                        .map_err(intelligence_error)?,
+                    operation_id: Uuid::new_v4(),
+                    parent_operation_id: Some(parent_operation_id),
+                })
                 .await
-                .map_err(intelligence_error),
+                .map_err(intelligence_error)
+                .and_then(|value| serde_json::to_value(value).map_err(local_api_error)),
             #[cfg(test)]
             ServiceBackend::Http(bases) => {
                 let part = multipart::Part::bytes(bytes)
@@ -1001,6 +1078,7 @@ impl Api {
                     "/api/v1/audio/transcriptions",
                     multipart::Form::new()
                         .text("prompt", prompt.to_owned())
+                        .text("model", model.to_owned())
                         .text("parent_operation_id", parent_operation_id.to_string())
                         .part("file", part),
                 )
@@ -1018,9 +1096,14 @@ impl Api {
         match &self.services {
             ServiceBackend::Local(local) => local
                 .intelligence
-                .extract_document_bytes(bytes, filename, mime)
+                .extract_document(kcode_intelligence_router::Document {
+                    bytes,
+                    file_name: filename,
+                    content_type: mime.to_owned(),
+                })
                 .await
-                .map_err(intelligence_error),
+                .map_err(intelligence_error)
+                .and_then(|value| serde_json::to_value(value).map_err(local_api_error)),
             #[cfg(test)]
             ServiceBackend::Http(bases) => {
                 let part = multipart::Part::bytes(bytes)
@@ -1040,7 +1123,8 @@ impl Api {
     #[allow(clippy::too_many_arguments)]
     pub async fn annotate_media(
         &self,
-        provider: &str,
+        user_id: &str,
+        model: &str,
         prompt: &str,
         bytes: Vec<u8>,
         filename: String,
@@ -1050,16 +1134,19 @@ impl Api {
         match &self.services {
             ServiceBackend::Local(local) => local
                 .intelligence
-                .annotate_media_bytes(
-                    provider,
-                    prompt,
-                    bytes,
-                    filename,
-                    mime,
-                    Some(parent_operation_id),
-                )
+                .for_user(user_id)
+                .map_err(intelligence_error)?
+                .annotate(kcode_intelligence_router::AnnotationRequest {
+                    prompt: prompt.to_owned(),
+                    model: model.to_owned(),
+                    media: media_for_annotation(bytes, filename, mime)
+                        .map_err(intelligence_error)?,
+                    operation_id: Uuid::new_v4(),
+                    parent_operation_id: Some(parent_operation_id),
+                })
                 .await
-                .map_err(intelligence_error),
+                .map_err(intelligence_error)
+                .and_then(|value| serde_json::to_value(value).map_err(local_api_error)),
             #[cfg(test)]
             ServiceBackend::Http(bases) => {
                 let part = multipart::Part::bytes(bytes)
@@ -1070,7 +1157,7 @@ impl Api {
                     &bases.intelligence,
                     "/api/v1/media/annotations",
                     multipart::Form::new()
-                        .text("provider", provider.to_owned())
+                        .text("model", model.to_owned())
                         .text("prompt", prompt.to_owned())
                         .text("parent_operation_id", parent_operation_id.to_string())
                         .part("file", part),
@@ -1114,16 +1201,6 @@ impl Api {
                         }),
                     }
                     .map_err(kmap_error),
-                    ServiceKind::Intelligence => match method {
-                        Method::GET => services.intelligence.get_json(path).await,
-                        Method::POST => services.intelligence.post_json(path, body).await,
-                        _ => Err(crate::intelligence::ApiError::new(
-                            StatusCode::METHOD_NOT_ALLOWED,
-                            "method_not_allowed",
-                            "Unsupported direct intelligence operation.",
-                        )),
-                    }
-                    .map_err(intelligence_error),
                     ServiceKind::Audio => match method {
                         Method::GET => services.audio.get_json(path).await,
                         Method::POST => services.audio.post_json(path, body).await,
@@ -1151,7 +1228,6 @@ impl Api {
             ServiceBackend::Http(bases) => {
                 let base = match service {
                     ServiceKind::Kmap | ServiceKind::Directory => &bases.kweb,
-                    ServiceKind::Intelligence => &bases.intelligence,
                     ServiceKind::Audio => &bases.audio,
                 };
                 self.request(method, base, path, body).await
@@ -1193,7 +1269,6 @@ impl AgentTurn {
 #[derive(Clone, Copy)]
 enum ServiceKind {
     Kmap,
-    Intelligence,
     Audio,
     Directory,
 }
@@ -1206,11 +1281,19 @@ fn kmap_error(error: crate::kmap_http::ApiError) -> ApiError {
     }
 }
 
-fn intelligence_error(error: crate::intelligence::ApiError) -> ApiError {
+fn intelligence_error(error: kcode_intelligence_router::Error) -> ApiError {
+    let status = match error.kind() {
+        kcode_intelligence_router::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        kcode_intelligence_router::ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        kcode_intelligence_router::ErrorKind::Conflict
+        | kcode_intelligence_router::ErrorKind::Cancelled => StatusCode::CONFLICT,
+        kcode_intelligence_router::ErrorKind::Provider => StatusCode::BAD_GATEWAY,
+        kcode_intelligence_router::ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    };
     ApiError {
-        status: Some(error.status),
-        code: error.code.into(),
-        message: error.message,
+        status: Some(status),
+        code: error.code().into(),
+        message: error.message().into(),
     }
 }
 
@@ -1356,6 +1439,39 @@ pub(crate) fn string_at<'a>(value: &'a Value, key: &str) -> Result<&'a str, ApiE
 
 pub(crate) fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", BASE64.encode(bytes))
+}
+
+fn media_for_annotation(
+    bytes: Vec<u8>,
+    filename: String,
+    mime: &str,
+) -> kcode_intelligence_router::Result<kcode_intelligence_router::Media> {
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_ascii_lowercase();
+    let kind = if normalized.starts_with("image/") {
+        kcode_intelligence_router::MediaKind::Image
+    } else if normalized.starts_with("audio/")
+        || matches!(normalized.as_str(), "application/ogg" | "video/ogg")
+        || filename.rsplit_once('.').is_some_and(|(_, extension)| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "ogg" | "oga" | "opus"
+            )
+        })
+    {
+        kcode_intelligence_router::MediaKind::Audio
+    } else if normalized.starts_with("video/") {
+        kcode_intelligence_router::MediaKind::Video
+    } else {
+        return Err(kcode_intelligence_router::Error::invalid(
+            "annotation requires image, audio, or video media",
+        ));
+    };
+    kcode_intelligence_router::Media::new(kind, bytes, filename, normalized)
 }
 
 fn active_connection_ids(node: &Value) -> Vec<String> {
@@ -1506,6 +1622,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn known_ogg_audio_is_not_misclassified_as_video() {
+        let media = media_for_annotation(vec![1], "voice.ogg".into(), "video/ogg").unwrap();
+        assert_eq!(media.kind, kcode_intelligence_router::MediaKind::Audio);
+        assert_eq!(media.content_type, "audio/ogg");
+    }
+
+    #[test]
     fn durable_work_uses_stable_valid_idempotency_ids() {
         let first = stable_idempotency_id("audio-ingress", "piece-1");
         assert_eq!(first, stable_idempotency_id("audio-ingress", "piece-1"));
@@ -1615,6 +1738,7 @@ mod tests {
             telegram_max_media_bytes: 1024,
             audio_ingress_base: base,
             telegram_web_user_handle: "@test".into(),
+            runtime_model: crate::orchestration::RuntimeModel::testing(),
         };
         let api = Api::new(&config).unwrap();
         let default_arguments = json!({

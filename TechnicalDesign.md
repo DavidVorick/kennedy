@@ -25,20 +25,24 @@ Kennedy is one Rust server with deliberately separated library domains:
    source snapshots, and backend calls for managed Rust libraries, Web
    libraries, and Rust binaries. `kcode-rust-bins` keeps editable source and
    immutable local executable publications in separate roots.
-5. `kennedy-server` owns context-policy decisions, orchestration, provider
-   calls, Ktool authorization and Chatend integration, graph policy, the one
-   Kweb writer lane, all browser HTTP adapters, roots, the credential vault,
-   and static assets. It adapts canonical Kweb objects for Rust-binary call
-   inputs and outputs and continues to serve immutable Web publications.
-6. `kcode-audio-ingress` owns durable audio intake, transcription, and
-   automatic whole-job recovery. KennedyServer owns the Axum adapter and a
-   separate prepared-transcript memory-ingress queue; those downstream
-   concepts are absent from the standalone library.
-7. Conversational history ingress uses the same session log as its source
+5. `kcode-intelligence-router` owns all Gemini, OpenAI, and Codex model calls,
+   exact-model routing, cancellation, error normalization, and per-user
+   per-call usage receipts. It is a typed in-process library with no HTTP API.
+6. `kennedy-server` owns context-policy decisions, orchestration, Ktool
+   authorization and Chatend integration, graph policy, the one Kweb writer
+   lane, all browser HTTP adapters, roots, the credential vault, and static
+   assets. It adapts canonical Kweb objects for Rust-binary call inputs and
+   outputs and continues to serve immutable Web publications.
+7. `kcode-audio-ingress` owns durable audio intake, chunking, transcript
+   workflow, and automatic whole-job recovery. It delegates every model call
+   through typed callbacks backed by `kcode-intelligence-router`. KennedyServer
+   owns the Axum adapter and a separate prepared-transcript memory-ingress
+   queue; those downstream concepts are absent from the standalone library.
+8. Conversational history ingress uses the same session log as its source
    session; KennedyServer serializes it with audio work through the global
    Kweb writer lane.
-8. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
-9. The browser frontend is an observer and command client only.
+9. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
+10. The browser frontend is an observer and command client only.
 
 Kennedy-owned routers share the main loopback listener. The Telegram crate
 retains its own loopback listener.
@@ -139,9 +143,11 @@ Every inference is a new provider request built from the current Chatend
 projection. There is no hidden provider thread history and no ResetContext.
 The exact provider input and provider usage receipt are appended to the journal.
 
-The provider always receives one dynamic function, `call_ktool`. System prompt
-boxes explain tool names and contracts. Dehydrating those instructions does
-not unregister the function.
+The provider always receives one dynamic function, `call_ktool`. The system
+prompt explains the Kmap bootstrap, critical Kmap/context navigation tools, and
+writable Kmap mutations when the mode permits them. Other tool names and
+contracts are discovered through Kmap manuals. Dehydrating prompt or manual
+boxes does not unregister the function.
 
 Every Kennedy message, user message, tool invocation, ordinary tool result,
 loaded Kweb node, system prompt, controller notice, and history inspection is
@@ -319,16 +325,20 @@ bytes, enforces the 20 MiB limit, and stages them idempotently. This keeps raw
 bytes out of model context and avoids eagerly duplicating every group
 attachment into every active participant session. A group message need not
 invoke Kennedy for its retained media to be eligible; invocation controls turn
-creation only.
+creation only. Static Telegram behavior is isolated in Telegram-only
+system-prompt layers. The bounded message history is a separate controller box
+rendered as natural-language prose; exact structured group data remains
+internal for authorization and media lookup.
 `TranscribeAudio` checks the 20 MiB limit and supported audio MIME types, then
-sends the exact original audio and Kennedy's required 4,000-character-bounded
-prompt to OpenAI GPT-4o Transcribe. The call joins the active parent
-operation's cancellation scope.
+sends the exact original audio, exact selected supported model, and Kennedy's
+required 4,000-character-bounded prompt to OpenAI or Gemini. The call joins
+the active parent operation's cancellation scope.
 `AnnotateMedia` reads the exact sidecar bytes after checking the 20 MiB
-enrichment limit, media/provider matrix, and Kennedy-authored 4,000-character
-prompt. Intelligence maps the request to OpenAI single-image analysis, a
-fresh ephemeral tool-free Codex image turn, or Gemini Pro multimodal
-inference. All calls join the active parent operation's cancellation scope.
+enrichment limit, exact-model/media matrix, and Kennedy-authored
+4,000-character prompt. Intelligence maps the exact model to OpenAI
+single-image analysis, a fresh ephemeral tool-free Codex image turn, or
+Gemini multimodal inference. All calls join the active parent operation's
+cancellation scope.
 Codex's media-bearing provider-input event is consumed without journaling it.
 `ExtractDocumentText` passes PDF, DOC, or DOCX bytes to the in-memory document
 extractor. All paths render provenance plus returned text as an ordinary

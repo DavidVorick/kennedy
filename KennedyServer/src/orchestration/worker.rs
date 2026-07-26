@@ -99,10 +99,9 @@ impl Orchestrator {
         loop {
             match self.initialize().await {
                 Ok(runtime) => {
-                    let provider = runtime.model.provider.clone();
                     let model = runtime.model.model.clone();
                     let _ = self.runtime.set(runtime);
-                    tracing::info!(%provider, %model, "Native Rust orchestration worker ready");
+                    tracing::info!(%model, "Native Rust orchestration worker ready");
                     return;
                 }
                 Err(error) => {
@@ -118,26 +117,21 @@ impl Orchestrator {
     }
 
     async fn initialize(&self) -> anyhow::Result<Runtime> {
-        let (kweb, intelligence, history, telegram, audio) = tokio::join!(
+        let (kweb, history, telegram, audio) = tokio::join!(
             self.api.kmap_get("/api/v1/kmap/health"),
-            self.api.intelligence_get("/health"),
             self.api.history_health(),
             self.api.telegram_health(),
             self.api.audio_get("/api/v1/audio-ingress/health"),
         );
         kweb?;
-        intelligence?;
         history?;
         telegram?;
         audio?;
         let manuals = Manuals::load(&self.config.system_prompts_directory)?;
-        let (roots, providers) = tokio::try_join!(
-            self.api.kmap_get("/api/v1/kmap/roots"),
-            self.api.intelligence_get("/api/v1/providers"),
-        )?;
+        let roots = self.api.kmap_get("/api/v1/kmap/roots").await?;
         let runtime = Runtime {
             manuals,
-            model: RuntimeModel::from_provider_payload(&providers)?,
+            model: self.config.runtime_model.clone(),
             user_root_node_id: required_string(&roots, "user_root_node_id")?,
             kennedy_root_node_id: required_string(&roots, "kennedy_root_node_id")?,
         };
@@ -213,13 +207,7 @@ impl Orchestrator {
                     .get(&conversation_id)
                     .copied()
                 {
-                    let _ = self
-                        .api
-                        .intelligence_post(
-                            &format!("/api/v1/operations/{operation}/cancel"),
-                            json!({}),
-                        )
-                        .await;
+                    let _ = self.api.cancel_intelligence(operation);
                 }
                 continue;
             }
@@ -1013,10 +1001,7 @@ impl Orchestrator {
                 .to_owned(),
             Ok(Err(error)) => return Err(error),
             Err(_) => {
-                let _ = self
-                    .api
-                    .intelligence_post(&format!("/api/v1/operations/{operation}/cancel"), json!({}))
-                    .await;
+                let _ = self.api.cancel_intelligence(operation);
                 "hard-stop".into()
             }
         };
@@ -1474,10 +1459,7 @@ impl Orchestrator {
                 tracing::warn!(event_id=%id,error=%error,"Telegram event will retry")
             }
             Err(_) => {
-                let _ = self
-                    .api
-                    .intelligence_post(&format!("/api/v1/operations/{operation}/cancel"), json!({}))
-                    .await;
+                let _ = self.api.cancel_intelligence(operation);
                 let conversation = conversation_id.lock().await.clone();
                 if let Some(conversation_id) = &conversation
                     && let Err(error) = self

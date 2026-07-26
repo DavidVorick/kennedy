@@ -1,14 +1,16 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::Context;
-use serde_json::Value;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 
-const PROMPT_FILES: [(&str, &str); 9] = [
+const PROMPT_FILES: [(&str, &str); 11] = [
     ("identity", "KennedyIdentity.txt"),
     ("conversationSession", "ConversationSession.txt"),
     ("freeTimeSession", "SelfTimeSession.txt"),
     ("historyIngressSession", "HistoryIngressSession.txt"),
     ("audioIngressSession", "AudioIngressSession.txt"),
+    ("telegramSession", "TelegramSession.txt"),
+    ("telegramGroupSession", "TelegramGroupSession.txt"),
     ("codexHarness", "CodexHarness.txt"),
     ("kmapBasics", "KmapBasics.txt"),
     ("readTools", "ReadTools.txt"),
@@ -20,58 +22,31 @@ pub(crate) struct Manuals(HashMap<String, String>);
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeModel {
-    pub provider: String,
-    pub provider_kind: String,
     pub model: String,
     pub reasoning_effort: String,
     pub context_window_tokens: u64,
 }
 
 impl RuntimeModel {
-    pub(crate) fn from_provider_payload(payload: &Value) -> anyhow::Result<Self> {
-        let provider = required_string(payload, "default_provider")?;
-        let selected = payload
-            .get("providers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(&provider))
-            .context("the intelligence service omitted its default provider")?;
-        let provider_kind = required_string(selected, "kind")?;
-        let model = required_string(selected, "default_model")?;
-        let reasoning_effort = required_string(selected, "reasoning_effort")?;
-        let capabilities = selected
-            .get("model_capabilities")
-            .and_then(|value| value.get(&model));
-        let context_window_tokens = capabilities
-            .and_then(|value| value.get("context_window_tokens"))
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                selected
-                    .get("context_window_tokens")
-                    .and_then(Value::as_u64)
-            })
-            .context("the intelligence service omitted context_window_tokens")?;
-        let max_input_tokens = capabilities
-            .and_then(|value| value.get("max_input_tokens"))
-            .and_then(Value::as_u64)
-            .or_else(|| selected.get("max_input_tokens").and_then(Value::as_u64))
-            .context("the intelligence service omitted max_input_tokens")?;
-        anyhow::ensure!(
-            context_window_tokens > 0 && max_input_tokens > 0,
-            "the intelligence service returned invalid model limits"
-        );
-        Ok(Self {
-            provider,
-            provider_kind,
-            model,
-            reasoning_effort,
-            context_window_tokens,
-        })
+    pub(crate) fn from_intelligence(runtime: kcode_intelligence_router::RuntimeModel) -> Self {
+        Self {
+            model: runtime.model,
+            reasoning_effort: runtime.reasoning_effort,
+            context_window_tokens: runtime.context_window_tokens,
+        }
     }
 
     pub(crate) fn attribution(&self) -> String {
         format!("{}-{}", self.model, self.reasoning_effort)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing() -> Self {
+        Self {
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: "xhigh".into(),
+            context_window_tokens: 1_000_000,
+        }
     }
 }
 
@@ -107,14 +82,9 @@ impl Manuals {
         self.compose(
             runtime,
             session_key,
-            session_detail("conversation", session_type),
             session_type == "free-time",
             session_context,
-            if session_type == "free-time" {
-                "Self-time schedule"
-            } else {
-                "Telegram group context"
-            },
+            session_type,
         )
     }
 
@@ -122,56 +92,56 @@ impl Manuals {
         &self,
         runtime: &RuntimeModel,
         source_session_type: &str,
-        session_context: &str,
     ) -> anyhow::Result<String> {
         let session_key = if source_session_type == "audio" {
             "audioIngressSession"
         } else {
             "historyIngressSession"
         };
-        self.compose(
-            runtime,
-            session_key,
-            session_detail("ingress", source_session_type),
-            true,
-            session_context,
-            "Telegram group context",
-        )
+        self.compose(runtime, session_key, true, "", source_session_type)
     }
 
     fn compose(
         &self,
         runtime: &RuntimeModel,
         session_key: &str,
-        detail: &str,
         writes: bool,
         session_context: &str,
-        context_title: &str,
+        channel: &str,
     ) -> anyhow::Result<String> {
         let mut sections = vec![
             section("Kennedy's identity", self.required("identity")?),
-            section(
-                "Session type",
-                &format!("{}\n\n{detail}", self.required(session_key)?),
-            ),
-            section("Kmap basics", self.required("kmapBasics")?),
-            section("Read-only tools", self.required("readTools")?),
+            section("Session type", self.required(session_key)?),
         ];
+        if matches!(channel, "telegram" | "telegram-group") {
+            sections.push(section(
+                "Telegram session",
+                self.required("telegramSession")?,
+            ));
+        }
+        if channel == "telegram-group" {
+            sections.push(section(
+                "Telegram group session",
+                self.required("telegramGroupSession")?,
+            ));
+        }
+        sections.extend([
+            section("Kmap basics", self.required("kmapBasics")?),
+            section(
+                "Critical Kmap and context tools",
+                self.required("readTools")?,
+            ),
+        ]);
         if writes {
             sections.push(section("Write tools", self.required("writeTools")?));
         }
-        if runtime.provider_kind == "codex" {
-            sections.push(section("Codex harness", self.required("codexHarness")?));
-        }
+        sections.push(section("Codex harness", self.required("codexHarness")?));
         if !session_context.trim().is_empty() {
-            sections.push(section(context_title, session_context.trim()));
+            sections.push(section("Self-time schedule", session_context.trim()));
         }
         sections.push(section(
             "Current runtime",
-            &format!(
-                "You are currently running on {} with {} thinking mode.",
-                runtime.model, runtime.reasoning_effort
-            ),
+            &runtime_description(runtime, Utc::now()),
         ));
         Ok(sections.join("\n\n"))
     }
@@ -184,43 +154,104 @@ impl Manuals {
     }
 }
 
-fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .with_context(|| format!("provider metadata is missing {key}"))
-}
-
 fn section(title: &str, content: &str) -> String {
     format!("{title}\n\n{content}")
 }
 
-fn session_detail(mode: &str, session_type: &str) -> &'static str {
-    if mode == "conversation" {
-        return match session_type {
-            "free-time" => {
-                "Channel: autonomous self time in Kennedy's backend harness. No live user response is expected. Read, web, and Kmap write tools are all authorized for this session."
-            }
-            "telegram-group" => {
-                "Channel: Telegram group. This is a persistent session scoped to one participant and one group. Every group message accumulates as passive context, but only this participant's direct invocations trigger your response; other participants have separate sessions. Other participant roots are references that you may load if useful."
-            }
-            "telegram" => {
-                "Channel: Telegram private message. The final conversational response is relayed by Kennedy's backend; a browser may observe the durable Chatend but does not run it."
-            }
-            _ => {
-                "Channel: Kennedy's web UI. The user submitted this message through the frontend, while Kennedy's Rust backend owns and persists the Chatend and tool loop."
-            }
-        };
+pub(crate) fn runtime_description(runtime: &RuntimeModel, current_time: DateTime<Utc>) -> String {
+    format!(
+        "You are currently running on {} with {} thinking mode. The current date and time is {}.",
+        runtime.model,
+        runtime.reasoning_effort,
+        human_utc_datetime(current_time)
+    )
+}
+
+pub(crate) fn human_utc_datetime(value: DateTime<Utc>) -> String {
+    let day = value.day();
+    let suffix = match day % 100 {
+        11..=13 => "th",
+        _ => match day % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        },
+    };
+    let hour = match value.hour() % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    let period = if value.hour() < 12 { "am" } else { "pm" };
+    format!(
+        "{} {day}{suffix}, {}, {hour}:{:02}{period} UTC",
+        value.format("%B"),
+        value.year(),
+        value.minute()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::TimeZone;
+
+    use super::*;
+
+    fn testing_manuals() -> Manuals {
+        Manuals(
+            PROMPT_FILES
+                .into_iter()
+                .map(|(key, _)| (key.to_owned(), format!("[{key}]")))
+                .collect::<HashMap<_, _>>(),
+        )
     }
-    match session_type {
-        "audio" => "Source: one chronologically placed piece of a vnote transcript.",
-        "telegram-group" => {
-            "Source: an archived Telegram group invocation or background group-chat batch."
-        }
-        "telegram" => "Source: an archived Telegram conversation (private message).",
-        "free-time" => "Source: one archived clean-slate session from an autonomous self-time run.",
-        _ => "Source: an archived browser conversation.",
+
+    #[test]
+    fn human_time_uses_ordinals_and_unambiguous_twelve_hour_clock() {
+        assert_eq!(
+            human_utc_datetime(Utc.with_ymd_and_hms(2026, 7, 6, 4, 23, 0).unwrap()),
+            "July 6th, 2026, 4:23am UTC"
+        );
+        assert_eq!(
+            human_utc_datetime(Utc.with_ymd_and_hms(2026, 7, 11, 16, 34, 0).unwrap()),
+            "July 11th, 2026, 4:34pm UTC"
+        );
+        assert_eq!(
+            human_utc_datetime(Utc.with_ymd_and_hms(2026, 7, 22, 0, 5, 0).unwrap()),
+            "July 22nd, 2026, 12:05am UTC"
+        );
+    }
+
+    #[test]
+    fn telegram_layers_are_scoped_to_telegram_channels() {
+        let manuals = testing_manuals();
+        let runtime = RuntimeModel::testing();
+        let browser = manuals
+            .compose_conversation(&runtime, "conversation", "")
+            .unwrap();
+        assert!(!browser.contains("[telegramSession]"));
+        assert!(!browser.contains("[telegramGroupSession]"));
+
+        let private = manuals
+            .compose_conversation(&runtime, "telegram", "")
+            .unwrap();
+        assert!(private.contains("[telegramSession]"));
+        assert!(!private.contains("[telegramGroupSession]"));
+
+        let group = manuals
+            .compose_conversation(&runtime, "telegram-group", "")
+            .unwrap();
+        assert!(group.contains("[telegramSession]"));
+        assert!(group.contains("[telegramGroupSession]"));
+
+        let group_ingress = manuals.compose_ingress(&runtime, "telegram-group").unwrap();
+        assert!(group_ingress.contains("[telegramSession]"));
+        assert!(group_ingress.contains("[telegramGroupSession]"));
+
+        let audio = manuals.compose_ingress(&runtime, "audio").unwrap();
+        assert!(!audio.contains("[telegramSession]"));
+        assert!(!audio.contains("[telegramGroupSession]"));
     }
 }

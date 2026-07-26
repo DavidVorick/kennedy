@@ -15,14 +15,18 @@ orchestrator; the browser does not run Kennedy.
   opaque active `Session` handles, Chatend
   reconstruction, lifecycle and commands in a separate control journal,
   pending objects, and durable completion receipts. It has no Axum dependency.
-- `KennedyServer` owns context and orchestration policy, provider calls,
-  Ktools, Kweb graph policy, credential handling, the global Kweb writer lane,
-  Session History's HTTP adapter, and static frontend serving.
+- `kcode-intelligence-router` owns Gemini, OpenAI, and Codex provider calls,
+  exact-model routing, cancellation, normalized errors, and one per-user usage
+  receipt for every call.
+- `KennedyServer` owns context and orchestration policy, Ktools, Kweb graph
+  policy, credential handling, the global Kweb writer lane, Session History's
+  HTTP adapter, and static frontend serving.
 - `Frontend/public` is a browser-native observer and command client.
 - `kcode-audio-ingress` is a standalone library that owns durable audio intake,
-  automatic transcription state, and completed transcripts. `KennedyServer`
-  owns its Axum adapter and the separate audio memory-ingress queue. The
-  Telegram crate owns its durable intake stream.
+  chunking, retry state, and completed transcripts. Its typed model callbacks
+  are backed by `kcode-intelligence-router`; it owns no provider client.
+  `KennedyServer` owns its Axum adapter and the separate audio memory-ingress
+  queue. The Telegram crate owns its durable intake stream.
 - `kcode-dev-tools` owns the session-scoped Rust-library, Web-library, and
   Rust-binary Ktool adapters. Its `kcode-rust-bins` backend publishes immutable
   local executables and exchanges call payloads through Kennedy's Kweb object
@@ -155,6 +159,7 @@ Defaults:
 - completed Session History ID list: `data/session-history.txt`;
 - AudioIngress persistence root: `data/audio-ingress-media` (including its
   derived `state.sqlite3` and `originals/`);
+- intelligence usage receipts: `data/intelligence-usage`;
 - Kennedy's audio memory-ingress queue and the Telegram and user-directory
   SQLite files under `data/`;
 - managed Rust libraries: `data/kcode/kcode-rust-libs`;

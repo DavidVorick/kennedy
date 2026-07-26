@@ -119,13 +119,13 @@ and aggregate staged object payload is 32 GiB. Uploads are sequential and the
 composer is disabled while the session processes a command. Unsupported
 extraction formats remain valid uploaded objects.
 
-The persisted read-tool prompt explains three optional enrichments over these
-same temporary IDs. Kennedy can call `TranscribeAudio` with her exact prompt
-for OpenAI speech transcription, call `AnnotateMedia` with an explicit
-provider and her exact prompt for supported image, audio, or video media, or
-call `ExtractDocumentText` for PDF, DOC, and DOCX files. The browser does not
-offer provider controls: tool selection and prompting remain model-callable
-backend concerns.
+Kmap tool manuals explain three optional enrichments over these same temporary
+IDs. Kennedy can call `TranscribeAudio` with her exact prompt and an exact
+supported OpenAI or Gemini model, call `AnnotateMedia` with an exact supported
+model and her exact prompt for image, audio, or video media, or call
+`ExtractDocumentText` for PDF, DOC, and DOCX files. These non-navigation tools
+are not repeated in every system prompt. The browser does not offer model
+controls: tool selection and prompting remain model-callable backend concerns.
 
 At final commit, the backend reads staged bytes and supplies them to
 `kcode-kweb-db`. This deliberately performs extra disk I/O in V1; a zero-copy

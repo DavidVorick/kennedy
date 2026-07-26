@@ -1973,16 +1973,14 @@ dependencies = [
 
 [[package]]
 name = "kcode-audio-ingress"
-version = "0.1.1"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb011d11253ed3203bfc8a6915a3d771ed78e348f5e9fdc7ef52bf5ab3d96a3"
+checksum = "5fdd343c52abef44f3db3c1e9c9f88341032b67581639e09d5d2d36c40dd3e17"
 dependencies = [
  "anyhow",
  "chrono",
  "futures",
  "hound",
- "kcode-codex-runtime",
- "kcode-gemini-api 0.1.1",
  "ruopus",
  "rusqlite",
  "serde",
@@ -2052,9 +2050,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-gemini-api"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d31bd4726dbabc53486e5e1af0a4790d88bf9f48efdf84faa08ccc3b00b014aa"
+checksum = "3d71193636b9ce2bcc7c358bc668cedd4b81ad239b8f0be24eb327536b1a65b3"
 dependencies = [
  "base64",
  "chrono",
@@ -2065,17 +2063,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "kcode-gemini-api"
-version = "0.2.0"
+name = "kcode-intelligence-router"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad83283c2202820aef4bc08a93abbf69799b92811bd223736ddd89247d46585c"
+checksum = "29c5e68a0b9a1dc7c307d99c6d674bb4d633e6f9962a5bc6a518d7571502f749"
 dependencies = [
- "base64",
+ "anyhow",
  "chrono",
- "reqwest 0.13.4",
+ "kcode-codex-runtime",
+ "kcode-codex-runtime-v2",
+ "kcode-doc-extraction",
+ "kcode-gemini-api",
+ "kcode-openai-api",
+ "kcode-web-fetch",
+ "serde",
  "serde_json",
  "tokio",
- "zeroize",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2230,14 +2235,10 @@ dependencies = [
  "kcode-codex-runtime",
  "kcode-codex-runtime-v2",
  "kcode-dev-tools",
- "kcode-doc-extraction",
- "kcode-gemini-api 0.1.1",
- "kcode-gemini-api 0.2.0",
+ "kcode-intelligence-router",
  "kcode-kweb-db",
- "kcode-openai-api",
  "kcode-session-history",
  "kcode-tg-kennedy-bot",
- "kcode-web-fetch",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rpassword",

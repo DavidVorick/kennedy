@@ -1,6 +1,5 @@
 mod audio_ingress;
 mod credentials;
-mod intelligence;
 mod kmap_http;
 mod kmap_size;
 mod kweb_writer;
@@ -81,6 +80,13 @@ struct Args {
         help = "AudioIngress-owned persistence root (database and original audio)"
     )]
     audio_ingress_directory: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        default_value = "./data/intelligence-usage",
+        help = "One-file-per-call intelligence usage receipt directory"
+    )]
+    intelligence_usage_directory: PathBuf,
     #[arg(long, default_value = "./data/kcode/kcode-rust-libs")]
     rust_libs_root: PathBuf,
     #[arg(long, default_value = "./data/kcode/kcode-web-libs")]
@@ -197,20 +203,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         GEMINI_API_KEY_SECRET,
         "Gemini search, media annotation, and audio transcription",
     )?;
-    let gemini = gemini_api_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(kcode_gemini_api::Gemini::open)
-        .transpose()
-        .context("opening shared Gemini client")?;
-    // AudioIngress still publishes a Gemini 0.1 constructor. Keep its
-    // compatibility client isolated until that library adopts Gemini 0.2.
-    let audio_gemini = gemini_api_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(kcode_gemini_api_legacy::Gemini::open)
-        .transpose()
-        .context("opening AudioIngress Gemini compatibility client")?;
     let telegram_bot_token =
         resolve_optional_secret(&vault, TELEGRAM_BOT_TOKEN_SECRET, "Telegram relay")?
             .map(kcode_tg_kennedy_bot::BotToken::new)
@@ -254,9 +246,14 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             completed_list: args.session_history_file,
         })?;
     let history_router = session_history_http::router(history_service.clone());
-    let intelligence_service =
-        intelligence::open(openai_api_key, gemini.clone(), codex_catalog_cache.clone()).await?;
-    let intelligence_router = intelligence::router(intelligence_service.clone());
+    let (intelligence_service, intelligence_runtime) =
+        kcode_intelligence_router::open(kcode_intelligence_router::Config {
+            openai_api_key,
+            gemini_api_key,
+            codex_catalog_cache: codex_catalog_cache.clone(),
+            receipt_directory: args.intelligence_usage_directory,
+        })
+        .await?;
     let telegram = kcode_tg_kennedy_bot::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
@@ -265,16 +262,66 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         identity_sink: telegram_identity.clone(),
         max_voice_bytes: args.telegram_max_voice_bytes,
     };
-    let audio_gemini = audio_gemini.context(
-        "AudioIngress requires the gemini-api-key credential; configure it before starting Kennedy",
-    )?;
-    let mut config =
-        kcode_codex_runtime::CodexConfig::new(kcode_audio_ingress::RECONCILIATION_MODEL);
-    config.validation_reasoning_effort = kcode_codex_runtime::ReasoningEffort::XHigh;
-    let codex = kcode_codex_runtime::Codex::open(config, codex_catalog_cache)
-        .await
-        .context("opening Codex audio-reconciliation runtime")?;
-    let audio_transcriber = kcode_audio_ingress::AudioTranscriber::new(audio_gemini, codex);
+    let chunk_intelligence = intelligence_service.clone();
+    let transcribe_chunk: kcode_audio_ingress::AudioChunkCall = Arc::new(move |request| {
+        let intelligence = chunk_intelligence.clone();
+        Box::pin(async move {
+            let user = intelligence
+                .for_user(request.user_id)
+                .map_err(audio_intelligence_error)?;
+            let media = kcode_intelligence_router::Media::audio(
+                request.audio_ogg,
+                "audio-chunk.ogg",
+                "audio/ogg",
+            )
+            .map_err(audio_intelligence_error)?;
+            user.transcribe_structured_audio(kcode_intelligence_router::StructuredAudioRequest {
+                operation: "transcribe_chunk".into(),
+                prompt: request.prompt,
+                model: request.model,
+                media,
+                schema: request.schema,
+                max_output_tokens: request.max_output_tokens,
+                operation_id: uuid::Uuid::new_v4(),
+                parent_operation_id: None,
+            })
+            .await
+            .map(|response| response.text)
+            .map_err(audio_intelligence_error)
+        })
+    });
+    let text_intelligence = intelligence_service.clone();
+    let generate_text: kcode_audio_ingress::TextGenerationCall = Arc::new(move |request| {
+        let intelligence = text_intelligence.clone();
+        Box::pin(async move {
+            let reasoning_effort = match request.reasoning_effort.as_str() {
+                "xhigh" => kcode_intelligence_router::ReasoningEffort::XHigh,
+                _ => {
+                    return Err(kcode_audio_ingress::IntelligenceError::new(
+                        "AudioIngress requested an unsupported reasoning effort.",
+                        false,
+                    ));
+                }
+            };
+            let user = intelligence
+                .for_user(request.user_id)
+                .map_err(audio_intelligence_error)?;
+            user.generate_text(kcode_intelligence_router::TextGenerationRequest {
+                operation: request.operation,
+                prompt: request.prompt,
+                model: request.model,
+                reasoning_effort,
+                timeout: request.timeout,
+                operation_id: uuid::Uuid::new_v4(),
+                parent_operation_id: None,
+            })
+            .await
+            .map(|response| response.text)
+            .map_err(audio_intelligence_error)
+        })
+    });
+    let audio_transcriber =
+        kcode_audio_ingress::AudioTranscriber::new(transcribe_chunk, generate_text);
     let audio_state_database = args.audio_ingress_directory.join("state.sqlite3");
     migrate_audio_ingress_database(&args.legacy_audio_ingress_database, &audio_state_database)?;
     let audio =
@@ -285,6 +332,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         &args.audio_memory_ingress_database,
         Some(&audio_state_database),
         args.audio_ingress_max_upload_bytes,
+        system_roots.user.to_string(),
     )?;
     let audio_ingress_router = audio_ingress::router(audio_service.clone());
     let orchestration = orchestration::Config {
@@ -300,6 +348,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         #[cfg(test)]
         audio_ingress_base: String::new(),
         telegram_web_user_handle: args.telegram_bootstrap_username,
+        runtime_model: orchestration::RuntimeModel::from_intelligence(intelligence_runtime),
     };
     let orchestration_api = orchestration::Api::local(
         &orchestration.telegram_relay_base,
@@ -316,18 +365,20 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kmap_http::serve_with_listener(
             kmap_service,
             args.frontend_dir,
-            kmap_http::MergedRouters::new(
-                intelligence_router,
-                history_router,
-                audio_ingress_router,
-                web_lib_router,
-            ),
+            kmap_http::MergedRouters::new(history_router, audio_ingress_router, web_lib_router),
             kweb_listener,
         ),
         kcode_tg_kennedy_bot::serve(telegram),
         orchestration::run(orchestration, orchestration_api),
     )?;
     Ok(())
+}
+
+fn audio_intelligence_error(
+    error: kcode_intelligence_router::Error,
+) -> kcode_audio_ingress::IntelligenceError {
+    let retryable = error.retryable();
+    kcode_audio_ingress::IntelligenceError::new(error.message(), retryable)
 }
 
 fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::Result<()> {
@@ -342,6 +393,7 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.legacy_audio_ingress_database,
         &args.audio_memory_ingress_database,
         &args.audio_ingress_directory,
+        &args.intelligence_usage_directory,
         &args.rust_libs_root,
         &args.web_libs_root,
         &args.web_libs_published_root,
@@ -652,6 +704,7 @@ mod tests {
             &args.legacy_audio_ingress_database,
             &args.audio_memory_ingress_database,
             &args.audio_ingress_directory,
+            &args.intelligence_usage_directory,
             &args.rust_libs_root,
             &args.web_libs_root,
             &args.web_libs_published_root,
@@ -903,6 +956,7 @@ mod tests {
             legacy_audio_ingress_database: audio.clone(),
             audio_memory_ingress_database: memory_ingress.clone(),
             audio_ingress_directory: audio_media.clone(),
+            intelligence_usage_directory: directory.join("intelligence-usage"),
             rust_libs_root: directory.join("rust-libs"),
             web_libs_root: directory.join("kcode-web-libs"),
             web_libs_published_root: directory.join("kcode-web-libs-published"),

@@ -13,8 +13,8 @@ listener, and exposes these browser-facing reads:
 - `GET /api/v1/kmap/nodes/{id}`
 - `GET /api/v1/kmap/nodes/{id}/history`
 
-The same listener also merges intelligence, Session History,
-and audio-ingress routes before serving frontend assets.
+The same listener also merges Session History and audio-ingress routes before
+serving frontend assets.
 Those routes remain separate application domains and are not Kmap storage
 methods.
 

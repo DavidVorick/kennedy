@@ -4,7 +4,6 @@ import { readFile } from "node:fs/promises";
 
 import {
   AudioIngressAPI,
-  IntelligenceAPI,
   KwebAPI,
   SessionHistoryAPI,
   TelegramRelayAPI,
@@ -194,8 +193,6 @@ test("browser API clients expose only browser-owned reads and commands", async (
     await audio.health();
     await audio.retryIngress("piece", { expected_version: 3 });
 
-    const intelligence = IntelligenceAPI("http://kennedy");
-    await intelligence.health();
     const kmap = KwebAPI("http://kennedy");
     await kmap.roots();
     const relay = TelegramRelayAPI("http://telegram");
@@ -208,7 +205,6 @@ test("browser API clients expose only browser-owned reads and commands", async (
     ["POST", "http://kennedy/api/v1/conversations/conversation/commands"],
     ["GET", "http://kennedy/api/v1/audio-ingress/health"],
     ["POST", "http://kennedy/api/v1/audio-ingress/pieces/piece/retry-ingress"],
-    ["GET", "http://kennedy/health"],
     ["GET", "http://kennedy/api/v1/kmap/roots"],
     ["GET", "http://telegram/health"],
   ]);
@@ -501,7 +497,8 @@ test("production frontend is server-driven and uses the consolidated origin", as
     readFile(new URL("../public/js/human_format.js", import.meta.url), "utf8"),
   ]);
   assert.match(app, /kwebBase: window\.location\.origin/);
-  assert.match(app, /intelligenceBase: window\.location\.origin/);
+  assert.doesNotMatch(app, /intelligenceBase|IntelligenceAPI/);
+  assert.doesNotMatch(api, /api\/v1\/providers|documents\/extract/);
   assert.match(app, /conversationHistoryBase: window\.location\.origin/);
   assert.match(app, /audioIngressBase: window\.location\.origin/);
   assert.doesNotMatch(app, /4323|4325/);
@@ -527,15 +524,17 @@ test("voice recordings are staged for Kennedy without browser transcription", as
 });
 
 test("Telegram group media remains model-addressable without eager byte embedding", async () => {
-  const [worker, session, tools] = await Promise.all([
+  const [worker, session, telegramGroupPrompt] = await Promise.all([
     readFile(new URL("../../KennedyServer/src/orchestration/worker.rs", import.meta.url), "utf8"),
     readFile(new URL("../../KennedyServer/src/orchestration/session.rs", import.meta.url), "utf8"),
-    readFile(new URL("../SystemPrompts/ReadTools.txt", import.meta.url), "utf8"),
+    readFile(new URL("../SystemPrompts/TelegramGroupSession.txt", import.meta.url), "utf8"),
   ]);
   assert.match(worker, /message\["mediaRef"\]/);
   assert.match(session, /"StageTelegramGroupMedia"/);
   assert.match(session, /telegram_group_media_reference\(&self\.group_context, message_id\)/);
-  assert.match(tools, /Media messages do not need to mention Kennedy or reply to her/);
+  assert.match(telegramGroupPrompt, /even when it did not mention or reply to Kennedy/);
+  assert.match(session, /retained conversation context/);
+  assert.doesNotMatch(session, /serde_json::to_string_pretty\(value\)/);
 });
 
 test("codex-safe preserves its documented workspace and catalog boundaries", async () => {

@@ -88,8 +88,11 @@ The retired terms “blanched” and “dirty” are not used.
 
 ## Tools
 
-The provider always has the `call_ktool` bridge. Actual tool definitions and
-operating instructions are system-prompt boxes.
+The provider always has the `call_ktool` bridge. The system-prompt box explains
+the Kmap from first principles and defines only the critical Kmap/context
+navigation tools plus writable Kmap mutations when the session permits them.
+Other tool inventories and operating manuals live in the Kmap and are loaded
+only when relevant.
 
 Read tools include:
 
@@ -163,7 +166,10 @@ Any retained media message in the current bounded Telegram group context
 remains available regardless of whether that message invoked Kennedy.
 Kennedy can stage one such message idempotently by its visible Telegram
 message ID; the server validates the current group boundary and keeps bytes
-out of model-readable context until requested.
+out of model-readable context until requested. The bounded group context is
+rendered into a separate controller box as natural-language conversation
+history rather than JSON inside the system prompt. Its exact structured form
+remains internal for boundary validation and media resolution.
 A later Kweb commit stores a versioned file envelope containing the safe
 filename, media type, transport kind, and exact original bytes, then obtains
 canonical object IDs. Exact known pending-object tokens in the session archive
@@ -172,13 +178,13 @@ finalizes. The Session History completion receipt records the
 pending-to-canonical mapping.
 
 Kennedy may enrich one staged object without changing it. `TranscribeAudio`
-accepts supported audio plus Kennedy's explicit bounded prompt and uses
-OpenAI's dedicated speech-transcription service. `AnnotateMedia`
-accepts a session-local `pending:N`, an explicit `openai`, `codex`, or `gemini`
-provider, and Kennedy's explicit bounded prompt. OpenAI and Codex accept
-supported images; Gemini accepts supported images, audio, and video. Kennedy
-therefore chooses between focused OpenAI transcription and Gemini native audio
-understanding instead of inheriting a transport-selected provider or prompt.
+accepts supported audio, an exact supported model, and Kennedy's explicit
+bounded prompt. `AnnotateMedia` accepts a session-local `pending:N`, an exact
+supported OpenAI, Codex, or Gemini model, and Kennedy's explicit bounded
+prompt. OpenAI and Codex models accept supported images; Gemini models accept
+supported images, audio, and video. Kennedy therefore chooses the precise
+model instead of inheriting a transport-selected provider, quality alias, or
+prompt.
 `ExtractDocumentText` locally extracts PDF, DOC, or DOCX text. Enrichment
 results are ordinary durable tool-result boxes with normal context-capacity
 enforcement. Provider input containing raw media is never copied into a

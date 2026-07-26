@@ -1,4 +1,4 @@
-import { KwebAPI, IntelligenceAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260725.1";
+import { KwebAPI, SessionHistoryAPI, AudioIngressAPI, TelegramRelayAPI, newIdempotencyId } from "./api.js?v=20260726.1";
 import { MemoryExplorer } from "./memory_explorer.js?v=20260723.1";
 import { renderTranscript, renderConversationHistory, renderAudioHistory, renderAudioRecording, conversationIngressActivity, renderInspector, renderUsage, inspectorText, showError, clearError, sortConversationHistory, reconcileConversationHistory, historyRefreshCanApply, historyObservationSignature, element } from "./render.js?v=20260725.2";
 import { isSessionLogArchive, projectSessionRecord } from "./session_log_view.js?v=20260724.1";
@@ -6,7 +6,6 @@ import { DEFAULT_FREE_TIME_MINUTES, formatFreeTimeRemaining, freeTimeTiming, par
 
 const CONFIG = {
   kwebBase: window.location.origin,
-  intelligenceBase: window.location.origin,
   conversationHistoryBase: window.location.origin,
   telegramRelayBase: "http://127.0.0.1:4324",
   audioIngressBase: window.location.origin,
@@ -22,14 +21,13 @@ const IDLE_OBSERVED_REFRESH_MS = 3_000;
 const HISTORY_HYDRATION_RENDER_MS = 1_000;
 const HISTORY_HYDRATION_GAP_MS = 150;
 const kweb = KwebAPI(CONFIG.kwebBase);
-const intelligence = IntelligenceAPI(CONFIG.intelligenceBase);
 const conversationHistory = SessionHistoryAPI(CONFIG.conversationHistoryBase);
 const telegramRelay = TelegramRelayAPI(CONFIG.telegramRelayBase);
 const audioIngress = AudioIngressAPI(CONFIG.audioIngressBase);
 
 let rootNodeIds = null;
-let provider = null;
-let model = null;
+const provider = null;
+const model = null;
 let explorer = null;
 let historyRecords = [];
 let conversationCommandHeads = new Map();
@@ -664,17 +662,6 @@ function finishComposerResize(event) {
 }
 
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024 * 1024;
-const EXTRACTABLE_DOCUMENT_EXTENSIONS = new Set([
-  "pdf", "docx", "xlsx", "xls", "xlsb", "ods", "csv", "tsv",
-  "txt", "md", "json", "yaml", "yml", "xml",
-]);
-
-function shouldExtractDocument(file) {
-  const extension = String(file?.name || "").split(".").at(-1)?.toLowerCase();
-  return EXTRACTABLE_DOCUMENT_EXTENSIONS.has(extension)
-    || String(file?.type || "").startsWith("text/");
-}
-
 async function attachSelectedFiles() {
   const id = selectedConversationId;
   const files = Array.from(ui.attachment_input.files || []);
@@ -708,21 +695,6 @@ async function attachSelectedFiles() {
         pendingId: staged.pendingId,
         extractionDurationMs: Math.max(0, Math.round(performance.now() - started)),
       };
-      if (shouldExtractDocument(file)) {
-        try {
-          const result = await intelligence.extractDocument({ file, fileName: file.name });
-          attachment.kind = "document";
-          attachment.fileName = result.file_name || file.name;
-          attachment.mimeType = file.type || result.content_type || attachment.mimeType;
-          attachment.format = result.format;
-          attachment.text = result.text;
-          attachment.characters = result.characters;
-          attachment.truncated = Boolean(result.truncated);
-          attachment.extractionDurationMs = Math.max(0, Math.round(performance.now() - started));
-        } catch (error) {
-          attachment.extractionError = error.message || "Text extraction was unavailable.";
-        }
-      }
       stagedAttachments.push(attachment);
     }
   } catch (error) {
@@ -1272,17 +1244,6 @@ async function initialize() {
     telegramRelayReady = true;
   } catch (error) {
     showError(ui.error_banner, `Telegram status is unavailable: ${error.message}`);
-  }
-
-  try {
-    await intelligence.health();
-    const providers = await intelligence.providers();
-    provider = providers.default_provider;
-    const selected = providers.providers.find(item => item.name === provider);
-    if (!selected) throw new Error("The intelligence service did not provide its configured default provider.");
-    model = selected.default_model;
-  } catch (error) {
-    showError(ui.error_banner, `Kennedy's model service is unavailable: ${error.message}`);
   }
 
   if (conversationHistoryReady) {

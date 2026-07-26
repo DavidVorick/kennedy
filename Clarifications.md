@@ -21,6 +21,34 @@ Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
   change the source box. Existing summarized or dehydrated representations
   remain under Kennedy's control when the canonical source changes.
 
+## Intelligence Library Boundary and Accounting
+
+- Replace KennedyServer's same-process intelligence Axum/JSON layer with the
+  managed `kcode-intelligence-router` typed Rust library. Remove its health
+  check, provider catalog, unused legacy generation paths, and other machinery
+  that is unnecessary once callers use the library directly.
+- Every model-backed operation takes the exact requested model identifier, not
+  only a provider name. Kennedy may explicitly select models such as a
+  particular Gemini Pro or Flash release; the library resolves the provider
+  internally and rejects models or media capabilities it does not support.
+- Every model-backed operation also requires a stable Kennedy user identifier.
+  Persist exactly one JSON usage receipt file per provider call, including
+  failed calls for which metering is unavailable. Daily UTC totals open and
+  iterate all receipts without folders or indexes, grouped by exact actual
+  model and user and split into non-cached input, cached input,
+  thinking/reasoning, and visible output tokens. Background audio transcription
+  and reconciliation make their actual Gemini and Codex calls through
+  `kcode-intelligence-router`; `kcode-audio-ingress` owns no provider client and
+  receives only typed model-call callbacks. Add folders or indexes only when
+  the linear scan becomes too slow.
+- Background audio chunk transcription remains pinned to
+  `gemini-3.1-pro-preview`. Interactive search, transcription, and annotation
+  take an exact supported model from Kennedy instead of a provider or
+  quality-mode alias.
+- Media inputs carry an explicit image, audio, or video kind independently of
+  their declared MIME type. Normalize Ogg audio to an audio MIME type and do not
+  let a misleading `video/ogg` declaration turn known audio into video.
+
 ## Session-log UI Authority
 
 - The append-ordered `kcode-session-log` is the canonical source of session events
@@ -266,12 +294,11 @@ canonical documents; this file is not an append-only log.
 - Register only the provider-native `call_ktool` function. Codex may request
   several calls before its next inference; execute them sequentially in
   provider order and return each result through its matching native call ID.
-- Give Kennedy `WebSearch(question, mode)` and `WebFetch(url)` as shared
+- Give Kennedy `WebSearch(question, model)` and `WebFetch(url)` as shared
   read-only tools in conversation, history ingress, and audio ingress. Kennedy
-  chooses `balanced` by default, `fast` for simple latency-sensitive lookups
-  where reduced research quality is acceptable, and `quality` for difficult,
-  high-stakes, cross-source, or conflict-resolution research. Search language,
-  geography, freshness, and domains remain natural language in the question;
+  chooses an exact supported Gemini or Codex search model rather than a
+  `fast`/`balanced`/`quality` alias. Search language, geography, freshness, and
+  domains remain natural language in the question;
   the compiled mappings are `quality` = `gpt-5.6-sol`/`xhigh`, `balanced` =
   `gpt-5.6-terra`/`low`, and `fast` = Gemini 3.1 Flash-Lite with grounded
   Google Search and a small amount of latency-conscious thinking.
@@ -719,8 +746,8 @@ canonical documents; this file is not an append-only log.
   `Starting…` state before the first network wait, and have Conversation History
   reject creation while any `free-time` record is already active so separate
   browser contexts cannot create overlapping runs.
-- Preserve the intelligence backend's request allowance for each provider
-  profile (including long quality searches), shortened only when the remaining
+- Preserve the intelligence library's request allowance for each exact selected
+  model operation (including long Codex searches), shortened only when the remaining
   self-time deadline plus two-minute shutdown grace is smaller. Do not impose a
   blanket 90-second cap on autonomous work.
 - Reconcile asynchronous Conversation History list responses monotonically by
@@ -1197,3 +1224,32 @@ canonical documents; this file is not an append-only log.
   shared session/lease behavior in the managed `kcode-dev-tools` Rust library.
   Kennedy consumes that library rather than retaining parallel adapter
   implementations in KennedyServer.
+
+## Kmap-First System Prompts
+
+- Preserve `KennedyIdentity.txt` exactly. Keep only the first paragraph of the
+  conversation prompt and the first and last paragraphs of the self-time
+  prompt. Simplify the history- and audio-ingress prompts while retaining their
+  essential solo-session, writable-Kmap, and completion semantics.
+- `KmapBasics.txt` must introduce the Kmap to a model with a completely fresh
+  context window and no training knowledge of Kennedy's harness. Explain what
+  the graph is, what nodes and connections mean, how canonical identifiers
+  work, which roots load automatically, and that further instructions and tool
+  manuals live in the Kmap. Do not put individual tool contracts in this layer.
+- Keep only `LoadNode`, box hydration/dehydration/summarization, and ingress
+  event hydration/dehydration in the read-only critical-tools prompt. Remove
+  search, fetch, media staging/annotation/transcription, document extraction,
+  and object emission from the system prompt; their manuals live in the Kmap.
+- Retain `WriteTools.txt` and `CodexHarness.txt` as system-prompt layers.
+- Add one Telegram prompt shared by private and group Telegram sessions and a
+  second group-only prompt. Never include Telegram instructions in browser,
+  self-time, audio, or other non-Telegram sessions.
+- Avoid JSON and other structured data in model context whenever possible.
+  Render Telegram group context and similar human-readable material as prose;
+  preserve exact structured values internally for validation and execution.
+  Existing exact machine contracts may remain where removing them would lose
+  necessary precision.
+- Alongside the model and thinking mode, inject the current date and time in
+  natural language. Use a twelve-hour clock with an explicit `am` or `pm` and a
+  timezone label so early-morning times cannot be mistaken for an ambiguous
+  twenty-four-hour timestamp.

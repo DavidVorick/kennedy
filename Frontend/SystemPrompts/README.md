@@ -6,25 +6,35 @@ read-only inspector. Edit a file and restart Kennedy to test a change; no Rust
 or JavaScript rebuild is needed.
 
 - `KennedyIdentity.txt` defines who Kennedy is and establishes that her learned
-  strategy lives in the kmap rather than in static harness instructions.
-- `CodexHarness.txt` corrects Codex wrapper capability claims, and is included
-  only when the backend-selected inference provider has kind `codex`.
+  strategy lives in the kmap rather than in static harness instructions. Its
+  wording is intentionally preserved.
 - `ConversationSession.txt`, `SelfTimeSession.txt`, `HistoryIngressSession.txt`,
-  and `AudioIngressSession.txt` are mutually exclusive, minimal descriptions of
-  the current session and its context-loading budget.
-- `KmapBasics.txt` defines identifier lifetime, the session's automatic root
-  set, the native `call_ktool` protocol, and the fact that more tools and
-  documentation may be available through the kmap.
-- `ReadTools.txt` defines all shared read-only tools, including kmap reads and
-  web research.
+  and `AudioIngressSession.txt` are mutually exclusive descriptions of the
+  current session.
+- `TelegramSession.txt` is added only for private or group Telegram sessions.
+  `TelegramGroupSession.txt` is added only for Telegram groups. Retained group
+  messages are supplied separately as ordinary prose, never serialized into
+  the system prompt as JSON.
+- `KmapBasics.txt` introduces the kmap to a model with no prior knowledge of
+  Kennedy's harness. It explains the graph, identifiers, connections,
+  automatically loaded roots, and Kmap-first tool discovery without embedding
+  individual tool contracts.
+- `ReadTools.txt` defines only the critical Kmap and context-navigation tools
+  needed to discover and manage further context.
 - `WriteTools.txt` defines the kmap mutation tools included in ingress and self
   time.
+- `CodexHarness.txt` establishes the native `call_ktool` boundary.
 
-The backend composes the identity first, then the selected session type, kmap
-basics, read-only tools, optional write tools, the Codex harness note only for
-Codex inference, and a dynamic runtime sentence identifying the configured
-model and thinking mode. Each fact or tool contract has one prompt source;
-strategy and learned judgment belong in Kennedy's kmap. Keep
-technical contracts synchronized with validation and execution in
-`KennedyServer/src/orchestration/session.rs`; hard limits remain enforced in
-code.
+The backend composes the identity first, then the selected session type,
+channel-specific Telegram layers when applicable, Kmap basics, critical
+navigation tools, writable tools when allowed, the Codex harness note, and
+dynamic runtime information. Runtime information identifies the model,
+thinking mode, and current date and time using an unambiguous twelve-hour
+clock with `am` or `pm` and an explicit UTC label.
+
+Most tool inventories, model matrices, and operating manuals belong in the
+kmap and are loaded only when relevant. Prefer natural-language context over
+JSON or other structured renderings whenever an exact machine protocol is not
+required. Keep the remaining prompt contracts synchronized with validation and
+execution in `KennedyServer/src/orchestration/session.rs`; hard limits remain
+enforced in code.
