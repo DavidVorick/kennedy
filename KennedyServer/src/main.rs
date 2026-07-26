@@ -1,5 +1,4 @@
 mod audio_ingress;
-mod backup;
 mod credentials;
 mod intelligence;
 mod kmap_http;
@@ -19,7 +18,6 @@ use std::{
 
 use age::secrecy::{ExposeSecret, SecretString};
 use anyhow::Context;
-use backup::BackupOptions;
 use clap::{Parser, Subcommand};
 use credentials::CredentialVault;
 use kcode_kweb_db::{Config as KwebConfig, NoopGossip, WriterId};
@@ -31,7 +29,7 @@ const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
 const CRATES_IO_KEY_SECRET: &str = "cratesio-key";
 const KWEB_WRITER_SIGNING_KEY_SECRET: &str = "kweb-writer-signing-key";
 const KWEB_WRITERS_SECRET: &str = "kweb-writers-by-priority";
-const RUST_LIBS_ROOT: &str = "/home/user/dev/kennedy/kcode/kcode-rust-libs";
+
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long, global = true, default_value = "./data/kennedy-secrets.age")]
@@ -83,6 +81,8 @@ struct Args {
         help = "AudioIngress-owned persistence root (database and original audio)"
     )]
     audio_ingress_directory: PathBuf,
+    #[arg(long, default_value = "./data/rust-libs")]
+    rust_libs_root: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
     frontend_dir: PathBuf,
     #[arg(long, default_value = "./Frontend/SystemPrompts")]
@@ -101,15 +101,6 @@ enum Command {
     Secrets {
         #[command(subcommand)]
         command: SecretsCommand,
-    },
-    /// Create a verified offline archive of all Kennedy-owned persistent data.
-    Backup {
-        /// Directory in which to create the timestamped .tar.gz archive.
-        #[arg(long, default_value = "./data/backups")]
-        backup_dir: PathBuf,
-        /// Omit immutable Kweb objects while retaining nodes and transaction metadata.
-        #[arg(long)]
-        lightweight_kweb: bool,
     },
     /// Estimate the token footprint of all current Kmap node text.
     KmapSize,
@@ -155,29 +146,6 @@ async fn main() -> anyhow::Result<()> {
                 })?;
             manage_secrets(command, &vault_path)
         }
-        Some(Command::Backup {
-            backup_dir,
-            lightweight_kweb,
-        }) => {
-            let path = backup::run(BackupOptions {
-                bind: args.kweb_bind,
-                backup_dir,
-                kweb_root: args.kweb_root,
-                include_kweb_objects: !lightweight_kweb,
-                conversation_database: args.conversation_history_database,
-                session_directory: args.session_directory,
-                session_history_file: args.session_history_file,
-                telegram_database: args.telegram_database,
-                user_database: args.user_database,
-                legacy_audio_database: Some(args.legacy_audio_ingress_database),
-                audio_memory_ingress_database: args.audio_memory_ingress_database,
-                audio_ingress_directory: args.audio_ingress_directory,
-                vault: vault_path,
-            })
-            .await?;
-            println!("Created Kennedy backup {}", path.display());
-            Ok(())
-        }
         Some(Command::KmapSize) => {
             let _maintenance_guard =
                 maintenance_guard(&args.kweb_bind, "measuring the Kweb").await?;
@@ -197,9 +165,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
-    // Bind the public Kennedy address before opening any persistent state. The
-    // backup command owns this same address for its entire run, making the port
-    // an inter-process offline lock rather than only a late startup check.
+    // Bind the public Kennedy address before opening any persistent state.
+    // Offline maintenance checks this address before copying the data tree.
     let kweb_listener = tokio::net::TcpListener::bind(&args.kweb_bind)
         .await
         .with_context(|| format!("binding Kweb listener {}", args.kweb_bind))?;
@@ -248,8 +215,15 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let (kmap, system_roots) =
         kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
     let kmap_service = kmap_http::Service::new(kmap, system_roots, &args.user_database)?;
-    let rust_lib_tools = rust_lib_tools::RustLibToolService::new(RUST_LIBS_ROOT, crates_io_key)
-        .with_context(|| format!("opening managed Rust libraries root {RUST_LIBS_ROOT}"))?;
+    let rust_lib_tools =
+        rust_lib_tools::RustLibToolService::new(&args.rust_libs_root, crates_io_key).with_context(
+            || {
+                format!(
+                    "opening managed Rust libraries root {}",
+                    args.rust_libs_root.display()
+                )
+            },
+        )?;
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
@@ -347,6 +321,7 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.legacy_audio_ingress_database,
         &args.audio_memory_ingress_database,
         &args.audio_ingress_directory,
+        &args.rust_libs_root,
     ] {
         let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) else {
             continue;
@@ -636,10 +611,30 @@ mod tests {
         assert_eq!(CRATES_IO_KEY_SECRET, "cratesio-key");
         assert_eq!(KWEB_WRITER_SIGNING_KEY_SECRET, "kweb-writer-signing-key");
         assert_eq!(KWEB_WRITERS_SECRET, "kweb-writers-by-priority");
-        assert_eq!(
-            RUST_LIBS_ROOT,
-            "/home/user/dev/kennedy/kcode/kcode-rust-libs"
-        );
+    }
+
+    #[test]
+    fn persistent_path_defaults_are_under_data() {
+        let args = Args::try_parse_from(["kennedy-server"]).unwrap();
+        for path in [
+            &args.vault_path,
+            &args.kweb_root,
+            &args.conversation_history_database,
+            &args.session_directory,
+            &args.session_history_file,
+            &args.telegram_database,
+            &args.user_database,
+            &args.legacy_audio_ingress_database,
+            &args.audio_memory_ingress_database,
+            &args.audio_ingress_directory,
+            &args.rust_libs_root,
+        ] {
+            assert!(
+                path.starts_with("./data"),
+                "persistent default is outside data/: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -754,6 +749,7 @@ mod tests {
             legacy_audio_ingress_database: audio.clone(),
             audio_memory_ingress_database: memory_ingress.clone(),
             audio_ingress_directory: audio_media.clone(),
+            rust_libs_root: directory.join("rust-libs"),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
             telegram_bootstrap_username: "@test".to_owned(),

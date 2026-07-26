@@ -78,8 +78,10 @@ canonical documents; this file is not an append-only log.
   defaults to locations under `./data/` while retaining those existing flags as
   overrides. Store live databases and their WAL/SHM companions directly in
   `data/`, audio originals in `data/audio-ingress-media/`, the transactional
-  Kweb root in `data/kweb/`, the encrypted vault in `data/`, and backup
-  and manual recovery material in `data/backups/` and `data/recovery/`.
+  Kweb root in `data/kweb/`, managed Rust libraries in `data/rust-libs/`, the
+  encrypted vault in `data/`, and manual recovery material in `data/recovery/`.
+  Generated whole-tree backup archives live outside `data/` so they cannot
+  recursively include themselves.
 
 ## Runtime Service Boundaries and Audio Retention
 
@@ -148,25 +150,21 @@ canonical documents; this file is not an append-only log.
 
 ## Offline Backups
 
-- `kennedy-server backup` creates a timestamped gzip-compressed tar archive of
-  the application SQLite databases, including the complete AudioIngress
-  persistence root and KennedyServer-owned audio-memory-ingress queue, the
-  complete transactional Kweb root, and the encrypted credential vault when
-  present. Include the pre-library AudioIngress database when it still exists
-  as optional migration evidence.
-  Each archive is self-describing: its README starts with the creating commit
-  hash and records the exact schemas and current data-format semantics.
-- Backups are deliberately offline. Before reading persistent data, the backup
-  command binds the configured Kweb HTTP address and serves a maintenance page
-  for the full operation. Normal server startup acquires that same address
-  before opening any persistent state, so an active or competing instance
-  fails before the databases can be touched.
-- Backup creation verifies standalone SQLite snapshots and publishes the final
-  archive atomically. The user is responsible for moving archives to durable
-  off-machine storage.
-- `backup --lightweight-kweb` intentionally omits immutable Kweb object bytes
-  while retaining nodes and transaction metadata. Such an archive is not a
-  complete recovery source unless the omitted objects are restored separately.
+- Replace the application-aware `kennedy-server backup` command with the simple
+  `scripts/backup` Bash script. It first refuses to run while Kennedy's process
+  or listener is active, then puts the complete opaque `data/` directory into
+  one timestamped gzip-compressed tar archive while printing progress.
+- Do not interpret, filter, snapshot, or selectively document individual
+  persistence formats during backup. Unknown future files, manual recovery
+  data, legacy archives, SQLite sidecars, and all Kweb objects are included
+  automatically.
+- Include one small metadata member with the Git commit and dirty-tree status.
+  Recovery is deliberately source-assisted: restore the bytes alongside the
+  last working source version and let Codex inspect and migrate formats then.
+- Write backup output outside `data/` and publish it only after `tar` succeeds.
+  The user remains responsible for durable off-machine storage. Codex
+  authentication state and the original vnote source directory are external
+  inputs rather than Kennedy-owned application persistence.
 
 ## Kmap Size Estimate
 

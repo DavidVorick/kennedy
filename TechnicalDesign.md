@@ -332,17 +332,17 @@ The Kweb writer signing key lives in the passphrase-encrypted credential vault.
 Kennedy never receives it. The server passes it directly to `kcode-kweb-db`
 after a human unlocks the vault.
 
-Backup format 11 captures:
+All Kennedy-owned runtime paths default beneath the repository-local `data/`
+tree, including managed Rust libraries. `scripts/backup` is an offline,
+format-agnostic backup: after verifying that Kennedy is stopped, it archives
+the complete tree without interpreting SQLite, Kweb, Session History, audio,
+vault, recovery, or legacy formats. A small metadata member records the source
+commit and dirty status. Recovery uses those opaque bytes with the matching
+source version; format inspection and migration happen at recovery time.
 
-- the complete Kweb root;
-- active session logs, pending-object files, and control journals;
-- `session-history.txt`;
-- runtime SQLite services;
-- audio media;
-- the encrypted vault when present.
-
-Legacy conversation files live only under `data/archive/` and are not runtime
-persistence.
+Backup archives are written outside `data/` to prevent recursive inclusion.
+Codex authentication and original vnote source media are replaceable external
+inputs rather than Kennedy-owned runtime persistence.
 
 ## 13. Known V1 boundaries
 

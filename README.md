@@ -130,6 +130,7 @@ Defaults:
   derived `state.sqlite3` and `originals/`);
 - Kennedy's audio memory-ingress queue and the Telegram and user-directory
   SQLite files under `data/`;
+- managed Rust libraries: `data/rust-libs`;
 - frontend assets: `Frontend/public`;
 - system-prompt boxes: `Frontend/SystemPrompts`.
 
@@ -200,24 +201,37 @@ not inject backend content as HTML.
 
 ## Backup
 
-Stop Kennedy or let the command acquire the offline listener lock:
+Stop Kennedy, then archive the complete opaque `data/` tree:
 
 ```sh
-cargo run -p kennedy-server -- backup
+scripts/backup
 ```
 
-Backup format 11 includes:
+The optional argument selects an output directory; the default is the ignored
+top-level `backups/` directory:
 
-- the complete Kweb root and objects;
-- all active session logs, pending-object files, and Session History control
-  journals;
-- `session-history.txt`;
-- current runtime SQLite databases;
-- audio media;
-- the encrypted vault, when present.
+```sh
+scripts/backup /path/to/off-machine-backups
+```
 
-Use `--lightweight-kweb` only when immutable Kweb objects are preserved
-elsewhere.
+The script refuses to start while a `kennedy-server` process exists or the
+default Kennedy listener is accepting connections. It creates one timestamped
+`.tar.gz` containing the complete opaque contents of `data/` plus
+`BACKUP-METADATA.txt`, which records the source commit and whether the source
+tree was dirty. Progress is reported as the compressed archive grows, and the
+completed archive is moved into place only after `tar` succeeds.
+
+The output directory must be outside `data/` so the archive cannot include
+itself. The backup is not encrypted as a whole: Kweb, sessions, databases, and
+audio are plaintext even though the included credential vault remains
+encrypted. For recovery, extract the archive at the repository root, check out
+the recorded commit, and inspect or migrate the restored formats from that
+source version.
+
+Kennedy-owned runtime defaults live under `data/`. Explicit path overrides
+outside that tree are operator-managed and are not captured by this script.
+Codex login state and the source vnote recording directory are external inputs,
+not Kennedy-owned runtime state.
 
 ## Legacy cutover
 

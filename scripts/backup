@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+program="${0##*/}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repository="$(cd -- "$script_dir/.." && pwd -P)"
+data_dir="$repository/data"
+backup_dir="${1:-${KENNEDY_BACKUP_DIR:-"$repository/backups"}}"
+kennedy_host="${KENNEDY_BACKUP_HOST:-127.0.0.1}"
+kennedy_port="${KENNEDY_BACKUP_PORT:-4321}"
+kennedy_process="${KENNEDY_BACKUP_PROCESS:-kennedy-server}"
+temporary_archive=""
+metadata_dir=""
+metadata_file=""
+archive_pid=""
+
+die() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf 'Usage: %s [OUTPUT_DIRECTORY]\n' "$program"
+}
+
+port_is_open() {
+    (
+        exec 3<>"/dev/tcp/$kennedy_host/$kennedy_port" || exit 1
+        exec 3<&-
+        exec 3>&-
+    ) >/dev/null 2>&1
+}
+
+kennedy_is_running() {
+    local comm name
+    for comm in /proc/[0-9]*/comm; do
+        [[ -r "$comm" ]] || continue
+        IFS= read -r name <"$comm" || continue
+        [[ "$name" != "$kennedy_process" ]] || return 0
+    done
+    return 1
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if [[ -n "$archive_pid" ]] && kill -0 "$archive_pid" 2>/dev/null; then
+        kill "$archive_pid" 2>/dev/null || true
+        wait "$archive_pid" 2>/dev/null || true
+    fi
+    [[ -z "$temporary_archive" ]] || rm -f -- "$temporary_archive"
+    [[ -z "$metadata_file" ]] || rm -f -- "$metadata_file"
+    [[ -z "$metadata_dir" ]] || rmdir -- "$metadata_dir" 2>/dev/null || true
+    exit "$status"
+}
+
+case "$#" in
+    0)
+        ;;
+    1)
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+        esac
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+for dependency in awk date du git mktemp mv numfmt realpath sleep stat tar; do
+    command -v "$dependency" >/dev/null 2>&1 ||
+        die "required command not found: $dependency"
+done
+
+[[ "$kennedy_port" =~ ^[0-9]+$ ]] &&
+    (( kennedy_port >= 1 && kennedy_port <= 65535 )) ||
+    die "KENNEDY_BACKUP_PORT must be a TCP port number"
+[[ -d "$data_dir" && ! -L "$data_dir" ]] ||
+    die "Kennedy data directory is missing or unsafe: $data_dir"
+
+# Check both the process name and the default listener. The process check also
+# catches Kennedy when it was started with a non-default bind address.
+if kennedy_is_running; then
+    die "Kennedy is running; stop it before creating a backup"
+fi
+if port_is_open; then
+    die "$kennedy_host:$kennedy_port is accepting connections; stop Kennedy before creating a backup"
+fi
+
+umask 077
+backup_dir="$(realpath -m -- "$backup_dir")"
+case "$backup_dir/" in
+    "$data_dir/"*)
+        die "the output directory must be outside $data_dir"
+        ;;
+esac
+mkdir -p -- "$backup_dir"
+backup_dir="$(cd -- "$backup_dir" && pwd -P)"
+
+timestamp="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
+commit="$(git -C "$repository" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+short_commit="${commit:0:12}"
+archive="$backup_dir/kennedy-data-$timestamp-$short_commit.tar.gz"
+temporary_archive="$backup_dir/.${archive##*/}.tmp.$$"
+[[ ! -e "$archive" && ! -e "$temporary_archive" ]] ||
+    die "backup destination already exists: $archive"
+
+metadata_dir="$(mktemp -d "$backup_dir/.kennedy-backup-metadata.XXXXXXXX")"
+metadata_file="$metadata_dir/BACKUP-METADATA.txt"
+source_status="$(git -C "$repository" status --porcelain 2>/dev/null || true)"
+source_dirty=false
+[[ -z "$source_status" ]] || source_dirty=true
+{
+    printf 'format=kennedy-data-tree-v1\n'
+    printf 'created_at=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    printf 'git_commit=%s\n' "$commit"
+    printf 'source_dirty=%s\n' "$source_dirty"
+    if [[ -n "$source_status" ]]; then
+        printf 'source_status_begin\n%s\nsource_status_end\n' "$source_status"
+    fi
+} >"$metadata_file"
+
+source_size="$(du -sh -- "$data_dir" | awk '{print $1}')"
+printf 'Archiving %s from %s\n' "$source_size" "$data_dir"
+printf 'Output: %s\n' "$archive"
+
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+tar -czf "$temporary_archive" \
+    -C "$repository" data \
+    -C "$metadata_dir" BACKUP-METADATA.txt &
+archive_pid=$!
+while kill -0 "$archive_pid" 2>/dev/null; do
+    bytes="$(stat --format='%s' "$temporary_archive" 2>/dev/null || printf '0')"
+    printf '\rWritten %s ...' "$(numfmt --to=iec --suffix=B "$bytes")"
+    sleep 1
+done
+
+archive_status=0
+wait "$archive_pid" || archive_status=$?
+archive_pid=""
+printf '\r%*s\r' 72 ''
+(( archive_status == 0 )) || die "tar failed with status $archive_status"
+
+mv -- "$temporary_archive" "$archive"
+temporary_archive=""
+rm -f -- "$metadata_file"
+metadata_file=""
+rmdir -- "$metadata_dir"
+metadata_dir=""
+
+archive_size="$(stat --format='%s' "$archive")"
+dirty_suffix=""
+[[ "$source_dirty" == false ]] || dirty_suffix=" (source tree was dirty)"
+printf 'Created %s (%s)\n' "$archive" "$(numfmt --to=iec --suffix=B "$archive_size")"
+printf 'Recovery commit: %s%s\n' "$commit" "$dirty_suffix"

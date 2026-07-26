@@ -1,5 +1,6 @@
 **/target/
 /data/
+/backups/
 .env
 .tools/
 .vnote-ingress-sha256-cache-v1
