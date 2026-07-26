@@ -11,10 +11,10 @@ orchestrator; the browser does not run Kennedy.
 - `kcode-session-log` 0.2.1 owns one append-only, checksummed transcript per
   in-progress session and one durable file per pending object. Only
   `kcode-session-history` depends on it.
-- `kcode-session-history` owns opaque active `Session` handles, Chatend
+- `kcode-session-history` 0.1.0 is a published standalone library. It owns
+  opaque active `Session` handles, Chatend
   reconstruction, lifecycle and commands in a separate control journal,
-  pending objects, and durable completion receipts. Its standalone private
-  library manifest has no Axum dependency.
+  pending objects, and durable completion receipts. It has no Axum dependency.
 - `KennedyServer` owns context and orchestration policy, provider calls,
   Ktools, Kweb graph policy, credential handling, the global Kweb writer lane,
   Session History's HTTP adapter, and static frontend serving.

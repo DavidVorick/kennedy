@@ -2107,6 +2107,8 @@ checksum = "dbfcb2a46ce2ac2fe8ef732927501ae23a9849dc006fab3d82fd5b603a3fd743"
 [[package]]
 name = "kcode-session-history"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de4bd37a570ab655ba948b025b36ae5ad73eff463b5381fa679b9138530218e7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2114,7 +2116,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tokio",
  "tracing",
  "uuid",
 ]

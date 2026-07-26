@@ -15,7 +15,7 @@ ed25519-dalek.workspace = true
 flate2.workspace = true
 hex.workspace = true
 kcode-audio-ingress.workspace = true
-kcode-session-history = { path = "../kcode-session-history" }
+kcode-session-history.workspace = true
 kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true
 kcode-doc-extraction.workspace = true

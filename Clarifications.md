@@ -6,7 +6,8 @@ Chatend, ResetContext, context-budget, and Kweb-persistence statements are not
 current requirements.
 
 Current Chatend authority is `UserSpecification.md`, `TechnicalDesign.md`,
-`Frontend/Specification.md`, `kcode-session-history/Specification.md`,
+`Frontend/Specification.md`, the
+[published `kcode-session-history` 0.1.0 specification](https://docs.rs/crate/kcode-session-history/0.1.0/source/Specification.md),
 `chatend-overhaul/chatend-overhaul-clarifications.md`, and
 `chatend-overhaul/chatend-discussion-review.txt`.
 

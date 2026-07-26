@@ -1,5 +1,5 @@
 [workspace]
-members = ["kcode-session-history", "KennedyServer"]
+members = ["KennedyServer"]
 resolver = "2"
 
 [workspace.package]
@@ -26,6 +26,7 @@ kcode-kweb-db = "1.0"
 kcode-audio-ingress = "0.1.1"
 kcode-openai-api = "=0.1.2"
 kcode-rust-libs-v2 = "=1.1.0"
+kcode-session-history = "=0.1.0"
 kcode-web-fetch = "0.1.1"
 rand = "0.9"
 rpassword = "7.5.4"
