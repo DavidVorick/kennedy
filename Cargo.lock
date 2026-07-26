@@ -2021,6 +2021,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-dev-tools"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d7c0163304d353471f09b323b027c508637d44b94f981f6d02ab887212f640c"
+dependencies = [
+ "http",
+ "kcode-rust-bins",
+ "kcode-rust-libs-v2",
+ "kcode-web-libs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "kcode-doc-extraction"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2086,6 +2103,15 @@ dependencies = [
  "reqwest 0.13.4",
  "serde_json",
  "zeroize",
+]
+
+[[package]]
+name = "kcode-rust-bins"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43c49ae3c8206c29286d341fc8d0cd62e17d38e6e94edb745f01a0d3782f7003"
+dependencies = [
+ "semver",
 ]
 
 [[package]]
@@ -2203,16 +2229,15 @@ dependencies = [
  "kcode-audio-ingress",
  "kcode-codex-runtime",
  "kcode-codex-runtime-v2",
+ "kcode-dev-tools",
  "kcode-doc-extraction",
  "kcode-gemini-api 0.1.1",
  "kcode-gemini-api 0.2.0",
  "kcode-kweb-db",
  "kcode-openai-api",
- "kcode-rust-libs-v2",
  "kcode-session-history",
  "kcode-tg-kennedy-bot",
  "kcode-web-fetch",
- "kcode-web-libs",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rpassword",

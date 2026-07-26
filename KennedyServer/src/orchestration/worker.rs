@@ -294,7 +294,7 @@ impl Orchestrator {
                 "abandonedPendingTurn":abandoned_pending_turn,
             });
             if let Some(session_id) = state.get("rustLibSessionId").and_then(Value::as_str) {
-                self.api.release_rust_libs(session_id).await;
+                self.api.release_managed_sources(session_id).await;
             }
             self.request_conversation_ingress(&record, Some(state))
                 .await?;
@@ -560,7 +560,7 @@ impl Orchestrator {
         record: &Arc<Mutex<Value>>,
         session: &Session,
     ) -> anyhow::Result<Value> {
-        session.release_rust_libs().await;
+        session.release_managed_sources().await;
         self.request_conversation_ingress(record, None).await
     }
 
@@ -787,7 +787,7 @@ impl Orchestrator {
                 .ok();
             return Err(error);
         }
-        self.api.release_rust_libs(&rust_session_id).await;
+        self.api.release_managed_sources(&rust_session_id).await;
         Ok(())
     }
 
@@ -921,7 +921,7 @@ impl Orchestrator {
             }
             return Err(error);
         }
-        self.api.release_rust_libs(&rust_session_id).await;
+        self.api.release_managed_sources(&rust_session_id).await;
         Ok(())
     }
 
@@ -1023,7 +1023,7 @@ impl Orchestrator {
         session.finalize_free_time(&reason)?;
         session.commit_current_write_session()?;
         persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
-        session.release_rust_libs().await;
+        session.release_managed_sources().await;
         let mut locked = record_arc.lock().await;
         let completed = self
             .api
@@ -1696,7 +1696,7 @@ impl Orchestrator {
             )
             .await?;
         if let Some(session_id) = state.get("rustLibSessionId").and_then(Value::as_str) {
-            self.api.release_rust_libs(session_id).await;
+            self.api.release_managed_sources(session_id).await;
         }
         Ok(())
     }
@@ -1981,7 +1981,7 @@ impl Orchestrator {
             return Ok(());
         }
         let session = self.session_for_record(&record).await?;
-        session.release_rust_libs().await;
+        session.release_managed_sources().await;
         self.api
             .history_request_ingress(
                 conversation_id,

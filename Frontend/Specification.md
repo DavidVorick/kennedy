@@ -76,26 +76,34 @@ System prompts are ordinary persisted boxes. The provider-level `call_ktool`
 function remains registered independently of whether Kennedy has dehydrated
 the box explaining it.
 
-### Managed library file operations
+### Managed source operations
 
 `kcode-rust-libs-v2/write-file-freeform` and
-`kcode-web-libs/write-file-freeform` are two-part operations within one Codex
-turn. Their ordinary Ktool call carries the already-open library `name`, file
+`kcode-web-libs/write-file-freeform`, and
+`kcode-rust-bins/write-file-freeform` are two-part operations within one Codex
+turn. Their ordinary Ktool call carries the already-open source `name`, file
 `path`, and one-line `updateDescription`. After the server returns a readiness
 acknowledgement, the terminal assistant message is captured as the complete
 file instead of becoming a conversational response. If that output does not
 end in a newline, the server adds one. The server previews the resulting
-complete library for context capacity, then translates the change into the
-whole-snapshot managed-library write.
+complete source for context capacity, then translates the change into the
+whole-snapshot managed-source write.
 
 The durable call box retains that normalized file output but is immediately
-summarized in active context using its path, library name, and update
-description. A failed preview or write leaves the managed-library source box
+summarized in active context using its path, source name, and update
+description. A failed preview or write leaves the managed-source box
 unchanged. The matching `kcode-rust-libs-v2/delete-file` and
-`kcode-web-libs/delete-file` operations are ordinary Ktools with `name` and
-`path`; each removes one file and commits the remaining complete snapshot.
-Both mutations require the named library of the corresponding kind to already
-be open and roll back the in-memory snapshot if the underlying write fails.
+`kcode-web-libs/delete-file`, and `kcode-rust-bins/delete-file` operations are
+ordinary Ktools with `name` and `path`; each removes one file and commits the
+remaining complete snapshot. Both mutations require the named source of the
+corresponding kind to already be open and roll back the in-memory snapshot if
+the underlying write fails.
+
+`kcode-rust-bins/call` selects an immutable published executable and accepts
+optional exact UTF-8 `input`, ordered canonical Kweb `objectIds`, and
+`timeoutSeconds` (two minutes by default). The frontend receives the binary's
+text exactly. Any output object IDs follow that text one per line, without
+labels or JSON wrapping.
 
 ## Composer and objects
 

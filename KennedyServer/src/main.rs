@@ -5,11 +5,9 @@ mod kmap_http;
 mod kmap_size;
 mod kweb_writer;
 mod orchestration;
-mod rust_lib_tools;
 mod session_history_http;
 mod telegram_identity;
 mod web_lib_http;
-mod web_lib_tools;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -87,6 +85,10 @@ struct Args {
     rust_libs_root: PathBuf,
     #[arg(long, default_value = "./data/kcode/kcode-web-libs")]
     web_libs_root: PathBuf,
+    #[arg(long, default_value = "./data/kcode/kcode-rust-bins")]
+    rust_bins_root: PathBuf,
+    #[arg(long, default_value = "./data/kcode/kcode-rust-bin-artifacts")]
+    rust_bin_artifacts_root: PathBuf,
     #[arg(long, default_value = "./Frontend/public")]
     frontend_dir: PathBuf,
     #[arg(long, default_value = "./Frontend/SystemPrompts")]
@@ -219,23 +221,26 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let (kmap, system_roots) =
         kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
     let kmap_service = kmap_http::Service::new(kmap, system_roots, &args.user_database)?;
-    let rust_lib_tools =
-        rust_lib_tools::RustLibToolService::new(&args.rust_libs_root, crates_io_key).with_context(
-            || {
-                format!(
-                    "opening managed Rust libraries root {}",
-                    args.rust_libs_root.display()
-                )
-            },
-        )?;
-    let web_lib_tools =
-        web_lib_tools::WebLibToolService::new(&args.web_libs_root).with_context(|| {
-            format!(
-                "opening managed Web libraries root {}",
-                args.web_libs_root.display()
-            )
-        })?;
-    let web_lib_router = web_lib_http::router(web_lib_tools.root());
+    let object_store = Arc::new(kmap_http::RustBinaryObjectStore::new(kmap_service.clone()));
+    let dev_tools = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
+        rust_libraries_root: args.rust_libs_root.clone(),
+        web_libraries_root: args.web_libs_root.clone(),
+        rust_binaries_root: args.rust_bins_root.clone(),
+        rust_binary_publications_root: args.rust_bin_artifacts_root.clone(),
+        crates_io_registry_token: crates_io_key,
+        object_store,
+    })
+    .map_err(anyhow::Error::new)
+    .with_context(|| {
+        format!(
+            "opening managed Kcode development roots under {}",
+            args.rust_libs_root
+                .parent()
+                .unwrap_or(Path::new("."))
+                .display()
+        )
+    })?;
+    let web_lib_router = web_lib_http::router(dev_tools.web_libraries_root());
     let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
@@ -301,8 +306,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             history: history_service,
             audio: audio_service,
             directory: telegram_identity.clone(),
-            rust_lib_tools,
-            web_lib_tools,
+            dev_tools,
         },
     )?;
     tokio::try_join!(
@@ -337,6 +341,8 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.audio_ingress_directory,
         &args.rust_libs_root,
         &args.web_libs_root,
+        &args.rust_bins_root,
+        &args.rust_bin_artifacts_root,
     ] {
         let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) else {
             continue;
@@ -644,6 +650,8 @@ mod tests {
             &args.audio_ingress_directory,
             &args.rust_libs_root,
             &args.web_libs_root,
+            &args.rust_bins_root,
+            &args.rust_bin_artifacts_root,
         ] {
             assert!(
                 path.starts_with("./data"),
@@ -651,6 +659,123 @@ mod tests {
                 path.display()
             );
         }
+        for path in [
+            &args.rust_libs_root,
+            &args.web_libs_root,
+            &args.rust_bins_root,
+            &args.rust_bin_artifacts_root,
+        ] {
+            assert!(
+                path.starts_with("./data/kcode"),
+                "managed Kcode default is outside data/kcode/: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_dev_tools_service_opens_all_roots_and_routes_three_source_kinds() {
+        struct EmptyObjectStore;
+
+        impl kcode_dev_tools::ObjectStore for EmptyObjectStore {
+            fn load(&self, _object_id: &str) -> kcode_dev_tools::ObjectStoreResult<Vec<u8>> {
+                Err(kcode_dev_tools::ObjectStoreError::new("not available"))
+            }
+
+            fn save(&self, _bytes: &[u8]) -> kcode_dev_tools::ObjectStoreResult<String> {
+                Err(kcode_dev_tools::ObjectStoreError::new("not available"))
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "kennedy-dev-tools-open-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let rust_libraries = directory.join("kcode-rust-libs");
+        let web_libraries = directory.join("kcode-web-libs");
+        let rust_binaries = directory.join("kcode-rust-bins");
+        let rust_binary_artifacts = directory.join("kcode-rust-bin-artifacts");
+        let service = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
+            rust_libraries_root: rust_libraries.clone(),
+            web_libraries_root: web_libraries.clone(),
+            rust_binaries_root: rust_binaries.clone(),
+            rust_binary_publications_root: rust_binary_artifacts.clone(),
+            crates_io_registry_token: "test-token".into(),
+            object_store: Arc::new(EmptyObjectStore),
+        })
+        .unwrap();
+
+        assert_eq!(
+            service.web_libraries_root(),
+            std::fs::canonicalize(&web_libraries).unwrap()
+        );
+        for path in [
+            rust_libraries,
+            web_libraries,
+            rust_binaries,
+            rust_binary_artifacts,
+        ] {
+            assert!(
+                path.is_dir(),
+                "managed root was not created: {}",
+                path.display()
+            );
+        }
+        for (create, open, write, name, path, kind) in [
+            (
+                kcode_dev_tools::CREATE_RUST_LIB_TOOL,
+                kcode_dev_tools::OPEN_RUST_LIB_TOOL,
+                kcode_dev_tools::WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+                "kennedy-test-lib",
+                "src/extra.rs",
+                kcode_dev_tools::ManagedSourceKind::RustLibrary,
+            ),
+            (
+                kcode_dev_tools::CREATE_WEB_LIB_TOOL,
+                kcode_dev_tools::OPEN_WEB_LIB_TOOL,
+                kcode_dev_tools::WRITE_FILE_FREEFORM_WEB_LIB_TOOL,
+                "kennedy-test-web",
+                "extra.js",
+                kcode_dev_tools::ManagedSourceKind::WebLibrary,
+            ),
+            (
+                kcode_dev_tools::CREATE_RUST_BIN_TOOL,
+                kcode_dev_tools::OPEN_RUST_BIN_TOOL,
+                kcode_dev_tools::WRITE_FILE_FREEFORM_RUST_BIN_TOOL,
+                "kennedy-test-bin",
+                "src/extra.rs",
+                kcode_dev_tools::ManagedSourceKind::RustBinary,
+            ),
+        ] {
+            let created = service
+                .execute("create-session", create, serde_json::json!({"name":name}))
+                .await
+                .unwrap();
+            assert_eq!(created.snapshot.unwrap().kind, kind);
+            let written = service
+                .execute(
+                    "create-session",
+                    write,
+                    serde_json::json!({
+                        "name":name,
+                        "path":path,
+                        "contents":"// Kennedy managed source\n",
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(written.snapshot.unwrap().kind, kind);
+
+            let open_result = service
+                .execute("open-session", open, serde_json::json!({"name":name}))
+                .await
+                .unwrap();
+            assert_eq!(open_result.snapshot.unwrap().kind, kind);
+        }
+        assert_eq!(service.release("create-session").await.unwrap(), 3);
+        assert_eq!(service.release("open-session").await.unwrap(), 3);
+        drop(service);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -767,6 +892,8 @@ mod tests {
             audio_ingress_directory: audio_media.clone(),
             rust_libs_root: directory.join("rust-libs"),
             web_libs_root: directory.join("kcode-web-libs"),
+            rust_bins_root: directory.join("kcode-rust-bins"),
+            rust_bin_artifacts_root: directory.join("kcode-rust-bin-artifacts"),
             frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
             telegram_bootstrap_username: "@test".to_owned(),

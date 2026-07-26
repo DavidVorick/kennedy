@@ -21,18 +21,24 @@ Kennedy is one Rust server with deliberately separated library domains:
    handles, reconstructed Chatend and box state, lifecycle and command
    journals, pending objects, and completion receipts. It has no Axum or HTTP
    API.
-4. `kennedy-server` owns context-policy decisions, orchestration, provider
-   calls, tool execution, graph policy, the one Kweb writer lane, all browser
-   HTTP adapters, roots, the credential vault, and static assets.
-5. `kcode-audio-ingress` owns durable audio intake, transcription, and
+4. `kcode-dev-tools` owns the shared session-scoped Ktool service, leases,
+   source snapshots, and backend calls for managed Rust libraries, Web
+   libraries, and Rust binaries. `kcode-rust-bins` keeps editable source and
+   immutable local executable publications in separate roots.
+5. `kennedy-server` owns context-policy decisions, orchestration, provider
+   calls, Ktool authorization and Chatend integration, graph policy, the one
+   Kweb writer lane, all browser HTTP adapters, roots, the credential vault,
+   and static assets. It adapts canonical Kweb objects for Rust-binary call
+   inputs and outputs and continues to serve immutable Web publications.
+6. `kcode-audio-ingress` owns durable audio intake, transcription, and
    automatic whole-job recovery. KennedyServer owns the Axum adapter and a
    separate prepared-transcript memory-ingress queue; those downstream
    concepts are absent from the standalone library.
-6. Conversational history ingress uses the same session log as its source
+7. Conversational history ingress uses the same session log as its source
    session; KennedyServer serializes it with audio work through the global
    Kweb writer lane.
-7. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
-8. The browser frontend is an observer and command client only.
+8. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
+9. The browser frontend is an observer and command client only.
 
 Kennedy-owned routers share the main loopback listener. The Telegram crate
 retains its own loopback listener.
@@ -341,12 +347,20 @@ Kennedy never receives it. The server passes it directly to `kcode-kweb-db`
 after a human unlocks the vault.
 
 All Kennedy-owned runtime paths default beneath the repository-local `data/`
-tree, including managed Rust and Web libraries. `scripts/backup` is an offline,
+tree, including managed Rust/Web libraries, Rust-binary source, and immutable
+Rust-binary executable publications. `scripts/backup` is an offline,
 format-agnostic backup: after verifying that Kennedy is stopped, it archives
 the complete tree without interpreting SQLite, Kweb, Session History, audio,
 vault, recovery, or legacy formats. A small metadata member records the source
 commit and dirty status. Recovery uses those opaque bytes with the matching
 source version; format inspection and migration happen at recovery time.
+
+Managed Web publication shares the Web-library root by contract but is
+separated from editable source beneath
+`data/kcode/kcode-web-libs/.published/module/<name>/v<version>/`. The
+publication directory is created lazily on the first successful publish.
+Rust-binary publications use the distinct
+`data/kcode/kcode-rust-bin-artifacts` root.
 
 Backup archives are written outside `data/` to prevent recursive inclusion.
 Codex authentication and original vnote source media are replaceable external

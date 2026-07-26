@@ -23,8 +23,7 @@ pub(crate) struct LocalServices {
     pub history: kcode_session_history::SessionHistory,
     pub audio: crate::audio_ingress::Service,
     pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
-    pub rust_lib_tools: crate::rust_lib_tools::RustLibToolService,
-    pub web_lib_tools: crate::web_lib_tools::WebLibToolService,
+    pub dev_tools: kcode_dev_tools::Service,
 }
 
 #[derive(Debug, Clone)]
@@ -683,25 +682,35 @@ impl Api {
             .await
     }
 
-    pub async fn rust_lib_execute(
+    pub async fn managed_source_execute(
         &self,
         session_id: &str,
         name: &str,
         arguments: Value,
-    ) -> Result<crate::rust_lib_tools::ToolExecution, ApiError> {
+    ) -> Result<kcode_dev_tools::ToolExecution, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local
-                .rust_lib_tools
-                .execute_detailed(session_id.to_owned(), name.to_owned(), arguments)
+                .dev_tools
+                .execute(session_id.to_owned(), name.to_owned(), arguments)
                 .await
-                .map_err(rust_lib_error),
+                .map_err(dev_tools_error),
             #[cfg(test)]
             ServiceBackend::Http(bases) => {
+                let kind = managed_source_kind(name).ok_or_else(|| ApiError {
+                    status: None,
+                    code: "unknown_managed_source_tool".into(),
+                    message: format!("Unknown managed-source tool {name}."),
+                })?;
+                let path = match kind {
+                    kcode_dev_tools::ManagedSourceKind::RustLibrary => "/api/v1/rust-libs/execute",
+                    kcode_dev_tools::ManagedSourceKind::WebLibrary => "/api/v1/web-libs/execute",
+                    kcode_dev_tools::ManagedSourceKind::RustBinary => "/api/v1/rust-bins/execute",
+                };
                 let payload = self
                     .request(
                         Method::POST,
                         &bases.kweb,
-                        "/api/v1/rust-libs/execute",
+                        path,
                         Some(json!({
                             "session_id":session_id,
                             "name":name,
@@ -716,12 +725,13 @@ impl Api {
                     .ok_or_else(|| ApiError {
                         status: None,
                         code: "invalid_tool_result".into(),
-                        message: "Rust library tool returned a non-text result.".into(),
+                        message: "Managed-source tool returned a non-text result.".into(),
                     })?;
                 let snapshot = payload
                     .get("snapshot")
                     .and_then(Value::as_str)
-                    .map(|snapshot| crate::rust_lib_tools::LibrarySnapshot {
+                    .map(|snapshot| kcode_dev_tools::SourceSnapshot {
+                        kind,
                         name: arguments
                             .get("name")
                             .and_then(Value::as_str)
@@ -730,127 +740,56 @@ impl Api {
                         text: snapshot.to_owned(),
                     })
                     .or_else(|| {
-                        if name == crate::rust_lib_tools::WRITE_RUST_LIB_TOOL {
-                            crate::rust_lib_tools::proposed_write_snapshot(&arguments)
-                        } else if name == crate::rust_lib_tools::PREVIEW_WRITE_FILE_RUST_LIB_TOOL {
-                            Some(crate::rust_lib_tools::LibrarySnapshot {
-                                name: arguments
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_owned(),
-                                text: text.clone(),
-                            })
-                        } else if matches!(
-                            name,
-                            crate::rust_lib_tools::CREATE_RUST_LIB_TOOL
-                                | crate::rust_lib_tools::OPEN_RUST_LIB_TOOL
-                        ) {
-                            arguments.get("name").and_then(Value::as_str).map(|name| {
-                                crate::rust_lib_tools::LibrarySnapshot {
-                                    name: name.to_owned(),
+                        kcode_dev_tools::proposed_write_snapshot(name, &arguments)
+                            .or_else(|| {
+                                let preview = matches!(
+                                    name,
+                                    kcode_dev_tools::PREVIEW_WRITE_FILE_RUST_LIB_TOOL
+                                        | kcode_dev_tools::PREVIEW_WRITE_FILE_WEB_LIB_TOOL
+                                        | kcode_dev_tools::PREVIEW_WRITE_FILE_RUST_BIN_TOOL
+                                );
+                                preview.then(|| kcode_dev_tools::SourceSnapshot {
+                                    kind,
+                                    name: arguments
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
                                     text: text.clone(),
-                                }
+                                })
                             })
-                        } else {
-                            None
-                        }
+                            .or_else(|| {
+                                matches!(
+                                    name,
+                                    kcode_dev_tools::CREATE_RUST_LIB_TOOL
+                                        | kcode_dev_tools::OPEN_RUST_LIB_TOOL
+                                        | kcode_dev_tools::CREATE_WEB_LIB_TOOL
+                                        | kcode_dev_tools::OPEN_WEB_LIB_TOOL
+                                        | kcode_dev_tools::CREATE_RUST_BIN_TOOL
+                                        | kcode_dev_tools::OPEN_RUST_BIN_TOOL
+                                )
+                                .then(|| {
+                                    arguments.get("name").and_then(Value::as_str).map(|name| {
+                                        kcode_dev_tools::SourceSnapshot {
+                                            kind,
+                                            name: name.to_owned(),
+                                            text: text.clone(),
+                                        }
+                                    })
+                                })
+                                .flatten()
+                            })
                     });
-                Ok(crate::rust_lib_tools::ToolExecution { text, snapshot })
+                Ok(kcode_dev_tools::ToolExecution { text, snapshot })
             }
         }
     }
 
-    pub async fn web_lib_execute(
-        &self,
-        session_id: &str,
-        name: &str,
-        arguments: Value,
-    ) -> Result<crate::rust_lib_tools::ToolExecution, ApiError> {
-        match &self.services {
-            ServiceBackend::Local(local) => local
-                .web_lib_tools
-                .execute_detailed(session_id.to_owned(), name.to_owned(), arguments)
-                .await
-                .map_err(rust_lib_error),
-            #[cfg(test)]
-            ServiceBackend::Http(bases) => {
-                let payload = self
-                    .request(
-                        Method::POST,
-                        &bases.kweb,
-                        "/api/v1/web-libs/execute",
-                        Some(json!({
-                            "session_id":session_id,
-                            "name":name,
-                            "arguments":arguments,
-                        })),
-                    )
-                    .await?;
-                let text = payload
-                    .get("result")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| ApiError {
-                        status: None,
-                        code: "invalid_tool_result".into(),
-                        message: "Web library tool returned a non-text result.".into(),
-                    })?;
-                let snapshot = payload
-                    .get("snapshot")
-                    .and_then(Value::as_str)
-                    .map(|snapshot| crate::rust_lib_tools::LibrarySnapshot {
-                        name: arguments
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        text: snapshot.to_owned(),
-                    })
-                    .or_else(|| {
-                        if name == crate::web_lib_tools::WRITE_WEB_LIB_TOOL {
-                            crate::web_lib_tools::proposed_write_snapshot(&arguments)
-                        } else if name == crate::web_lib_tools::PREVIEW_WRITE_FILE_WEB_LIB_TOOL {
-                            Some(crate::rust_lib_tools::LibrarySnapshot {
-                                name: arguments
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_owned(),
-                                text: text.clone(),
-                            })
-                        } else if matches!(
-                            name,
-                            crate::web_lib_tools::CREATE_WEB_LIB_TOOL
-                                | crate::web_lib_tools::OPEN_WEB_LIB_TOOL
-                        ) {
-                            arguments.get("name").and_then(Value::as_str).map(|name| {
-                                crate::rust_lib_tools::LibrarySnapshot {
-                                    name: name.to_owned(),
-                                    text: text.clone(),
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    });
-                Ok(crate::rust_lib_tools::ToolExecution { text, snapshot })
-            }
-        }
-    }
-
-    pub async fn release_rust_libs(&self, session_id: &str) {
+    pub async fn release_managed_sources(&self, session_id: &str) {
         match &self.services {
             ServiceBackend::Local(local) => {
-                let (rust_result, web_result) = tokio::join!(
-                    local.rust_lib_tools.release(session_id.to_owned()),
-                    local.web_lib_tools.release(session_id.to_owned()),
-                );
-                if let Err(error) = rust_result {
-                    tracing::warn!(error=%error.message, "Rust library session release failed");
-                }
-                if let Err(error) = web_result {
-                    tracing::warn!(error=%error.message, "Web library session release failed");
+                if let Err(error) = local.dev_tools.release(session_id.to_owned()).await {
+                    tracing::warn!(error=%error.message, "Managed-source session release failed");
                 }
             }
             #[cfg(test)]
@@ -1283,7 +1222,26 @@ fn directory_error(error: crate::telegram_identity::ApiError) -> ApiError {
     }
 }
 
-fn rust_lib_error(error: crate::rust_lib_tools::ToolError) -> ApiError {
+#[cfg(test)]
+fn managed_source_kind(name: &str) -> Option<kcode_dev_tools::ManagedSourceKind> {
+    if kcode_dev_tools::RUST_LIB_TOOLS.contains(&name)
+        || name == kcode_dev_tools::PREVIEW_WRITE_FILE_RUST_LIB_TOOL
+    {
+        Some(kcode_dev_tools::ManagedSourceKind::RustLibrary)
+    } else if kcode_dev_tools::WEB_LIB_TOOLS.contains(&name)
+        || name == kcode_dev_tools::PREVIEW_WRITE_FILE_WEB_LIB_TOOL
+    {
+        Some(kcode_dev_tools::ManagedSourceKind::WebLibrary)
+    } else if kcode_dev_tools::RUST_BIN_TOOLS.contains(&name)
+        || name == kcode_dev_tools::PREVIEW_WRITE_FILE_RUST_BIN_TOOL
+    {
+        Some(kcode_dev_tools::ManagedSourceKind::RustBinary)
+    } else {
+        None
+    }
+}
+
+fn dev_tools_error(error: kcode_dev_tools::ToolError) -> ApiError {
     ApiError {
         status: Some(error.status),
         code: error.code.into(),
@@ -1624,5 +1582,80 @@ mod tests {
             telegram_native_kind("application/pdf", Some("document")),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn rust_binary_call_arguments_and_raw_text_cross_the_test_boundary_unchanged() {
+        use axum::{Json, Router, extract::State, routing::post};
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/api/v1/rust-bins/execute",
+                post(
+                    |State(calls): State<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
+                     Json(body): Json<Value>| async move {
+                        calls.lock().unwrap().push(body);
+                        Json(json!({
+                            "result":" leading space\n{\"not\":\"pretty printed\"}\nABCDEFGH"
+                        }))
+                    },
+                ),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = Config {
+            system_prompts_directory: std::path::PathBuf::new(),
+            kweb_base: base.clone(),
+            intelligence_base: base.clone(),
+            session_history_base: base.clone(),
+            telegram_relay_base: base.clone(),
+            telegram_max_media_bytes: 1024,
+            audio_ingress_base: base,
+            telegram_web_user_handle: "@test".into(),
+        };
+        let api = Api::new(&config).unwrap();
+        let default_arguments = json!({
+            "name":"example",
+            "version":"^1",
+            "input":" exact input ",
+            "objectIds":["ABCDEFGH"],
+        });
+        let custom_arguments = json!({
+            "name":"example",
+            "version":"v1.2.3",
+            "timeoutSeconds":7,
+        });
+
+        let first = api
+            .managed_source_execute(
+                "test-session",
+                kcode_dev_tools::CALL_RUST_BIN_TOOL,
+                default_arguments.clone(),
+            )
+            .await
+            .unwrap();
+        let second = api
+            .managed_source_execute(
+                "test-session",
+                kcode_dev_tools::CALL_RUST_BIN_TOOL,
+                custom_arguments.clone(),
+            )
+            .await
+            .unwrap();
+
+        let exact = " leading space\n{\"not\":\"pretty printed\"}\nABCDEFGH";
+        assert_eq!(first.text, exact);
+        assert_eq!(second.text, exact);
+        assert!(first.snapshot.is_none());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0]["arguments"], default_arguments);
+        assert!(calls[0]["arguments"].get("timeoutSeconds").is_none());
+        assert_eq!(calls[1]["arguments"], custom_arguments);
+        assert_eq!(calls[1]["arguments"]["timeoutSeconds"], 7);
+        drop(calls);
+        server.abort();
     }
 }

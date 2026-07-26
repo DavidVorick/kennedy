@@ -23,6 +23,10 @@ orchestrator; the browser does not run Kennedy.
   automatic transcription state, and completed transcripts. `KennedyServer`
   owns its Axum adapter and the separate audio memory-ingress queue. The
   Telegram crate owns its durable intake stream.
+- `kcode-dev-tools` owns the session-scoped Rust-library, Web-library, and
+  Rust-binary Ktool adapters. Its `kcode-rust-bins` backend publishes immutable
+  local executables and exchanges call payloads through Kennedy's Kweb object
+  adapter.
 
 Every provider-visible item is a Chatend box. Boxes can be hydrated,
 dehydrated, summarized, or stale. Kennedy controls their representation. There
@@ -155,7 +159,11 @@ Defaults:
   SQLite files under `data/`;
 - managed Rust libraries: `data/kcode/kcode-rust-libs`;
 - managed Web libraries and immutable publications:
-  `data/kcode/kcode-web-libs`;
+  `data/kcode/kcode-web-libs` (published versions are created lazily beneath
+  `.published/module/<name>/v<version>/`);
+- managed Rust-binary source: `data/kcode/kcode-rust-bins`;
+- immutable published Rust executables:
+  `data/kcode/kcode-rust-bin-artifacts`;
 - frontend assets: `Frontend/public`;
 - system-prompt boxes: `Frontend/SystemPrompts`.
 

@@ -16,6 +16,7 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
+use kcode_dev_tools::{ObjectStore, ObjectStoreError, ObjectStoreResult};
 use kcode_kweb_db::{
     Config, Error as KwebError, KwebDb, Node, NodeData, NodeId, ObjectId, Owner, Provenance,
 };
@@ -156,6 +157,42 @@ impl Service {
         let id = parse_object_id(id)?;
         let bytes = self.database.get_object(id)?;
         decode_file_object(id, bytes)
+    }
+
+    fn load_rust_binary_object(&self, object_id: &str) -> ObjectStoreResult<Vec<u8>> {
+        let id = ObjectId::from_str(object_id)
+            .map_err(|_| ObjectStoreError::new("The Rust-binary input object ID is invalid."))?;
+        self.database.get_object(id).map_err(|error| {
+            tracing::warn!(error=%error, object_id, "Rust-binary input object load failed");
+            ObjectStoreError::new(match error {
+                KwebError::NotFound(_) => "The Rust-binary input object was not found.",
+                _ => "The Rust-binary input object could not be loaded.",
+            })
+        })
+    }
+
+    fn save_rust_binary_object(&self, bytes: &[u8]) -> ObjectStoreResult<String> {
+        let mut transaction = self
+            .database
+            .start_transaction(Provenance {
+                author: "Kennedy".into(),
+                source: "kennedy-rust-binary".into(),
+                source_created_at: Utc::now(),
+                data: "Output payload from a managed Rust-binary call.".into(),
+            })
+            .map_err(|error| {
+                tracing::warn!(error=%error, "Rust-binary output transaction failed to start");
+                ObjectStoreError::new("The Rust-binary output object could not be stored.")
+            })?;
+        let id = transaction.create_object(bytes.to_vec()).map_err(|error| {
+            tracing::warn!(error=%error, "Rust-binary output object creation failed");
+            ObjectStoreError::new("The Rust-binary output object could not be stored.")
+        })?;
+        transaction.finalize().map_err(|error| {
+            tracing::warn!(error=%error, "Rust-binary output transaction failed to finalize");
+            ObjectStoreError::new("The Rust-binary output object could not be stored.")
+        })?;
+        Ok(id.to_string())
     }
 
     /// Commit all permanent effects of one completed Kennedy session in one
@@ -387,6 +424,27 @@ impl Service {
             ));
         }
         Ok(result_id)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RustBinaryObjectStore {
+    service: Service,
+}
+
+impl RustBinaryObjectStore {
+    pub(crate) fn new(service: Service) -> Self {
+        Self { service }
+    }
+}
+
+impl ObjectStore for RustBinaryObjectStore {
+    fn load(&self, object_id: &str) -> ObjectStoreResult<Vec<u8>> {
+        self.service.load_rust_binary_object(object_id)
+    }
+
+    fn save(&self, bytes: &[u8]) -> ObjectStoreResult<String> {
+        self.service.save_rust_binary_object(bytes)
     }
 }
 
@@ -1692,6 +1750,30 @@ mod tests {
         database.get_node(roots.user).unwrap();
         database.get_node(roots.kennedy).unwrap();
         drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rust_binary_object_store_loads_and_saves_canonical_kweb_objects() {
+        let directory = std::env::temp_dir().join(format!(
+            "kennedy-rust-binary-objects-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let identity = directory.join("users.sqlite3");
+        let (database, roots) = initialize(&directory.join("kweb"), config(), &identity).unwrap();
+        let service = Service::new(database, roots, &identity).unwrap();
+        let store = RustBinaryObjectStore::new(service);
+
+        let object_id = store.save(b"\0binary output\n").unwrap();
+        assert_eq!(object_id.len(), 8);
+        assert_eq!(store.load(&object_id).unwrap(), b"\0binary output\n");
+        assert_eq!(
+            store.load("pending:1").unwrap_err().to_string(),
+            "The Rust-binary input object ID is invalid."
+        );
+
+        drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
