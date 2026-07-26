@@ -44,7 +44,15 @@ Kennedy is one Rust server with deliberately separated library domains:
    session; KennedyServer serializes it with audio work through the global
    Kweb writer lane.
 9. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
-10. The browser frontend is the managed `kcode-kennedy-ui` Web library and is
+10. `kcode-telegram-identity` owns Kennedy's persistent Telegram whitelist,
+    handle-to-numeric-ID binding, delegated additions, opaque observed-group
+    directory, and user/group Kmap-root assignments. Its public boundary is a
+    typed in-process API plus the Telegram transport's `IdentitySink`; it owns
+    no HTTP router, Telegram network transport, or Kweb writes.
+11. `kcode-kmap-size` reads current Kweb nodes and returns a typed approximate
+    text-footprint measurement or renders the command-line report. The server
+    retains vault access, Kweb configuration, and the offline maintenance lock.
+12. The browser frontend is the managed `kcode-kennedy-ui` Web library and is
     an observer and command client only. The managed `kcode-kui-loader`
     library selects its floating patch line.
 

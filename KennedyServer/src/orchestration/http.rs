@@ -22,7 +22,7 @@ pub(crate) struct LocalServices {
     pub intelligence: kcode_intelligence_router::Intelligence,
     pub history: kcode_session_history::SessionHistory,
     pub audio: crate::audio_ingress::Service,
-    pub directory: std::sync::Arc<crate::telegram_identity::Directory>,
+    pub directory: std::sync::Arc<kcode_telegram_identity::Directory>,
     pub dev_tools: kcode_dev_tools::Service,
 }
 
@@ -743,14 +743,179 @@ impl Api {
             .await
     }
 
-    pub async fn directory_get(&self, path: &str) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Directory, Method::GET, path, None)
-            .await
+    pub async fn directory_provisioning_users(
+        &self,
+    ) -> Result<Vec<kcode_telegram_identity::User>, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .directory
+                .provisioning_users()
+                .map_err(directory_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let value = self
+                    .request(
+                        Method::GET,
+                        &bases.kweb,
+                        "/api/v1/telegram-directory/users/provisioning",
+                        None,
+                    )
+                    .await?;
+                serde_json::from_value(value.get("users").cloned().unwrap_or_else(|| json!([])))
+                    .map_err(local_api_error)
+            }
+        }
     }
 
-    pub async fn directory_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Directory, Method::POST, path, Some(body))
-            .await
+    pub async fn directory_provisioning_groups(
+        &self,
+    ) -> Result<Vec<kcode_telegram_identity::Group>, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .directory
+                .provisioning_groups()
+                .map_err(directory_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                let value = self
+                    .request(
+                        Method::GET,
+                        &bases.kweb,
+                        "/api/v1/telegram-directory/groups/provisioning",
+                        None,
+                    )
+                    .await?;
+                serde_json::from_value(value.get("groups").cloned().unwrap_or_else(|| json!([])))
+                    .map_err(local_api_error)
+            }
+        }
+    }
+
+    pub async fn directory_user(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<kcode_telegram_identity::User, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .directory
+                .user(telegram_user_id)
+                .map_err(directory_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => self
+                .request(
+                    Method::GET,
+                    &bases.kweb,
+                    &format!(
+                        "/api/v1/telegram-directory/users/{}",
+                        encode_path(telegram_user_id)
+                    ),
+                    None,
+                )
+                .await
+                .and_then(|value| serde_json::from_value(value).map_err(local_api_error)),
+        }
+    }
+
+    pub async fn directory_group(
+        &self,
+        group_id: &str,
+    ) -> Result<kcode_telegram_identity::Group, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                local.directory.group(group_id).map_err(directory_error)
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => self
+                .request(
+                    Method::GET,
+                    &bases.kweb,
+                    &format!(
+                        "/api/v1/telegram-directory/groups/{}",
+                        encode_path(group_id)
+                    ),
+                    None,
+                )
+                .await
+                .and_then(|value| serde_json::from_value(value).map_err(local_api_error)),
+        }
+    }
+
+    pub async fn directory_complete_handle_root(
+        &self,
+        handle: &str,
+        root_node_id: kcode_kweb_db::NodeId,
+    ) -> Result<kcode_telegram_identity::User, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .directory
+                .complete_handle_root(handle, root_node_id)
+                .map_err(directory_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => self
+                .request(
+                    Method::POST,
+                    &bases.kweb,
+                    &format!(
+                        "/api/v1/telegram-directory/users/by-handle/{}/root-ready",
+                        encode_path(handle)
+                    ),
+                    Some(json!({"rootNodeId":root_node_id.to_string()})),
+                )
+                .await
+                .and_then(|value| serde_json::from_value(value).map_err(local_api_error)),
+        }
+    }
+
+    pub async fn directory_complete_user_root(
+        &self,
+        telegram_user_id: i64,
+        root_node_id: kcode_kweb_db::NodeId,
+    ) -> Result<kcode_telegram_identity::User, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .directory
+                .complete_user_root(telegram_user_id, root_node_id)
+                .map_err(directory_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => self
+                .request(
+                    Method::POST,
+                    &bases.kweb,
+                    &format!(
+                        "/api/v1/telegram-directory/users/{}/root-ready",
+                        encode_path(telegram_user_id)
+                    ),
+                    Some(json!({"rootNodeId":root_node_id.to_string()})),
+                )
+                .await
+                .and_then(|value| serde_json::from_value(value).map_err(local_api_error)),
+        }
+    }
+
+    pub async fn directory_complete_group_root(
+        &self,
+        group_id: &str,
+        root_node_id: kcode_kweb_db::NodeId,
+    ) -> Result<kcode_telegram_identity::Group, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .directory
+                .complete_group_root(group_id, root_node_id)
+                .map_err(directory_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => self
+                .request(
+                    Method::POST,
+                    &bases.kweb,
+                    &format!(
+                        "/api/v1/telegram-directory/groups/{}/root-ready",
+                        encode_path(group_id)
+                    ),
+                    Some(json!({"rootNodeId":root_node_id.to_string()})),
+                )
+                .await
+                .and_then(|value| serde_json::from_value(value).map_err(local_api_error)),
+        }
     }
 
     pub async fn managed_source_execute(
@@ -1212,22 +1377,12 @@ impl Api {
                         }),
                     }
                     .map_err(audio_error),
-                    ServiceKind::Directory => match method {
-                        Method::GET => services.directory.get_json(path).await,
-                        Method::POST => services.directory.post_json(path, body).await,
-                        _ => Err(crate::telegram_identity::ApiError {
-                            status: StatusCode::METHOD_NOT_ALLOWED,
-                            code: "method_not_allowed",
-                            message: "Unsupported direct directory operation.".into(),
-                        }),
-                    }
-                    .map_err(directory_error),
                 }
             }
             #[cfg(test)]
             ServiceBackend::Http(bases) => {
                 let base = match service {
-                    ServiceKind::Kmap | ServiceKind::Directory => &bases.kweb,
+                    ServiceKind::Kmap => &bases.kweb,
                     ServiceKind::Audio => &bases.audio,
                 };
                 self.request(method, base, path, body).await
@@ -1270,7 +1425,6 @@ impl AgentTurn {
 enum ServiceKind {
     Kmap,
     Audio,
-    Directory,
 }
 
 fn kmap_error(error: crate::kmap_http::ApiError) -> ApiError {
@@ -1297,11 +1451,21 @@ fn intelligence_error(error: kcode_intelligence_router::Error) -> ApiError {
     }
 }
 
-fn directory_error(error: crate::telegram_identity::ApiError) -> ApiError {
+fn directory_error(error: kcode_telegram_identity::Error) -> ApiError {
+    let (status, code) = match error.kind() {
+        kcode_telegram_identity::ErrorKind::InvalidInput => {
+            (StatusCode::BAD_REQUEST, "invalid_request")
+        }
+        kcode_telegram_identity::ErrorKind::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        kcode_telegram_identity::ErrorKind::Conflict => (StatusCode::CONFLICT, "state_conflict"),
+        kcode_telegram_identity::ErrorKind::Storage => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        }
+    };
     ApiError {
-        status: Some(error.status),
-        code: error.code.into(),
-        message: error.message,
+        status: Some(status),
+        code: code.into(),
+        message: error.message().into(),
     }
 }
 

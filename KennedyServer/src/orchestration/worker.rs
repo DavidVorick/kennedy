@@ -1110,18 +1110,11 @@ impl Orchestrator {
     async fn provision_directory(&self) -> anyhow::Result<()> {
         let runtime = self.runtime()?;
         let (users, groups) = tokio::try_join!(
-            self.api
-                .directory_get("/api/v1/telegram-directory/users/provisioning"),
-            self.api
-                .directory_get("/api/v1/telegram-directory/groups/provisioning")
+            self.api.directory_provisioning_users(),
+            self.api.directory_provisioning_groups()
         )?;
-        for user in users
-            .get("users")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let handle = required_string(user, "handle")?;
+        for user in users {
+            let handle = user.handle;
             let is_web = handle
                 .trim_start_matches('@')
                 .eq_ignore_ascii_case(self.config.telegram_web_user_handle.trim_start_matches('@'));
@@ -1137,22 +1130,15 @@ impl Orchestrator {
                     .to_owned()
             };
             self.api
-                .directory_post(
-                    &format!(
-                        "/api/v1/telegram-directory/users/by-handle/{}/root-ready",
-                        encode_path(&handle)
-                    ),
-                    json!({"rootNodeId":root}),
+                .directory_complete_handle_root(
+                    &handle,
+                    root.parse()
+                        .context("created an invalid user root node ID")?,
                 )
                 .await?;
         }
-        for group in groups
-            .get("groups")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let group_id = required_string(group, "groupId")?;
+        for group in groups {
+            let group_id = group.group_id;
             let _guard = self.writer.lock().await;
             let created = self.api.bootstrap_node(Some("Group Root")).await?;
             let root = created
@@ -1161,31 +1147,25 @@ impl Orchestrator {
                 .context("created group root omitted its node ID")?
                 .to_owned();
             self.api
-                .directory_post(
-                    &format!(
-                        "/api/v1/telegram-directory/groups/{}/root-ready",
-                        encode_path(&group_id)
-                    ),
-                    json!({"rootNodeId":root}),
+                .directory_complete_group_root(
+                    &group_id,
+                    root.parse()
+                        .context("created an invalid group root node ID")?,
                 )
                 .await?;
         }
         Ok(())
     }
 
-    async fn directory_user(&self, event: &Value) -> anyhow::Result<Value> {
+    async fn directory_user(&self, event: &Value) -> anyhow::Result<kcode_telegram_identity::User> {
         let id = event
             .get("telegramUserId")
             .map(value_string)
-            .context("Telegram event omitted user ID")?;
-        let mut user = self
-            .api
-            .directory_get(&format!(
-                "/api/v1/telegram-directory/users/{}",
-                encode_path(&id)
-            ))
-            .await?;
-        if user.get("rootReady").and_then(Value::as_bool) != Some(true) {
+            .context("Telegram event omitted user ID")?
+            .parse::<i64>()
+            .context("Telegram event has an invalid user ID")?;
+        let mut user = self.api.directory_user(id).await?;
+        if !user.root_ready {
             let _guard = self.writer.lock().await;
             let created = self.api.bootstrap_node(None).await?;
             let root = created
@@ -1194,26 +1174,22 @@ impl Orchestrator {
                 .context("created user root omitted its node ID")?;
             user = self
                 .api
-                .directory_post(
-                    &format!(
-                        "/api/v1/telegram-directory/users/{}/root-ready",
-                        encode_path(&id)
-                    ),
-                    json!({"rootNodeId":root}),
+                .directory_complete_user_root(
+                    id,
+                    root.parse()
+                        .context("created an invalid user root node ID")?,
                 )
                 .await?;
         }
         Ok(user)
     }
-    async fn directory_group(&self, group_id: &str) -> anyhow::Result<Value> {
-        let mut group = self
-            .api
-            .directory_get(&format!(
-                "/api/v1/telegram-directory/groups/{}",
-                encode_path(group_id)
-            ))
-            .await?;
-        if group.get("rootReady").and_then(Value::as_bool) != Some(true) {
+
+    async fn directory_group(
+        &self,
+        group_id: &str,
+    ) -> anyhow::Result<kcode_telegram_identity::Group> {
+        let mut group = self.api.directory_group(group_id).await?;
+        if !group.root_ready {
             let _guard = self.writer.lock().await;
             let created = self.api.bootstrap_node(Some("Group Root")).await?;
             let root = created
@@ -1222,12 +1198,10 @@ impl Orchestrator {
                 .context("created group root omitted its node ID")?;
             group = self
                 .api
-                .directory_post(
-                    &format!(
-                        "/api/v1/telegram-directory/groups/{}/root-ready",
-                        encode_path(group_id)
-                    ),
-                    json!({"rootNodeId":root}),
+                .directory_complete_group_root(
+                    group_id,
+                    root.parse()
+                        .context("created an invalid group root node ID")?,
                 )
                 .await?;
         }
@@ -1241,8 +1215,8 @@ impl Orchestrator {
     ) -> anyhow::Result<Value> {
         let group = self.directory_group(group_id).await?;
         context["groupId"] = json!(group_id);
-        context["groupRootNodeId"] = group.get("rootNodeId").cloned().unwrap_or(Value::Null);
-        context["groupRootReady"] = group.get("rootReady").cloned().unwrap_or(json!(true));
+        context["groupRootNodeId"] = json!(group.root_node_id);
+        context["groupRootReady"] = json!(group.root_ready);
         let mut participants = Vec::new();
         for participant in context
             .get("participants")
@@ -1252,8 +1226,8 @@ impl Orchestrator {
         {
             let user = self.directory_user(&participant).await?;
             let mut participant = participant;
-            participant["rootNodeId"] = user.get("rootNodeId").cloned().unwrap_or(Value::Null);
-            participant["rootReady"] = user.get("rootReady").cloned().unwrap_or(json!(true));
+            participant["rootNodeId"] = json!(user.root_node_id);
+            participant["rootReady"] = json!(user.root_ready);
             participants.push(participant);
         }
         context["participants"] = json!(participants);
@@ -1763,13 +1737,19 @@ impl Orchestrator {
         let runtime = self.runtime()?.clone();
         let user = self.directory_user(event).await?;
         let group = event.get("sessionKind").and_then(Value::as_str) == Some("group");
-        let mut roots = vec![required_string(&user, "rootNodeId")?];
+        let mut roots = vec![
+            user.root_node_id
+                .context("Telegram user root is not ready")?,
+        ];
         let mut channel = json!({"kind":if group{"telegram-group"}else{"telegram"},"telegramUserId":event.get("telegramUserId").cloned().unwrap_or(Value::Null),"chatId":event.get("chatId").cloned().unwrap_or(Value::Null),"groupId":event.get("groupId").cloned().unwrap_or(Value::Null),"username":event.get("username").cloned().unwrap_or(Value::Null),"displayName":event.get("displayName").cloned().unwrap_or(Value::Null),"maxObjectBytes":self.config.telegram_max_media_bytes});
         let mut references = Vec::new();
         if group {
             let group_id = required_string(event, "groupId")?;
             let group_record = self.directory_group(&group_id).await?;
-            roots.push(required_string(&group_record, "rootNodeId")?);
+            let group_root = group_record
+                .root_node_id
+                .context("Telegram group root is not ready")?;
+            roots.push(group_root.clone());
             if let Some(context) = event.get("groupContext") {
                 let context = self
                     .prepare_group_context(
@@ -1779,10 +1759,7 @@ impl Orchestrator {
                     )
                     .await?;
                 channel["groupContext"] = context.clone();
-                channel["groupRootNodeId"] = group_record
-                    .get("rootNodeId")
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                channel["groupRootNodeId"] = json!(group_root);
                 references = participant_references(&context, &roots);
             }
         }
@@ -2201,11 +2178,11 @@ impl Orchestrator {
         let context = self
             .prepare_group_context(raw_context, None, &group_id)
             .await?;
-        let roots = vec![
-            required_string(&group, "rootNodeId")?,
-            runtime.kennedy_root_node_id,
-        ];
-        let channel = json!({"kind":"telegram-group","chatId":batch.get("chatId").cloned().unwrap_or(Value::Null),"groupId":group_id,"groupRootNodeId":group.get("rootNodeId").cloned().unwrap_or(Value::Null),"groupIngressBatchId":id,"backgroundIngress":true,"groupContext":context});
+        let group_root = group
+            .root_node_id
+            .context("Telegram group root is not ready")?;
+        let roots = vec![group_root.clone(), runtime.kennedy_root_node_id];
+        let channel = json!({"kind":"telegram-group","chatId":batch.get("chatId").cloned().unwrap_or(Value::Null),"groupId":group_id,"groupRootNodeId":group_root,"groupIngressBatchId":id,"backgroundIngress":true,"groupContext":context});
         let mut options = SessionOptions::conversation("telegram-group", roots.clone());
         options.channel = channel;
         options.reference_root_node_ids = participant_references(&context, &roots);

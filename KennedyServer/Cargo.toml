@@ -20,7 +20,9 @@ kcode-codex-runtime-v2.workspace = true
 kcode-dev-tools.workspace = true
 kcode-intelligence-router.workspace = true
 kcode-kweb-db.workspace = true
+kcode-kmap-size.workspace = true
 kcode-tg-kennedy-bot = "=0.3.0"
+kcode-telegram-identity.workspace = true
 kcode-web-semver-routing.workspace = true
 rusqlite.workspace = true
 rand.workspace = true

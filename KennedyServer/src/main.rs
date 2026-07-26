@@ -1,11 +1,9 @@
 mod audio_ingress;
 mod credentials;
 mod kmap_http;
-mod kmap_size;
 mod kweb_writer;
 mod orchestration;
 mod session_history_http;
-mod telegram_identity;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -162,8 +160,8 @@ async fn main() -> anyhow::Result<()> {
                 maintenance_guard(&args.kweb_bind, "measuring the Kweb").await?;
             let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
             let vault = CredentialVault::unlock(&vault_path, passphrase)?;
-            let size = kmap_size::measure(&args.kweb_root, kweb_config(&vault)?)?;
-            println!("{}", kmap_size::render(&size));
+            let size = kcode_kmap_size::measure(&args.kweb_root, kweb_config(&vault)?)?;
+            println!("{}", kcode_kmap_size::render(&size));
             Ok(())
         }
         Some(Command::ProvisionKwebWriter) => {
@@ -233,7 +231,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         )
     })?;
     let web_lib_router = kcode_web_semver_routing::router(dev_tools.web_publications_root());
-    let telegram_identity = std::sync::Arc::new(telegram_identity::Directory::open(
+    let telegram_identity = std::sync::Arc::new(kcode_telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
     )?);

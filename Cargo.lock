@@ -2078,6 +2078,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-kmap-size"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-kweb-db",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-kweb-db"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2145,6 +2155,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "kcode-telegram-identity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-kweb-db",
+ "kcode-tg-kennedy-bot",
+ "rusqlite",
+ "serde",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
@@ -2244,8 +2268,10 @@ dependencies = [
  "kcode-codex-runtime-v2",
  "kcode-dev-tools",
  "kcode-intelligence-router",
+ "kcode-kmap-size",
  "kcode-kweb-db",
  "kcode-session-history",
+ "kcode-telegram-identity",
  "kcode-tg-kennedy-bot",
  "kcode-web-semver-routing",
  "rand 0.9.5",

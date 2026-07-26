@@ -30,6 +30,14 @@ orchestrator; the browser does not run Kennedy.
   are backed by `kcode-intelligence-router`; it owns no provider client.
   `KennedyServer` owns its Axum adapter and the separate audio memory-ingress
   queue. The Telegram crate owns its durable intake stream.
+- `kcode-telegram-identity` owns Kennedy's SQLite-backed Telegram whitelist,
+  handle-to-numeric-ID binding, delegated-add authorization, observed opaque
+  groups, and user/group Kmap-root assignments. It exposes typed in-process
+  operations and implements the Telegram transport's identity sink; it owns no
+  HTTP routes, Telegram networking, or Kweb mutation.
+- `kcode-kmap-size` owns the typed measurement and report rendering for the
+  deliberately approximate current-node text footprint. `KennedyServer` owns
+  the maintenance command, vault unlock, Kweb configuration, and offline lock.
 - `kcode-dev-tools` owns the session-scoped Rust-library, Web-library, and
   Rust-binary Ktool adapters. Its `kcode-rust-bins` backend publishes immutable
   local executables and exchanges call payloads through Kennedy's Kweb object

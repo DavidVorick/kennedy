@@ -202,6 +202,25 @@ canonical documents; this file is not an append-only log.
   and long descriptions alone, while excluding history, provenance,
   connections, and all non-node tables.
 
+## Telegram Identity and Kmap Size Library Boundaries
+
+- Extract the Telegram directory into the standalone Rust package
+  `kcode-telegram-identity`. It owns the SQLite whitelist, observed identity
+  binding, delegated additions, opaque group records, and user/group Kmap-root
+  assignments behind a typed in-process API. It owns no HTTP routes, Telegram
+  networking, Kweb root creation, orchestration, listener, or credential
+  vault.
+- Extract current-node Kmap footprint measurement and report rendering into
+  the standalone Rust package `kcode-kmap-size`. KennedyServer retains the
+  `kmap-size` CLI, maintenance exclusion, vault unlock, and configured Kweb
+  opening.
+- Maintain both packages as conforming `kcode-rust-libs-v2` libraries under
+  `data/kcode/kcode-rust-libs/`, publish their releases to crates.io, and have
+  KennedyServer consume exact published versions rather than workspace members
+  or local path dependencies.
+- Leave Kweb writer provisioning in KennedyServer for now; its boundary needs
+  a separate design decision before extraction.
+
 ## Durable Vnote Audio Ingress
 
 - Historical `vnote-ingress` scans must cache local SHA-256 results and avoid
