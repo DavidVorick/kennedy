@@ -20,8 +20,10 @@ orchestrator; the browser does not run Kennedy.
   receipt for every call.
 - `KennedyServer` owns context and orchestration policy, Ktools, Kweb graph
   policy, credential handling, the global Kweb writer lane, Session History's
-  HTTP adapter, and static frontend serving.
-- `Frontend/public` is a browser-native observer and command client.
+  HTTP adapter, the tiny root UI loader page, and immutable Web-publication
+  serving.
+- `kcode-kui-loader` and `kcode-kennedy-ui` are managed, published Web
+  libraries. The browser application remains an observer and command client.
 - `kcode-audio-ingress` is a standalone library that owns durable audio intake,
   chunking, retry state, and completed transcripts. Its typed model callbacks
   are backed by `kcode-intelligence-router`; it owns no provider client.
@@ -117,11 +119,10 @@ sandbox, and does not expose the host user's personal Cargo credentials.
 ```sh
 cargo build --workspace
 cargo test --workspace
-node --test Frontend/tests/*.test.mjs
 ```
 
-Node is used only for frontend development tests. It is not a production
-dependency.
+`kcode-web-libs` runs each managed Web library's browser tests in Chromium
+before publication. Node is not a development or production dependency.
 
 ## Credential vault
 
@@ -169,8 +170,11 @@ Defaults:
 - managed Rust-binary source: `data/kcode/kcode-rust-bins`;
 - immutable published Rust executables:
   `data/kcode/kcode-rust-bin-artifacts`;
-- frontend assets: `Frontend/public`;
-- system-prompt boxes: `Frontend/SystemPrompts`.
+- Kennedy UI source: `data/kcode/kcode-web-libs/kcode-kennedy-ui`;
+- Kennedy UI loader source: `data/kcode/kcode-web-libs/kcode-kui-loader`;
+- their immutable releases under
+  `data/kcode/kcode-web-libs-published/module/`;
+- system-prompt boxes: `KennedyServer/runtime/system-prompts`.
 
 The main listener is bound before persistent state is opened. Maintenance
 commands use that address as an offline lock.
@@ -225,7 +229,14 @@ session-log archive from Kweb on demand. There is no purge action.
 
 ## Frontend
 
-Open the main origin in a browser. The UI can:
+Open the main origin in a browser. KennedyServer serves a tiny uncached page
+that imports `/lib/kcode-kui-loader/v0.1`. The highest published loader patch
+navigates to `/lib/kcode-kennedy-ui/v0.1/index.html`; that floating request
+resolves to one exact immutable UI release.
+
+Kennedy can create, open, edit, check, and publish both libraries through the
+managed Web-library Ktools. Publishing a higher compatible patch makes it live
+on the next load. The UI can:
 
 - start, continue, retry, end, and stop sessions;
 - capture/upload original attachments and voice notes;

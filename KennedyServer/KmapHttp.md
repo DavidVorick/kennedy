@@ -4,8 +4,8 @@
 `kcode-kweb-db` 1.0 library. The library itself contains no Axum or filesystem asset
 serving code.
 
-The adapter owns one transactional `KwebDb`, serves the frontend on the same
-listener, and exposes these browser-facing reads:
+The adapter owns one transactional `KwebDb`, serves the tiny Kennedy UI loader
+page on the same listener, and exposes these browser-facing reads:
 
 - `GET /api/v1/kmap/health`
 - `GET /api/v1/kmap/roots`
@@ -13,8 +13,9 @@ listener, and exposes these browser-facing reads:
 - `GET /api/v1/kmap/nodes/{id}`
 - `GET /api/v1/kmap/nodes/{id}/history`
 
-The same listener also merges Session History and audio-ingress routes before
-serving frontend assets.
+The same listener also merges Session History, audio-ingress, and immutable
+Web-library routes. `/` imports the floating `kcode-kui-loader` patch line;
+that library loads the floating `kcode-kennedy-ui` patch line.
 Those routes remain separate application domains and are not Kmap storage
 methods.
 

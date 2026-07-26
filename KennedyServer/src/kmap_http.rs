@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    path::{Path as FilePath, PathBuf},
+    path::Path as FilePath,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -25,12 +25,29 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EMBEDDED_PROVENANCE_BYTES: usize = 1024 * 1024;
 const PROVENANCE_MAGIC: &[u8; 8] = b"KPROV\0\x01\0";
 const FILE_MAGIC: &[u8; 8] = b"KFILE001";
+const KUI_LOADER_MODULE: &str = "/lib/kcode-kui-loader/v0.1";
+const KUI_LOADER_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kennedy</title>
+</head>
+<body>
+  <p>Loading Kennedy…</p>
+  <script type="module">
+    import { load } from "/lib/kcode-kui-loader/v0.1";
+    load();
+  </script>
+</body>
+</html>
+"#;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SystemRoots {
@@ -1114,11 +1131,12 @@ impl MergedRouters {
 
 pub(crate) async fn serve_with_listener(
     state: Service,
-    frontend_dir: PathBuf,
     merged_routers: MergedRouters,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let app = Router::new()
+        .route("/", get(kui_loader_page))
+        .route("/index.html", get(kui_loader_page))
         .route("/api/v1/kmap/health", get(health))
         .route("/api/v1/kmap/roots", get(get_roots))
         .route("/api/v1/kmap/nodes/{node_id}", get(get_node))
@@ -1136,16 +1154,25 @@ pub(crate) async fn serve_with_listener(
         .merge(merged_routers.session_history)
         .merge(merged_routers.audio_ingress)
         .merge(merged_routers.web_libraries)
-        .fallback_service(ServeDir::new(frontend_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::map_response(prevent_stale_frontend_assets));
+        .layer(middleware::map_response(set_default_cache_control));
     tracing::info!(address=%listener.local_addr()?, "Kennedy main HTTP server ready");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn prevent_stale_frontend_assets(mut response: Response) -> Response {
+async fn kui_loader_page() -> Response {
+    debug_assert!(KUI_LOADER_PAGE.contains(KUI_LOADER_MODULE));
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store, max-age=0")
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(KUI_LOADER_PAGE))
+        .expect("fixed Kennedy UI loader response is valid")
+}
+
+async fn set_default_cache_control(mut response: Response) -> Response {
     if !response.headers().contains_key(header::CACHE_CONTROL) {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
@@ -1720,6 +1747,27 @@ fn decode_stored_provenance(bytes: &[u8]) -> anyhow::Result<StoredProvenance> {
 mod tests {
     use super::*;
     use kcode_kweb_db::{NoopGossip, WriterId};
+
+    #[tokio::test]
+    async fn root_page_loads_the_floating_kui_patch_line_without_caching() {
+        let response = kui_loader_page().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, max-age=0"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains(r#"import { load } from "/lib/kcode-kui-loader/v0.1""#));
+        assert!(body.contains("load();"));
+        assert!(!body.contains("kcode-kennedy-ui"));
+    }
 
     fn config() -> Config {
         let signing_key = rand::random::<[u8; 32]>();

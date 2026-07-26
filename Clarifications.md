@@ -358,6 +358,22 @@ canonical documents; this file is not an append-only log.
 
 ## Frontend Behavior
 
+- The browser application is a managed `kcode-web-libs` publication named
+  `kcode-kennedy-ui`. KennedyServer's `/` response is only a tiny loader page:
+  it imports the floating patch-compatible `kcode-kui-loader` Web library, and
+  that loader navigates to the floating patch-compatible
+  `kcode-kennedy-ui` page. Exact publications remain immutable, while a newer
+  patch becomes live automatically through the existing SemVer routes.
+- Do not add frontend activation state, an activation or rollback CLI, a
+  static-asset fallback, or a second durability mechanism. Publication
+  durability and exact-version retention belong to `kcode-web-libs`; a
+  rollback may publish the desired older source as a higher patch release.
+- Keep the loader deliberately small. A failed frontend upgrade is repaired
+  through Codex and a subsequent immutable patch publication rather than
+  through server-side fallback machinery.
+- The historical `Frontend/SystemPrompts` files are backend orchestration
+  assets, not browser application source. Move them beneath KennedyServer when
+  the browser application moves into `kcode-kennedy-ui`.
 - Do not expose per-action Chatend persistence state such as “saving” or
   “saved.” Accepted updates are appended directly to the session journal; no
   separate frontend state is shown for kernel writeback or power-loss
@@ -1173,6 +1189,12 @@ canonical documents; this file is not an append-only log.
 
 ## Managed Web Libraries
 
+- Extract immutable Web-publication SemVer selection and serving from
+  KennedyServer into the standalone `kcode-web-semver-routing` Rust library.
+  Maintain its source as a conforming `kcode-rust-libs-v2` library under
+  `data/kcode/kcode-rust-libs/` alongside the other managed Rust libraries.
+  The library owns the complete `/lib` and `/module` Axum subrouter; Kennedy
+  configures the publication root and merges that router into its listener.
 - Consume the published `kcode-web-libs` crate and expose a Ktool family as
   identical to `kcode-rust-libs-v2` as practical: create, open, docs, complete
   write, terminal-output `write-file-freeform`, delete-file, check, and

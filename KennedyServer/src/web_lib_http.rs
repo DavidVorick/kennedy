@@ -475,6 +475,11 @@ mod tests {
                 "export function runTests() {}\n",
             )
             .unwrap();
+            fs::write(
+                version_root.join("index.html"),
+                format!("<!doctype html><title>demo {version}</title>\n"),
+            )
+            .unwrap();
         }
         root
     }
@@ -542,6 +547,14 @@ mod tests {
                 content_type: "text/javascript; charset=utf-8"
             } if std::str::from_utf8(&bytes).unwrap().contains("1.2.3")
         ));
+        let page = prepare_file(&root, "lib", "demo", "v1.2.3", "index.html").unwrap();
+        assert!(matches!(
+            page,
+            PreparedResponse::File {
+                bytes,
+                content_type: "text/html; charset=utf-8"
+            } if std::str::from_utf8(&bytes).unwrap().contains("demo 1.2.3")
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -589,6 +602,21 @@ mod tests {
             IMMUTABLE_CACHE_CONTROL
         );
         assert!(exact.text().await.unwrap().contains("1.2.3"));
+
+        let floating_page = client
+            .get(format!("http://{address}/lib/demo/v1/index.html"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(floating_page.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            floating_page.headers()[header::LOCATION],
+            "/lib/demo/v1.8.0/index.html"
+        );
+        assert_eq!(
+            floating_page.headers()[header::CACHE_CONTROL],
+            FLOATING_CACHE_CONTROL
+        );
 
         server.abort();
         let _ = server.await;

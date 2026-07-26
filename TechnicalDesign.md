@@ -30,9 +30,9 @@ Kennedy is one Rust server with deliberately separated library domains:
    per-call usage receipts. It is a typed in-process library with no HTTP API.
 6. `kennedy-server` owns context-policy decisions, orchestration, Ktool
    authorization and Chatend integration, graph policy, the one Kweb writer
-   lane, all browser HTTP adapters, roots, the credential vault, and static
-   assets. It adapts canonical Kweb objects for Rust-binary call inputs and
-   outputs and continues to serve immutable Web publications.
+   lane, all browser HTTP adapters, roots, the credential vault, and the tiny
+   root UI loader page. It adapts canonical Kweb objects for Rust-binary call
+   inputs and outputs and serves immutable Web publications.
 7. `kcode-audio-ingress` owns durable audio intake, chunking, transcript
    workflow, and automatic whole-job recovery. It delegates every model call
    through typed callbacks backed by `kcode-intelligence-router`. KennedyServer
@@ -42,7 +42,9 @@ Kennedy is one Rust server with deliberately separated library domains:
    session; KennedyServer serializes it with audio work through the global
    Kweb writer lane.
 9. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
-10. The browser frontend is an observer and command client only.
+10. The browser frontend is the managed `kcode-kennedy-ui` Web library and is
+    an observer and command client only. The managed `kcode-kui-loader`
+    library selects its floating patch line.
 
 Kennedy-owned routers share the main loopback listener. The Telegram crate
 retains its own loopback listener.

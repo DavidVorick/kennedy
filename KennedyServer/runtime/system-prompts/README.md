@@ -1,9 +1,8 @@
 # Kennedy system prompts
 
-These plain-text files are Kennedy's live behavioral configuration. The Kweb
-service serves them to Kennedy's backend orchestration worker and the browser's
-read-only inspector. Edit a file and restart Kennedy to test a change; no Rust
-or JavaScript rebuild is needed.
+These plain-text files are Kennedy's live backend behavioral configuration.
+KennedyServer loads them into the orchestration worker. Edit a file and restart
+Kennedy to test a change; no Rust rebuild is needed.
 
 - `KennedyIdentity.txt` defines who Kennedy is and establishes that her learned
   strategy lives in the kmap rather than in static harness instructions. Its

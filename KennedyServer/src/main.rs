@@ -97,9 +97,7 @@ struct Args {
     rust_bins_root: PathBuf,
     #[arg(long, default_value = "./data/kcode/kcode-rust-bin-artifacts")]
     rust_bin_artifacts_root: PathBuf,
-    #[arg(long, default_value = "./Frontend/public")]
-    frontend_dir: PathBuf,
-    #[arg(long, default_value = "./Frontend/SystemPrompts")]
+    #[arg(long, default_value = "./KennedyServer/runtime/system-prompts")]
     system_prompts_dir: PathBuf,
     #[arg(long, default_value = "@taek42")]
     telegram_bootstrap_username: String,
@@ -364,7 +362,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     tokio::try_join!(
         kmap_http::serve_with_listener(
             kmap_service,
-            args.frontend_dir,
             kmap_http::MergedRouters::new(history_router, audio_ingress_router, web_lib_router),
             kweb_listener,
         ),
@@ -730,6 +727,42 @@ mod tests {
                 path.display()
             );
         }
+        assert_eq!(
+            args.system_prompts_dir,
+            PathBuf::from("./KennedyServer/runtime/system-prompts")
+        );
+        orchestration::Manuals::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/system-prompts"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_launcher_preserves_workspace_catalog_and_runtime_boundaries() {
+        let launcher = include_str!("../../scripts/codex-safe");
+        let runtime_builder = include_str!("../../scripts/build-codex-safe-runtime");
+        let readme = include_str!("../../README.md");
+        let default_catalog = "${TMPDIR:-/tmp}/kcode-codex-catalogs";
+
+        assert!(launcher.contains(default_catalog));
+        assert!(readme.contains(default_catalog));
+        assert!(!launcher.contains("kennedy-codex-catalogs"));
+        assert!(launcher.contains("CODEX_SAFE_CARGO_CACHE_DIR"));
+        assert!(launcher.contains("CODEX_IMAGE:-local/codex-dev"));
+        assert!(runtime_builder.contains("CODEX_SAFE_RUNTIME_IMAGE:-local/codex-dev"));
+        assert!(runtime_builder.contains("chromium"));
+        assert!(runtime_builder.contains("--security-opt=no-new-privileges"));
+        assert!(runtime_builder.contains("--cap-drop=all"));
+        assert!(runtime_builder.contains("--cap-add=SYS_CHROOT"));
+        assert!(readme.contains("scripts/build-codex-safe-runtime"));
+    }
+
+    #[test]
+    fn native_orchestration_remains_a_rust_backend_concern() {
+        let worker = include_str!("orchestration/worker.rs");
+        let session = include_str!("orchestration/session.rs");
+        assert!(worker.contains("Native Rust orchestration worker ready"));
+        assert!(session.contains("struct Session"));
     }
 
     #[tokio::test]
@@ -962,7 +995,6 @@ mod tests {
             web_libs_published_root: directory.join("kcode-web-libs-published"),
             rust_bins_root: directory.join("kcode-rust-bins"),
             rust_bin_artifacts_root: directory.join("kcode-rust-bin-artifacts"),
-            frontend_dir: directory.join("frontend"),
             system_prompts_dir: directory.join("prompts"),
             telegram_bootstrap_username: "@test".to_owned(),
             telegram_max_voice_bytes: 1024,
