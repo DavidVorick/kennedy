@@ -1,5 +1,5 @@
 [workspace]
-members = ["KennedyServer", "kcode-kmap-size", "kcode-telegram-identity"]
+members = ["KennedyServer", "data/kcode/kcode-session-history"]
 resolver = "2"
 
 [workspace.package]
@@ -19,11 +19,11 @@ http = "1"
 kcode-codex-runtime = "0.1.0"
 kcode-codex-runtime-v2 = "0.1.2"
 kcode-kweb-db = "1.0"
-kcode-kmap-size = { path = "kcode-kmap-size" }
+kcode-kmap-size = "=0.1.0"
 kcode-audio-ingress = "=0.3.1"
 kcode-dev-tools = "=0.2.0"
-kcode-session-history = "=0.1.0"
-kcode-telegram-identity = { path = "kcode-telegram-identity" }
+kcode-session-history = { path = "data/kcode/kcode-session-history" }
+kcode-telegram-identity = "=0.1.0"
 kcode-intelligence-router = "=0.1.0"
 kcode-web-semver-routing = "0.1.0"
 rand = "0.9"

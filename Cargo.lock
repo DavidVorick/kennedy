@@ -2080,11 +2080,11 @@ dependencies = [
 [[package]]
 name = "kcode-kmap-size"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d56efa87e36df8d73802a6c87df8152e29c1285bffd19924c284a322f788b7"
 dependencies = [
  "anyhow",
- "chrono",
  "kcode-kweb-db",
- "uuid",
 ]
 
 [[package]]
@@ -2131,9 +2131,7 @@ checksum = "dbfcb2a46ce2ac2fe8ef732927501ae23a9849dc006fab3d82fd5b603a3fd743"
 
 [[package]]
 name = "kcode-session-history"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de4bd37a570ab655ba948b025b36ae5ad73eff463b5381fa679b9138530218e7"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2141,6 +2139,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -2160,6 +2159,8 @@ dependencies = [
 [[package]]
 name = "kcode-telegram-identity"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2180d6614ab320d5b91e590b950abd098449f6cf76bb3adbb263c100ba09a6e0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2168,7 +2169,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "thiserror 2.0.19",
- "uuid",
 ]
 
 [[package]]

@@ -21,8 +21,6 @@ pub(crate) struct Config {
     pub session_history_base: String,
     pub telegram_relay_base: String,
     pub telegram_max_media_bytes: usize,
-    #[cfg(test)]
-    pub audio_ingress_base: String,
     pub telegram_web_user_handle: String,
     pub runtime_model: RuntimeModel,
 }

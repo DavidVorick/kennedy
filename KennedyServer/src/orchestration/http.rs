@@ -74,7 +74,6 @@ struct TestBases {
     kweb: String,
     intelligence: String,
     history: String,
-    audio: String,
 }
 
 impl Api {
@@ -100,7 +99,6 @@ impl Api {
                 kweb: trim_base(&config.kweb_base),
                 intelligence: trim_base(&config.intelligence_base),
                 history: trim_base(&config.session_history_base),
-                audio: trim_base(&config.audio_ingress_base),
             }),
             history_sessions,
             telegram: trim_base(&config.telegram_relay_base),
@@ -136,14 +134,13 @@ impl Api {
     }
 
     pub async fn kmap_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Kmap, Method::POST, path, Some(body))
+        self.service_request(Method::POST, path, Some(body))
             .await
             .map(normalize_kmap_mutation_response)
     }
 
     pub async fn kmap_get(&self, path: &str) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Kmap, Method::GET, path, None)
-            .await
+        self.service_request(Method::GET, path, None).await
     }
 
     pub async fn kmap_node(&self, node_id: &str) -> Result<Value, ApiError> {
@@ -678,33 +675,6 @@ impl Api {
         }
     }
 
-    pub async fn history_record_completion(
-        &self,
-        input: kcode_session_history::RecordCompletion,
-    ) -> Result<Value, ApiError> {
-        match &self.services {
-            ServiceBackend::Local(local) => {
-                let object_id = input.session_object_id.clone();
-                local
-                    .history
-                    .record_completion(input)
-                    .await
-                    .map_err(history_error)?;
-                Ok(json!({"sessionObjectId":object_id,"recorded":true}))
-            }
-            #[cfg(test)]
-            ServiceBackend::Http(bases) => {
-                self.request(
-                    Method::POST,
-                    &bases.history,
-                    "/api/v1/session-history",
-                    Some(json_value(input)?),
-                )
-                .await
-            }
-        }
-    }
-
     pub async fn history_release_interrupted_ingress(&self) -> Result<Value, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => {
@@ -726,21 +696,6 @@ impl Api {
                 .await
             }
         }
-    }
-
-    pub async fn audio_get(&self, path: &str) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Audio, Method::GET, path, None)
-            .await
-    }
-
-    pub async fn audio_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Audio, Method::POST, path, Some(body))
-            .await
-    }
-
-    pub async fn audio_put(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(ServiceKind::Audio, Method::PUT, path, Some(body))
-            .await
     }
 
     pub async fn directory_provisioning_users(
@@ -1332,21 +1287,20 @@ impl Api {
         }
     }
 
-    pub fn next_audio_ingress(&self) -> Result<Option<Value>, ApiError> {
+    pub async fn synchronize_audio_ingress(&self) -> Result<(), ApiError> {
         match &self.services {
-            ServiceBackend::Local(local) => local.audio.next_ingress_piece().map_err(audio_error),
+            ServiceBackend::Local(local) => local
+                .audio
+                .synchronize_completed_transcripts()
+                .await
+                .map_err(audio_error),
             #[cfg(test)]
-            ServiceBackend::Http(_) => Err(ApiError {
-                status: None,
-                code: "local_service_unavailable".into(),
-                message: "The audio-ingress queue is unavailable in HTTP test mode.".into(),
-            }),
+            ServiceBackend::Http(_) => Ok(()),
         }
     }
 
     async fn service_request(
         &self,
-        service: ServiceKind,
         method: Method,
         path: &str,
         body: Option<Value>,
@@ -1354,39 +1308,20 @@ impl Api {
         match &self.services {
             ServiceBackend::Local(services) => {
                 let body = body.unwrap_or(Value::Null);
-                match service {
-                    ServiceKind::Kmap => match method {
-                        Method::GET => services.kmap.get_json(path).await,
-                        Method::POST => services.kmap.post_json(path, body).await,
-                        Method::PUT => services.kmap.put_json(path, body).await,
-                        _ => Err(crate::kmap_http::ApiError {
-                            status: StatusCode::METHOD_NOT_ALLOWED,
-                            code: "method_not_allowed",
-                            message: "Unsupported direct Kmap operation.".into(),
-                        }),
-                    }
-                    .map_err(kmap_error),
-                    ServiceKind::Audio => match method {
-                        Method::GET => services.audio.get_json(path).await,
-                        Method::POST => services.audio.post_json(path, body).await,
-                        Method::PUT => services.audio.put_json(path, body).await,
-                        _ => Err(crate::audio_ingress::ServiceError {
-                            status: StatusCode::METHOD_NOT_ALLOWED.as_u16(),
-                            code: "method_not_allowed",
-                            message: "Unsupported direct audio operation.".into(),
-                        }),
-                    }
-                    .map_err(audio_error),
+                match method {
+                    Method::GET => services.kmap.get_json(path).await,
+                    Method::POST => services.kmap.post_json(path, body).await,
+                    Method::PUT => services.kmap.put_json(path, body).await,
+                    _ => Err(crate::kmap_http::ApiError {
+                        status: StatusCode::METHOD_NOT_ALLOWED,
+                        code: "method_not_allowed",
+                        message: "Unsupported direct Kmap operation.".into(),
+                    }),
                 }
+                .map_err(kmap_error)
             }
             #[cfg(test)]
-            ServiceBackend::Http(bases) => {
-                let base = match service {
-                    ServiceKind::Kmap => &bases.kweb,
-                    ServiceKind::Audio => &bases.audio,
-                };
-                self.request(method, base, path, body).await
-            }
+            ServiceBackend::Http(bases) => self.request(method, &bases.kweb, path, body).await,
         }
     }
 }
@@ -1419,12 +1354,6 @@ impl AgentTurn {
             Self::Http(_) => Ok(()),
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum ServiceKind {
-    Kmap,
-    Audio,
 }
 
 fn kmap_error(error: crate::kmap_http::ApiError) -> ApiError {
@@ -1900,7 +1829,6 @@ mod tests {
             session_history_base: base.clone(),
             telegram_relay_base: base.clone(),
             telegram_max_media_bytes: 1024,
-            audio_ingress_base: base,
             telegram_web_user_handle: "@test".into(),
             runtime_model: crate::orchestration::RuntimeModel::testing(),
         };

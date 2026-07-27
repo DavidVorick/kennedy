@@ -38,11 +38,12 @@ Kennedy is one Rust server with deliberately separated library domains:
 7. `kcode-audio-ingress` owns durable audio intake, chunking, transcript
    workflow, and automatic whole-job recovery. It delegates every model call
    through typed callbacks backed by `kcode-intelligence-router`. KennedyServer
-   owns the Axum adapter and a separate prepared-transcript memory-ingress
-   queue; those downstream concepts are absent from the standalone library.
-8. Conversational history ingress uses the same session log as its source
-   session; KennedyServer serializes it with audio work through the global
-   Kweb writer lane.
+   owns the Axum adapter and submits completed transcript pieces to Session
+   History; downstream memory-ingress concepts remain absent from the standalone
+   library.
+8. Session History owns one claim, checkpoint, retry, failure, and completion
+   lifecycle for conversational, Telegram, and audio ingress. KennedyServer
+   processes that lifecycle through the global Kweb writer lane.
 9. `kcode-tg-kennedy-bot` owns Telegram transport and its durable event stream.
 10. `kcode-telegram-identity` owns Kennedy's persistent Telegram whitelist,
     handle-to-numeric-ID binding, delegated additions, opaque observed-group

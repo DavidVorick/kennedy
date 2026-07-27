@@ -28,8 +28,9 @@ orchestrator; the browser does not run Kennedy.
 - `kcode-audio-ingress` is a standalone library that owns durable audio intake,
   chunking, retry state, and completed transcripts. Its typed model callbacks
   are backed by `kcode-intelligence-router`; it owns no provider client.
-  `KennedyServer` owns its Axum adapter and the separate audio memory-ingress
-  queue. The Telegram crate owns its durable intake stream.
+  `KennedyServer` owns its Axum adapter and submits completed transcript pieces
+  to Session History's existing ingress lifecycle. The Telegram crate owns its
+  durable intake stream.
 - `kcode-telegram-identity` owns Kennedy's SQLite-backed Telegram whitelist,
   handle-to-numeric-ID binding, delegated-add authorization, observed opaque
   groups, and user/group Kmap-root assignments. It exposes typed in-process
@@ -170,8 +171,7 @@ Defaults:
 - AudioIngress persistence root: `data/audio-ingress-media` (including its
   derived `state.sqlite3` and `originals/`);
 - intelligence usage receipts: `data/intelligence-usage`;
-- Kennedy's audio memory-ingress queue and the Telegram and user-directory
-  SQLite files under `data/`;
+- the Telegram and user-directory SQLite files under `data/`;
 - managed Rust libraries: `data/kcode/kcode-rust-libs`;
 - managed Web-library source: `data/kcode/kcode-web-libs`;
 - immutable published Web libraries:

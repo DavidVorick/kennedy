@@ -117,16 +117,14 @@ impl Orchestrator {
     }
 
     async fn initialize(&self) -> anyhow::Result<Runtime> {
-        let (kweb, history, telegram, audio) = tokio::join!(
+        let (kweb, history, telegram) = tokio::join!(
             self.api.kmap_get("/api/v1/kmap/health"),
             self.api.history_health(),
             self.api.telegram_health(),
-            self.api.audio_get("/api/v1/audio-ingress/health"),
         );
         kweb?;
         history?;
         telegram?;
-        audio?;
         let manuals = Manuals::load(&self.config.system_prompts_directory)?;
         let roots = self.api.kmap_get("/api/v1/kmap/roots").await?;
         let runtime = Runtime {
@@ -135,13 +133,7 @@ impl Orchestrator {
             user_root_node_id: required_string(&roots, "user_root_node_id")?,
             kennedy_root_node_id: required_string(&roots, "kennedy_root_node_id")?,
         };
-        let (history_repairs, audio_repairs) = tokio::join!(
-            self.api.history_release_interrupted_ingress(),
-            self.api
-                .audio_post("/api/v1/audio-ingress/ingress/repairs/release", json!({}),),
-        );
-        history_repairs?;
-        audio_repairs?;
+        self.api.history_release_interrupted_ingress().await?;
         Ok(runtime)
     }
 
@@ -152,6 +144,7 @@ impl Orchestrator {
     }
 
     async fn poll_once(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.api.synchronize_audio_ingress().await?;
         let histories = self.list_history().await?;
         self.sync_conversation_commands().await?;
         self.sync_directory_provisioning().await?;
@@ -605,31 +598,14 @@ impl Orchestrator {
             .await;
             return Ok(());
         }
-        let conversation = next_conversation_ingress(histories, Utc::now());
-        let audio = self.api.next_audio_ingress()?;
-        if let Some(record) = conversation
-            .filter(|record| {
-                audio
-                    .as_ref()
-                    .is_none_or(|piece| ingress_record_precedes(record, piece))
-            })
-            .cloned()
-        {
-            self.launch_writer_job("session history ingress", move |worker| async move {
+        if let Some(record) = next_ingress(histories, Utc::now()).cloned() {
+            self.launch_writer_job("memory ingress", move |worker| async move {
                 let id = required_string(&record, "id")?;
                 let record = worker.get_conversation(&id).await?;
-                worker.process_conversation_ingress(record).await
+                worker.process_ingress(record).await
             })
             .await;
-            return Ok(());
         }
-        let Some(piece) = audio else {
-            return Ok(());
-        };
-        self.launch_writer_job("audio ingress", move |worker| async move {
-            worker.process_audio_ingress(piece).await
-        })
-        .await;
         Ok(())
     }
 
@@ -655,7 +631,7 @@ impl Orchestrator {
         });
     }
 
-    async fn process_conversation_ingress(&self, mut record: Value) -> anyhow::Result<()> {
+    async fn process_ingress(&self, mut record: Value) -> anyhow::Result<()> {
         let id = required_string(&record, "id")?;
         let rust_session_id = format!("kennedy:history-ingress:{id}");
         let mut stage = "prepare";
@@ -770,16 +746,14 @@ impl Orchestrator {
         }
         .await;
         if let Err(error) = result {
-            self.record_conversation_ingress_failure(&id, stage, &error)
-                .await
-                .ok();
+            self.record_ingress_failure(&id, stage, &error).await.ok();
             return Err(error);
         }
         self.api.release_managed_sources(&rust_session_id).await;
         Ok(())
     }
 
-    async fn record_conversation_ingress_failure(
+    async fn record_ingress_failure(
         &self,
         id: &str,
         stage: &str,
@@ -806,110 +780,6 @@ impl Orchestrator {
                 },
             )
             .await?;
-        Ok(())
-    }
-
-    async fn process_audio_ingress(&self, mut piece: Value) -> anyhow::Result<()> {
-        let id = required_string(&piece, "id")?;
-        let rust_session_id = format!("kennedy:audio-ingress:{id}");
-        let mut stage = "prepare";
-        let result = async {
-            if piece.get("phase").and_then(Value::as_str) == Some("ingress_pending") {
-                stage = "claim";
-                piece = self
-                    .api.audio_post(
-                        &format!(
-                            "/api/v1/audio-ingress/pieces/{}/ingress-started",
-                            encode_path(&id)
-                        ),
-                        json!({
-                            "expected_version":version(&piece)?,
-                            "provenance_id":format!("session:audio:{id}"),
-                            "completion_protocol":crate::audio_ingress::COMPLETION_PROTOCOL
-                        }),
-                    )
-                    .await?;
-            }
-            if piece.get("phase").and_then(Value::as_str) != Some("ingress_in_progress") {
-                return Ok(());
-            }
-            stage = "model_loop";
-            let runtime = self.runtime()?.clone();
-            let options = SessionOptions {
-                session_type: "history-ingress".into(),
-                root_node_ids: vec![runtime.user_root_node_id.clone(), runtime.kennedy_root_node_id.clone()],
-                reference_root_node_ids: Vec::new(), channel:Value::Null, free_time:Value::Null, orchestration:Value::Null,
-                provenance_id:None,mode:AgentMode::Ingress{record_id:None},source_session_type:Some("audio".into()),group_context:Value::Null,rust_lib_session_id:Some(rust_session_id.clone()),
-            };
-            let state=piece.get("state").cloned().unwrap_or_else(||json!({}));
-            let mut session=Session::new(self.api.clone(),runtime.manuals,runtime.model,options,state.get("historyIngress")).await?;
-            session.stage_ingress_source(
-                &format!(
-                    "Vnote final transcript piece\n\nRecording began: {}\nRecording SHA-256: {}\nOriginal filename: {}\nTranscript piece: {} of {}\n\n{}",
-                    piece.get("source_created_at").and_then(Value::as_str).unwrap_or("unknown"),
-                    piece.get("sha256").and_then(Value::as_str).unwrap_or("unknown"),
-                    piece.get("original_filename").and_then(Value::as_str).unwrap_or("unknown"),
-                    piece.get("piece_index").and_then(Value::as_u64).unwrap_or_default()+1,
-                    piece.get("piece_count").and_then(Value::as_u64).unwrap_or_default(),
-                    piece.get("transcript_text").and_then(Value::as_str).unwrap_or("")
-                ),
-                &json!({"kind":"audio-transcript","audioPieceId":id}),
-            ).await?;
-            let piece=Arc::new(Mutex::new(piece));persist_audio_ingress(&self.api,&piece,session.snapshot()?).await?;
-            let api=self.api.clone();let saved=piece.clone();
-            session.run_pending_turn(Uuid::new_v4(),move|session_state|{let api=api.clone();let piece=saved.clone();async move{persist_audio_ingress(&api,&piece,session_state).await?;Ok(())}}).await?;
-            let completed_state = session.snapshot()?;
-            persist_audio_ingress(&self.api,&piece,completed_state.clone()).await?;
-            self.api
-                .history_record_completion(kcode_session_history::RecordCompletion {
-                    session_object_id: completed_state
-                        .get("sessionObjectId")
-                        .and_then(Value::as_str)
-                        .context("audio ingress session has no permanent object ID")?
-                        .to_owned(),
-                    commit_receipt: completed_state
-                        .get("commitReceipt")
-                        .filter(|value| !value.is_null())
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()?,
-                    session_id: completed_state
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    session_type: completed_state
-                        .get("sessionType")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    created_at: completed_state
-                        .get("startedAt")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                })
-                .await?;
-            stage="completion";
-            let locked=piece.lock().await;
-            self.api.audio_post(&format!("/api/v1/audio-ingress/pieces/{}/ingress-completed",encode_path(&id)),json!({"expected_version":version(&locked)?})).await?;
-            Ok(())
-        }.await;
-        if let Err(error) = result {
-            if let Ok(latest) = self
-                .api
-                .audio_get(&format!(
-                    "/api/v1/audio-ingress/pieces/{}",
-                    encode_path(&id)
-                ))
-                .await
-                && matches!(
-                    latest.get("phase").and_then(Value::as_str),
-                    Some("ingress_pending" | "ingress_in_progress")
-                )
-            {
-                let _=self.api.audio_post(&format!("/api/v1/audio-ingress/pieces/{}/ingress-failure",encode_path(&id)),json!({"expected_version":version(&latest)?,"stage":stage,"code":"ingress_error","message":bounded_error(&error)})).await;
-            }
-            return Err(error);
-        }
-        self.api.release_managed_sources(&rust_session_id).await;
         Ok(())
     }
 
@@ -2306,45 +2176,6 @@ async fn persist_ingress_record(
     *record = result;
     Ok(())
 }
-async fn persist_audio_ingress(
-    api: &Api,
-    piece: &Arc<Mutex<Value>>,
-    archive: Value,
-) -> anyhow::Result<()> {
-    let mut piece = piece.lock().await;
-    let id = required_string(&piece, "id")?;
-    let mut state = piece.get("state").cloned().unwrap_or_else(|| json!({}));
-    state["historyIngress"] = archive;
-    let result = match api
-        .audio_put(
-            &format!(
-                "/api/v1/audio-ingress/pieces/{}/ingress-checkpoint",
-                encode_path(&id)
-            ),
-            json!({"expected_version":version(&piece)?,"state":state}),
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(error) if error.code == "state_conflict" => {
-            let latest = api
-                .audio_get(&format!(
-                    "/api/v1/audio-ingress/pieces/{}",
-                    encode_path(&id)
-                ))
-                .await?;
-            if latest.get("state") == Some(&state) {
-                latest
-            } else {
-                return Err(error.into());
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
-    *piece = result;
-    Ok(())
-}
-
 fn session_type(record: &Value) -> String {
     record
         .get("state")
@@ -2354,7 +2185,7 @@ fn session_type(record: &Value) -> String {
         .into()
 }
 
-fn next_conversation_ingress(histories: &[Value], now: DateTime<Utc>) -> Option<&Value> {
+fn next_ingress(histories: &[Value], now: DateTime<Utc>) -> Option<&Value> {
     histories
         .iter()
         .filter(|record| match record.get("phase").and_then(Value::as_str) {
@@ -2367,10 +2198,6 @@ fn next_conversation_ingress(histories: &[Value], now: DateTime<Utc>) -> Option<
             _ => false,
         })
         .min_by(|left, right| ingress_record_order(left, right))
-}
-
-fn ingress_record_precedes(left: &Value, right: &Value) -> bool {
-    ingress_record_order(left, right).is_lt()
 }
 
 fn ingress_record_order(left: &Value, right: &Value) -> std::cmp::Ordering {
@@ -2574,7 +2401,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_ingress_scheduler_uses_due_oldest_work_not_newest_updates() {
+    fn ingress_scheduler_uses_due_oldest_work_not_newest_updates() {
         let now = DateTime::parse_from_rfc3339("2026-07-25T03:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -2599,7 +2426,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            next_conversation_ingress(&histories, now)
+            next_ingress(&histories, now)
                 .and_then(|record| record.get("id"))
                 .and_then(Value::as_str),
             Some("oldest-due")
@@ -2607,28 +2434,28 @@ mod tests {
     }
 
     #[test]
-    fn claimed_writer_work_precedes_pending_work_across_ingress_sources() {
-        let conversation = json!({
-            "id":"conversation",
+    fn ingress_scheduler_resumes_claimed_work_before_pending_work() {
+        let pending = json!({
+            "id":"pending",
             "phase":"ingress_pending",
             "updated_at":"2026-07-25T01:00:00Z"
         });
-        let audio = json!({
-            "id":"audio",
+        let claimed = json!({
+            "id":"claimed",
             "phase":"ingress_in_progress",
             "updated_at":"2026-07-25T02:00:00Z",
             "source_created_at":"2026-07-25T00:00:00Z"
         });
-        assert!(!ingress_record_precedes(&conversation, &audio));
-
-        let pending_audio = json!({
-            "id":"audio",
-            "phase":"ingress_pending",
-            "updated_at":"2026-07-25T00:30:00Z",
-            "source_created_at":"2026-07-25T00:00:00Z"
-        });
-        assert!(!ingress_record_precedes(&conversation, &pending_audio));
-        assert!(ingress_record_precedes(&pending_audio, &conversation));
+        let now = DateTime::parse_from_rfc3339("2026-07-25T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let histories = vec![pending, claimed];
+        assert_eq!(
+            next_ingress(&histories, now)
+                .and_then(|record| record.get("id"))
+                .and_then(Value::as_str),
+            Some("claimed")
+        );
     }
 
     #[tokio::test]

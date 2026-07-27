@@ -63,13 +63,6 @@ struct Args {
     )]
     legacy_audio_ingress_database: PathBuf,
     #[arg(
-        long = "memory-ingress-database",
-        global = true,
-        default_value = "./data/kennedy-memory-ingress.sqlite3",
-        help = "Kennedy-owned audio transcript memory-ingress queue"
-    )]
-    audio_memory_ingress_database: PathBuf,
-    #[arg(
         long,
         alias = "audio-ingress-media",
         global = true,
@@ -324,10 +317,10 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             .await?;
     let audio_service = audio_ingress::Service::open(
         audio,
-        &args.audio_memory_ingress_database,
-        Some(&audio_state_database),
+        history_service.clone(),
         args.audio_ingress_max_upload_bytes,
         system_roots.user.to_string(),
+        intelligence_runtime.context_window_tokens,
     )?;
     let audio_ingress_router = audio_ingress::router(audio_service.clone());
     let orchestration = orchestration::Config {
@@ -340,8 +333,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         intelligence_base: String::new(),
         #[cfg(test)]
         session_history_base: String::new(),
-        #[cfg(test)]
-        audio_ingress_base: String::new(),
         telegram_web_user_handle: args.telegram_bootstrap_username,
         runtime_model: orchestration::RuntimeModel::from_intelligence(intelligence_runtime),
     };
@@ -385,7 +376,6 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.telegram_database,
         &args.user_database,
         &args.legacy_audio_ingress_database,
-        &args.audio_memory_ingress_database,
         &args.audio_ingress_directory,
         &args.intelligence_usage_directory,
         &args.rust_libs_root,
@@ -696,7 +686,6 @@ mod tests {
             &args.telegram_database,
             &args.user_database,
             &args.legacy_audio_ingress_database,
-            &args.audio_memory_ingress_database,
             &args.audio_ingress_directory,
             &args.intelligence_usage_directory,
             &args.rust_libs_root,
@@ -1045,7 +1034,6 @@ mod tests {
         let telegram = directory.join("telegram.sqlite3");
         let users = directory.join("users.sqlite3");
         let audio = directory.join("audio.sqlite3");
-        let memory_ingress = directory.join("memory-ingress.sqlite3");
         let audio_media = directory.join("audio-media");
         let args = Args {
             vault_path: vault.clone(),
@@ -1060,7 +1048,6 @@ mod tests {
             telegram_database: telegram.clone(),
             user_database: users.clone(),
             legacy_audio_ingress_database: audio.clone(),
-            audio_memory_ingress_database: memory_ingress.clone(),
             audio_ingress_directory: audio_media.clone(),
             intelligence_usage_directory: directory.join("intelligence-usage"),
             rust_libs_root: directory.join("rust-libs"),
@@ -1082,7 +1069,6 @@ mod tests {
         assert!(!telegram.exists());
         assert!(!users.exists());
         assert!(!audio.exists());
-        assert!(!memory_ingress.exists());
         assert!(!audio_media.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -1302,7 +1302,6 @@ impl Session {
         if matches!(session.mode, AgentMode::Ingress { .. })
             && !session.completed
             && !session.journal.state().history_ingress_started
-            && !needs_initialization
         {
             session.prepare_history_ingress(&system_prompt).await?;
         }
@@ -1418,33 +1417,6 @@ impl Session {
             )?;
             self.journal.dehydrate_box(now(), notice)?;
         }
-        Ok(())
-    }
-
-    pub(crate) async fn stage_ingress_source(
-        &mut self,
-        text: &str,
-        metadata: &Value,
-    ) -> anyhow::Result<()> {
-        if self.completed {
-            self.pending_turn = false;
-            return Ok(());
-        }
-        if self.journal.state().history_ingress_started {
-            self.pending_turn = true;
-            return Ok(());
-        }
-        self.stage_user_input_inner(text.trim(), metadata, Vec::new())?;
-        let prompt = self
-            .journal
-            .state()
-            .boxes
-            .values()
-            .find(|state| matches!(state.owner, BoxOwner::System))
-            .map(|state| state.canonical.content.text.clone())
-            .context("ingress session has no system prompt")?;
-        self.prepare_history_ingress(&prompt).await?;
-        self.pending_turn = !self.completed;
         Ok(())
     }
 
