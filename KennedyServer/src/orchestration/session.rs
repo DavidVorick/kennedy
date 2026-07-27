@@ -389,7 +389,7 @@ fn render_web_fetch_result(result: &Value) -> anyhow::Result<String> {
         text.push_str("\nTitle: ");
         text.push_str(title);
     }
-    if let Some(content_type) = result.get("content_type").and_then(Value::as_str) {
+    if let Some(content_type) = result.get("contentType").and_then(Value::as_str) {
         text.push_str("\nContent type: ");
         text.push_str(content_type);
     }
@@ -405,7 +405,12 @@ fn render_web_fetch_result(result: &Value) -> anyhow::Result<String> {
     Ok(text)
 }
 
-fn render_media_annotation_result(object_id: &PendingId, result: &Value) -> anyhow::Result<String> {
+fn render_media_annotation_result(
+    object_id: &PendingId,
+    file_name: &str,
+    content_type: &str,
+    result: &Value,
+) -> anyhow::Result<String> {
     let text = result
         .get("text")
         .and_then(Value::as_str)
@@ -415,14 +420,6 @@ fn render_media_annotation_result(object_id: &PendingId, result: &Value) -> anyh
         .get("model")
         .and_then(Value::as_str)
         .context("media annotation response has no model")?;
-    let file_name = result
-        .get("file_name")
-        .and_then(Value::as_str)
-        .context("media annotation response has no filename")?;
-    let content_type = result
-        .get("content_type")
-        .and_then(Value::as_str)
-        .context("media annotation response has no content type")?;
     let status = if result
         .get("complete")
         .and_then(Value::as_bool)
@@ -436,7 +433,7 @@ fn render_media_annotation_result(object_id: &PendingId, result: &Value) -> anyh
         "Annotation for {object_id}\nFile: {file_name}\nContent type: {content_type}\nModel: {model}\nStatus: {status}"
     );
     if let Some(reason) = result
-        .get("incomplete_reason")
+        .get("incompleteReason")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
     {
@@ -470,16 +467,13 @@ fn render_audio_transcription_result(
 
 fn render_document_extraction_result(
     object_id: &PendingId,
+    file_name: &str,
     result: &Value,
 ) -> anyhow::Result<String> {
     let text = result
         .get("text")
         .and_then(Value::as_str)
         .context("document extraction response has no text")?;
-    let file_name = result
-        .get("file_name")
-        .and_then(Value::as_str)
-        .context("document extraction response has no filename")?;
     let format = result
         .get("format")
         .and_then(Value::as_str)
@@ -1486,11 +1480,11 @@ impl Session {
         let mut attachment_boxes = Vec::new();
         let mut attachment_names = Vec::new();
         for attachment in &attachments {
-            let file_name = attachment
-                .get("fileName")
-                .and_then(Value::as_str)
-                .unwrap_or("document");
-            attachment_names.push(file_name.to_owned());
+            let file_name = ingress_object_filename(
+                attachment.get("fileName").and_then(Value::as_str),
+                "document",
+            );
+            attachment_names.push(file_name.clone());
             if let Some(pending_id) = attachment.get("pendingId").and_then(Value::as_str) {
                 let pending_id = PendingId::parse(pending_id.to_owned())?;
                 anyhow::ensure!(
@@ -1503,7 +1497,7 @@ impl Session {
                 let id = self.journal.stage_object(
                     now(),
                     media_type,
-                    Some(file_name.to_owned()),
+                    Some(file_name.clone()),
                     attachment_metadata_without_payload(attachment),
                     &bytes,
                 )?;
@@ -1537,13 +1531,12 @@ impl Session {
                 content.objects.push(pending_id.to_string());
             } else if let Some(data_url) = media.get("dataUrl").and_then(Value::as_str) {
                 let (media_type, bytes) = decode_data_url(data_url)?;
+                let file_name =
+                    ingress_object_filename(media.get("fileName").and_then(Value::as_str), "media");
                 let id = self.journal.stage_object(
                     now(),
                     media_type,
-                    media
-                        .get("fileName")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    Some(file_name),
                     attachment_metadata_without_payload(media),
                     &bytes,
                 )?;
@@ -2785,7 +2778,7 @@ impl Session {
                         size_bytes,
                         message_id,
                         true,
-                    )
+                    )?
                 } else {
                     let (bytes, downloaded_media_type) = self
                         .api
@@ -2826,7 +2819,7 @@ impl Session {
                         bytes.len() as u64,
                         message_id,
                         false,
-                    )
+                    )?
                 }
             }
             "TranscribeAudio" => {
@@ -2839,7 +2832,7 @@ impl Session {
                 let media_type = normalized_media_type(&metadata.media_type);
                 validate_transcribable_audio(&media_type)?;
                 validate_transcription_model(&model)?;
-                let file_name = pending_object_filename(&metadata);
+                let file_name = authoritative_object_filename(&metadata)?.to_owned();
                 let user_id = self
                     .root_node_ids
                     .first()
@@ -2867,6 +2860,7 @@ impl Session {
                     read_pending_object(&mut self.journal, &object_id)?;
                 let media_type = normalized_media_type(&metadata.media_type);
                 validate_annotation_media(&model, &media_type)?;
+                let file_name = authoritative_object_filename(&metadata)?.to_owned();
                 let user_id = self
                     .root_node_ids
                     .first()
@@ -2878,12 +2872,12 @@ impl Session {
                         &model,
                         &prompt,
                         bytes,
-                        pending_object_filename(&metadata),
+                        file_name.clone(),
                         &media_type,
                         operation_id,
                     )
                     .await?;
-                render_media_annotation_result(&pending_id, &result)?
+                render_media_annotation_result(&pending_id, &file_name, &media_type, &result)?
             }
             "ExtractDocumentText" => {
                 validate_arguments(&call.arguments, &["objectId"], &[])?;
@@ -2891,15 +2885,16 @@ impl Session {
                 let (pending_id, metadata, bytes) =
                     read_pending_object(&mut self.journal, &object_id)?;
                 validate_extractable_document(&metadata)?;
+                let file_name = authoritative_object_filename(&metadata)?.to_owned();
                 let result = self
                     .api
                     .extract_document(
                         bytes,
-                        pending_object_filename(&metadata),
+                        file_name.clone(),
                         &normalized_media_type(&metadata.media_type),
                     )
                     .await?;
-                render_document_extraction_result(&pending_id, &result)?
+                render_document_extraction_result(&pending_id, &file_name, &result)?
             }
             "ConnectNodes" => self.connect_nodes(&call.arguments)?,
             "ConsolidateFanout" => self.consolidate_fanout(&call.arguments)?,
@@ -4043,13 +4038,24 @@ fn read_pending_object(
     Ok((pending_id, location.metadata, bytes))
 }
 
-fn pending_object_filename(metadata: &ObjectMetadata) -> String {
+fn ingress_object_filename(value: Option<&str>, fallback: &str) -> String {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn authoritative_object_filename(metadata: &ObjectMetadata) -> anyhow::Result<&str> {
     metadata
         .file_name
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("object-{}", metadata.pending_id.number()))
+        .with_context(|| {
+            format!(
+                "staged object {} has no authoritative filename",
+                metadata.pending_id
+            )
+        })
 }
 
 fn telegram_group_media_reference(group_context: &Value, message_id: i64) -> anyhow::Result<Value> {
@@ -4146,8 +4152,8 @@ fn render_staged_telegram_group_media(
     size_bytes: u64,
     message_id: i64,
     reused: bool,
-) -> String {
-    format!(
+) -> anyhow::Result<String> {
+    Ok(format!(
         "{} Telegram group media\nMessage ID: {message_id}\nObject: {pending_id}\nKind: {}\nFile: {}\nContent type: {}\nSize: {size_bytes} bytes\n\nUse Object {pending_id} with AnnotateMedia, TranscribeAudio, or ExtractDocumentText as appropriate.",
         if reused {
             "Reused already-staged"
@@ -4159,9 +4165,9 @@ fn render_staged_telegram_group_media(
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("media"),
-        pending_object_filename(metadata),
+        authoritative_object_filename(metadata)?,
         normalized_media_type(&metadata.media_type),
-    )
+    ))
 }
 
 fn normalized_media_type(value: &str) -> String {
@@ -4854,7 +4860,8 @@ mod tests {
             telegram_group_media_filename(&metadata.transport, "image/jpeg", 77),
             "thread-photo.jpg"
         );
-        let rendered = render_staged_telegram_group_media(&found, &metadata, size_bytes, 77, true);
+        let rendered =
+            render_staged_telegram_group_media(&found, &metadata, size_bytes, 77, true).unwrap();
         assert!(rendered.contains("Reused already-staged Telegram group media"));
         assert!(rendered.contains(&format!("Object: {pending_id}")));
         assert!(staged_telegram_group_media(&journal, -100123, 78).is_none());
@@ -4893,21 +4900,58 @@ mod tests {
     }
 
     #[test]
-    fn media_and_document_tool_results_are_plain_provenanced_text() {
+    fn staged_object_filename_is_assigned_once_and_then_required() {
+        assert_eq!(
+            ingress_object_filename(Some("original.png"), "media"),
+            "original.png"
+        );
+        assert_eq!(ingress_object_filename(Some("  "), "media"), "media");
+
+        let mut metadata = ObjectMetadata {
+            pending_id: PendingId::parse("pending:47").unwrap(),
+            event_id: EventId(47),
+            recorded_at: "t1".into(),
+            media_type: "image/png".into(),
+            file_name: Some("original.png".into()),
+            transport: Value::Null,
+        };
+        assert_eq!(
+            authoritative_object_filename(&metadata).unwrap(),
+            "original.png"
+        );
+        metadata.file_name = None;
+        assert!(
+            authoritative_object_filename(&metadata)
+                .unwrap_err()
+                .to_string()
+                .contains("has no authoritative filename")
+        );
+    }
+
+    #[test]
+    fn media_and_document_results_use_authoritative_staged_filenames() {
         let pending = PendingId::parse("pending:47").unwrap();
-        let annotation = render_media_annotation_result(
-            &pending,
-            &json!({
-                "complete":true,
-                "model":"gpt-5.6",
-                "file_name":"scene.png",
-                "content_type":"image/png",
-                "text":"A sign reads \"Kennedy\"."
-            }),
-        )
-        .unwrap();
+        let annotation_result =
+            serde_json::to_value(kcode_intelligence_router::AnnotationResponse {
+                complete: false,
+                model: "gpt-5.6".into(),
+                file_name: "adapter-reconstructed.png".into(),
+                content_type: "application/octet-stream".into(),
+                text: "A sign reads \"Kennedy\".".into(),
+                incomplete_reason: Some("output limit".into()),
+                usage: None,
+            })
+            .unwrap();
+        let annotation =
+            render_media_annotation_result(&pending, "scene.png", "image/png", &annotation_result)
+                .unwrap();
         assert!(annotation.contains("Annotation for pending:47"));
+        assert!(annotation.contains("File: scene.png"));
+        assert!(annotation.contains("Content type: image/png"));
         assert!(annotation.contains("Model: gpt-5.6"));
+        assert!(annotation.contains("Status: incomplete"));
+        assert!(annotation.contains("Incomplete reason: output limit"));
+        assert!(!annotation.contains("adapter-reconstructed.png"));
         assert!(annotation.ends_with("A sign reads \"Kennedy\"."));
 
         let transcription = render_audio_transcription_result(
@@ -4924,18 +4968,21 @@ mod tests {
         assert!(transcription.contains("Model: gpt-4o-transcribe"));
         assert!(transcription.ends_with("The exact spoken words."));
 
-        let extraction = render_document_extraction_result(
-            &pending,
-            &json!({
-                "file_name":"brief.doc",
-                "format":"doc",
-                "text":"Original body",
-                "characters":13,
-                "truncated":false
-            }),
-        )
-        .unwrap();
+        let extraction_result =
+            serde_json::to_value(kcode_intelligence_router::DocumentExtraction {
+                file_name: "adapter-reconstructed.doc".into(),
+                content_type: "application/octet-stream".into(),
+                format: "doc".into(),
+                text: "Original body".into(),
+                characters: 13,
+                truncated: false,
+            })
+            .unwrap();
+        let extraction =
+            render_document_extraction_result(&pending, "brief.doc", &extraction_result).unwrap();
+        assert!(extraction.contains("File: brief.doc"));
         assert!(extraction.contains("Format: doc"));
+        assert!(!extraction.contains("adapter-reconstructed.doc"));
         assert!(extraction.ends_with("Original body"));
     }
 
@@ -5606,14 +5653,16 @@ mod tests {
         );
         assert!(!search.contains("\\\"quotes\\\""));
 
-        let fetched = render_web_fetch_result(&json!({
-            "url":"https://example.test/page",
-            "title":"A page",
-            "content_type":"text/plain",
-            "content":"fn main() {\n    println!(\"raw\");\n}\n",
-            "truncated":true
-        }))
+        let fetch_result = serde_json::to_value(kcode_intelligence_router::FetchResponse {
+            url: "https://example.test/page".into(),
+            title: Some("A page".into()),
+            content_type: "text/plain".into(),
+            content: "fn main() {\n    println!(\"raw\");\n}\n".into(),
+            truncated: true,
+            retrieved_at: Utc::now(),
+        })
         .unwrap();
+        let fetched = render_web_fetch_result(&fetch_result).unwrap();
         assert_eq!(
             fetched,
             "Source URL: https://example.test/page\nTitle: A page\nContent type: text/plain\nThe returned page text was truncated.\n\nfn main() {\n    println!(\"raw\");\n}\n"
