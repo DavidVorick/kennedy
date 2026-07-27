@@ -2,6 +2,7 @@ mod context;
 mod http;
 mod prompts;
 mod session;
+mod subagent;
 mod worker;
 
 use std::{path::PathBuf, sync::Arc};
@@ -9,6 +10,7 @@ use std::{path::PathBuf, sync::Arc};
 pub(crate) use http::{Api, ApiError, LocalServices};
 pub(crate) use prompts::{Manuals, RuntimeModel, human_utc_datetime, runtime_description};
 pub(crate) use session::{AgentMode, Session};
+pub(crate) use subagent::Providers as SubagentProviders;
 
 // Recent connections are navigation-only fanout summaries unless this policy changes.
 const ACTIVE_CONNECTION_LIMIT: usize = 0;

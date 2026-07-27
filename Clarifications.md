@@ -14,6 +14,11 @@ This document records user intention with regard to Kennedy.
 - Same-process components should normally communicate through small typed Rust
   APIs. HTTP belongs at genuine transport boundaries, not between parts of one
   process.
+- Reduce KennedyServer by extracting cohesive Rust capabilities into managed
+  Kcode libraries, starting with the least-coupled boundaries. An extracted
+  library should normally contain 300-3,000 lines of code, expose a lightweight
+  well-defined API, and materially simplify what KennedyServer owns; do not
+  create pass-through crates that merely relocate server-specific glue.
 - The Rust backend owns orchestration. Browser code owns presentation and local
   input concerns only. Do not add a server-side JavaScript runtime.
 - Prefer explicit, visible behavior over hidden automation. Failures should be
@@ -112,13 +117,21 @@ This document records user intention with regard to Kennedy.
   fast/balanced/quality aliases and do not infer media capability solely from a
   MIME string.
 - Kennedy may delegate a focused task through an explicit subagent tool. Each
-  subagent uses Kennedy's chosen exact model and begins with an intentionally
-  box-free application context: the current long descriptions of
+  subagent uses Kennedy's chosen exact model through any configured
+  tool-capable provider, not only the Codex harness, and begins with an
+  intentionally box-free application context: the current long descriptions of
   Kennedy-selected canonical Kmap nodes, in Kennedy's selected order, followed
   by Kennedy's task prompt. The backend assigns no special role to any selected
   node; Kennedy controls whether a node's text acts as identity, system-like
   instruction, operating knowledge, a tool manual, or ordinary task context
   through her selection and ordering.
+- Ordinary API model identifiers keep their provider-native names:
+  `gpt-*`/other OpenAI identifiers use the OpenAI API and `gemini-*` identifiers
+  use Gemini. Codex-harness models use the explicit `codex/<catalog-id>`
+  namespace so an API model can never silently run through Codex. Do not limit
+  API subagents to a hard-coded model allowlist: resolve model availability
+  against the configured provider, and fail unavailable or ambiguous names
+  explicitly.
 - A subagent does not inherit the parent Chatend, boxes, transcript,
   automatically loaded roots or connections, ordinary Kennedy prompt layers,
   ambient host instructions, or provider conversation state. The backend
@@ -139,6 +152,13 @@ This document records user intention with regard to Kennedy.
   representation is already compact, do not duplicate complete old and new
   values, and do not revise state after a failed call. This projection applies
   generically to managed source and any other box-aware tool.
+- A successful subagent call returns its one terminal assistant response as the
+  plain Ktool result to Kennedy. Do not wrap it in a redundant report, inject
+  the child context or trace into Kennedy's active context, or treat the
+  subagent's claim as proof that its task succeeded. Kennedy decides what to
+  inspect or verify through her own context and tools. Child failure or
+  cancellation returns an actionable tool error and must disclose when effects
+  may already have occurred.
 - Subagent effects remain subject to the parent session's permissions and
   transaction boundaries, and stopping the parent operation stops its active
   subagent work.
@@ -320,6 +340,13 @@ This document records user intention with regard to Kennedy.
 - Kennedy's strategy, detailed tool manuals, user preferences, and evolving
   operating knowledge belong in Kmap rather than an ever-growing static system
   prompt.
+- New capability manuals, including delegation and subagent tooling, must be
+  delivered as standalone ingress material for Kmap and must not be added to
+  runtime system-prompt files. A feature implementation does not authorize
+  expanding the system prompt with its usage documentation. Keeping manuals in
+  Kmap lets Kennedy revise them, connect them to related operating knowledge,
+  and select them only when relevant. Runtime prompts may retain only the small
+  bootstrapping and navigation instructions needed for Kennedy to reach Kmap.
 - The Kmap introduction must be sufficient for a model with no prior knowledge
   of Kennedy to find the automatic roots, understand canonical identifiers,
   navigate connections, and discover further manuals.

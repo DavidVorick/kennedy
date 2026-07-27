@@ -1,6 +1,10 @@
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -23,6 +27,7 @@ pub(crate) struct LocalServices {
     pub audio: crate::audio_ingress::Service,
     pub directory: std::sync::Arc<kcode_telegram_identity::Directory>,
     pub dev_tools: kcode_dev_tools::Service,
+    pub subagents: super::subagent::Providers,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +52,7 @@ pub(crate) struct Api {
     services: ServiceBackend,
     history_sessions: kcode_session_history::SessionHistory,
     telegram: String,
+    child_operations: Arc<Mutex<HashMap<Uuid, HashSet<Uuid>>>>,
 }
 
 #[derive(Clone)]
@@ -56,10 +62,36 @@ enum ServiceBackend {
     Http(TestBases),
 }
 
-pub(crate) enum AgentTurn {
+enum AgentTurnBackend {
     Local(kcode_intelligence_router::AgentTurn),
+    Api(super::subagent::Turn),
     #[cfg(test)]
     Http(HttpAgentTurn),
+}
+
+pub(crate) struct AgentTurn {
+    backend: AgentTurnBackend,
+    child_operation: Option<ChildOperationRegistration>,
+}
+
+struct ChildOperationRegistration {
+    parent: Uuid,
+    child: Uuid,
+    operations: Arc<Mutex<HashMap<Uuid, HashSet<Uuid>>>>,
+}
+
+impl Drop for ChildOperationRegistration {
+    fn drop(&mut self) {
+        let Ok(mut operations) = self.operations.lock() else {
+            return;
+        };
+        if let Some(children) = operations.get_mut(&self.parent) {
+            children.remove(&self.child);
+            if children.is_empty() {
+                operations.remove(&self.parent);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +133,7 @@ impl Api {
             }),
             history_sessions,
             telegram: trim_base(&config.telegram_relay_base),
+            child_operations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -115,6 +148,7 @@ impl Api {
             services: ServiceBackend::Local(std::sync::Arc::new(services)),
             history_sessions,
             telegram: trim_base(telegram_base),
+            child_operations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -191,7 +225,10 @@ impl Api {
                 .map_err(intelligence_error)?
                 .start_agent_turn(operation_id, request)
                 .await
-                .map(AgentTurn::Local)
+                .map(|turn| AgentTurn {
+                    backend: AgentTurnBackend::Local(turn),
+                    child_operation: None,
+                })
                 .map_err(intelligence_error),
             #[cfg(test)]
             ServiceBackend::Http(bases) => {
@@ -279,19 +316,146 @@ impl Api {
                         usage,
                     },
                 )));
-                Ok(AgentTurn::Http(HttpAgentTurn { events }))
+                Ok(AgentTurn {
+                    backend: AgentTurnBackend::Http(HttpAgentTurn { events }),
+                    child_operation: None,
+                })
+            }
+        }
+    }
+
+    pub async fn start_subagent_turn(
+        &self,
+        user_id: &str,
+        parent_operation_id: Uuid,
+        child_operation_id: Uuid,
+        model: &super::subagent::Model,
+        request: kcode_codex_runtime_v2::AgentRequest,
+    ) -> Result<AgentTurn, ApiError> {
+        {
+            let mut operations = self.child_operations.lock().map_err(|_| ApiError {
+                status: None,
+                code: "internal_error".into(),
+                message: "Subagent operation registry is unavailable.".into(),
+            })?;
+            operations
+                .entry(parent_operation_id)
+                .or_default()
+                .insert(child_operation_id);
+        }
+        let started = match &self.services {
+            ServiceBackend::Local(local) => match model.backend {
+                super::subagent::Backend::Codex => local
+                    .intelligence
+                    .for_user(user_id)
+                    .map_err(intelligence_error)?
+                    .start_agent_turn(child_operation_id, request)
+                    .await
+                    .map(|turn| AgentTurn {
+                        backend: AgentTurnBackend::Local(turn),
+                        child_operation: None,
+                    })
+                    .map_err(intelligence_error),
+                super::subagent::Backend::OpenAi | super::subagent::Backend::Gemini => local
+                    .subagents
+                    .start_turn(user_id, child_operation_id, model, request)
+                    .await
+                    .map(|turn| AgentTurn {
+                        backend: AgentTurnBackend::Api(turn),
+                        child_operation: None,
+                    })
+                    .map_err(local_api_error),
+            },
+            #[cfg(test)]
+            ServiceBackend::Http(_) => {
+                self.start_agent_turn(user_id, child_operation_id, request)
+                    .await
+            }
+        };
+        match started {
+            Ok(mut turn) => {
+                turn.child_operation = Some(ChildOperationRegistration {
+                    parent: parent_operation_id,
+                    child: child_operation_id,
+                    operations: self.child_operations.clone(),
+                });
+                Ok(turn)
+            }
+            Err(error) => {
+                drop(ChildOperationRegistration {
+                    parent: parent_operation_id,
+                    child: child_operation_id,
+                    operations: self.child_operations.clone(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn resolve_subagent_model(
+        &self,
+        runtime: &super::RuntimeModel,
+        requested: &str,
+    ) -> Result<super::subagent::Model, ApiError> {
+        if let Some(model) = runtime.codex_subagent_model(requested) {
+            return model.map_err(local_api_error);
+        }
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .subagents
+                .resolve(requested)
+                .await
+                .map_err(local_api_error),
+            #[cfg(test)]
+            ServiceBackend::Http(_) => {
+                let backend = if requested.starts_with("gemini-") {
+                    super::subagent::Backend::Gemini
+                } else {
+                    super::subagent::Backend::OpenAi
+                };
+                Ok(super::subagent::Model {
+                    requested: requested.to_owned(),
+                    provider_model: requested.to_owned(),
+                    backend,
+                    context_window_tokens: 1_000_000,
+                    max_input_tokens: 700_000,
+                })
             }
         }
     }
 
     pub fn cancel_intelligence(&self, operation_id: Uuid) -> Result<bool, ApiError> {
+        let children = self
+            .child_operations
+            .lock()
+            .map_err(|_| ApiError {
+                status: None,
+                code: "internal_error".into(),
+                message: "Subagent operation registry is unavailable.".into(),
+            })?
+            .remove(&operation_id)
+            .unwrap_or_default();
         match &self.services {
-            ServiceBackend::Local(local) => local
-                .intelligence
-                .cancel(operation_id)
-                .map_err(intelligence_error),
+            ServiceBackend::Local(local) => {
+                let mut cancelled = local
+                    .intelligence
+                    .cancel(operation_id)
+                    .map_err(intelligence_error)?;
+                cancelled |= local
+                    .subagents
+                    .cancel(operation_id)
+                    .map_err(local_api_error)?;
+                for child in children {
+                    cancelled |= local
+                        .intelligence
+                        .cancel(child)
+                        .map_err(intelligence_error)?;
+                    cancelled |= local.subagents.cancel(child).map_err(local_api_error)?;
+                }
+                Ok(cancelled)
+            }
             #[cfg(test)]
-            ServiceBackend::Http(_) => Ok(false),
+            ServiceBackend::Http(_) => Ok(!children.is_empty()),
         }
     }
 
@@ -1329,28 +1493,35 @@ impl AgentTurn {
     pub(crate) async fn next_event(
         &mut self,
     ) -> Option<Result<kcode_codex_runtime_v2::AgentEvent, ApiError>> {
-        match self {
-            Self::Local(turn) => match turn.next_event().await {
+        match &mut self.backend {
+            AgentTurnBackend::Local(turn) => match turn.next_event().await {
                 Ok(event) => event.map(Ok),
                 Err(error) => Some(Err(intelligence_error(error))),
             },
+            AgentTurnBackend::Api(turn) => turn
+                .next_event()
+                .await
+                .map(|event| event.map_err(local_api_error)),
             #[cfg(test)]
-            Self::Http(turn) => turn.events.pop_front(),
+            AgentTurnBackend::Http(turn) => turn.events.pop_front(),
         }
     }
 
     pub(crate) async fn respond(
-        &self,
+        &mut self,
         call_id: &str,
         result: kcode_codex_runtime_v2::ToolResult,
     ) -> Result<(), ApiError> {
-        match self {
-            Self::Local(turn) => turn
+        match &mut self.backend {
+            AgentTurnBackend::Local(turn) => turn
                 .respond(call_id, result)
                 .await
                 .map_err(intelligence_error),
+            AgentTurnBackend::Api(turn) => {
+                turn.respond(call_id, result).await.map_err(local_api_error)
+            }
             #[cfg(test)]
-            Self::Http(_) => Ok(()),
+            AgentTurnBackend::Http(_) => Ok(()),
         }
     }
 }

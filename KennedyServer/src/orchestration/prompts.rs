@@ -25,19 +25,56 @@ pub(crate) struct RuntimeModel {
     pub model: String,
     pub reasoning_effort: String,
     pub context_window_tokens: u64,
+    catalog: Option<kcode_codex_runtime::Catalog>,
 }
 
 impl RuntimeModel {
-    pub(crate) fn from_intelligence(runtime: kcode_intelligence_router::RuntimeModel) -> Self {
+    pub(crate) fn from_intelligence(
+        runtime: kcode_intelligence_router::RuntimeModel,
+        catalog: kcode_codex_runtime::Catalog,
+    ) -> Self {
         Self {
             model: runtime.model,
             reasoning_effort: runtime.reasoning_effort,
             context_window_tokens: runtime.context_window_tokens,
+            catalog: Some(catalog),
         }
     }
 
     pub(crate) fn attribution(&self) -> String {
         format!("{}-{}", self.model, self.reasoning_effort)
+    }
+
+    pub(crate) fn model_limits(&self, model: &str) -> Option<kcode_codex_runtime::ModelLimits> {
+        self.catalog
+            .as_ref()
+            .and_then(|catalog| catalog.model_limits(model))
+            .or_else(|| {
+                (model == self.model).then_some(kcode_codex_runtime::ModelLimits {
+                    context_window_tokens: self.context_window_tokens,
+                    max_input_tokens: self.context_window_tokens.saturating_mul(70) / 100,
+                })
+            })
+    }
+
+    pub(crate) fn codex_subagent_model(
+        &self,
+        requested: &str,
+    ) -> Option<anyhow::Result<super::subagent::Model>> {
+        let provider_model = requested.strip_prefix("codex/")?;
+        Some(
+            self.model_limits(provider_model)
+                .map(|limits| {
+                    super::subagent::Model::codex(
+                        requested.to_owned(),
+                        provider_model.to_owned(),
+                        limits,
+                    )
+                })
+                .with_context(|| {
+                    format!("{provider_model:?} is not an available model in the Codex catalog")
+                }),
+        )
     }
 
     #[cfg(test)]
@@ -46,6 +83,7 @@ impl RuntimeModel {
             model: "gpt-5.6-sol".into(),
             reasoning_effort: "xhigh".into(),
             context_window_tokens: 1_000_000,
+            catalog: None,
         }
     }
 }

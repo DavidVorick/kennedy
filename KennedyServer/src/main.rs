@@ -235,6 +235,12 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             completed_list: args.session_history_file,
         })?;
     let history_router = session_history_http::router(history_service.clone());
+    let subagent_providers = orchestration::SubagentProviders::open(
+        openai_api_key.clone(),
+        gemini_api_key.clone(),
+        args.intelligence_usage_directory.clone(),
+    )
+    .context("opening API-backed subagent providers")?;
     let (intelligence_service, intelligence_runtime) =
         kcode_intelligence_router::open(kcode_intelligence_router::Config {
             openai_api_key,
@@ -243,6 +249,10 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             receipt_directory: args.intelligence_usage_directory,
         })
         .await?;
+    let codex_catalog = codex_catalog_cache
+        .load()
+        .await
+        .context("loading the shared Codex model catalog for subagent selection")?;
     let telegram = kcode_tg_kennedy_bot::Config {
         bind: args.telegram_bind,
         database: args.telegram_database,
@@ -335,7 +345,10 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         #[cfg(test)]
         session_history_base: String::new(),
         telegram_web_user_handle: args.telegram_bootstrap_username,
-        runtime_model: orchestration::RuntimeModel::from_intelligence(intelligence_runtime),
+        runtime_model: orchestration::RuntimeModel::from_intelligence(
+            intelligence_runtime,
+            codex_catalog,
+        ),
     };
     let orchestration_api = orchestration::Api::local(
         &orchestration.telegram_relay_base,
@@ -346,6 +359,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             audio: audio_service,
             directory: telegram_identity.clone(),
             dev_tools,
+            subagents: subagent_providers,
         },
     )?;
     tokio::try_join!(

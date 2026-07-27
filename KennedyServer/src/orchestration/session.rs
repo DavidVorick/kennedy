@@ -54,6 +54,8 @@ const WEB_LIB_TOOL_INSTANCE: &str = "managed-web-libraries";
 const RUST_BIN_TOOL_INSTANCE: &str = "managed-rust-binaries";
 const CAPACITY_ERROR_BOX_NAME: &str = "Context capacity error";
 const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
+const SUBAGENT_CONTEXT_NODE_LIMIT: usize = 64;
+const SUBAGENT_PROTOCOL_TOKEN_RESERVE: u64 = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -1070,6 +1072,178 @@ struct ToolOutcome {
     end_session: bool,
     freeform_write: Option<FreeformWriteRequest>,
     managed_source_snapshot: Option<ManagedSourceSnapshot>,
+}
+
+#[derive(Clone)]
+struct SubagentProjection {
+    context: Vec<String>,
+    task: String,
+    history: Vec<String>,
+    states: Vec<SubagentState>,
+}
+
+#[derive(Clone)]
+struct SubagentState {
+    key: String,
+    text: String,
+}
+
+impl SubagentProjection {
+    fn new(context: Vec<String>, task: String) -> Self {
+        Self {
+            context,
+            task,
+            history: Vec::new(),
+            states: Vec::new(),
+        }
+    }
+
+    fn render(&self) -> String {
+        self.context
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(self.task.as_str()))
+            .chain(self.history.iter().map(String::as_str))
+            .chain(self.states.iter().map(|state| state.text.as_str()))
+            .filter(|section| !section.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn push_history(&mut self, text: impl Into<String>) {
+        self.history.push(text.into());
+    }
+
+    fn update_state(&mut self, key: String, text: String) {
+        self.states.retain(|state| state.key != key);
+        self.states.push(SubagentState { key, text });
+    }
+
+    fn estimated_tokens(&self) -> u64 {
+        kcode_session_history::chatend::estimate_tokens(&self.render())
+            .saturating_add(SUBAGENT_PROTOCOL_TOKEN_RESERVE)
+    }
+}
+
+#[derive(Clone)]
+struct ChangedSubagentState {
+    box_id: BoxId,
+    name: String,
+    text: Option<String>,
+    hide_from_parent: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalBoxVersion {
+    event_id: EventId,
+    active: bool,
+    tool_owned: bool,
+    dehydrated: bool,
+}
+
+type CanonicalBoxVersions = BTreeMap<BoxId, CanonicalBoxVersion>;
+
+fn canonical_box_versions(journal: &HistorySession) -> CanonicalBoxVersions {
+    journal
+        .state()
+        .boxes
+        .iter()
+        .map(|(box_id, state)| {
+            (
+                *box_id,
+                CanonicalBoxVersion {
+                    event_id: state.canonical.event_id,
+                    active: state.active,
+                    tool_owned: matches!(state.owner, BoxOwner::Tool { .. }),
+                    dehydrated: matches!(state.representation, Representation::Dehydrated { .. }),
+                },
+            )
+        })
+        .collect()
+}
+
+fn changed_subagent_tool_states(
+    journal: &HistorySession,
+    previous: &CanonicalBoxVersions,
+) -> Vec<ChangedSubagentState> {
+    journal
+        .state()
+        .boxes
+        .iter()
+        .filter_map(|(box_id, state)| {
+            let current_tool_owned = matches!(state.owner, BoxOwner::Tool { .. });
+            let prior = previous.get(box_id);
+            if !current_tool_owned && !prior.is_some_and(|prior| prior.tool_owned) {
+                return None;
+            }
+            let changed = prior.is_none_or(|prior| {
+                prior.event_id != state.canonical.event_id
+                    || prior.active != state.active
+                    || prior.tool_owned != current_tool_owned
+            });
+            changed.then(|| ChangedSubagentState {
+                box_id: *box_id,
+                name: state.name.clone(),
+                text: (current_tool_owned && !state.canonical.content.text.is_empty())
+                    .then(|| state.canonical.content.text.clone()),
+                hide_from_parent: prior.is_none_or(|prior| prior.dehydrated || !prior.active),
+            })
+        })
+        .collect()
+}
+
+fn apply_changed_subagent_states(
+    projection: &mut SubagentProjection,
+    states: &[ChangedSubagentState],
+) {
+    for state in states {
+        let key = format!("tool-state:{}", state.box_id);
+        if let Some(text) = &state.text {
+            projection.update_state(key, format!("Current {}:\n{text}", state.name));
+        } else {
+            projection.states.retain(|state| state.key != key);
+        }
+    }
+}
+
+fn compact_subagent_tool_result(outcome: &ToolOutcome, states: &[ChangedSubagentState]) -> String {
+    if states.is_empty() {
+        return outcome.text.clone();
+    }
+    let result = if outcome.text.chars().count() <= INLINE_TOOL_INVOCATION_CHARACTERS {
+        outcome.text.as_str()
+    } else {
+        "Tool completed successfully."
+    };
+    format!(
+        "{result}\n\nThe updated state will be rendered in the next fresh context slice; end this slice now."
+    )
+}
+
+fn subagent_managed_write_fits(
+    journal: &HistorySession,
+    call: &ToolCall,
+    projection: &SubagentProjection,
+    input_limit: u64,
+) -> bool {
+    let Some(snapshot) = proposed_write_snapshot(&call.name, &call.arguments) else {
+        return true;
+    };
+    let kind = ManagedSourceKind::from_backend(snapshot.kind);
+    let key = managed_lib_box_id(journal, kind, &snapshot.name)
+        .map(|box_id| format!("tool-state:{box_id}"))
+        .unwrap_or_else(|| format!("prospective-managed-state:{:?}:{}", kind, snapshot.name));
+    let mut prospective = projection.clone();
+    prospective.update_state(
+        key,
+        format!(
+            "Current Managed {} {}:\n{}",
+            kind.label(),
+            snapshot.name,
+            snapshot.text
+        ),
+    );
+    prospective.estimated_tokens() <= input_limit
 }
 
 #[derive(Debug)]
@@ -2397,6 +2571,442 @@ impl Session {
         Err(AgentLoopRoundLimitError.into())
     }
 
+    async fn run_subagent(
+        &mut self,
+        arguments: &Value,
+        parent_operation_id: Uuid,
+    ) -> anyhow::Result<String> {
+        validate_arguments(
+            arguments,
+            &["model", "contextNodeIds", "task"],
+            &["reasoningEffort"],
+        )?;
+        let model = nonempty_string(arguments, "model", 128)?;
+        let selected_model = self
+            .api
+            .resolve_subagent_model(&self.runtime, &model)
+            .await?;
+        let input_limit = selected_model.max_input_tokens;
+        let reasoning_effort = arguments
+            .get("reasoningEffort")
+            .map(|_| nonempty_string(arguments, "reasoningEffort", 32))
+            .transpose()?
+            .unwrap_or_else(|| self.runtime.reasoning_effort.clone());
+        let reasoning_effort = codex_reasoning_effort(&reasoning_effort)?;
+        let task = bounded_nonempty_string(arguments, "task", 100_000)?;
+        let context_node_ids =
+            canonical_node_id_array(arguments, "contextNodeIds", SUBAGENT_CONTEXT_NODE_LIMIT)?;
+        let mut context = Vec::with_capacity(context_node_ids.len());
+        for node_id in &context_node_ids {
+            let node = self.api.kmap_node(node_id).await?;
+            context.push(
+                node.get("long_description")
+                    .or_else(|| node.get("longDescription"))
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("Kmap node {node_id} has no long description"))?
+                    .to_owned(),
+            );
+        }
+        let mut projection = SubagentProjection::new(context, task);
+        ensure_subagent_capacity(&projection, input_limit)?;
+        self.journal.record(
+            now(),
+            EventKind::Note {
+                label: "subagent_started".into(),
+                value: json!({
+                    "model":model,
+                    "providerModel":selected_model.provider_model,
+                    "backend":format!("{:?}", selected_model.backend),
+                    "contextWindowTokens":selected_model.context_window_tokens,
+                    "maxInputTokens":selected_model.max_input_tokens,
+                    "contextNodeIds":context_node_ids,
+                    "contextLongDescriptions":projection.context,
+                    "task":projection.task,
+                }),
+            },
+        )?;
+
+        let user_id = self
+            .root_node_ids
+            .first()
+            .context("session has no user root for subagent intelligence accounting")?
+            .clone();
+        let mut deferred_freeform_write: Option<FreeformWriteRequest> = None;
+        for round in 0..AGENT_LOOP_ROUND_LIMIT {
+            let capturing_freeform_output = deferred_freeform_write.is_some();
+            ensure_subagent_capacity(&projection, input_limit)?;
+            let input = projection.render();
+            let manifest_hash = hex::encode(Sha256::digest(input.as_bytes()));
+            self.journal.record(
+                now(),
+                EventKind::Note {
+                    label: "subagent_inference_submitted".into(),
+                    value: json!({
+                        "round":round + 1,
+                        "manifestHash":manifest_hash,
+                        "estimatedInputTokens":projection.estimated_tokens(),
+                    }),
+                },
+            )?;
+            let mut request = kcode_codex_runtime_v2::AgentRequest::new(
+                input,
+                selected_model.provider_model.clone(),
+            );
+            request.reasoning_effort = reasoning_effort;
+            request.previous_thread_id = None;
+            request.tools = if capturing_freeform_output {
+                Vec::new()
+            } else {
+                vec![subagent_ktool_definition()]
+            };
+            request.ephemeral = true;
+            if let Some(timeout) = self.agent_request_timeout() {
+                request.timeout = timeout;
+            }
+            let child_operation_id = Uuid::new_v4();
+            let mut turn = self
+                .api
+                .start_subagent_turn(
+                    &user_id,
+                    parent_operation_id,
+                    child_operation_id,
+                    &selected_model,
+                    request,
+                )
+                .await?;
+            let mut used_tool = false;
+            let mut pending_freeform_write: Option<FreeformWriteRequest> = None;
+            let mut requires_rerender = false;
+            let completed = loop {
+                let event = turn
+                    .next_event()
+                    .await
+                    .context("subagent provider ended without a terminal turn event")??;
+                match event {
+                    kcode_codex_runtime_v2::AgentEvent::ProviderInput(_) => {}
+                    kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
+                        used_tool = true;
+                        if capturing_freeform_output {
+                            let text = "No Ktool is available while complete file contents are being captured.";
+                            turn.respond(
+                                &native.call_id,
+                                kcode_codex_runtime_v2::ToolResult::failure(text),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        if let Some(request) = &pending_freeform_write {
+                            let text = format!(
+                                "{} is awaiting the complete file contents; no other Ktool can run first.",
+                                request.kind.freeform_write_tool()
+                            );
+                            turn.respond(
+                                &native.call_id,
+                                kcode_codex_runtime_v2::ToolResult::failure(text),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        if requires_rerender {
+                            let text = "A state update is waiting to be re-rendered. End this slice before calling another Ktool.";
+                            turn.respond(
+                                &native.call_id,
+                                kcode_codex_runtime_v2::ToolResult::failure(text),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let call = match native_ktool_call(&native) {
+                            Ok(call) => call,
+                            Err(error) => {
+                                let text = format!("Invalid Ktool call: {error}");
+                                projection.push_history(format!("Ktool result:\n{text}"));
+                                turn.respond(
+                                    &native.call_id,
+                                    kcode_codex_runtime_v2::ToolResult::failure(text),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        let exact_call = json!({
+                            "name":call.name,
+                            "arguments":call.arguments,
+                        });
+                        self.journal.record(
+                            now(),
+                            EventKind::Note {
+                                label: "subagent_tool_call".into(),
+                                value: exact_call,
+                            },
+                        )?;
+                        projection.push_history(subagent_tool_call_text(&call)?);
+                        let (mut outcome, states) = if call.name == "RunSubagent" {
+                            (
+                                failed_tool_outcome(
+                                    "RunSubagent is unavailable inside a subagent. Only Kennedy may launch subagents.",
+                                ),
+                                Vec::new(),
+                            )
+                        } else if projection.estimated_tokens() > input_limit {
+                            (
+                                failed_tool_outcome(
+                                    "The Ktool call was not run because its retained invocation would exceed the subagent context limit.",
+                                ),
+                                Vec::new(),
+                            )
+                        } else if !subagent_managed_write_fits(
+                            &self.journal,
+                            &call,
+                            &projection,
+                            input_limit,
+                        ) {
+                            (
+                                failed_tool_outcome(
+                                    "The managed-source write was not run because its resulting current state would exceed the subagent context limit.",
+                                ),
+                                Vec::new(),
+                            )
+                        } else {
+                            let previous = canonical_box_versions(&self.journal);
+                            let mut outcome = match Box::pin(
+                                self.execute_tool(&call, child_operation_id),
+                            )
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    failed_tool_outcome(format!("{} failed: {error}", call.name))
+                                }
+                            };
+                            if let Some(managed) = outcome.managed_source_snapshot.take() {
+                                apply_managed_source_snapshot(
+                                    &mut self.journal,
+                                    managed.kind,
+                                    managed.snapshot,
+                                )?;
+                                outcome.store_result = false;
+                            }
+                            let states = if outcome.ok {
+                                changed_subagent_tool_states(&self.journal, &previous)
+                            } else {
+                                Vec::new()
+                            };
+                            (outcome, states)
+                        };
+                        let exact_result = outcome.text.clone();
+                        let tool_ok = outcome.ok;
+                        let mut provider_result = compact_subagent_tool_result(&outcome, &states);
+                        let mut candidate = projection.clone();
+                        apply_changed_subagent_states(&mut candidate, &states);
+                        candidate.push_history(format!("Ktool result:\n{provider_result}"));
+                        let projection_accepted = candidate.estimated_tokens() <= input_limit;
+                        if projection_accepted {
+                            projection = candidate;
+                            requires_rerender = !states.is_empty();
+                        } else {
+                            outcome.ok = false;
+                            outcome.freeform_write = None;
+                            provider_result = "The Ktool ran, but its result or updated state could not fit in the subagent context. Do not retry it; report the capacity failure to Kennedy.".into();
+                            projection.push_history(format!("Ktool result:\n{provider_result}"));
+                        }
+                        for state in &states {
+                            if state.hide_from_parent && state.text.is_some() {
+                                self.journal.dehydrate_box(now(), state.box_id)?;
+                            }
+                        }
+                        self.journal.record(
+                            now(),
+                            EventKind::Note {
+                                label: "subagent_tool_result".into(),
+                                value: json!({
+                                    "name":call.name,
+                                    "ok":tool_ok,
+                                    "projectionAccepted":projection_accepted,
+                                    "result":exact_result,
+                                }),
+                            },
+                        )?;
+                        pending_freeform_write = outcome.freeform_write.take();
+                        turn.respond(
+                            &native.call_id,
+                            if outcome.ok {
+                                kcode_codex_runtime_v2::ToolResult::success(provider_result)
+                            } else {
+                                kcode_codex_runtime_v2::ToolResult::failure(provider_result)
+                            },
+                        )
+                        .await?;
+                    }
+                    kcode_codex_runtime_v2::AgentEvent::Completed(completed) => break completed,
+                }
+            };
+            let usage = completed.usage.as_ref();
+            self.journal.record(
+                now(),
+                EventKind::Note {
+                    label: "subagent_provider_receipt".into(),
+                    value: json!({
+                        "round":round + 1,
+                        "usage":usage.map(|usage| json!({
+                            "inputTokens":usage.input_tokens,
+                            "outputTokens":usage.output_tokens,
+                            "cachedInputTokens":usage.cached_input_tokens,
+                            "reasoningOutputTokens":usage.reasoning_output_tokens,
+                            "lastInputTokens":usage.last_input_tokens,
+                            "lastOutputTokens":usage.last_output_tokens,
+                        })),
+                    }),
+                },
+            )?;
+            let freeform_write = deferred_freeform_write.take().or(pending_freeform_write);
+            if let Some(request) = freeform_write {
+                if !capturing_freeform_output && completed.answer.is_empty() {
+                    deferred_freeform_write = Some(request);
+                    continue;
+                }
+                let freeform_tool = request.kind.freeform_write_tool();
+                let (outcome, states) = self
+                    .complete_subagent_freeform_write(
+                        request,
+                        completed.answer,
+                        input_limit,
+                        &projection,
+                    )
+                    .await?;
+                let mut candidate = projection.clone();
+                apply_changed_subagent_states(&mut candidate, &states);
+                candidate.push_history(format!("Ktool result:\n{}", outcome.text));
+                ensure_subagent_capacity(&candidate, input_limit)?;
+                projection = candidate;
+                for state in &states {
+                    if state.hide_from_parent && state.text.is_some() {
+                        self.journal.dehydrate_box(now(), state.box_id)?;
+                    }
+                }
+                self.journal.record(
+                    now(),
+                    EventKind::Note {
+                        label: "subagent_tool_result".into(),
+                        value: json!({
+                            "name":freeform_tool,
+                            "ok":outcome.ok,
+                            "projectionAccepted":true,
+                            "result":outcome.text,
+                        }),
+                    },
+                )?;
+                continue;
+            }
+            if requires_rerender {
+                let draft = completed.answer.trim();
+                if !draft.is_empty() {
+                    projection.push_history(format!(
+                        "Assistant draft produced before the state refresh:\n{draft}"
+                    ));
+                }
+                continue;
+            }
+            let answer = completed.answer.trim().to_owned();
+            if !answer.is_empty() {
+                self.journal.record(
+                    now(),
+                    EventKind::Note {
+                        label: "subagent_completed".into(),
+                        value: json!({
+                            "model":model,
+                            "response":answer,
+                        }),
+                    },
+                )?;
+                return Ok(answer);
+            }
+            anyhow::ensure!(
+                used_tool,
+                "subagent provider completed without a response or tool call"
+            );
+        }
+        anyhow::bail!("subagent exceeded the {AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit")
+    }
+
+    async fn complete_subagent_freeform_write(
+        &mut self,
+        request: FreeformWriteRequest,
+        contents: String,
+        input_limit: u64,
+        projection: &SubagentProjection,
+    ) -> anyhow::Result<(ToolOutcome, Vec<ChangedSubagentState>)> {
+        let kind = request.kind;
+        let freeform_tool = kind.freeform_write_tool();
+        let contents = ensure_final_newline(contents);
+        self.journal.record(
+            now(),
+            EventKind::Note {
+                label: "subagent_freeform_write_output".into(),
+                value: json!({
+                    "tool":freeform_tool,
+                    "name":request.name,
+                    "path":request.path,
+                    "updateDescription":request.update_description,
+                    "contents":contents,
+                }),
+            },
+        )?;
+        let backend_arguments = json!({
+            "name":request.name,
+            "path":request.path,
+            "contents":contents,
+        });
+        let preview = self
+            .api
+            .managed_source_execute(
+                &self.rust_lib_session_id,
+                kind.preview_write_tool(),
+                backend_arguments.clone(),
+            )
+            .await?;
+        let preview = preview
+            .snapshot
+            .context("subagent freeform write preview omitted its source snapshot")?;
+        let source_box_id = managed_lib_box_id(&self.journal, kind, &request.name)
+            .context("subagent freeform write source is no longer open")?;
+        let mut prospective = projection.clone();
+        prospective.update_state(
+            format!("tool-state:{source_box_id}"),
+            format!(
+                "Current Managed {} {}:\n{}",
+                kind.label(),
+                preview.name,
+                preview.text
+            ),
+        );
+        anyhow::ensure!(
+            prospective.estimated_tokens() <= input_limit,
+            "{freeform_tool} was not run because its resulting source state would exceed the subagent context limit"
+        );
+        let previous = canonical_box_versions(&self.journal);
+        let execution = self
+            .api
+            .managed_source_execute(&self.rust_lib_session_id, freeform_tool, backend_arguments)
+            .await?;
+        let snapshot = execution
+            .snapshot
+            .context("subagent freeform write omitted its resulting source snapshot")?;
+        apply_managed_source_snapshot(&mut self.journal, kind, snapshot)?;
+        let states = changed_subagent_tool_states(&self.journal, &previous);
+        Ok((
+            ToolOutcome {
+                text: execution.text,
+                store_result: false,
+                ok: true,
+                end_session: false,
+                freeform_write: None,
+                managed_source_snapshot: None,
+            },
+            states,
+        ))
+    }
+
     async fn complete_freeform_write(
         &mut self,
         pending: PendingFreeformWrite,
@@ -2534,6 +3144,30 @@ impl Session {
         let mut freeform_write = None;
         let mut managed_source_snapshot = None;
         let text = match call.name.as_str() {
+            "RunSubagent" => {
+                store_result = true;
+                let first_event = self.journal.state().events.len();
+                match self.run_subagent(&call.arguments, operation_id).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let may_have_effects = self.journal.state().events[first_event..]
+                            .iter()
+                            .any(|event| {
+                                matches!(
+                                    &event.kind,
+                                    EventKind::Note { label, .. }
+                                        if label == "subagent_tool_call"
+                                )
+                            });
+                        if may_have_effects {
+                            return Err(error.context(
+                                "the subagent failed after making Ktool calls; some tool effects may already have occurred",
+                            ));
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             "EndSession" => {
                 validate_arguments(&call.arguments, &[], &["message"])?;
                 anyhow::ensure!(
@@ -4299,6 +4933,50 @@ fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
     )
 }
 
+fn subagent_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
+    kcode_codex_runtime_v2::DynamicTool::new(
+        "call_ktool",
+        "Call one available Ktool by its exact name.",
+        json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["name","arguments"],
+            "properties":{
+                "name":{"type":"string"},
+                "arguments":{"type":"object"}
+            }
+        }),
+    )
+}
+
+fn subagent_tool_call_text(call: &ToolCall) -> anyhow::Result<String> {
+    let rendered = tool_call_box_content(call)?.text;
+    Ok(format!("Ktool call:\n{rendered}"))
+}
+
+fn failed_tool_outcome(text: impl Into<String>) -> ToolOutcome {
+    ToolOutcome {
+        text: text.into(),
+        store_result: false,
+        ok: false,
+        end_session: false,
+        freeform_write: None,
+        managed_source_snapshot: None,
+    }
+}
+
+fn ensure_subagent_capacity(
+    projection: &SubagentProjection,
+    max_input_tokens: u64,
+) -> anyhow::Result<()> {
+    let estimated = projection.estimated_tokens();
+    anyhow::ensure!(
+        estimated <= max_input_tokens,
+        "subagent context requires approximately {estimated} input tokens, over the selected model's {max_input_tokens}-token input limit"
+    );
+    Ok(())
+}
+
 fn native_ktool_call(call: &kcode_codex_runtime_v2::DynamicToolCall) -> anyhow::Result<ToolCall> {
     anyhow::ensure!(call.tool == "call_ktool", "unknown provider tool");
     validate_arguments(&call.arguments, &["name", "arguments"], &[])?;
@@ -4362,6 +5040,35 @@ fn canonical_id(value: &str) -> anyhow::Result<String> {
 fn canonical_node_id(value: &Value, key: &str) -> anyhow::Result<String> {
     let value = string_value(value, key)?;
     canonical_id(&value)
+}
+
+fn canonical_node_id_array(
+    value: &Value,
+    key: &str,
+    maximum: usize,
+) -> anyhow::Result<Vec<String>> {
+    let ids = value
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("{key} must be an array"))?
+        .iter()
+        .map(|value| {
+            canonical_id(
+                value
+                    .as_str()
+                    .with_context(|| format!("{key} entries must be canonical node IDs"))?,
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        ids.len() <= maximum,
+        "{key} must contain at most {maximum} identifiers"
+    );
+    anyhow::ensure!(
+        ids.iter().collect::<HashSet<_>>().len() == ids.len(),
+        "{key} must not contain duplicate identifiers"
+    );
+    Ok(ids)
 }
 
 fn parse_resource_id(value: &str) -> anyhow::Result<String> {
@@ -4689,9 +5396,17 @@ fn controller_message(mode: &AgentMode, free_time: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
+    use axum::{
+        Json, Router,
+        extract::Path,
+        routing::{get, post},
+    };
 
     fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, HistorySession) {
         let root = std::env::temp_dir().join(format!(
@@ -4728,6 +5443,217 @@ mod tests {
             "pending:47".to_owned()
         );
         assert!(parse_resource_id("km:47").is_err());
+    }
+
+    #[test]
+    fn subagent_initial_projection_is_only_ordered_long_descriptions_and_task() {
+        let projection = SubagentProjection::new(
+            vec![
+                "First curated paragraph.".into(),
+                "Second curated paragraph.".into(),
+            ],
+            "Complete the focused task.".into(),
+        );
+
+        assert_eq!(
+            projection.render(),
+            "First curated paragraph.\n\nSecond curated paragraph.\n\nComplete the focused task."
+        );
+        assert!(!projection.render().contains("[box"));
+        assert!(!projection.render().contains("Kennedy system prompt"));
+        assert!(!projection.render().contains("call_ktool"));
+    }
+
+    #[test]
+    fn subagent_state_projection_replaces_and_moves_current_value_to_the_bottom() {
+        let mut projection =
+            SubagentProjection::new(vec!["Tool instructions.".into()], "Edit the code.".into());
+        projection.push_history("Ktool call:\nopen");
+        projection.update_state("source:demo".into(), "Current source:\nold code".into());
+        projection.push_history("Ktool result:\nload completed");
+        projection.update_state("source:demo".into(), "Current source:\nnew code".into());
+
+        let rendered = projection.render();
+        assert!(!rendered.contains("old code"));
+        assert_eq!(rendered.matches("Current source:").count(), 1);
+        assert!(rendered.find("Ktool result").unwrap() < rendered.find("Current source:").unwrap());
+        assert!(rendered.ends_with("Current source:\nnew code"));
+    }
+
+    #[test]
+    fn subagent_receives_new_canonical_state_even_when_parent_box_is_dehydrated() {
+        let (path, mut journal) = test_journal("subagent-dehydrated-state", 10_000);
+        let box_id = apply_rust_lib_snapshot(
+            &mut journal,
+            SourceSnapshot {
+                kind: BackendManagedSourceKind::RustLibrary,
+                name: "example-lib".into(),
+                text: "old source".into(),
+            },
+        )
+        .unwrap();
+        journal.dehydrate_box("t2", box_id).unwrap();
+        let previous = canonical_box_versions(&journal);
+        apply_rust_lib_snapshot(
+            &mut journal,
+            SourceSnapshot {
+                kind: BackendManagedSourceKind::RustLibrary,
+                name: "example-lib".into(),
+                text: "new source".into(),
+            },
+        )
+        .unwrap();
+
+        let states = changed_subagent_tool_states(&journal, &previous);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text.as_deref(), Some("new source"));
+        assert!(states[0].hide_from_parent);
+        if states[0].hide_from_parent {
+            journal.dehydrate_box("t3", box_id).unwrap();
+        }
+        assert!(matches!(
+            journal.state().boxes[&box_id].representation,
+            Representation::Dehydrated { .. }
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn subagent_node_selection_preserves_order_and_rejects_duplicates() {
+        let selected = canonical_node_id_array(
+            &json!({"contextNodeIds":["AAECAwQG","AAECAwQF"]}),
+            "contextNodeIds",
+            SUBAGENT_CONTEXT_NODE_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(selected, vec!["AAECAwQG", "AAECAwQF"]);
+        assert!(
+            canonical_node_id_array(
+                &json!({"contextNodeIds":["AAECAwQF","AAECAwQF"]}),
+                "contextNodeIds",
+                SUBAGENT_CONTEXT_NODE_LIMIT,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_returns_only_terminal_response_from_clean_selected_context() {
+        let submitted = Arc::new(Mutex::new(None));
+        let submitted_for_route = submitted.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/kmap/nodes/{id}",
+                get(|Path(id): Path<String>| async move {
+                    Json(json!({
+                        "id":id,
+                        "short_name":"Selected context",
+                        "short_description":"Not sent",
+                        "long_description":"Exact selected long description.",
+                        "fixed_connections":[],
+                        "recent_connections":[],
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/generate",
+                post(move |Json(body): Json<Value>| {
+                    let submitted = submitted_for_route.clone();
+                    async move {
+                        *submitted.lock().unwrap() = Some(body);
+                        Json(json!({
+                            "response_id":"subagent-response",
+                            "message":{"content":"Exact terminal response."},
+                            "usage":{
+                                "input_tokens":12,
+                                "output_tokens":3,
+                                "cached_tokens":0,
+                                "reasoning_tokens":0,
+                            },
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = super::super::Config {
+            system_prompts_directory: PathBuf::new(),
+            kweb_base: base.clone(),
+            intelligence_base: base.clone(),
+            session_history_base: base.clone(),
+            telegram_relay_base: base,
+            telegram_max_media_bytes: 1_024,
+            telegram_web_user_handle: "@test".into(),
+            runtime_model: RuntimeModel::testing(),
+        };
+        let api = Api::new(&config).unwrap();
+        let (path, journal) = test_journal("subagent-terminal", 1_000_000);
+        let root = "AAECAwQF".to_owned();
+        let context = KmapContext::new(api.clone(), vec![root.clone()]).unwrap();
+        let mut session = Session {
+            api,
+            runtime: RuntimeModel::testing(),
+            journal,
+            plan: KwebPlan::default(),
+            session_type: "conversation".into(),
+            channel: Value::Null,
+            free_time: Value::Null,
+            orchestration: Value::Null,
+            provenance_id: None,
+            rust_lib_session_id: format!("subagent-test:{}", Uuid::new_v4()),
+            root_node_ids: vec![root],
+            reference_root_node_ids: Vec::new(),
+            started_at: "2026-07-27T00:00:00Z".into(),
+            transcript: Vec::new(),
+            pending_turn: true,
+            pending_external_event_id: None,
+            completed: false,
+            rounds_used: 0,
+            commit_receipt: None,
+            commit_author: "test-model".into(),
+            mode: AgentMode::Conversation,
+            source_session_type: None,
+            group_context: Value::Null,
+            context,
+            free_time_end_reason: None,
+            fatal_persistence_error: None,
+        };
+
+        let outcome = session
+            .execute_tool(
+                &ToolCall {
+                    name: "RunSubagent".into(),
+                    arguments: json!({
+                    "model":"gpt-5.6",
+                    "reasoningEffort":"high",
+                    "contextNodeIds":["AAECAwQG"],
+                    "task":"Do exactly this task.",
+                    }),
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "Exact terminal response.");
+        assert!(outcome.ok);
+        assert!(outcome.store_result);
+        let request = submitted.lock().unwrap().clone().unwrap();
+        assert_eq!(request["model"], "gpt-5.6");
+        assert_eq!(
+            request["chatend"],
+            "Exact selected long description.\n\nDo exactly this task."
+        );
+        assert!(!request["chatend"].as_str().unwrap().contains("[box"));
+        assert!(
+            !request["chatend"]
+                .as_str()
+                .unwrap()
+                .contains("Kennedy system prompt")
+        );
+        server.abort();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
