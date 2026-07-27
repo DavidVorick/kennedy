@@ -10,6 +10,9 @@ pub(crate) use http::{Api, ApiError, LocalServices};
 pub(crate) use prompts::{Manuals, RuntimeModel, human_utc_datetime, runtime_description};
 pub(crate) use session::{AgentMode, Session};
 
+// Recent connections are navigation-only fanout summaries unless this policy changes.
+const ACTIVE_CONNECTION_LIMIT: usize = 0;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub system_prompts_directory: PathBuf,

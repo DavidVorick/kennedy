@@ -11,10 +11,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::ACTIVE_CONNECTION_LIMIT;
 #[cfg(test)]
 use super::Config;
-
-const ACTIVE_CONNECTION_LIMIT: usize = 8;
 
 #[derive(Clone)]
 pub(crate) struct LocalServices {
@@ -151,8 +150,8 @@ impl Api {
 
     pub(crate) fn commit_kweb_session(
         &self,
-        input: crate::kmap_http::SessionCommit,
-    ) -> Result<crate::kmap_http::SessionCommitResult, ApiError> {
+        input: kcode_commit_session::CommitRequest,
+    ) -> Result<kcode_commit_session::CommitReceipt, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local.kmap.commit_session(input).map_err(kmap_error),
             #[cfg(test)]
@@ -167,7 +166,7 @@ impl Api {
     pub(crate) fn kmap_file(
         &self,
         object_id: &str,
-    ) -> Result<crate::kmap_http::StoredFile, ApiError> {
+    ) -> Result<crate::kweb_file::StoredFile, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local.kmap.get_file(object_id).map_err(kmap_error),
             #[cfg(test)]
@@ -1083,7 +1082,7 @@ impl Api {
         &self,
         event_id: &str,
         conversation_id: &str,
-        file: &crate::kmap_http::StoredFile,
+        file: &crate::kweb_file::StoredFile,
         complete: bool,
     ) -> Result<Value, ApiError> {
         if let Some(kind) = telegram_native_kind(&file.media_type, file.transport_kind.as_deref()) {
@@ -1596,7 +1595,7 @@ fn fixed_connection_ids(node: &Value) -> Vec<String> {
         .collect()
 }
 
-fn normalize_node(mut node: Value) -> Value {
+pub(super) fn normalize_node(mut node: Value) -> Value {
     let summaries = node
         .get("connection_summaries")
         .and_then(Value::as_array)
@@ -1645,11 +1644,23 @@ fn normalize_node(mut node: Value) -> Value {
         object.insert("fixed_connections".into(), json!(fixed));
         object.insert(
             "active_connections".into(),
-            json!(recent.iter().take(8).cloned().collect::<Vec<_>>()),
+            json!(
+                recent
+                    .iter()
+                    .take(ACTIVE_CONNECTION_LIMIT)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            ),
         );
         object.insert(
             "fanout_connections".into(),
-            json!(recent.iter().skip(8).cloned().collect::<Vec<_>>()),
+            json!(
+                recent
+                    .iter()
+                    .skip(ACTIVE_CONNECTION_LIMIT)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     node
@@ -1687,7 +1698,7 @@ fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Optio
 
 fn telegram_file_form(
     conversation_id: &str,
-    file: &crate::kmap_http::StoredFile,
+    file: &crate::kweb_file::StoredFile,
     complete: bool,
     kind: Option<&str>,
 ) -> Result<multipart::Form, ApiError> {
@@ -1765,21 +1776,27 @@ mod tests {
         assert_eq!(node["owner_root_node_id"], "root");
         assert_eq!(node["fixed_connections"][0]["id"], "fixed");
         assert_eq!(node["fixed_connections"][0]["slot"], 1);
-        assert_eq!(node["active_connections"].as_array().unwrap().len(), 8);
-        assert_eq!(node["fanout_connections"].as_array().unwrap().len(), 1);
-        assert_eq!(node["fanout_connections"][0]["short_name"], "Recent 8");
+        assert!(node["active_connections"].as_array().unwrap().is_empty());
+        assert_eq!(node["fanout_connections"].as_array().unwrap().len(), 9);
+        assert_eq!(node["fanout_connections"][0]["short_name"], "Recent 0");
     }
 
     #[test]
-    fn context_fetch_expands_only_the_first_eight_recent_connections() {
+    fn context_fetch_does_not_expand_recent_connections() {
         let recent = (0..12)
             .map(|index| json!({"id":format!("recent-{index}")}))
             .collect::<Vec<_>>();
+        assert!(active_connection_ids(&json!({"recent_connections":recent})).is_empty());
+    }
+
+    #[test]
+    fn fixed_connection_selection_has_no_policy_count_cap() {
+        let expected = (0..64)
+            .map(|index| format!("fixed-{index}"))
+            .collect::<Vec<_>>();
         assert_eq!(
-            active_connection_ids(&json!({"recent_connections":recent})),
-            (0..8)
-                .map(|index| format!("recent-{index}"))
-                .collect::<Vec<_>>()
+            fixed_connection_ids(&json!({"fixed_connections":expected.clone()})),
+            expected
         );
     }
 

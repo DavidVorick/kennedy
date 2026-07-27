@@ -2013,6 +2013,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-commit-session"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7143f190dbb966fe7de61ec06b803fcdd32aee9f7b9b7e651474333a74469078"
+dependencies = [
+ "chrono",
+ "kcode-kweb-db",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "kcode-dev-tools"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2266,6 +2280,7 @@ dependencies = [
  "kcode-audio-ingress",
  "kcode-codex-runtime",
  "kcode-codex-runtime-v2",
+ "kcode-commit-session",
  "kcode-dev-tools",
  "kcode-intelligence-router",
  "kcode-kmap-size",

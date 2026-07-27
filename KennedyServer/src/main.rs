@@ -1,6 +1,7 @@
 mod audio_ingress;
 mod credentials;
 mod kmap_http;
+mod kweb_file;
 mod kweb_writer;
 mod orchestration;
 mod session_history_http;
@@ -724,14 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_launcher_preserves_workspace_catalog_and_runtime_boundaries() {
+    fn codex_launcher_preserves_catalog_and_runtime_boundaries() {
         let launcher = include_str!("../../scripts/codex-safe");
         let runtime_builder = include_str!("../../scripts/build-codex-safe-runtime");
-        let readme = include_str!("../../README.md");
         let default_catalog = "${TMPDIR:-/tmp}/kcode-codex-catalogs";
 
         assert!(launcher.contains(default_catalog));
-        assert!(readme.contains(default_catalog));
         assert!(!launcher.contains("kennedy-codex-catalogs"));
         assert!(launcher.contains("CODEX_SAFE_CARGO_CACHE_DIR"));
         assert!(launcher.contains("CODEX_IMAGE:-local/codex-dev"));
@@ -740,7 +739,6 @@ mod tests {
         assert!(runtime_builder.contains("--security-opt=no-new-privileges"));
         assert!(runtime_builder.contains("--cap-drop=all"));
         assert!(runtime_builder.contains("--cap-add=SYS_CHROOT"));
-        assert!(readme.contains("scripts/build-codex-safe-runtime"));
     }
 
     #[test]

@@ -1,5 +1,8 @@
 [workspace]
-members = ["KennedyServer", "data/kcode/kcode-session-history"]
+members = [
+    "KennedyServer",
+    "data/kcode/kcode-session-history",
+]
 resolver = "2"
 
 [workspace.package]
@@ -18,6 +21,7 @@ hex = "0.4"
 http = "1"
 kcode-codex-runtime = "0.1.0"
 kcode-codex-runtime-v2 = "0.1.2"
+kcode-commit-session = "=0.1.0"
 kcode-kweb-db = "1.0"
 kcode-kmap-size = "=0.1.0"
 kcode-audio-ingress = "=0.3.1"

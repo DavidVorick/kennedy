@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use kcode_kweb_db::NodeId;
 use serde_json::{Value, json};
 
-use super::Api;
+use super::{ACTIVE_CONNECTION_LIMIT, Api};
 
 struct LoadReceipt {
     requested_identifier: String,
@@ -918,15 +918,11 @@ pub(crate) fn stored_recent_ids(node: &Value) -> Vec<String> {
 }
 
 pub(crate) fn stored_active_ids(node: &Value) -> Vec<String> {
-    let values = stored_connection_ids(node, "active_connections");
+    let mut values = stored_connection_ids(node, "active_connections");
     if values.is_empty() {
-        stored_connection_ids(node, "recent_connections")
-            .into_iter()
-            .take(8)
-            .collect()
-    } else {
-        values
+        values = stored_connection_ids(node, "recent_connections");
     }
+    values.into_iter().take(ACTIVE_CONNECTION_LIMIT).collect()
 }
 
 fn stored_connection_ids(node: &Value, field: &str) -> Vec<String> {
@@ -1473,8 +1469,9 @@ mod tests {
             projection.get("directNodePromotions"),
             Some(&json!([node_a_id.clone()]))
         );
+        assert!(array(projection.get("activeConnectionNodes")).is_empty());
         assert_eq!(
-            array(projection.get("activeConnectionNodes"))
+            array(projection.get("directFanoutNodes"))
                 .iter()
                 .filter_map(node_identifier)
                 .map(str::to_owned)
@@ -1496,11 +1493,26 @@ mod tests {
             position(
                 &rendered,
                 "Now directly loaded; full text already present: AAAAAAAC"
-            ) < position(&rendered, "Node ID: AAAAAAAE")
+            ) < position(&rendered, "AAAAAAAE: Node D")
         );
         assert!(!rendered.contains("Node ID: AAAAAAAD"));
-        assert_eq!(occurrences(&rendered, "Node ID: AAAAAAAE"), 1);
+        assert!(!rendered.contains("Node ID: AAAAAAAE"));
+        assert_eq!(occurrences(&rendered, "AAAAAAAE: Node D"), 1);
         server.abort();
+    }
+
+    #[test]
+    fn legacy_recent_connections_are_fanout_only() {
+        let node = json!({
+            "active_connections": [{"id": "AAAAAAAB"}],
+            "fanout_connections": [{"id": "AAAAAAAC"}],
+            "recent_connections": ["AAAAAAAB", "AAAAAAAC"],
+        });
+        assert!(stored_active_ids(&node).is_empty());
+        assert_eq!(
+            stored_recent_ids(&node),
+            vec!["AAAAAAAB".to_owned(), "AAAAAAAC".to_owned()]
+        );
     }
 
     #[test]

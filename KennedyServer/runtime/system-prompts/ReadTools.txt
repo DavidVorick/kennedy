@@ -1,5 +1,5 @@
 LoadNode
-  Give it the exact canonical eight-character identifier of a node. It loads or refreshes that node and the nearby fixed, active, and fanout context that helps navigate from it. Repeated loads refresh existing boxes instead of duplicating them. A summarized or dehydrated box keeps that representation and becomes stale if the canonical node changed. There is no fixed LoadNode count; the active context budget is the limit.
+  Give it the exact canonical eight-character identifier of a node. It loads or refreshes that node and the nearby fixed and fanout context that helps navigate from it. Repeated loads refresh existing boxes instead of duplicating them. A summarized or dehydrated box keeps that representation and becomes stale if the canonical node changed. There is no fixed LoadNode count; the active context budget is the limit.
 
 DehydrateBox
   Give it the numeric boxId. It removes that box's substantive contents from active context while retaining its identity, lineage, revision, restoration metadata, and chronological continuation markers. This does not unload tool state or change canonical contents.

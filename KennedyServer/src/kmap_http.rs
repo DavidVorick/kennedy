@@ -1,5 +1,7 @@
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     path::Path as FilePath,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -16,13 +18,15 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use kcode_commit_session::PlannedNode;
+use kcode_commit_session::{CommitReceipt, CommitRequest, ErrorKind as CommitErrorKind};
 use kcode_dev_tools::{ObjectStore, ObjectStoreError, ObjectStoreResult};
 use kcode_kweb_db::{
     Config, Error as KwebError, KwebDb, Node, NodeData, NodeId, ObjectId, Owner, Provenance,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower_http::trace::TraceLayer;
@@ -30,7 +34,6 @@ use tower_http::trace::TraceLayer;
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EMBEDDED_PROVENANCE_BYTES: usize = 1024 * 1024;
 const PROVENANCE_MAGIC: &[u8; 8] = b"KPROV\0\x01\0";
-const FILE_MAGIC: &[u8; 8] = b"KFILE001";
 const KUI_LOADER_MODULE: &str = "/lib/kcode-kui-loader/v0.1";
 const KUI_LOADER_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -60,6 +63,7 @@ pub(crate) struct Service {
     database: Arc<KwebDb>,
     roots: SystemRoots,
     receipts: Arc<Mutex<Connection>>,
+    receipt_database: std::path::PathBuf,
 }
 
 impl Service {
@@ -79,6 +83,7 @@ impl Service {
             database: Arc::new(database),
             roots,
             receipts: Arc::new(Mutex::new(receipts)),
+            receipt_database: identity_database.to_path_buf(),
         })
     }
 
@@ -170,10 +175,10 @@ impl Service {
         Ok(value)
     }
 
-    pub(crate) fn get_file(&self, id: &str) -> Result<StoredFile, ApiError> {
+    pub(crate) fn get_file(&self, id: &str) -> Result<crate::kweb_file::StoredFile, ApiError> {
         let id = parse_object_id(id)?;
         let bytes = self.database.get_object(id)?;
-        decode_file_object(id, bytes)
+        crate::kweb_file::decode(id, bytes).map_err(ApiError::internal)
     }
 
     fn load_rust_binary_object(&self, object_id: &str) -> ObjectStoreResult<Vec<u8>> {
@@ -212,165 +217,16 @@ impl Service {
         Ok(id.to_string())
     }
 
-    /// Commit all permanent effects of one completed Kennedy session in one
-    /// Kweb transaction. Pending object and node IDs are allocated first;
-    /// pending node creates are then resolved and materialized; canonical node
-    /// updates are applied last.
-    pub(crate) fn commit_session(
-        &self,
-        input: SessionCommit,
-    ) -> Result<SessionCommitResult, ApiError> {
-        let session_id = input.session_id.clone();
-        let request = serde_json::to_vec(&input).map_err(ApiError::internal)?;
-        let request_sha256 = Sha256::digest(&request);
-        let receipts = self
+    pub(crate) fn commit_session(&self, request: CommitRequest) -> Result<CommitReceipt, ApiError> {
+        // All Kmap mutations share this lane. The library owns the session
+        // receipt connection, while this guard preserves Kennedy's scheduling
+        // relationship with its other idempotent Kweb mutations.
+        let _receipt_lane = self
             .receipts
             .lock()
             .map_err(|_| ApiError::internal("Kmap idempotency mutex is poisoned"))?;
-        let existing = receipts
-            .query_row(
-                "SELECT request_sha256,prepared_json,result_json
-                 FROM kmap_session_commit_receipts WHERE session_id=?1",
-                [&session_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(ApiError::internal)?;
-        if let Some((stored_hash, prepared, result)) = existing {
-            if stored_hash.as_slice() != request_sha256.as_slice() {
-                return Err(ApiError::conflict(
-                    "session ID was already used for a different Kweb commit",
-                ));
-            }
-            if let Some(result) = result {
-                return serde_json::from_str(&result).map_err(ApiError::internal);
-            }
-            if let Some(prepared) = prepared {
-                let recovered: SessionCommitResult =
-                    serde_json::from_str(&prepared).map_err(ApiError::internal)?;
-                let session_object_id = parse_object_id(&recovered.session_object_id)?;
-                match self.database.get_object(session_object_id) {
-                    Ok(_) => {
-                        receipts
-                            .execute(
-                                "UPDATE kmap_session_commit_receipts
-                                 SET result_json=prepared_json,committed_at=?2
-                                 WHERE session_id=?1 AND result_json IS NULL",
-                                params![&session_id, Utc::now().to_rfc3339()],
-                            )
-                            .map_err(ApiError::internal)?;
-                        return Ok(recovered);
-                    }
-                    Err(KwebError::NotFound(_)) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            receipts
-                .execute(
-                    "DELETE FROM kmap_session_commit_receipts
-                     WHERE session_id=?1 AND result_json IS NULL",
-                    [&session_id],
-                )
-                .map_err(ApiError::internal)?;
-        }
-        receipts
-            .execute(
-                "INSERT INTO kmap_session_commit_receipts(
-                     session_id,request_sha256,prepared_json,result_json,started_at,committed_at
-                 ) VALUES(?1,?2,NULL,NULL,?3,NULL)",
-                params![
-                    &session_id,
-                    request_sha256.as_slice(),
-                    Utc::now().to_rfc3339(),
-                ],
-            )
-            .map_err(ApiError::internal)?;
-
-        let mut transaction = self.database.start_transaction(Provenance {
-            author: input.author.clone(),
-            source: "kennedy-session".into(),
-            source_created_at: input.source_created_at,
-            data: format!("Kennedy session {}.", input.session_id),
-        })?;
-        let mut object_ids = BTreeMap::new();
-        for object in input.objects {
-            let bytes = encode_file_object(
-                &object.pending_id,
-                object.file_name.as_deref(),
-                &object.media_type,
-                object.transport_kind.as_deref(),
-                object.bytes,
-            )?;
-            let id = transaction.create_object(bytes)?;
-            object_ids.insert(object.pending_id, id);
-        }
-        let archive = replace_pending_object_tokens(&input.archive, &object_ids);
-        let session_object_id = transaction.create_object(archive)?;
-
-        let mut node_ids = BTreeMap::<String, NodeId>::new();
-        for create in &input.creates {
-            node_ids.insert(create.pending_id.clone(), transaction.reserve_node_id()?);
-        }
-        for create in input.creates {
-            let data =
-                resolve_session_node_data(&create.data, &node_ids, &object_ids, session_object_id)?;
-            transaction.create_reserved_node(node_ids[&create.pending_id], data)?;
-        }
-        for update in input.updates {
-            let id = parse_node_id(&update.node_id)?;
-            let data =
-                resolve_session_node_data(&update.data, &node_ids, &object_ids, session_object_id)?;
-            transaction.update_node(id, data)?;
-        }
-        let mut result = SessionCommitResult {
-            transaction_id: None,
-            session_object_id: session_object_id.to_string(),
-            node_ids: node_ids
-                .iter()
-                .map(|(pending, id)| (pending.clone(), id.to_string()))
-                .collect(),
-            object_ids: object_ids
-                .iter()
-                .map(|(pending, id)| (pending.clone(), id.to_string()))
-                .collect(),
-        };
-        let prepared_json = serde_json::to_string(&result).map_err(ApiError::internal)?;
-        let updated = receipts
-            .execute(
-                "UPDATE kmap_session_commit_receipts
-                 SET prepared_json=?2
-                 WHERE session_id=?1 AND prepared_json IS NULL AND result_json IS NULL",
-                params![&session_id, prepared_json],
-            )
-            .map_err(ApiError::internal)?;
-        if updated != 1 {
-            return Err(ApiError::internal(
-                "Kweb session commit preparation receipt disappeared",
-            ));
-        }
-        let transaction_id = transaction.finalize()?;
-        result.transaction_id = Some(transaction_id.to_string());
-        let result_json = serde_json::to_string(&result).map_err(ApiError::internal)?;
-        let updated = receipts
-            .execute(
-                "UPDATE kmap_session_commit_receipts
-                 SET result_json=?2,committed_at=?3
-                 WHERE session_id=?1 AND result_json IS NULL",
-                params![&session_id, result_json, Utc::now().to_rfc3339(),],
-            )
-            .map_err(ApiError::internal)?;
-        if updated != 1 {
-            return Err(ApiError::internal(
-                "Kweb session commit receipt disappeared during mutation",
-            ));
-        }
-        Ok(result)
+        kcode_commit_session::commit_session(&self.database, &self.receipt_database, request)
+            .map_err(ApiError::from)
     }
 
     fn with_idempotency(
@@ -465,392 +321,6 @@ impl ObjectStore for RustBinaryObjectStore {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct SessionObject {
-    pub pending_id: String,
-    pub file_name: Option<String>,
-    pub media_type: String,
-    pub transport_kind: Option<String>,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionNodeData {
-    pub short_name: String,
-    pub short_description: String,
-    pub long_description: String,
-    pub owner: String,
-    #[serde(default)]
-    pub fixed_connections: Vec<String>,
-    #[serde(default)]
-    pub recent_connections: Vec<String>,
-    #[serde(default)]
-    pub objects: Vec<String>,
-    #[serde(default)]
-    pub include_session_object: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionNodeCreate {
-    pub pending_id: String,
-    pub data: SessionNodeData,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionNodeUpdate {
-    pub node_id: String,
-    pub data: SessionNodeData,
-}
-
-#[derive(Clone, Serialize)]
-pub(crate) struct SessionCommit {
-    pub session_id: String,
-    pub author: String,
-    pub source_created_at: DateTime<Utc>,
-    pub archive: Vec<u8>,
-    pub objects: Vec<SessionObject>,
-    pub creates: Vec<SessionNodeCreate>,
-    pub updates: Vec<SessionNodeUpdate>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionCommitResult {
-    pub transaction_id: Option<String>,
-    pub session_object_id: String,
-    pub node_ids: BTreeMap<String, String>,
-    pub object_ids: BTreeMap<String, String>,
-}
-
-fn is_pending(value: &str) -> bool {
-    value.starts_with("pending:")
-}
-
-fn resolve_session_node_data(
-    data: &SessionNodeData,
-    node_ids: &BTreeMap<String, NodeId>,
-    object_ids: &BTreeMap<String, ObjectId>,
-    session_object_id: ObjectId,
-) -> Result<NodeData, ApiError> {
-    let node = |value: &str| -> Result<NodeId, ApiError> {
-        if is_pending(value) {
-            node_ids
-                .get(value)
-                .copied()
-                .ok_or_else(|| ApiError::invalid(format!("unresolved pending node {value}")))
-        } else {
-            parse_node_id(value)
-        }
-    };
-    let owner = match data.owner.as_str() {
-        "unowned" => Owner::Unowned,
-        "self" => Owner::SelfNode,
-        value => Owner::Node(node(value)?),
-    };
-    let mut objects =
-        data.objects
-            .iter()
-            .map(|value| {
-                if is_pending(value) {
-                    object_ids.get(value).copied().ok_or_else(|| {
-                        ApiError::invalid(format!("unresolved pending object {value}"))
-                    })
-                } else {
-                    parse_object_id(value)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-    if data.include_session_object && !objects.contains(&session_object_id) {
-        objects.push(session_object_id);
-    }
-    Ok(NodeData {
-        short_name: replace_pending_object_tokens_in_text(&data.short_name, object_ids),
-        short_description: replace_pending_object_tokens_in_text(
-            &data.short_description,
-            object_ids,
-        ),
-        long_description: replace_pending_object_tokens_in_text(&data.long_description, object_ids),
-        owner,
-        fixed_connections: data
-            .fixed_connections
-            .iter()
-            .map(|value| node(value))
-            .collect::<Result<_, _>>()?,
-        recent_connections: data
-            .recent_connections
-            .iter()
-            .map(|value| node(value))
-            .collect::<Result<_, _>>()?,
-        objects,
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredFile {
-    pub object_id: ObjectId,
-    pub file_name: String,
-    pub media_type: String,
-    pub transport_kind: Option<String>,
-    pub bytes: Vec<u8>,
-    pub enveloped: bool,
-}
-
-fn encode_file_object(
-    pending_id: &str,
-    file_name: Option<&str>,
-    media_type: &str,
-    transport_kind: Option<&str>,
-    bytes: Vec<u8>,
-) -> Result<Vec<u8>, ApiError> {
-    let file_name = safe_file_name(
-        file_name.unwrap_or_default(),
-        &format!("object-{}.bin", pending_id.trim_start_matches("pending:")),
-    );
-    let media_type = safe_media_type(media_type);
-    let transport_kind = transport_kind
-        .map(safe_transport_kind)
-        .filter(|value| !value.is_empty());
-    let file_name_len = u32::try_from(file_name.len())
-        .map_err(|_| ApiError::invalid("object filename is too large"))?;
-    let media_type_len = u32::try_from(media_type.len())
-        .map_err(|_| ApiError::invalid("object media type is too large"))?;
-    let transport_kind_len =
-        u32::try_from(transport_kind.as_deref().map(str::len).unwrap_or_default())
-            .map_err(|_| ApiError::invalid("object transport kind is too large"))?;
-    let content_len =
-        u64::try_from(bytes.len()).map_err(|_| ApiError::invalid("object content is too large"))?;
-    let mut encoded = Vec::with_capacity(
-        FILE_MAGIC.len()
-            + 4
-            + 4
-            + 4
-            + 8
-            + file_name.len()
-            + media_type.len()
-            + transport_kind.as_deref().map(str::len).unwrap_or_default()
-            + bytes.len(),
-    );
-    encoded.extend_from_slice(FILE_MAGIC);
-    encoded.extend_from_slice(&file_name_len.to_be_bytes());
-    encoded.extend_from_slice(&media_type_len.to_be_bytes());
-    encoded.extend_from_slice(&transport_kind_len.to_be_bytes());
-    encoded.extend_from_slice(&content_len.to_be_bytes());
-    encoded.extend_from_slice(file_name.as_bytes());
-    encoded.extend_from_slice(media_type.as_bytes());
-    if let Some(transport_kind) = transport_kind {
-        encoded.extend_from_slice(transport_kind.as_bytes());
-    }
-    encoded.extend_from_slice(&bytes);
-    Ok(encoded)
-}
-
-fn decode_file_object(id: ObjectId, bytes: Vec<u8>) -> Result<StoredFile, ApiError> {
-    if !bytes.starts_with(FILE_MAGIC) {
-        let (media_type, extension) = sniff_media_type(&bytes);
-        return Ok(StoredFile {
-            object_id: id,
-            file_name: format!("{id}.{extension}"),
-            media_type: media_type.into(),
-            transport_kind: None,
-            bytes,
-            enveloped: false,
-        });
-    }
-    if bytes.len() < FILE_MAGIC.len() + 4 + 4 + 4 + 8 {
-        return Err(ApiError::internal("file object header is truncated"));
-    }
-    let mut offset = FILE_MAGIC.len();
-    let file_name_len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-    let media_type_len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-    let transport_kind_len =
-        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-    let content_len = usize::try_from(u64::from_be_bytes(
-        bytes[offset..offset + 8].try_into().unwrap(),
-    ))
-    .map_err(|_| ApiError::internal("file object content length exceeds usize"))?;
-    offset += 8;
-    let metadata_end = offset
-        .checked_add(file_name_len)
-        .and_then(|value| value.checked_add(media_type_len))
-        .and_then(|value| value.checked_add(transport_kind_len))
-        .context("file object metadata length overflow")
-        .map_err(ApiError::internal)?;
-    let object_end = metadata_end
-        .checked_add(content_len)
-        .context("file object content length overflow")
-        .map_err(ApiError::internal)?;
-    if object_end != bytes.len() {
-        return Err(ApiError::internal(
-            "file object declared lengths differ from its payload",
-        ));
-    }
-    let file_name = std::str::from_utf8(&bytes[offset..offset + file_name_len])
-        .context("file object filename is not UTF-8")
-        .map_err(ApiError::internal)?;
-    offset += file_name_len;
-    let media_type = std::str::from_utf8(&bytes[offset..offset + media_type_len])
-        .context("file object media type is not UTF-8")
-        .map_err(ApiError::internal)?;
-    offset += media_type_len;
-    let transport_kind = std::str::from_utf8(&bytes[offset..offset + transport_kind_len])
-        .context("file object transport kind is not UTF-8")
-        .map_err(ApiError::internal)?;
-    if safe_file_name(file_name, "") != file_name || file_name.is_empty() {
-        return Err(ApiError::internal("file object filename is unsafe"));
-    }
-    if safe_media_type(media_type) != media_type {
-        return Err(ApiError::internal("file object media type is unsafe"));
-    }
-    if !transport_kind.is_empty() && safe_transport_kind(transport_kind) != transport_kind {
-        return Err(ApiError::internal("file object transport kind is unsafe"));
-    }
-    Ok(StoredFile {
-        object_id: id,
-        file_name: file_name.into(),
-        media_type: media_type.into(),
-        transport_kind: (!transport_kind.is_empty()).then(|| transport_kind.into()),
-        bytes: bytes[metadata_end..].to_vec(),
-        enveloped: true,
-    })
-}
-
-fn safe_file_name(value: &str, fallback: &str) -> String {
-    let basename = FilePath::new(value)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    let mut output = basename
-        .chars()
-        .filter(|character| !character.is_control())
-        .map(|character| {
-            if matches!(character, '/' | '\\' | '"' | '\r' | '\n') {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    while output.len() > 255 {
-        output.pop();
-    }
-    if output.trim().is_empty() {
-        fallback.into()
-    } else {
-        output
-    }
-}
-
-fn safe_media_type(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > 255
-        || value
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-        || !value.contains('/')
-    {
-        "application/octet-stream".into()
-    } else {
-        value.into()
-    }
-}
-
-fn safe_transport_kind(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-        .take(64)
-        .collect()
-}
-
-fn sniff_media_type(bytes: &[u8]) -> (&'static str, &'static str) {
-    if bytes.starts_with(b"%PDF-") {
-        ("application/pdf", "pdf")
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        ("image/png", "png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        ("image/jpeg", "jpg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        ("image/gif", "gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        ("image/webp", "webp")
-    } else if bytes.starts_with(b"OggS") {
-        ("audio/ogg", "ogg")
-    } else if bytes.starts_with(b"ID3") || bytes.starts_with(b"\xff\xfb") {
-        ("audio/mpeg", "mp3")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
-        ("audio/wav", "wav")
-    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-        ("video/mp4", "mp4")
-    } else if bytes.starts_with(b"\x1a\x45\xdf\xa3") {
-        ("video/webm", "webm")
-    } else {
-        ("application/octet-stream", "bin")
-    }
-}
-
-fn replace_pending_object_tokens(bytes: &[u8], object_ids: &BTreeMap<String, ObjectId>) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return bytes.to_vec();
-    };
-    replace_pending_object_tokens_in_text(text, object_ids).into_bytes()
-}
-
-fn replace_pending_object_tokens_in_text(
-    text: &str,
-    object_ids: &BTreeMap<String, ObjectId>,
-) -> String {
-    if object_ids.is_empty() || !text.contains("pending:") {
-        return text.into();
-    }
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while let Some(relative) = text[cursor..].find("pending:") {
-        let start = cursor + relative;
-        let number_start = start + "pending:".len();
-        let number_len = text[number_start..]
-            .bytes()
-            .take_while(|byte| byte.is_ascii_digit())
-            .count();
-        if number_len == 0 {
-            output.push_str(&text[cursor..number_start]);
-            cursor = number_start;
-            continue;
-        }
-        let end = number_start + number_len;
-        let token = &text[start..end];
-        let left_boundary = start == 0
-            || !text[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
-        let right_boundary = text[end..]
-            .chars()
-            .next()
-            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
-        if left_boundary
-            && right_boundary
-            && let Some(id) = object_ids.get(token)
-        {
-            output.push_str(&text[cursor..start]);
-            output.push_str(&id.to_string());
-            cursor = end;
-            continue;
-        }
-        output.push_str(&text[cursor..end]);
-        cursor = end;
-    }
-    output.push_str(&text[cursor..]);
-    output
-}
-
 #[derive(Debug)]
 pub(crate) struct ApiError {
     pub(crate) status: StatusCode,
@@ -909,6 +379,17 @@ impl From<KwebError> for ApiError {
             | KwebError::Corrupt(_)
             | KwebError::InvalidConfig(_)
             | KwebError::OfflineUpgradeRequired(_) => Self::internal(error),
+        }
+    }
+}
+
+impl From<kcode_commit_session::Error> for ApiError {
+    fn from(error: kcode_commit_session::Error) -> Self {
+        match error.kind() {
+            CommitErrorKind::InvalidInput => Self::invalid(error.to_string()),
+            CommitErrorKind::NotFound => Self::not_found(error.to_string()),
+            CommitErrorKind::Conflict => Self::conflict(error.to_string()),
+            _ => Self::internal(error),
         }
     }
 }
@@ -1009,30 +490,8 @@ pub(crate) fn initialize(
              started_at TEXT NOT NULL,
              committed_at TEXT,
              CHECK((result_id IS NULL) = (committed_at IS NULL))
-         );
-         CREATE TABLE IF NOT EXISTS kmap_session_commit_receipts (
-             session_id TEXT PRIMARY KEY,
-             request_sha256 BLOB NOT NULL CHECK(length(request_sha256)=32),
-             prepared_json TEXT,
-             result_json TEXT,
-             started_at TEXT NOT NULL,
-             committed_at TEXT,
-             CHECK((result_json IS NULL) = (committed_at IS NULL))
          );",
     )?;
-    let has_prepared_session_receipt = {
-        let mut statement = identity.prepare("PRAGMA table_info(kmap_session_commit_receipts)")?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        columns.iter().any(|column| column == "prepared_json")
-    };
-    if !has_prepared_session_receipt {
-        identity.execute(
-            "ALTER TABLE kmap_session_commit_receipts ADD COLUMN prepared_json TEXT",
-            [],
-        )?;
-    }
     let database = KwebDb::open(kweb_root, config).map_err(anyhow::Error::new)?;
     let existing_user = system_root(&identity, "user")?;
     let existing_kennedy = system_root(&identity, "kennedy")?;
@@ -1256,7 +715,7 @@ async fn get_object_file(
     stored_file_response(state.get_file(&id)?)
 }
 
-fn stored_file_response(file: StoredFile) -> Result<Response, ApiError> {
+fn stored_file_response(file: crate::kweb_file::StoredFile) -> Result<Response, ApiError> {
     let content_type = HeaderValue::from_str(&file.media_type)
         .map_err(|_| ApiError::internal("stored object has an invalid media type"))?;
     let disposition = HeaderValue::from_str(&format!(
@@ -1288,7 +747,7 @@ fn stored_file_response(file: StoredFile) -> Result<Response, ApiError> {
 }
 
 fn ascii_response_file_name(value: &str) -> String {
-    let output = safe_file_name(value, "object.bin")
+    let output = crate::kweb_file::safe_file_name(value, "object.bin")
         .chars()
         .map(|character| {
             if character.is_ascii_graphic() && !matches!(character, '"' | '\\' | '/' | ';') {
@@ -1851,7 +1310,7 @@ mod tests {
     #[test]
     fn file_envelope_preserves_original_bytes_and_safe_metadata() {
         let object_id = ObjectId::from_bytes([0x80, 1, 2, 3, 4, 6]).unwrap();
-        let encoded = encode_file_object(
+        let encoded = crate::kweb_file::encode(
             "pending:4",
             Some("../résumé.pdf"),
             "application/pdf",
@@ -1859,7 +1318,7 @@ mod tests {
             b"%PDF-original".to_vec(),
         )
         .unwrap();
-        let decoded = decode_file_object(object_id, encoded).unwrap();
+        let decoded = crate::kweb_file::decode(object_id, encoded).unwrap();
         assert_eq!(decoded.file_name, "résumé.pdf");
         assert_eq!(decoded.media_type, "application/pdf");
         assert_eq!(decoded.transport_kind.as_deref(), Some("document"));
@@ -1869,19 +1328,6 @@ mod tests {
         assert_eq!(
             response.headers()[header::CONTENT_DISPOSITION],
             "inline; filename=\"r_sum_.pdf\""
-        );
-    }
-
-    #[test]
-    fn pending_object_replacement_respects_token_boundaries() {
-        let object_id = ObjectId::from_bytes([0x80, 1, 2, 3, 4, 7]).unwrap();
-        let ids = BTreeMap::from([("pending:12".into(), object_id)]);
-        assert_eq!(
-            replace_pending_object_tokens_in_text(
-                "object pending:12; keep pending:12abc and xpending:12",
-                &ids,
-            ),
-            format!("object {object_id}; keep pending:12abc and xpending:12")
         );
     }
 
@@ -1968,25 +1414,29 @@ mod tests {
         let circular_node = "pending:9".to_owned();
         let pending_object = "pending:8".to_owned();
         let result = service
-            .commit_session(SessionCommit {
-                session_id: "session-test".into(),
+            .commit_session(CommitRequest {
+                idempotency_key: "session-test".into(),
                 author: "test-model".into(),
                 source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc),
                 archive: format!("{{\"session\":\"archive\",\"object\":\"{pending_object}\"}}")
                     .into_bytes(),
-                objects: vec![SessionObject {
-                    pending_id: pending_object.clone(),
-                    file_name: Some("attachment.txt".into()),
-                    media_type: "text/plain".into(),
-                    transport_kind: Some("document".into()),
-                    bytes: b"attachment".to_vec(),
-                }],
-                creates: vec![
-                    SessionNodeCreate {
-                        pending_id: pending_node.clone(),
-                        data: SessionNodeData {
+                objects: BTreeMap::from([(
+                    pending_object.clone(),
+                    crate::kweb_file::encode(
+                        &pending_object,
+                        Some("attachment.txt"),
+                        "text/plain",
+                        Some("document"),
+                        b"attachment".to_vec(),
+                    )
+                    .unwrap(),
+                )]),
+                creates: BTreeMap::from([
+                    (
+                        pending_node.clone(),
+                        PlannedNode {
                             short_name: "Created Memory".into(),
                             short_description: String::new(),
                             long_description: format!(
@@ -1996,12 +1446,12 @@ mod tests {
                             fixed_connections: Vec::new(),
                             recent_connections: vec![roots.user.to_string(), circular_node.clone()],
                             objects: vec![pending_object.clone()],
-                            include_session_object: true,
+                            attach_session_archive: true,
                         },
-                    },
-                    SessionNodeCreate {
-                        pending_id: circular_node.clone(),
-                        data: SessionNodeData {
+                    ),
+                    (
+                        circular_node.clone(),
+                        PlannedNode {
                             short_name: "Circular Memory".into(),
                             short_description: String::new(),
                             long_description: "References the other created node.".into(),
@@ -2009,13 +1459,13 @@ mod tests {
                             fixed_connections: Vec::new(),
                             recent_connections: vec![pending_node.clone()],
                             objects: Vec::new(),
-                            include_session_object: false,
+                            attach_session_archive: false,
                         },
-                    },
-                ],
-                updates: vec![SessionNodeUpdate {
-                    node_id: roots.user.to_string(),
-                    data: SessionNodeData {
+                    ),
+                ]),
+                updates: BTreeMap::from([(
+                    roots.user,
+                    PlannedNode {
                         short_name: root.data.short_name,
                         short_description: root.data.short_description,
                         long_description: root.data.long_description,
@@ -2028,13 +1478,13 @@ mod tests {
                             .collect(),
                         recent_connections: vec![pending_node.clone()],
                         objects: root.data.objects.iter().map(ToString::to_string).collect(),
-                        include_session_object: true,
+                        attach_session_archive: true,
                     },
-                }],
+                )]),
             })
             .unwrap();
-        let created_id = result.node_ids[&pending_node].parse::<NodeId>().unwrap();
-        let circular_id = result.node_ids[&circular_node].parse::<NodeId>().unwrap();
+        let created_id = result.node_ids[&pending_node];
+        let circular_id = result.node_ids[&circular_node];
         let created = service.database.get_node(created_id).unwrap();
         let circular = service.database.get_node(circular_id).unwrap();
         let updated_root = service.database.get_node(roots.user).unwrap();
@@ -2044,13 +1494,7 @@ mod tests {
         );
         assert_eq!(circular.data.recent_connections, vec![created_id]);
         assert_eq!(updated_root.data.recent_connections, vec![created_id]);
-        assert!(
-            created
-                .data
-                .objects
-                .iter()
-                .any(|id| id.to_string() == result.session_object_id)
-        );
+        assert!(created.data.objects.contains(&result.session_object_id));
         assert_eq!(
             created.data.long_description,
             format!(
@@ -2060,18 +1504,18 @@ mod tests {
         );
         assert_eq!(
             service
-                .get_file(&result.object_ids[&pending_object])
+                .get_file(&result.object_ids[&pending_object].to_string())
                 .unwrap()
                 .bytes,
             b"attachment"
         );
         let archive = service
             .database
-            .get_object(result.session_object_id.parse().unwrap())
+            .get_object(result.session_object_id)
             .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&archive).unwrap()["object"],
-            result.object_ids[&pending_object]
+            result.object_ids[&pending_object].to_string()
         );
         drop(service);
         std::fs::remove_dir_all(directory).unwrap();
@@ -2095,17 +1539,17 @@ mod tests {
         assert!(long_description.split_whitespace().count() > 1_000);
 
         let result = service
-            .commit_session(SessionCommit {
-                session_id: "legacy-node-text".into(),
+            .commit_session(CommitRequest {
+                idempotency_key: "legacy-node-text".into(),
                 author: "test-model".into(),
                 source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc),
                 archive: b"{\"session\":\"sealed-before-policy-change\"}".to_vec(),
-                objects: Vec::new(),
-                creates: vec![SessionNodeCreate {
-                    pending_id: pending_node.clone(),
-                    data: SessionNodeData {
+                objects: BTreeMap::new(),
+                creates: BTreeMap::from([(
+                    pending_node.clone(),
+                    PlannedNode {
                         short_name: String::new(),
                         short_description: "x".repeat(201),
                         long_description: long_description.clone(),
@@ -2113,15 +1557,15 @@ mod tests {
                         fixed_connections: Vec::new(),
                         recent_connections: Vec::new(),
                         objects: Vec::new(),
-                        include_session_object: true,
+                        attach_session_archive: true,
                     },
-                }],
-                updates: Vec::new(),
+                )]),
+                updates: BTreeMap::new(),
             })
             .unwrap();
         let created = service
             .database
-            .get_node(result.node_ids[&pending_node].parse().unwrap())
+            .get_node(result.node_ids[&pending_node])
             .unwrap();
         assert_eq!(created.data.short_name, "");
         assert_eq!(created.data.short_description.chars().count(), 201);
@@ -2142,16 +1586,16 @@ mod tests {
         let kweb = directory.join("kweb");
         let (database, roots) = initialize(&kweb, config(), &identity).unwrap();
         let service = Service::new(database, roots, &identity).unwrap();
-        let input = SessionCommit {
-            session_id: "session-replay-test".into(),
+        let input = CommitRequest {
+            idempotency_key: "session-replay-test".into(),
             author: "test-model".into(),
             source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
             archive: b"{\"header\":{},\"events\":[]}".to_vec(),
-            objects: Vec::new(),
-            creates: Vec::new(),
-            updates: Vec::new(),
+            objects: BTreeMap::new(),
+            creates: BTreeMap::new(),
+            updates: BTreeMap::new(),
         };
         let first = service.commit_session(input.clone()).unwrap();
         let committed_length = std::fs::metadata(kweb.join("transactions.kwl"))

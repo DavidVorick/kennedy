@@ -9,6 +9,7 @@ use std::{
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
+use kcode_commit_session::{CommitReceipt, CommitRequest, PlannedNode};
 use kcode_dev_tools::{
     ManagedSourceKind as BackendManagedSourceKind, PREVIEW_WRITE_FILE_RUST_BIN_TOOL,
     PREVIEW_WRITE_FILE_RUST_LIB_TOOL, PREVIEW_WRITE_FILE_WEB_LIB_TOOL, RUST_BIN_TOOLS,
@@ -29,13 +30,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::kmap_http::{
-    SessionCommit, SessionCommitResult, SessionNodeCreate, SessionNodeData, SessionNodeUpdate,
-    SessionObject,
-};
-
 use super::{
-    Api, Manuals, RuntimeModel,
+    ACTIVE_CONNECTION_LIMIT, Api, Manuals, RuntimeModel,
     context::{
         KmapContext, format_context_node, stored_active_ids, stored_fixed_ids, stored_recent_ids,
     },
@@ -109,7 +105,7 @@ fn restore_session_type(options: &mut SessionOptions, state: &Value) {
     }
 }
 
-fn restore_commit_receipt(restored: Option<&Value>) -> anyhow::Result<Option<SessionCommitResult>> {
+fn restore_commit_receipt(restored: Option<&Value>) -> anyhow::Result<Option<CommitReceipt>> {
     restored
         .and_then(|state| state.get("commitReceipt"))
         .filter(|receipt| !receipt.is_null())
@@ -122,8 +118,15 @@ fn restore_commit_receipt(restored: Option<&Value>) -> anyhow::Result<Option<Ses
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct KwebPlan {
-    creates: Vec<SessionNodeCreate>,
-    updates: BTreeMap<String, SessionNodeData>,
+    creates: Vec<StagedNodeCreate>,
+    updates: BTreeMap<String, PlannedNode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedNodeCreate {
+    pending_id: String,
+    data: PlannedNode,
 }
 
 impl KwebPlan {
@@ -147,14 +150,14 @@ impl KwebPlan {
             .map(Option::unwrap_or_default)
     }
 
-    fn created(&self, id: &str) -> Option<&SessionNodeData> {
+    fn created(&self, id: &str) -> Option<&PlannedNode> {
         self.creates
             .iter()
             .find(|create| create.pending_id == id)
             .map(|create| &create.data)
     }
 
-    fn created_mut(&mut self, id: &str) -> Option<&mut SessionNodeData> {
+    fn created_mut(&mut self, id: &str) -> Option<&mut PlannedNode> {
         self.creates
             .iter_mut()
             .find(|create| create.pending_id == id)
@@ -181,7 +184,7 @@ pub(crate) struct Session {
     pub pending_external_event_id: Option<String>,
     pub completed: bool,
     pub rounds_used: u64,
-    commit_receipt: Option<SessionCommitResult>,
+    commit_receipt: Option<CommitReceipt>,
     commit_author: String,
     mode: AgentMode,
     source_session_type: Option<String>,
@@ -1216,7 +1219,7 @@ impl Session {
             .map(str::to_owned)
             .unwrap_or_else(|| runtime.attribution());
         if let Some(receipt) = &commit_receipt {
-            journal.mark_completed(receipt.session_object_id.clone());
+            journal.mark_completed(receipt.session_object_id.to_string());
         }
         let completed =
             journal.state().completed_session_object.is_some() || commit_receipt.is_some();
@@ -3233,18 +3236,18 @@ impl Session {
     fn staged_kweb_box_content(
         &self,
         identifier: &str,
-        data: &SessionNodeData,
+        data: &PlannedNode,
     ) -> anyhow::Result<BoxContent> {
         let active = data
             .recent_connections
             .iter()
-            .take(8)
+            .take(ACTIVE_CONNECTION_LIMIT)
             .cloned()
             .collect::<Vec<_>>();
         let fanout = data
             .recent_connections
             .iter()
-            .skip(8)
+            .skip(ACTIVE_CONNECTION_LIMIT)
             .cloned()
             .collect::<Vec<_>>();
         let text = format!(
@@ -3342,7 +3345,7 @@ impl Session {
         Ok(())
     }
 
-    fn node_data(&self, id: &str) -> anyhow::Result<SessionNodeData> {
+    fn node_data(&self, id: &str) -> anyhow::Result<PlannedNode> {
         if let Some(data) = self.plan.created(id) {
             return Ok(data.clone());
         }
@@ -3353,7 +3356,7 @@ impl Session {
         Ok(session_node_data(&node))
     }
 
-    fn put_node_data(&mut self, id: &str, data: SessionNodeData) -> anyhow::Result<()> {
+    fn put_node_data(&mut self, id: &str, data: PlannedNode) -> anyhow::Result<()> {
         if let Some(created) = self.plan.created_mut(id) {
             *created = data;
         } else {
@@ -3493,9 +3496,9 @@ impl Session {
             }
         }
         let pending = self.journal.allocate_pending_node(now())?.to_string();
-        self.plan.creates.push(SessionNodeCreate {
+        self.plan.creates.push(StagedNodeCreate {
             pending_id: pending.clone(),
-            data: SessionNodeData {
+            data: PlannedNode {
                 short_name,
                 short_description,
                 long_description,
@@ -3503,7 +3506,7 @@ impl Session {
                 fixed_connections: Vec::new(),
                 recent_connections: parents.clone(),
                 objects: Vec::new(),
-                include_session_object: true,
+                attach_session_archive: true,
             },
         });
         for parent in parents {
@@ -3545,7 +3548,7 @@ impl Session {
         data.short_name = short_name;
         data.short_description = short_description;
         data.long_description = long_description;
-        data.include_session_object = true;
+        data.attach_session_archive = true;
         self.put_node_data(&id, data)?;
         self.stage_plan()?;
         Ok(format!("Staged the update to node {id}."))
@@ -3580,37 +3583,56 @@ impl Session {
             .iter()
             .map(|(id, location)| (id.clone(), location.clone()))
             .collect::<Vec<_>>();
-        let mut objects = Vec::with_capacity(object_locations.len());
+        let mut objects = BTreeMap::new();
         for (id, location) in object_locations {
-            objects.push(SessionObject {
-                pending_id: id.to_string(),
-                file_name: location.metadata.file_name,
-                media_type: location.metadata.media_type,
-                transport_kind: staged_object_transport_kind(&self.journal, &id),
-                bytes: self.journal.read_object(&id)?,
-            });
+            let pending_id = id.to_string();
+            let bytes = crate::kweb_file::encode(
+                &pending_id,
+                location.metadata.file_name.as_deref(),
+                &location.metadata.media_type,
+                staged_object_transport_kind(&self.journal, &id).as_deref(),
+                self.journal.read_object(&id)?,
+            )
+            .with_context(|| format!("encoding staged object {pending_id}"))?;
+            anyhow::ensure!(
+                objects.insert(pending_id.clone(), bytes).is_none(),
+                "duplicate staged object {pending_id}"
+            );
         }
-        let result = self.api.commit_kweb_session(SessionCommit {
-            session_id: self.journal.state().metadata.session_id.clone(),
+        let mut creates = BTreeMap::new();
+        for create in &self.plan.creates {
+            anyhow::ensure!(
+                creates
+                    .insert(create.pending_id.clone(), create.data.clone())
+                    .is_none(),
+                "duplicate staged node {}",
+                create.pending_id
+            );
+        }
+        let updates = self
+            .plan
+            .updates
+            .iter()
+            .map(|(node_id, data)| {
+                node_id
+                    .parse::<NodeId>()
+                    .with_context(|| format!("{node_id:?} is not a canonical node ID"))
+                    .map(|node_id| (node_id, data.clone()))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let result = self.api.commit_kweb_session(CommitRequest {
+            idempotency_key: self.journal.state().metadata.session_id.clone(),
             author: self.commit_author.clone(),
             source_created_at: DateTime::parse_from_rfc3339(&self.started_at)
                 .context("session start timestamp is invalid")?
                 .with_timezone(&Utc),
             archive,
             objects,
-            creates: self.plan.creates.clone(),
-            updates: self
-                .plan
-                .updates
-                .iter()
-                .map(|(node_id, data)| SessionNodeUpdate {
-                    node_id: node_id.clone(),
-                    data: data.clone(),
-                })
-                .collect(),
+            creates,
+            updates,
         })?;
         self.journal
-            .mark_completed(result.session_object_id.clone());
+            .mark_completed(result.session_object_id.to_string());
         self.commit_receipt = Some(result);
         Ok(())
     }
@@ -3784,22 +3806,22 @@ fn restore_kweb_context(journal: &HistorySession, context: &mut KmapContext) -> 
             .box_state(slot.box_id)
             .context("Kweb slot references a missing box")?;
         if let Some(node) = state.canonical.content.metadata.get("storedNode") {
-            nodes.push(node.clone());
+            let node = super::http::normalize_node(node.clone());
             let identifier = node
                 .get("id")
                 .and_then(Value::as_str)
                 .context("stored Kweb node has no identifier")?
                 .to_owned();
-            match state
+            nodes.push(node);
+            if state
                 .canonical
                 .content
                 .metadata
                 .get("kwebRole")
                 .and_then(Value::as_str)
+                == Some("fixed")
             {
-                Some("fixed") => fixed.push(identifier),
-                Some("active") => active.push(identifier),
-                _ => {}
+                fixed.push(identifier);
             }
         }
     }
@@ -3929,8 +3951,8 @@ fn staged_object_transport_kind(
     None
 }
 
-fn session_node_data(node: &Value) -> SessionNodeData {
-    SessionNodeData {
+fn session_node_data(node: &Value) -> PlannedNode {
+    PlannedNode {
         short_name: node
             .get("short_name")
             .and_then(Value::as_str)
@@ -3961,7 +3983,7 @@ fn session_node_data(node: &Value) -> SessionNodeData {
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect(),
-        include_session_object: true,
+        attach_session_archive: true,
     }
 }
 
@@ -4995,9 +5017,9 @@ mod tests {
     #[test]
     fn staged_plan_round_trips_as_additive_json() {
         let plan = KwebPlan {
-            creates: vec![SessionNodeCreate {
+            creates: vec![StagedNodeCreate {
                 pending_id: "pending:3".into(),
-                data: SessionNodeData {
+                data: PlannedNode {
                     short_name: "Test node".into(),
                     short_description: String::new(),
                     long_description: String::new(),
@@ -5005,7 +5027,7 @@ mod tests {
                     fixed_connections: Vec::new(),
                     recent_connections: Vec::new(),
                     objects: Vec::new(),
-                    include_session_object: true,
+                    attach_session_archive: true,
                 },
             }],
             updates: BTreeMap::new(),

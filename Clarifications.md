@@ -36,6 +36,10 @@ This document records user intention with regard to Kennedy.
 - Fixed connections are deliberately placed references, not task slots or a
   priority system. Graph hygiene belongs to Kennedy; the harness should not
   silently promote or rearrange connections.
+- Loading a node loads all of its fixed connections in full, without an
+  arbitrary fixed-connection count cap. Recent connections remain fanout
+  summaries and are not automatically promoted into full active-connection
+  nodes; explicit loading and provider context capacity govern expansion.
 - Use canonical Kweb node and object identifiers at every Kennedy boundary.
   Do not introduce session-local aliases for already-durable resources.
 - Trusted Kennedy users share one graph. Node ownership records provenance and
@@ -107,6 +111,37 @@ This document records user intention with regard to Kennedy.
 - Kennedy chooses exact supported models and capabilities. Avoid vague
   fast/balanced/quality aliases and do not infer media capability solely from a
   MIME string.
+- Kennedy may delegate a focused task through an explicit subagent tool. Each
+  subagent uses Kennedy's chosen exact model and begins with an intentionally
+  box-free application context: the current long descriptions of
+  Kennedy-selected canonical Kmap nodes, in Kennedy's selected order, followed
+  by Kennedy's task prompt. The backend assigns no special role to any selected
+  node; Kennedy controls whether a node's text acts as identity, system-like
+  instruction, operating knowledge, a tool manual, or ordinary task context
+  through her selection and ordering.
+- A subagent does not inherit the parent Chatend, boxes, transcript,
+  automatically loaded roots or connections, ordinary Kennedy prompt layers,
+  ambient host instructions, or provider conversation state. The backend
+  resolves the exact selected nodes at launch and records an inspectable
+  context manifest.
+- Every Ktool otherwise permitted by the parent session is callable through
+  the normal bridge, but the subsystem does not inject a Ktool catalog or any
+  tool manuals. Kennedy must teach a subagent the relevant calls through the
+  selected node descriptions or task prompt. Subagents cannot launch
+  subagents; delegation strategy remains with Kennedy because she has the Kmap
+  context needed to choose it.
+- Stateful Ktools retain exact canonical history while projecting only one
+  current value into the box-free subagent context. When a successful tool call
+  revises that value, keep the earlier call in its existing concise successful
+  representation when suitable, replace only the superseded bulky payload, and
+  move the latest complete value to the bottom of the context after the call
+  that produced it. Do not invent a special marker syntax when the ordinary
+  representation is already compact, do not duplicate complete old and new
+  values, and do not revise state after a failed call. This projection applies
+  generically to managed source and any other box-aware tool.
+- Subagent effects remain subject to the parent session's permissions and
+  transaction boundaries, and stopping the parent operation stops its active
+  subagent work.
 - Attribute every provider call to a stable Kennedy user and persist one usage
   receipt per call, including failed calls for which complete metering is
   unavailable. Cached input, uncached input, reasoning, and visible output must

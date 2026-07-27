@@ -17,6 +17,7 @@ kcode-audio-ingress.workspace = true
 kcode-session-history.workspace = true
 kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true
+kcode-commit-session.workspace = true
 kcode-dev-tools.workspace = true
 kcode-intelligence-router.workspace = true
 kcode-kweb-db.workspace = true
