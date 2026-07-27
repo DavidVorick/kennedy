@@ -19,6 +19,10 @@ This document records user intention with regard to Kennedy.
   library should normally contain 300-3,000 lines of code, expose a lightweight
   well-defined API, and materially simplify what KennedyServer owns; do not
   create pass-through crates that merely relocate server-specific glue.
+- Managed libraries maintained only by LLMs are source-first: their code and
+  tests are the specification. Do not add a separate `Specification.md` that
+  duplicates an ingestible codebase; retain only documentation required by the
+  managed-library or publication boundary.
 - The Rust backend owns orchestration. Browser code owns presentation and local
   input concerns only. Do not add a server-side JavaScript runtime.
 - Prefer explicit, visible behavior over hidden automation. Failures should be
@@ -36,6 +40,10 @@ This document records user intention with regard to Kennedy.
 - Kweb is a generic transactional graph and object store. It should not acquire
   Kennedy-specific concepts such as users, roots, active connections, fanout,
   UI policy, or model behavior.
+- Kweb's root files and binary database records are private to
+  `kcode-kweb-db`. KennedyServer and offline application tooling must use its
+  public API rather than parsing or mutating those formats behind the
+  library's lock and recovery boundary.
 - Kennedy owns graph policy, including roots, ownership, fixed connections,
   active/fanout interpretation, validation, and model attribution.
 - Fixed connections are deliberately placed references, not task slots or a
@@ -206,9 +214,13 @@ This document records user intention with regard to Kennedy.
   Treat transcription, translation, visual interpretation, and speaker
   identification as potentially wrong and preserve uncertainty.
 - Store committed files in self-describing Kweb object envelopes so an object
-  identifier is sufficient to recover safe metadata and exact bytes. Resolve
-  known pending-object references in the same transaction that commits the
-  session.
+  identifier is sufficient to recover safe metadata and exact bytes. Payload
+  readers return the exact original bytes; the application storage envelope is
+  never part of the returned payload. Resolve known pending-object references
+  in the same transaction that commits the session.
+- Application-level file and provenance payload envelopes stored inside opaque
+  Kweb objects have one small typed library owner. KennedyServer decides when
+  to store and transport them, but does not duplicate their binary codecs.
 - Native media delivery and generic-document delivery are intentional distinct
   actions. A failed native send must remain visible as that failure rather than
   silently changing the semantic delivery type.
@@ -324,6 +336,15 @@ This document records user intention with regard to Kennedy.
 - Managed binaries preserve text output exactly and place binary output in the
   object store. Do not pretty-print or wrap exact output merely for consistency
   with an unrelated API.
+- Managed-binary inputs may name canonical objects or objects staged in the
+  current session. Kennedy resolves those references at the session boundary;
+  binary execution receives exact ordered payload bytes and does not own Kweb
+  or Session History lookup. Do not commit or expose staged inputs early merely
+  to execute a binary.
+- Managed-binary outputs become ordinary canonical objects that can immediately
+  flow into later binary calls or normal channel delivery. Preserve recognizable
+  file payloads exactly so existing file decoding and transport selection can
+  identify and emit them without a binary-specific wrapper or conversion step.
 - Runtime networking and timeout choices belong to the managed binary call,
   not to a broad build-time restriction or an unnecessary global concurrency
   policy.

@@ -2028,9 +2028,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-dev-tools"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8737fca4830f1b67c86ed57b37ffe3dcdcb3f6ca37612aff356b40b2872c07bc"
+checksum = "88d1a0a493fb8a58a3d11338775e809dbccf29fad6755a0d5b977e3bb4def767"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2130,9 +2130,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-bins"
-version = "2.0.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c49ae3c8206c29286d341fc8d0cd62e17d38e6e94edb745f01a0d3782f7003"
+checksum = "bad273b7b7fde4caba456f9f8d29555ffeafe45d9bc23806b16eb6a420727cab"
 dependencies = [
  "semver",
 ]
@@ -2142,6 +2142,14 @@ name = "kcode-rust-libs-v2"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbfcb2a46ce2ac2fe8ef732927501ae23a9849dc006fab3d82fd5b603a3fd743"
+
+[[package]]
+name = "kcode-server-object-envelopes"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "kcode-kweb-db",
+]
 
 [[package]]
 name = "kcode-session-history"
@@ -2285,6 +2293,7 @@ dependencies = [
  "kcode-intelligence-router",
  "kcode-kmap-size",
  "kcode-kweb-db",
+ "kcode-server-object-envelopes",
  "kcode-session-history",
  "kcode-telegram-identity",
  "kcode-tg-kennedy-bot",

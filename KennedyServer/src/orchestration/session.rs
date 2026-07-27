@@ -11,13 +11,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use kcode_commit_session::{CommitReceipt, CommitRequest, PlannedNode};
 use kcode_dev_tools::{
-    ManagedSourceKind as BackendManagedSourceKind, PREVIEW_WRITE_FILE_RUST_BIN_TOOL,
-    PREVIEW_WRITE_FILE_RUST_LIB_TOOL, PREVIEW_WRITE_FILE_WEB_LIB_TOOL, RUST_BIN_TOOLS,
-    RUST_LIB_TOOLS, SourceSnapshot, WEB_LIB_TOOLS, WRITE_FILE_FREEFORM_RUST_BIN_TOOL,
-    WRITE_FILE_FREEFORM_RUST_LIB_TOOL, WRITE_FILE_FREEFORM_WEB_LIB_TOOL, WRITE_RUST_BIN_TOOL,
-    WRITE_RUST_LIB_TOOL, WRITE_WEB_LIB_TOOL, proposed_write_snapshot,
+    CALL_RUST_BIN_TOOL, ManagedSourceKind as BackendManagedSourceKind,
+    PREVIEW_WRITE_FILE_RUST_BIN_TOOL, PREVIEW_WRITE_FILE_RUST_LIB_TOOL,
+    PREVIEW_WRITE_FILE_WEB_LIB_TOOL, RUST_BIN_TOOLS, RUST_LIB_TOOLS, SourceSnapshot, WEB_LIB_TOOLS,
+    WRITE_FILE_FREEFORM_RUST_BIN_TOOL, WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
+    WRITE_FILE_FREEFORM_WEB_LIB_TOOL, WRITE_RUST_BIN_TOOL, WRITE_RUST_LIB_TOOL, WRITE_WEB_LIB_TOOL,
+    proposed_write_snapshot,
 };
 use kcode_kweb_db::{NodeId, ObjectId};
+use kcode_server_object_envelopes::encode_file;
 use kcode_session_history::{
     NewSession, Session as HistorySession,
     chatend::{
@@ -2963,6 +2965,7 @@ impl Session {
                 &self.rust_lib_session_id,
                 kind.preview_write_tool(),
                 backend_arguments.clone(),
+                Vec::new(),
             )
             .await?;
         let preview = preview
@@ -2987,7 +2990,12 @@ impl Session {
         let previous = canonical_box_versions(&self.journal);
         let execution = self
             .api
-            .managed_source_execute(&self.rust_lib_session_id, freeform_tool, backend_arguments)
+            .managed_source_execute(
+                &self.rust_lib_session_id,
+                freeform_tool,
+                backend_arguments,
+                Vec::new(),
+            )
             .await?;
         let snapshot = execution
             .snapshot
@@ -3035,6 +3043,7 @@ impl Session {
                 &self.rust_lib_session_id,
                 kind.preview_write_tool(),
                 backend_arguments.clone(),
+                Vec::new(),
             )
             .await;
         let preview = match preview_result {
@@ -3104,7 +3113,12 @@ impl Session {
 
         let execution_result = self
             .api
-            .managed_source_execute(&self.rust_lib_session_id, freeform_tool, backend_arguments)
+            .managed_source_execute(
+                &self.rust_lib_session_id,
+                freeform_tool,
+                backend_arguments,
+                Vec::new(),
+            )
             .await;
         let execution = match execution_result {
             Ok(execution) => execution,
@@ -3539,9 +3553,27 @@ impl Session {
                 || WEB_LIB_TOOLS.contains(&name)
                 || RUST_BIN_TOOLS.contains(&name) =>
             {
+                let mut objects = Vec::new();
+                if name == CALL_RUST_BIN_TOOL {
+                    let object_ids = rust_binary_object_ids(&call.arguments)?;
+                    objects.reserve(object_ids.len());
+                    for object_id in object_ids {
+                        let bytes = if object_id.starts_with("pending:") {
+                            read_pending_binary_object(&mut self.journal, &object_id)?
+                        } else {
+                            self.api.kmap_file(&object_id)?.bytes
+                        };
+                        objects.push(bytes);
+                    }
+                }
                 let execution = self
                     .api
-                    .managed_source_execute(&self.rust_lib_session_id, name, call.arguments.clone())
+                    .managed_source_execute(
+                        &self.rust_lib_session_id,
+                        name,
+                        call.arguments.clone(),
+                        objects,
+                    )
                     .await?;
                 if let Some(snapshot) = execution.snapshot {
                     let kind = ManagedSourceKind::from_backend(snapshot.kind);
@@ -4220,7 +4252,7 @@ impl Session {
         let mut objects = BTreeMap::new();
         for (id, location) in object_locations {
             let pending_id = id.to_string();
-            let bytes = crate::kweb_file::encode(
+            let bytes = encode_file(
                 &pending_id,
                 location.metadata.file_name.as_deref(),
                 &location.metadata.media_type,
@@ -4664,6 +4696,33 @@ fn read_pending_object(
     );
     let bytes = journal.read_object(&pending_id)?;
     Ok((pending_id, location.metadata, bytes))
+}
+
+fn rust_binary_object_ids(arguments: &Value) -> anyhow::Result<Vec<String>> {
+    let Some(object_ids) = arguments.get("objectIds") else {
+        return Ok(Vec::new());
+    };
+    object_ids
+        .as_array()
+        .context("Rust-binary objectIds must be an array")?
+        .iter()
+        .map(|object_id| {
+            object_id
+                .as_str()
+                .map(str::to_owned)
+                .context("Rust-binary objectIds must contain only strings")
+        })
+        .collect()
+}
+
+fn read_pending_binary_object(
+    journal: &mut HistorySession,
+    object_id: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let pending_id = PendingId::parse(object_id.to_owned())?;
+    journal
+        .read_object(&pending_id)
+        .with_context(|| format!("reading Rust-binary input object {pending_id}"))
 }
 
 fn ingress_object_filename(value: Option<&str>, fallback: &str) -> String {
@@ -5682,6 +5741,17 @@ mod tests {
         assert_eq!(object_id, staged);
         assert_eq!(metadata.file_name.as_deref(), Some("diagram.png"));
         assert_eq!(bytes, expected);
+        assert_eq!(
+            rust_binary_object_ids(&json!({
+                "objectIds":[staged.to_string(), "AAECAwQF"]
+            }))
+            .unwrap(),
+            vec![staged.to_string(), "AAECAwQF".to_owned()]
+        );
+        assert_eq!(
+            read_pending_binary_object(&mut journal, &staged.to_string()).unwrap(),
+            expected
+        );
         assert!(validate_annotation_media("gpt-5.6", "image/png").is_ok());
         assert!(validate_annotation_media("gpt-5.6-sol", "image/webp").is_ok());
         assert!(validate_annotation_media("gemini-2.5-flash", "audio/mpeg").is_ok());

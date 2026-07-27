@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use kcode_server_object_envelopes::StoredFile;
 use reqwest::multipart;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
@@ -197,10 +198,7 @@ impl Api {
         }
     }
 
-    pub(crate) fn kmap_file(
-        &self,
-        object_id: &str,
-    ) -> Result<crate::kweb_file::StoredFile, ApiError> {
+    pub(crate) fn kmap_file(&self, object_id: &str) -> Result<StoredFile, ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local.kmap.get_file(object_id).map_err(kmap_error),
             #[cfg(test)]
@@ -1041,15 +1039,37 @@ impl Api {
         session_id: &str,
         name: &str,
         arguments: Value,
+        objects: Vec<Vec<u8>>,
     ) -> Result<kcode_dev_tools::ToolExecution, ApiError> {
         match &self.services {
-            ServiceBackend::Local(local) => local
-                .dev_tools
-                .execute(session_id.to_owned(), name.to_owned(), arguments)
-                .await
-                .map_err(dev_tools_error),
+            ServiceBackend::Local(local) => {
+                let mut execution = local
+                    .dev_tools
+                    .execute(session_id.to_owned(), name.to_owned(), arguments, objects)
+                    .await
+                    .map_err(dev_tools_error)?;
+                let mut object_ids = Vec::with_capacity(execution.objects.len());
+                for bytes in std::mem::take(&mut execution.objects) {
+                    object_ids.push(
+                        local
+                            .kmap
+                            .save_rust_binary_object(bytes)
+                            .map_err(kmap_error)?,
+                    );
+                }
+                append_object_ids(&mut execution.text, &object_ids);
+                Ok(execution)
+            }
             #[cfg(test)]
             ServiceBackend::Http(bases) => {
+                if !objects.is_empty() {
+                    return Err(ApiError {
+                        status: None,
+                        code: "local_service_unavailable".into(),
+                        message: "Managed-source object calls require the in-process Kweb service."
+                            .into(),
+                    });
+                }
                 let kind = managed_source_kind(name).ok_or_else(|| ApiError {
                     status: None,
                     code: "unknown_managed_source_tool".into(),
@@ -1134,7 +1154,11 @@ impl Api {
                                 .flatten()
                             })
                     });
-                Ok(kcode_dev_tools::ToolExecution { text, snapshot })
+                Ok(kcode_dev_tools::ToolExecution {
+                    text,
+                    objects: Vec::new(),
+                    snapshot,
+                })
             }
         }
     }
@@ -1246,7 +1270,7 @@ impl Api {
         &self,
         event_id: &str,
         conversation_id: &str,
-        file: &crate::kweb_file::StoredFile,
+        file: &StoredFile,
         complete: bool,
     ) -> Result<Value, ApiError> {
         if let Some(kind) = telegram_native_kind(&file.media_type, file.transport_kind.as_deref()) {
@@ -1587,6 +1611,16 @@ fn managed_source_kind(name: &str) -> Option<kcode_dev_tools::ManagedSourceKind>
     }
 }
 
+fn append_object_ids(text: &mut String, object_ids: &[String]) {
+    if object_ids.is_empty() {
+        return;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&object_ids.join("\n"));
+}
+
 fn dev_tools_error(error: kcode_dev_tools::ToolError) -> ApiError {
     ApiError {
         status: Some(error.status),
@@ -1869,7 +1903,7 @@ fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Optio
 
 fn telegram_file_form(
     conversation_id: &str,
-    file: &crate::kweb_file::StoredFile,
+    file: &StoredFile,
     complete: bool,
     kind: Option<&str>,
 ) -> Result<multipart::Form, ApiError> {
@@ -1895,6 +1929,20 @@ fn telegram_file_form(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_output_ids_preserve_exact_guest_text() {
+        let mut text = "plain text".to_owned();
+        append_object_ids(&mut text, &[]);
+        assert_eq!(text, "plain text");
+
+        append_object_ids(&mut text, &["object-1".into()]);
+        assert_eq!(text, "plain text\nobject-1");
+
+        let mut text = "already terminated\n".to_owned();
+        append_object_ids(&mut text, &["one".into(), "two".into()]);
+        assert_eq!(text, "already terminated\none\ntwo");
+    }
 
     #[test]
     fn known_ogg_audio_is_not_misclassified_as_video() {
@@ -2038,6 +2086,7 @@ mod tests {
                 "test-session",
                 kcode_dev_tools::CALL_RUST_BIN_TOOL,
                 default_arguments.clone(),
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -2046,6 +2095,7 @@ mod tests {
                 "test-session",
                 kcode_dev_tools::CALL_RUST_BIN_TOOL,
                 custom_arguments.clone(),
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -2053,6 +2103,7 @@ mod tests {
         let exact = " leading space\n{\"not\":\"pretty printed\"}\nABCDEFGH";
         assert_eq!(first.text, exact);
         assert_eq!(second.text, exact);
+        assert!(first.objects.is_empty());
         assert!(first.snapshot.is_none());
         let calls = calls.lock().unwrap();
         assert_eq!(calls[0]["arguments"], default_arguments);

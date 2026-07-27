@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "KennedyServer",
+    "data/kcode/kcode-server-object-envelopes",
     "data/kcode/kcode-session-history",
 ]
 resolver = "2"
@@ -24,8 +25,9 @@ kcode-codex-runtime-v2 = "0.1.2"
 kcode-commit-session = "=0.1.0"
 kcode-kweb-db = "1.0"
 kcode-kmap-size = "=0.1.0"
+kcode-server-object-envelopes = { path = "data/kcode/kcode-server-object-envelopes" }
 kcode-audio-ingress = "=0.3.1"
-kcode-dev-tools = "=0.2.0"
+kcode-dev-tools = "=0.3.0"
 kcode-session-history = { path = "data/kcode/kcode-session-history" }
 kcode-telegram-identity = "=0.1.0"
 kcode-intelligence-router = "=0.1.0"

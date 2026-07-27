@@ -1,8 +1,6 @@
 mod audio_ingress;
 mod credentials;
 mod kmap_http;
-mod kweb_file;
-mod kweb_writer;
 mod orchestration;
 mod session_history_http;
 
@@ -107,8 +105,6 @@ enum Command {
     },
     /// Estimate the token footprint of all current Kmap node text.
     KmapSize,
-    /// Generate Kennedy's permanent Kweb key inside the encrypted vault.
-    ProvisionKwebWriter,
 }
 
 #[derive(Subcommand, Debug)]
@@ -158,11 +154,6 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", kcode_kmap_size::render(&size));
             Ok(())
         }
-        Some(Command::ProvisionKwebWriter) => {
-            let _maintenance_guard =
-                maintenance_guard(&args.kweb_bind, "provisioning the Kweb writer").await?;
-            provision_kweb_writer(&args.kweb_root, &vault_path)
-        }
         None => run_server(args, vault_path).await,
     }
 }
@@ -204,7 +195,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let (kmap, system_roots) =
         kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
     let kmap_service = kmap_http::Service::new(kmap, system_roots, &args.user_database)?;
-    let object_store = Arc::new(kmap_http::RustBinaryObjectStore::new(kmap_service.clone()));
     let dev_tools = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
         rust_libraries_root: args.rust_libs_root.clone(),
         web_libraries_root: args.web_libs_root.clone(),
@@ -212,7 +202,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         rust_binaries_root: args.rust_bins_root.clone(),
         rust_binary_publications_root: args.rust_bin_artifacts_root.clone(),
         crates_io_registry_token: crates_io_key,
-        object_store,
     })
     .map_err(anyhow::Error::new)
     .with_context(|| {
@@ -501,44 +490,6 @@ fn kweb_config(vault: &CredentialVault) -> anyhow::Result<KwebConfig> {
         writers_by_priority,
         gossip: Arc::new(NoopGossip),
     })
-}
-
-fn provision_kweb_writer(kweb_root: &Path, vault_path: &Path) -> anyhow::Result<()> {
-    let (mut vault, passphrase) = unlock_for_edit(vault_path)?;
-    let mut signing_key = if let Some(existing) = vault.secret(KWEB_WRITER_SIGNING_KEY_SECRET)? {
-        let decoded = hex::decode(existing.expose_secret().trim())
-            .context("decoding the existing Kweb writer signing key")?;
-        Zeroizing::new(
-            decoded
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("the existing Kweb signing key is not 32 bytes"))?,
-        )
-    } else {
-        let generated = Zeroizing::new(rand::random::<[u8; 32]>());
-        vault.set(KWEB_WRITER_SIGNING_KEY_SECRET, hex::encode(*generated))?;
-        vault.save(vault_path, &passphrase)?;
-        generated
-    };
-    let permanent_writer = WriterId::from_signing_key(&signing_key);
-    let writers = if kweb_root.exists() {
-        kweb_writer::install_permanent_writer(kweb_root, permanent_writer)?
-    } else {
-        vec![permanent_writer]
-    };
-    vault.set(
-        KWEB_WRITERS_SECRET,
-        writers
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-    )?;
-    vault.save(vault_path, &passphrase)?;
-    signing_key.zeroize();
-    println!(
-        "Provisioned Kennedy Kweb writer {permanent_writer}. The private key was written only to the encrypted vault."
-    );
-    Ok(())
 }
 
 fn resolve_optional_secret(
@@ -841,18 +792,6 @@ mod tests {
 
     #[tokio::test]
     async fn unified_dev_tools_service_opens_all_roots_and_routes_three_source_kinds() {
-        struct EmptyObjectStore;
-
-        impl kcode_dev_tools::ObjectStore for EmptyObjectStore {
-            fn load(&self, _object_id: &str) -> kcode_dev_tools::ObjectStoreResult<Vec<u8>> {
-                Err(kcode_dev_tools::ObjectStoreError::new("not available"))
-            }
-
-            fn save(&self, _bytes: &[u8]) -> kcode_dev_tools::ObjectStoreResult<String> {
-                Err(kcode_dev_tools::ObjectStoreError::new("not available"))
-            }
-        }
-
         let directory = std::env::temp_dir().join(format!(
             "kennedy-dev-tools-open-test-{}",
             uuid::Uuid::new_v4()
@@ -869,7 +808,6 @@ mod tests {
             rust_binaries_root: rust_binaries.clone(),
             rust_binary_publications_root: rust_binary_artifacts.clone(),
             crates_io_registry_token: "test-token".into(),
-            object_store: Arc::new(EmptyObjectStore),
         })
         .unwrap();
 
@@ -921,7 +859,12 @@ mod tests {
             ),
         ] {
             let created = service
-                .execute("create-session", create, serde_json::json!({"name":name}))
+                .execute(
+                    "create-session",
+                    create,
+                    serde_json::json!({"name":name}),
+                    Vec::new(),
+                )
                 .await
                 .unwrap();
             assert_eq!(created.snapshot.unwrap().kind, kind);
@@ -934,13 +877,19 @@ mod tests {
                         "path":path,
                         "contents":"// Kennedy managed source\n",
                     }),
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
             assert_eq!(written.snapshot.unwrap().kind, kind);
 
             let open_result = service
-                .execute("open-session", open, serde_json::json!({"name":name}))
+                .execute(
+                    "open-session",
+                    open,
+                    serde_json::json!({"name":name}),
+                    Vec::new(),
+                )
                 .await
                 .unwrap();
             assert_eq!(open_result.snapshot.unwrap().kind, kind);

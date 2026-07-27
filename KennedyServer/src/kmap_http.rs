@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use axum::{
     Json, Router,
     body::Body,
@@ -21,9 +21,14 @@ use chrono::{DateTime, Utc};
 #[cfg(test)]
 use kcode_commit_session::PlannedNode;
 use kcode_commit_session::{CommitReceipt, CommitRequest, ErrorKind as CommitErrorKind};
-use kcode_dev_tools::{ObjectStore, ObjectStoreError, ObjectStoreResult};
 use kcode_kweb_db::{
     Config, Error as KwebError, KwebDb, Node, NodeData, NodeId, ObjectId, Owner, Provenance,
+};
+#[cfg(test)]
+use kcode_server_object_envelopes::encode_file;
+use kcode_server_object_envelopes::{
+    StoredFile, StoredProvenance, decode_file, decode_provenance, encode_provenance,
+    sanitize_file_name,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -33,7 +38,6 @@ use tower_http::trace::TraceLayer;
 
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EMBEDDED_PROVENANCE_BYTES: usize = 1024 * 1024;
-const PROVENANCE_MAGIC: &[u8; 8] = b"KPROV\0\x01\0";
 const KUI_LOADER_MODULE: &str = "/lib/kcode-kui-loader/v0.1";
 const KUI_LOADER_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -175,45 +179,21 @@ impl Service {
         Ok(value)
     }
 
-    pub(crate) fn get_file(&self, id: &str) -> Result<crate::kweb_file::StoredFile, ApiError> {
+    pub(crate) fn get_file(&self, id: &str) -> Result<StoredFile, ApiError> {
         let id = parse_object_id(id)?;
         let bytes = self.database.get_object(id)?;
-        crate::kweb_file::decode(id, bytes).map_err(ApiError::internal)
+        decode_file(id, bytes).map_err(ApiError::internal)
     }
 
-    fn load_rust_binary_object(&self, object_id: &str) -> ObjectStoreResult<Vec<u8>> {
-        let id = ObjectId::from_str(object_id)
-            .map_err(|_| ObjectStoreError::new("The Rust-binary input object ID is invalid."))?;
-        self.database.get_object(id).map_err(|error| {
-            tracing::warn!(error=%error, object_id, "Rust-binary input object load failed");
-            ObjectStoreError::new(match error {
-                KwebError::NotFound(_) => "The Rust-binary input object was not found.",
-                _ => "The Rust-binary input object could not be loaded.",
-            })
-        })
-    }
-
-    fn save_rust_binary_object(&self, bytes: &[u8]) -> ObjectStoreResult<String> {
-        let mut transaction = self
-            .database
-            .start_transaction(Provenance {
-                author: "Kennedy".into(),
-                source: "kennedy-rust-binary".into(),
-                source_created_at: Utc::now(),
-                data: "Output payload from a managed Rust-binary call.".into(),
-            })
-            .map_err(|error| {
-                tracing::warn!(error=%error, "Rust-binary output transaction failed to start");
-                ObjectStoreError::new("The Rust-binary output object could not be stored.")
-            })?;
-        let id = transaction.create_object(bytes.to_vec()).map_err(|error| {
-            tracing::warn!(error=%error, "Rust-binary output object creation failed");
-            ObjectStoreError::new("The Rust-binary output object could not be stored.")
+    pub(crate) fn save_rust_binary_object(&self, bytes: Vec<u8>) -> Result<String, ApiError> {
+        let mut transaction = self.database.start_transaction(Provenance {
+            author: "Kennedy".into(),
+            source: "kennedy-rust-binary".into(),
+            source_created_at: Utc::now(),
+            data: "Output payload from a managed Rust-binary call.".into(),
         })?;
-        transaction.finalize().map_err(|error| {
-            tracing::warn!(error=%error, "Rust-binary output transaction failed to finalize");
-            ObjectStoreError::new("The Rust-binary output object could not be stored.")
-        })?;
+        let id = transaction.create_object(bytes)?;
+        transaction.finalize()?;
         Ok(id.to_string())
     }
 
@@ -297,27 +277,6 @@ impl Service {
             ));
         }
         Ok(result_id)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct RustBinaryObjectStore {
-    service: Service,
-}
-
-impl RustBinaryObjectStore {
-    pub(crate) fn new(service: Service) -> Self {
-        Self { service }
-    }
-}
-
-impl ObjectStore for RustBinaryObjectStore {
-    fn load(&self, object_id: &str) -> ObjectStoreResult<Vec<u8>> {
-        self.service.load_rust_binary_object(object_id)
-    }
-
-    fn save(&self, bytes: &[u8]) -> ObjectStoreResult<String> {
-        self.service.save_rust_binary_object(bytes)
     }
 }
 
@@ -444,24 +403,6 @@ struct CreateProvenanceRequest {
     data: String,
     source: String,
     source_created_at: String,
-}
-
-#[derive(Clone, Debug)]
-struct StoredProvenance {
-    data: String,
-    source: String,
-    source_created_at: DateTime<Utc>,
-    artifacts: Vec<StoredArtifact>,
-}
-
-#[derive(Clone, Debug)]
-struct StoredArtifact {
-    object_id: ObjectId,
-    original_filename: String,
-    media_type: String,
-    role: String,
-    byte_length: u64,
-    sha256: [u8; 32],
 }
 
 pub(crate) fn initialize(
@@ -677,8 +618,8 @@ async fn create_provenance(
             source_created_at,
             artifacts: Vec::new(),
         };
-        let id = transaction
-            .create_object(encode_stored_provenance(&envelope).map_err(ApiError::internal)?)?;
+        let id =
+            transaction.create_object(encode_provenance(&envelope).map_err(ApiError::internal)?)?;
         transaction.finalize()?;
         Ok(id.to_string())
     })?;
@@ -715,7 +656,7 @@ async fn get_object_file(
     stored_file_response(state.get_file(&id)?)
 }
 
-fn stored_file_response(file: crate::kweb_file::StoredFile) -> Result<Response, ApiError> {
+fn stored_file_response(file: StoredFile) -> Result<Response, ApiError> {
     let content_type = HeaderValue::from_str(&file.media_type)
         .map_err(|_| ApiError::internal("stored object has an invalid media type"))?;
     let disposition = HeaderValue::from_str(&format!(
@@ -747,7 +688,7 @@ fn stored_file_response(file: crate::kweb_file::StoredFile) -> Result<Response, 
 }
 
 fn ascii_response_file_name(value: &str) -> String {
-    let output = crate::kweb_file::safe_file_name(value, "object.bin")
+    let output = sanitize_file_name(value, "object.bin")
         .chars()
         .map(|character| {
             if character.is_ascii_graphic() && !matches!(character, '"' | '\\' | '/' | ';') {
@@ -973,7 +914,7 @@ fn transaction_provenance(
 
 fn load_provenance(database: &KwebDb, id: ObjectId) -> Result<StoredProvenance, ApiError> {
     let bytes = database.get_object(id)?;
-    decode_stored_provenance(&bytes)
+    decode_provenance(&bytes)
         .map_err(|error| ApiError::internal(format!("invalid provenance object {id}: {error}")))
 }
 
@@ -1093,115 +1034,6 @@ fn node_request_digest(
     hash.finish()
 }
 
-fn encode_stored_provenance(value: &StoredProvenance) -> anyhow::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    output.extend_from_slice(PROVENANCE_MAGIC);
-    output.extend_from_slice(&value.source_created_at.timestamp().to_be_bytes());
-    output.extend_from_slice(
-        &value
-            .source_created_at
-            .timestamp_subsec_nanos()
-            .to_be_bytes(),
-    );
-    put_provenance_string(&mut output, &value.source)?;
-    put_provenance_string(&mut output, &value.data)?;
-    output.extend_from_slice(
-        &u64::try_from(value.artifacts.len())
-            .context("too many provenance artifacts")?
-            .to_be_bytes(),
-    );
-    for artifact in &value.artifacts {
-        output.extend_from_slice(&artifact.object_id.to_bytes());
-        put_provenance_string(&mut output, &artifact.original_filename)?;
-        put_provenance_string(&mut output, &artifact.media_type)?;
-        put_provenance_string(&mut output, &artifact.role)?;
-        output.extend_from_slice(&artifact.byte_length.to_be_bytes());
-        output.extend_from_slice(&artifact.sha256);
-    }
-    Ok(output)
-}
-
-fn put_provenance_string(output: &mut Vec<u8>, value: &str) -> anyhow::Result<()> {
-    output.extend_from_slice(
-        &u32::try_from(value.len())
-            .context("provenance string exceeds u32")?
-            .to_be_bytes(),
-    );
-    output.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn decode_stored_provenance(bytes: &[u8]) -> anyhow::Result<StoredProvenance> {
-    struct Reader<'a> {
-        bytes: &'a [u8],
-        offset: usize,
-    }
-    impl<'a> Reader<'a> {
-        fn take(&mut self, length: usize) -> anyhow::Result<&'a [u8]> {
-            let end = self
-                .offset
-                .checked_add(length)
-                .context("provenance offset overflow")?;
-            ensure!(end <= self.bytes.len(), "provenance object is truncated");
-            let value = &self.bytes[self.offset..end];
-            self.offset = end;
-            Ok(value)
-        }
-        fn array<const N: usize>(&mut self) -> anyhow::Result<[u8; N]> {
-            Ok(self.take(N)?.try_into()?)
-        }
-        fn u32(&mut self) -> anyhow::Result<u32> {
-            Ok(u32::from_be_bytes(self.array()?))
-        }
-        fn u64(&mut self) -> anyhow::Result<u64> {
-            Ok(u64::from_be_bytes(self.array()?))
-        }
-        fn string(&mut self) -> anyhow::Result<String> {
-            let length = usize::try_from(self.u32()?)?;
-            Ok(std::str::from_utf8(self.take(length)?)?.to_owned())
-        }
-    }
-
-    let mut input = Reader { bytes, offset: 0 };
-    ensure!(
-        input.take(PROVENANCE_MAGIC.len())? == PROVENANCE_MAGIC,
-        "provenance object has unknown format"
-    );
-    let seconds = i64::from_be_bytes(input.array()?);
-    let nanos = u32::from_be_bytes(input.array()?);
-    let source_created_at = DateTime::<Utc>::from_timestamp(seconds, nanos)
-        .context("provenance object has invalid timestamp")?;
-    let source = input.string()?;
-    let data = input.string()?;
-    let artifact_count =
-        usize::try_from(input.u64()?).context("provenance artifact count exceeds usize")?;
-    ensure!(
-        artifact_count <= bytes.len() / 50,
-        "provenance artifact count is impossible"
-    );
-    let mut artifacts = Vec::with_capacity(artifact_count);
-    for _ in 0..artifact_count {
-        artifacts.push(StoredArtifact {
-            object_id: ObjectId::from_bytes(input.array()?).map_err(anyhow::Error::new)?,
-            original_filename: input.string()?,
-            media_type: input.string()?,
-            role: input.string()?,
-            byte_length: input.u64()?,
-            sha256: input.array()?,
-        });
-    }
-    ensure!(
-        input.offset == bytes.len(),
-        "provenance object has trailing bytes"
-    );
-    Ok(StoredProvenance {
-        data,
-        source,
-        source_created_at,
-        artifacts,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_binary_object_store_loads_and_saves_canonical_kweb_objects() {
+    fn rust_binary_payloads_are_stored_raw_and_file_envelopes_decode_to_exact_bytes() {
         let directory = std::env::temp_dir().join(format!(
             "kennedy-rust-binary-objects-{}",
             uuid::Uuid::new_v4()
@@ -1266,51 +1098,38 @@ mod tests {
         let identity = directory.join("users.sqlite3");
         let (database, roots) = initialize(&directory.join("kweb"), config(), &identity).unwrap();
         let service = Service::new(database, roots, &identity).unwrap();
-        let store = RustBinaryObjectStore::new(service);
 
-        let object_id = store.save(b"\0binary output\n").unwrap();
+        let object_id = service
+            .save_rust_binary_object(b"%PDF-1.7\nexact binary output\n".to_vec())
+            .unwrap();
         assert_eq!(object_id.len(), 8);
-        assert_eq!(store.load(&object_id).unwrap(), b"\0binary output\n");
-        assert_eq!(
-            store.load("pending:1").unwrap_err().to_string(),
-            "The Rust-binary input object ID is invalid."
-        );
+        let output = service.get_file(&object_id).unwrap();
+        assert_eq!(output.bytes, b"%PDF-1.7\nexact binary output\n");
+        assert_eq!(output.media_type, "application/pdf");
+        assert_eq!(output.file_name, format!("{object_id}.pdf"));
+        assert!(!output.enveloped);
 
-        drop(store);
+        let envelope = encode_file(
+            "pending:1",
+            Some("original.jpg"),
+            "image/jpeg",
+            Some("photo"),
+            b"\xff\xd8\xffexact original".to_vec(),
+        )
+        .unwrap();
+        let object_id = service.save_rust_binary_object(envelope).unwrap();
+        let input = service.get_file(&object_id).unwrap();
+        assert_eq!(input.bytes, b"\xff\xd8\xffexact original");
+        assert!(input.enveloped);
+
+        drop(service);
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn provenance_envelope_has_one_canonical_binary_round_trip() {
-        let value = StoredProvenance {
-            data: "complete source".into(),
-            source: "test".into(),
-            source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            artifacts: vec![StoredArtifact {
-                object_id: ObjectId::from_bytes([0x80, 1, 2, 3, 4, 5]).unwrap(),
-                original_filename: "source.bin".into(),
-                media_type: "application/octet-stream".into(),
-                role: "media".into(),
-                byte_length: 3,
-                sha256: Sha256::digest(b"abc").into(),
-            }],
-        };
-        let first = encode_stored_provenance(&value).unwrap();
-        assert!(first.starts_with(PROVENANCE_MAGIC));
-        assert!(!first.starts_with(b"{"));
-        let decoded = decode_stored_provenance(&first).unwrap();
-        let second = encode_stored_provenance(&decoded).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(decoded.data, value.data);
-        assert_eq!(decoded.artifacts[0].sha256, value.artifacts[0].sha256);
     }
 
     #[test]
     fn file_envelope_preserves_original_bytes_and_safe_metadata() {
         let object_id = ObjectId::from_bytes([0x80, 1, 2, 3, 4, 6]).unwrap();
-        let encoded = crate::kweb_file::encode(
+        let encoded = encode_file(
             "pending:4",
             Some("../résumé.pdf"),
             "application/pdf",
@@ -1318,7 +1137,7 @@ mod tests {
             b"%PDF-original".to_vec(),
         )
         .unwrap();
-        let decoded = crate::kweb_file::decode(object_id, encoded).unwrap();
+        let decoded = decode_file(object_id, encoded).unwrap();
         assert_eq!(decoded.file_name, "résumé.pdf");
         assert_eq!(decoded.media_type, "application/pdf");
         assert_eq!(decoded.transport_kind.as_deref(), Some("document"));
@@ -1424,7 +1243,7 @@ mod tests {
                     .into_bytes(),
                 objects: BTreeMap::from([(
                     pending_object.clone(),
-                    crate::kweb_file::encode(
+                    encode_file(
                         &pending_object,
                         Some("attachment.txt"),
                         "text/plain",
