@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::ensure;
 use axum::{
     Json, Router,
@@ -134,6 +136,12 @@ impl Service {
     }
 
     async fn synchronize(&self) -> Result<(), ApiError> {
+        let histories = self.history.list().await.map_err(history_error)?;
+        let mut existing = histories
+            .iter()
+            .filter_map(ingress_source_id)
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
         for recording in self.audio.status().map_err(library_error)?.recordings {
             let RecordingState::Complete { transcript } = &recording.state else {
                 continue;
@@ -142,9 +150,13 @@ impl Service {
             let piece_count = u32::try_from(pieces.len()).map_err(ApiError::internal)?;
             for (index, piece) in pieces.into_iter().enumerate() {
                 let piece_index = u32::try_from(index).map_err(ApiError::internal)?;
+                let idempotency_id = audio_piece_id(recording.id, piece_index);
+                if existing.contains(&idempotency_id) {
+                    continue;
+                }
                 self.history
                     .enqueue_ingress(NewIngressSession {
-                        idempotency_id: audio_piece_id(recording.id, piece_index),
+                        idempotency_id: idempotency_id.clone(),
                         started_at: recording.recorded_at.to_rfc3339(),
                         source_session_type: "audio".into(),
                         kind: SessionKind::AudioIngress,
@@ -154,13 +166,13 @@ impl Service {
                     })
                     .await
                     .map_err(history_error)?;
+                existing.insert(idempotency_id);
             }
         }
         Ok(())
     }
 
     async fn browser_snapshot(&self) -> Result<Vec<BrowserRecording>, ApiError> {
-        self.synchronize().await?;
         let histories = self.history.list().await.map_err(history_error)?;
         let mut recordings = Vec::new();
         for recording in self.audio.status().map_err(library_error)?.recordings {
@@ -174,7 +186,6 @@ impl Service {
         &self,
         recording: &RecordingStatus,
     ) -> Result<Vec<IngressPiece>, ApiError> {
-        self.synchronize().await?;
         let histories = self.history.list().await.map_err(history_error)?;
         ingress_pieces(recording, &histories)
     }
@@ -552,10 +563,12 @@ fn ingress_pieces(
     for (index, transcript_text) in transcript_pieces.into_iter().enumerate() {
         let piece_index = u32::try_from(index).map_err(ApiError::internal)?;
         let idempotency_id = audio_piece_id(recording.id, piece_index);
-        let record = histories
+        let Some(record) = histories
             .iter()
             .find(|record| ingress_source_id(record) == Some(idempotency_id.as_str()))
-            .ok_or_else(ApiError::not_found)?;
+        else {
+            continue;
+        };
         pieces.push(IngressPiece::from_record(
             recording,
             piece_index,
@@ -713,5 +726,27 @@ mod tests {
             audio_piece_id(recording_id, 2),
             format!("audio:{recording_id}:2")
         );
+    }
+
+    #[test]
+    fn browser_reads_allow_a_completed_transcript_before_worker_synchronization() {
+        let now = Utc::now();
+        let recording = RecordingStatus {
+            id: Uuid::new_v4(),
+            user_id: "user".into(),
+            sha256: "0".repeat(64),
+            original_filename: "recording.wav".into(),
+            size_bytes: 1,
+            recorded_at: now,
+            received_at: now,
+            transcription_model: "transcription-model".into(),
+            reconciliation_model: "reconciliation-model".into(),
+            reconciliation_reasoning: "xhigh".into(),
+            state: RecordingState::Complete {
+                transcript: "New transcript".into(),
+            },
+        };
+
+        assert!(ingress_pieces(&recording, &[]).unwrap().is_empty());
     }
 }
