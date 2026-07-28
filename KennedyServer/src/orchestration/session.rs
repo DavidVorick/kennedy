@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::path::PathBuf;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     time::Duration,
 };
@@ -57,7 +57,6 @@ const RUST_BIN_TOOL_INSTANCE: &str = "managed-rust-binaries";
 const CAPACITY_ERROR_BOX_NAME: &str = "Context capacity error";
 const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
 const SUBAGENT_CONTEXT_NODE_LIMIT: usize = 64;
-const SUBAGENT_PROTOCOL_TOKEN_RESERVE: u64 = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -1077,57 +1076,6 @@ struct ToolOutcome {
 }
 
 #[derive(Clone)]
-struct SubagentProjection {
-    context: Vec<String>,
-    task: String,
-    history: Vec<String>,
-    states: Vec<SubagentState>,
-}
-
-#[derive(Clone)]
-struct SubagentState {
-    key: String,
-    text: String,
-}
-
-impl SubagentProjection {
-    fn new(context: Vec<String>, task: String) -> Self {
-        Self {
-            context,
-            task,
-            history: Vec::new(),
-            states: Vec::new(),
-        }
-    }
-
-    fn render(&self) -> String {
-        self.context
-            .iter()
-            .map(String::as_str)
-            .chain(std::iter::once(self.task.as_str()))
-            .chain(self.history.iter().map(String::as_str))
-            .chain(self.states.iter().map(|state| state.text.as_str()))
-            .filter(|section| !section.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-
-    fn push_history(&mut self, text: impl Into<String>) {
-        self.history.push(text.into());
-    }
-
-    fn update_state(&mut self, key: String, text: String) {
-        self.states.retain(|state| state.key != key);
-        self.states.push(SubagentState { key, text });
-    }
-
-    fn estimated_tokens(&self) -> u64 {
-        kcode_session_history::chatend::estimate_tokens(&self.render())
-            .saturating_add(SUBAGENT_PROTOCOL_TOKEN_RESERVE)
-    }
-}
-
-#[derive(Clone)]
 struct ChangedSubagentState {
     box_id: BoxId,
     name: String,
@@ -1194,39 +1142,10 @@ fn changed_subagent_tool_states(
         .collect()
 }
 
-fn apply_changed_subagent_states(
-    projection: &mut SubagentProjection,
-    states: &[ChangedSubagentState],
-) {
-    for state in states {
-        let key = format!("tool-state:{}", state.box_id);
-        if let Some(text) = &state.text {
-            projection.update_state(key, format!("Current {}:\n{text}", state.name));
-        } else {
-            projection.states.retain(|state| state.key != key);
-        }
-    }
-}
-
-fn compact_subagent_tool_result(outcome: &ToolOutcome, states: &[ChangedSubagentState]) -> String {
-    if states.is_empty() {
-        return outcome.text.clone();
-    }
-    let result = if outcome.text.chars().count() <= INLINE_TOOL_INVOCATION_CHARACTERS {
-        outcome.text.as_str()
-    } else {
-        "Tool completed successfully."
-    };
-    format!(
-        "{result}\n\nThe updated state will be rendered in the next fresh context slice; end this slice now."
-    )
-}
-
 fn subagent_managed_write_fits(
     journal: &HistorySession,
     call: &ToolCall,
-    projection: &SubagentProjection,
-    input_limit: u64,
+    budget: &kcode_agent_runtime::ContextBudget,
 ) -> bool {
     let Some(snapshot) = proposed_write_snapshot(&call.name, &call.arguments) else {
         return true;
@@ -1235,8 +1154,7 @@ fn subagent_managed_write_fits(
     let key = managed_lib_box_id(journal, kind, &snapshot.name)
         .map(|box_id| format!("tool-state:{box_id}"))
         .unwrap_or_else(|| format!("prospective-managed-state:{:?}:{}", kind, snapshot.name));
-    let mut prospective = projection.clone();
-    prospective.update_state(
+    budget.fits_state(
         key,
         format!(
             "Current Managed {} {}:\n{}",
@@ -1244,8 +1162,27 @@ fn subagent_managed_write_fits(
             snapshot.name,
             snapshot.text
         ),
-    );
-    prospective.estimated_tokens() <= input_limit
+    )
+}
+
+fn subagent_state_updates(
+    states: &[ChangedSubagentState],
+) -> Vec<kcode_agent_runtime::StateUpdate> {
+    states
+        .iter()
+        .map(|state| kcode_agent_runtime::StateUpdate {
+            key: format!("tool-state:{}", state.box_id),
+            text: state
+                .text
+                .as_ref()
+                .map(|text| format!("Current {}:\n{text}", state.name)),
+        })
+        .collect()
+}
+
+struct KennedySubagentHost<'a> {
+    session: &'a mut Session,
+    captures: HashMap<String, FreeformWriteRequest>,
 }
 
 #[derive(Debug)]
@@ -2584,17 +2521,11 @@ impl Session {
             &["reasoningEffort"],
         )?;
         let model = nonempty_string(arguments, "model", 128)?;
-        let selected_model = self
-            .api
-            .resolve_subagent_model(&self.runtime, &model)
-            .await?;
-        let input_limit = selected_model.max_input_tokens;
         let reasoning_effort = arguments
             .get("reasoningEffort")
             .map(|_| nonempty_string(arguments, "reasoningEffort", 32))
             .transpose()?
             .unwrap_or_else(|| self.runtime.reasoning_effort.clone());
-        let reasoning_effort = codex_reasoning_effort(&reasoning_effort)?;
         let task = bounded_nonempty_string(arguments, "task", 100_000)?;
         let context_node_ids =
             canonical_node_id_array(arguments, "contextNodeIds", SUBAGENT_CONTEXT_NODE_LIMIT)?;
@@ -2609,334 +2540,59 @@ impl Session {
                     .to_owned(),
             );
         }
-        let mut projection = SubagentProjection::new(context, task);
-        ensure_subagent_capacity(&projection, input_limit)?;
-        self.journal.record(
-            now(),
-            EventKind::Note {
-                label: "subagent_started".into(),
-                value: json!({
-                    "model":model,
-                    "providerModel":selected_model.provider_model,
-                    "backend":format!("{:?}", selected_model.backend),
-                    "contextWindowTokens":selected_model.context_window_tokens,
-                    "maxInputTokens":selected_model.max_input_tokens,
-                    "contextNodeIds":context_node_ids,
-                    "contextLongDescriptions":projection.context,
-                    "task":projection.task,
-                }),
-            },
-        )?;
-
         let user_id = self
             .root_node_ids
             .first()
             .context("session has no user root for subagent intelligence accounting")?
             .clone();
-        let mut deferred_freeform_write: Option<FreeformWriteRequest> = None;
-        for round in 0..AGENT_LOOP_ROUND_LIMIT {
-            let capturing_freeform_output = deferred_freeform_write.is_some();
-            ensure_subagent_capacity(&projection, input_limit)?;
-            let input = projection.render();
-            let manifest_hash = hex::encode(Sha256::digest(input.as_bytes()));
-            self.journal.record(
-                now(),
-                EventKind::Note {
-                    label: "subagent_inference_submitted".into(),
-                    value: json!({
-                        "round":round + 1,
-                        "manifestHash":manifest_hash,
-                        "estimatedInputTokens":projection.estimated_tokens(),
-                    }),
-                },
-            )?;
-            let mut request = kcode_codex_runtime_v2::AgentRequest::new(
-                input,
-                selected_model.provider_model.clone(),
-            );
-            request.reasoning_effort = reasoning_effort;
-            request.previous_thread_id = None;
-            request.tools = if capturing_freeform_output {
-                Vec::new()
-            } else {
-                vec![subagent_ktool_definition()]
+        let timeout = self.agent_request_timeout();
+        let runtime = self.api.agent_runtime()?;
+        let first_event = self.journal.state().events.len();
+        let result = {
+            let mut host = KennedySubagentHost {
+                session: self,
+                captures: HashMap::new(),
             };
-            request.ephemeral = true;
-            if let Some(timeout) = self.agent_request_timeout() {
-                request.timeout = timeout;
-            }
-            let child_operation_id = Uuid::new_v4();
-            let mut turn = self
-                .api
-                .start_subagent_turn(
-                    &user_id,
-                    parent_operation_id,
-                    child_operation_id,
-                    &selected_model,
-                    request,
+            runtime
+                .run(
+                    kcode_agent_runtime::RunRequest {
+                        user_id,
+                        parent_operation_id,
+                        model,
+                        reasoning_effort,
+                        context,
+                        task,
+                        timeout,
+                        start_metadata: json!({"contextNodeIds":context_node_ids}),
+                    },
+                    &mut host,
                 )
-                .await?;
-            let mut used_tool = false;
-            let mut pending_freeform_write: Option<FreeformWriteRequest> = None;
-            let mut requires_rerender = false;
-            let completed = loop {
-                let event = turn
-                    .next_event()
-                    .await
-                    .context("subagent provider ended without a terminal turn event")??;
-                match event {
-                    kcode_codex_runtime_v2::AgentEvent::ProviderInput(_) => {}
-                    kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
-                        used_tool = true;
-                        if capturing_freeform_output {
-                            let text = "No Ktool is available while complete file contents are being captured.";
-                            turn.respond(
-                                &native.call_id,
-                                kcode_codex_runtime_v2::ToolResult::failure(text),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        if let Some(request) = &pending_freeform_write {
-                            let text = format!(
-                                "{} is awaiting the complete file contents; no other Ktool can run first.",
-                                request.kind.freeform_write_tool()
-                            );
-                            turn.respond(
-                                &native.call_id,
-                                kcode_codex_runtime_v2::ToolResult::failure(text),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        if requires_rerender {
-                            let text = "A state update is waiting to be re-rendered. End this slice before calling another Ktool.";
-                            turn.respond(
-                                &native.call_id,
-                                kcode_codex_runtime_v2::ToolResult::failure(text),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        let call = match native_ktool_call(&native) {
-                            Ok(call) => call,
-                            Err(error) => {
-                                let text = format!("Invalid Ktool call: {error}");
-                                projection.push_history(format!("Ktool result:\n{text}"));
-                                turn.respond(
-                                    &native.call_id,
-                                    kcode_codex_runtime_v2::ToolResult::failure(text),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        let exact_call = json!({
-                            "name":call.name,
-                            "arguments":call.arguments,
-                        });
-                        self.journal.record(
-                            now(),
-                            EventKind::Note {
-                                label: "subagent_tool_call".into(),
-                                value: exact_call,
-                            },
-                        )?;
-                        projection.push_history(subagent_tool_call_text(&call)?);
-                        let (mut outcome, states) = if call.name == "RunSubagent" {
-                            (
-                                failed_tool_outcome(
-                                    "RunSubagent is unavailable inside a subagent. Only Kennedy may launch subagents.",
-                                ),
-                                Vec::new(),
-                            )
-                        } else if projection.estimated_tokens() > input_limit {
-                            (
-                                failed_tool_outcome(
-                                    "The Ktool call was not run because its retained invocation would exceed the subagent context limit.",
-                                ),
-                                Vec::new(),
-                            )
-                        } else if !subagent_managed_write_fits(
-                            &self.journal,
-                            &call,
-                            &projection,
-                            input_limit,
-                        ) {
-                            (
-                                failed_tool_outcome(
-                                    "The managed-source write was not run because its resulting current state would exceed the subagent context limit.",
-                                ),
-                                Vec::new(),
-                            )
-                        } else {
-                            let previous = canonical_box_versions(&self.journal);
-                            let mut outcome = match Box::pin(
-                                self.execute_tool(&call, child_operation_id),
-                            )
-                            .await
-                            {
-                                Ok(outcome) => outcome,
-                                Err(error) => {
-                                    failed_tool_outcome(format!("{} failed: {error}", call.name))
-                                }
-                            };
-                            if let Some(managed) = outcome.managed_source_snapshot.take() {
-                                apply_managed_source_snapshot(
-                                    &mut self.journal,
-                                    managed.kind,
-                                    managed.snapshot,
-                                )?;
-                                outcome.store_result = false;
-                            }
-                            let states = if outcome.ok {
-                                changed_subagent_tool_states(&self.journal, &previous)
-                            } else {
-                                Vec::new()
-                            };
-                            (outcome, states)
-                        };
-                        let exact_result = outcome.text.clone();
-                        let tool_ok = outcome.ok;
-                        let mut provider_result = compact_subagent_tool_result(&outcome, &states);
-                        let mut candidate = projection.clone();
-                        apply_changed_subagent_states(&mut candidate, &states);
-                        candidate.push_history(format!("Ktool result:\n{provider_result}"));
-                        let projection_accepted = candidate.estimated_tokens() <= input_limit;
-                        if projection_accepted {
-                            projection = candidate;
-                            requires_rerender = !states.is_empty();
-                        } else {
-                            outcome.ok = false;
-                            outcome.freeform_write = None;
-                            provider_result = "The Ktool ran, but its result or updated state could not fit in the subagent context. Do not retry it; report the capacity failure to Kennedy.".into();
-                            projection.push_history(format!("Ktool result:\n{provider_result}"));
-                        }
-                        for state in &states {
-                            if state.hide_from_parent && state.text.is_some() {
-                                self.journal.dehydrate_box(now(), state.box_id)?;
-                            }
-                        }
-                        self.journal.record(
-                            now(),
-                            EventKind::Note {
-                                label: "subagent_tool_result".into(),
-                                value: json!({
-                                    "name":call.name,
-                                    "ok":tool_ok,
-                                    "projectionAccepted":projection_accepted,
-                                    "result":exact_result,
-                                }),
-                            },
-                        )?;
-                        pending_freeform_write = outcome.freeform_write.take();
-                        turn.respond(
-                            &native.call_id,
-                            if outcome.ok {
-                                kcode_codex_runtime_v2::ToolResult::success(provider_result)
-                            } else {
-                                kcode_codex_runtime_v2::ToolResult::failure(provider_result)
-                            },
-                        )
-                        .await?;
-                    }
-                    kcode_codex_runtime_v2::AgentEvent::Completed(completed) => break completed,
-                }
-            };
-            let usage = completed.usage.as_ref();
-            self.journal.record(
-                now(),
-                EventKind::Note {
-                    label: "subagent_provider_receipt".into(),
-                    value: json!({
-                        "round":round + 1,
-                        "usage":usage.map(|usage| json!({
-                            "inputTokens":usage.input_tokens,
-                            "outputTokens":usage.output_tokens,
-                            "cachedInputTokens":usage.cached_input_tokens,
-                            "reasoningOutputTokens":usage.reasoning_output_tokens,
-                            "lastInputTokens":usage.last_input_tokens,
-                            "lastOutputTokens":usage.last_output_tokens,
-                        })),
-                    }),
-                },
-            )?;
-            let freeform_write = deferred_freeform_write.take().or(pending_freeform_write);
-            if let Some(request) = freeform_write {
-                if !capturing_freeform_output && completed.answer.is_empty() {
-                    deferred_freeform_write = Some(request);
-                    continue;
-                }
-                let freeform_tool = request.kind.freeform_write_tool();
-                let (outcome, states) = self
-                    .complete_subagent_freeform_write(
-                        request,
-                        completed.answer,
-                        input_limit,
-                        &projection,
+                .await
+        };
+        result.map(|result| result.answer).map_err(|error| {
+            let may_have_effects = self.journal.state().events[first_event..]
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.kind,
+                        EventKind::Note { label, .. } if label == "subagent_tool_call"
                     )
-                    .await?;
-                let mut candidate = projection.clone();
-                apply_changed_subagent_states(&mut candidate, &states);
-                candidate.push_history(format!("Ktool result:\n{}", outcome.text));
-                ensure_subagent_capacity(&candidate, input_limit)?;
-                projection = candidate;
-                for state in &states {
-                    if state.hide_from_parent && state.text.is_some() {
-                        self.journal.dehydrate_box(now(), state.box_id)?;
-                    }
-                }
-                self.journal.record(
-                    now(),
-                    EventKind::Note {
-                        label: "subagent_tool_result".into(),
-                        value: json!({
-                            "name":freeform_tool,
-                            "ok":outcome.ok,
-                            "projectionAccepted":true,
-                            "result":outcome.text,
-                        }),
-                    },
-                )?;
-                continue;
+                });
+            if may_have_effects {
+                error.context(
+                    "the subagent failed after making Ktool calls; some tool effects may already have occurred",
+                )
+            } else {
+                error
             }
-            if requires_rerender {
-                let draft = completed.answer.trim();
-                if !draft.is_empty() {
-                    projection.push_history(format!(
-                        "Assistant draft produced before the state refresh:\n{draft}"
-                    ));
-                }
-                continue;
-            }
-            let answer = completed.answer.trim().to_owned();
-            if !answer.is_empty() {
-                self.journal.record(
-                    now(),
-                    EventKind::Note {
-                        label: "subagent_completed".into(),
-                        value: json!({
-                            "model":model,
-                            "response":answer,
-                        }),
-                    },
-                )?;
-                return Ok(answer);
-            }
-            anyhow::ensure!(
-                used_tool,
-                "subagent provider completed without a response or tool call"
-            );
-        }
-        anyhow::bail!("subagent exceeded the {AGENT_LOOP_ROUND_LIMIT}-round tool-loop safety limit")
+        })
     }
 
     async fn complete_subagent_freeform_write(
         &mut self,
         request: FreeformWriteRequest,
         contents: String,
-        input_limit: u64,
-        projection: &SubagentProjection,
+        budget: &kcode_agent_runtime::ContextBudget,
     ) -> anyhow::Result<(ToolOutcome, Vec<ChangedSubagentState>)> {
         let kind = request.kind;
         let freeform_tool = kind.freeform_write_tool();
@@ -2973,18 +2629,16 @@ impl Session {
             .context("subagent freeform write preview omitted its source snapshot")?;
         let source_box_id = managed_lib_box_id(&self.journal, kind, &request.name)
             .context("subagent freeform write source is no longer open")?;
-        let mut prospective = projection.clone();
-        prospective.update_state(
-            format!("tool-state:{source_box_id}"),
-            format!(
-                "Current Managed {} {}:\n{}",
-                kind.label(),
-                preview.name,
-                preview.text
-            ),
-        );
         anyhow::ensure!(
-            prospective.estimated_tokens() <= input_limit,
+            budget.fits_state(
+                format!("tool-state:{source_box_id}"),
+                format!(
+                    "Current Managed {} {}:\n{}",
+                    kind.label(),
+                    preview.name,
+                    preview.text
+                ),
+            ),
             "{freeform_tool} was not run because its resulting source state would exceed the subagent context limit"
         );
         let previous = canonical_box_versions(&self.journal);
@@ -3501,6 +3155,44 @@ impl Session {
                     )
                     .await?;
                 render_media_annotation_result(&pending_id, &file_name, &media_type, &result)?
+            }
+            "GenerateImage" => {
+                validate_arguments(
+                    &call.arguments,
+                    &["model", "prompt"],
+                    &["referenceObjectIds"],
+                )?;
+                let model = nonempty_string(&call.arguments, "model", 128)?;
+                validate_image_model(&model)?;
+                let prompt = bounded_nonempty_string(&call.arguments, "prompt", 100_000)?;
+                let reference_ids =
+                    optional_object_id_array(&call.arguments, "referenceObjectIds", 14)?;
+                let mut references = Vec::with_capacity(reference_ids.len());
+                for object_id in &reference_ids {
+                    references.push(read_image_object(&mut self.journal, &self.api, object_id)?);
+                }
+                let user_id = self
+                    .root_node_ids
+                    .first()
+                    .context("session has no user root for intelligence accounting")?
+                    .clone();
+                let result = self
+                    .api
+                    .generate_image(&user_id, &model, &prompt, references, operation_id)
+                    .await?;
+                let size = result.bytes.len();
+                let file_name =
+                    format!("generated-image.{}", image_extension(&result.content_type));
+                let object_id = self.api.save_generated_image(
+                    result.bytes,
+                    &file_name,
+                    &result.content_type,
+                    &result.model,
+                )?;
+                format!(
+                    "Generated image.\nObject: {object_id}\nFile: {file_name}\nContent type: {}\nSize: {size} bytes\nModel: {}\nUse EmitObject with {object_id} to deliver it.",
+                    result.content_type, result.model
+                )
             }
             "ExtractDocumentText" => {
                 validate_arguments(&call.arguments, &["objectId"], &[])?;
@@ -4459,6 +4151,120 @@ impl Session {
     }
 }
 
+impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
+    fn render_tool_call(&mut self, call: &kcode_agent_runtime::ToolCall) -> anyhow::Result<String> {
+        Ok(tool_call_box_content(&ToolCall {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        })?
+        .text)
+    }
+
+    fn execute_tool<'a>(
+        &'a mut self,
+        call: kcode_agent_runtime::ToolCall,
+        operation_id: Uuid,
+        budget: kcode_agent_runtime::ContextBudget,
+    ) -> kcode_agent_runtime::HostFuture<'a, kcode_agent_runtime::ToolOutcome> {
+        Box::pin(async move {
+            let call = ToolCall {
+                name: call.name,
+                arguments: call.arguments,
+            };
+            if call.name == "RunSubagent" {
+                return Ok(kcode_agent_runtime::ToolOutcome::failure(
+                    "RunSubagent is unavailable inside a subagent. Only Kennedy may launch subagents.",
+                ));
+            }
+            if budget.estimated_tokens() > budget.max_input_tokens() {
+                return Ok(kcode_agent_runtime::ToolOutcome::failure(
+                    "The Ktool call was not run because its retained invocation would exceed the subagent context limit.",
+                ));
+            }
+            if !subagent_managed_write_fits(&self.session.journal, &call, &budget) {
+                return Ok(kcode_agent_runtime::ToolOutcome::failure(
+                    "The managed-source write was not run because its resulting current state would exceed the subagent context limit.",
+                ));
+            }
+
+            let previous = canonical_box_versions(&self.session.journal);
+            let mut outcome = self.session.execute_tool(&call, operation_id).await?;
+            if let Some(managed) = outcome.managed_source_snapshot.take() {
+                apply_managed_source_snapshot(
+                    &mut self.session.journal,
+                    managed.kind,
+                    managed.snapshot,
+                )?;
+                outcome.store_result = false;
+            }
+            let states = if outcome.ok {
+                changed_subagent_tool_states(&self.session.journal, &previous)
+            } else {
+                Vec::new()
+            };
+            for state in &states {
+                if state.hide_from_parent && state.text.is_some() {
+                    self.session.journal.dehydrate_box(now(), state.box_id)?;
+                }
+            }
+            let capture = outcome.freeform_write.take().map(|request| {
+                let id = Uuid::new_v4().to_string();
+                self.captures.insert(id.clone(), request);
+                Value::String(id)
+            });
+            Ok(kcode_agent_runtime::ToolOutcome {
+                text: outcome.text,
+                ok: outcome.ok,
+                state_updates: subagent_state_updates(&states),
+                capture,
+            })
+        })
+    }
+
+    fn complete_capture<'a>(
+        &'a mut self,
+        capture: Value,
+        contents: String,
+        budget: kcode_agent_runtime::ContextBudget,
+    ) -> kcode_agent_runtime::HostFuture<'a, kcode_agent_runtime::ToolOutcome> {
+        Box::pin(async move {
+            let id = capture
+                .as_str()
+                .context("subagent freeform capture token is invalid")?;
+            let request = self
+                .captures
+                .remove(id)
+                .context("subagent freeform capture token is unknown")?;
+            let (outcome, states) = self
+                .session
+                .complete_subagent_freeform_write(request, contents, &budget)
+                .await?;
+            for state in &states {
+                if state.hide_from_parent && state.text.is_some() {
+                    self.session.journal.dehydrate_box(now(), state.box_id)?;
+                }
+            }
+            Ok(kcode_agent_runtime::ToolOutcome {
+                text: outcome.text,
+                ok: outcome.ok,
+                state_updates: subagent_state_updates(&states),
+                capture: None,
+            })
+        })
+    }
+
+    fn record(&mut self, label: &str, value: Value) -> anyhow::Result<()> {
+        self.session.journal.record(
+            now(),
+            EventKind::Note {
+                label: label.into(),
+                value,
+            },
+        )?;
+        Ok(())
+    }
+}
+
 fn restore_kweb_context(journal: &HistorySession, context: &mut KmapContext) -> anyhow::Result<()> {
     let Some(tool) = journal.state().tools.get(KWEB_TOOL_INSTANCE) else {
         return Ok(());
@@ -4698,6 +4504,36 @@ fn read_pending_object(
     Ok((pending_id, location.metadata, bytes))
 }
 
+fn read_image_object(
+    journal: &mut HistorySession,
+    api: &Api,
+    object_id: &str,
+) -> anyhow::Result<(Vec<u8>, String, String)> {
+    let (bytes, file_name, media_type) = if object_id.starts_with("pending:") {
+        let (_, metadata, bytes) = read_pending_object(journal, object_id)?;
+        (
+            bytes,
+            authoritative_object_filename(&metadata)?.to_owned(),
+            normalized_media_type(&metadata.media_type),
+        )
+    } else {
+        object_id
+            .parse::<ObjectId>()
+            .with_context(|| format!("{object_id:?} is not an object ID"))?;
+        let file = api.kmap_file(object_id)?;
+        (
+            file.bytes,
+            file.file_name,
+            normalized_media_type(&file.media_type),
+        )
+    };
+    anyhow::ensure!(
+        media_type.starts_with("image/"),
+        "GenerateImage reference {object_id} is not an image"
+    );
+    Ok((bytes, file_name, media_type))
+}
+
 fn rust_binary_object_ids(arguments: &Value) -> anyhow::Result<Vec<String>> {
     let Some(object_ids) = arguments.get("objectIds") else {
         return Ok(Vec::new());
@@ -4841,7 +4677,7 @@ fn render_staged_telegram_group_media(
     reused: bool,
 ) -> anyhow::Result<String> {
     Ok(format!(
-        "{} Telegram group media\nMessage ID: {message_id}\nObject: {pending_id}\nKind: {}\nFile: {}\nContent type: {}\nSize: {size_bytes} bytes\n\nUse Object {pending_id} with AnnotateMedia, TranscribeAudio, or ExtractDocumentText as appropriate.",
+        "{} Telegram group media\nMessage ID: {message_id}\nObject: {pending_id}\nKind: {}\nFile: {}\nContent type: {}\nSize: {size_bytes} bytes\n\nUse Object {pending_id} with AnnotateMedia, GenerateImage (for images), TranscribeAudio, or ExtractDocumentText as appropriate.",
         if reused {
             "Reused already-staged"
         } else {
@@ -4882,6 +4718,57 @@ fn validate_annotation_media(model: &str, media_type: &str) -> anyhow::Result<()
         _ => anyhow::bail!("unsupported exact annotation model {model}"),
     }
     Ok(())
+}
+
+fn validate_image_model(model: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(model, "gpt-image-2" | "gemini-3-pro-image"),
+        "unsupported exact image model {model}; use gpt-image-2 or gemini-3-pro-image"
+    );
+    Ok(())
+}
+
+fn image_extension(media_type: &str) -> &'static str {
+    match normalized_media_type(media_type).as_str() {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    }
+}
+
+fn optional_object_id_array(
+    value: &Value,
+    key: &str,
+    maximum: usize,
+) -> anyhow::Result<Vec<String>> {
+    let Some(values) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .with_context(|| format!("{key} must be an array"))?;
+    anyhow::ensure!(
+        values.len() <= maximum,
+        "{key} must contain at most {maximum} object IDs"
+    );
+    let ids = values
+        .iter()
+        .map(|value| {
+            let id = value
+                .as_str()
+                .with_context(|| format!("{key} entries must be strings"))?;
+            anyhow::ensure!(
+                !id.trim().is_empty() && id.chars().count() <= 64,
+                "{key} entries must contain between 1 and 64 characters"
+            );
+            Ok(id.to_owned())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        ids.iter().collect::<HashSet<_>>().len() == ids.len(),
+        "{key} must not contain duplicate object IDs"
+    );
+    Ok(ids)
 }
 
 fn validate_transcription_model(model: &str) -> anyhow::Result<()> {
@@ -4990,50 +4877,6 @@ fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
             }
         }),
     )
-}
-
-fn subagent_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
-    kcode_codex_runtime_v2::DynamicTool::new(
-        "call_ktool",
-        "Call one available Ktool by its exact name.",
-        json!({
-            "type":"object",
-            "additionalProperties":false,
-            "required":["name","arguments"],
-            "properties":{
-                "name":{"type":"string"},
-                "arguments":{"type":"object"}
-            }
-        }),
-    )
-}
-
-fn subagent_tool_call_text(call: &ToolCall) -> anyhow::Result<String> {
-    let rendered = tool_call_box_content(call)?.text;
-    Ok(format!("Ktool call:\n{rendered}"))
-}
-
-fn failed_tool_outcome(text: impl Into<String>) -> ToolOutcome {
-    ToolOutcome {
-        text: text.into(),
-        store_result: false,
-        ok: false,
-        end_session: false,
-        freeform_write: None,
-        managed_source_snapshot: None,
-    }
-}
-
-fn ensure_subagent_capacity(
-    projection: &SubagentProjection,
-    max_input_tokens: u64,
-) -> anyhow::Result<()> {
-    let estimated = projection.estimated_tokens();
-    anyhow::ensure!(
-        estimated <= max_input_tokens,
-        "subagent context requires approximately {estimated} input tokens, over the selected model's {max_input_tokens}-token input limit"
-    );
-    Ok(())
 }
 
 fn native_ktool_call(call: &kcode_codex_runtime_v2::DynamicToolCall) -> anyhow::Result<ToolCall> {
@@ -5455,17 +5298,9 @@ fn controller_message(mode: &AgentMode, free_time: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use axum::{
-        Json, Router,
-        extract::Path,
-        routing::{get, post},
-    };
 
     fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, HistorySession) {
         let root = std::env::temp_dir().join(format!(
@@ -5502,41 +5337,6 @@ mod tests {
             "pending:47".to_owned()
         );
         assert!(parse_resource_id("km:47").is_err());
-    }
-
-    #[test]
-    fn subagent_initial_projection_is_only_ordered_long_descriptions_and_task() {
-        let projection = SubagentProjection::new(
-            vec![
-                "First curated paragraph.".into(),
-                "Second curated paragraph.".into(),
-            ],
-            "Complete the focused task.".into(),
-        );
-
-        assert_eq!(
-            projection.render(),
-            "First curated paragraph.\n\nSecond curated paragraph.\n\nComplete the focused task."
-        );
-        assert!(!projection.render().contains("[box"));
-        assert!(!projection.render().contains("Kennedy system prompt"));
-        assert!(!projection.render().contains("call_ktool"));
-    }
-
-    #[test]
-    fn subagent_state_projection_replaces_and_moves_current_value_to_the_bottom() {
-        let mut projection =
-            SubagentProjection::new(vec!["Tool instructions.".into()], "Edit the code.".into());
-        projection.push_history("Ktool call:\nopen");
-        projection.update_state("source:demo".into(), "Current source:\nold code".into());
-        projection.push_history("Ktool result:\nload completed");
-        projection.update_state("source:demo".into(), "Current source:\nnew code".into());
-
-        let rendered = projection.render();
-        assert!(!rendered.contains("old code"));
-        assert_eq!(rendered.matches("Current source:").count(), 1);
-        assert!(rendered.find("Ktool result").unwrap() < rendered.find("Current source:").unwrap());
-        assert!(rendered.ends_with("Current source:\nnew code"));
     }
 
     #[test]
@@ -5596,125 +5396,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn subagent_returns_only_terminal_response_from_clean_selected_context() {
-        let submitted = Arc::new(Mutex::new(None));
-        let submitted_for_route = submitted.clone();
-        let app = Router::new()
-            .route(
-                "/api/v1/kmap/nodes/{id}",
-                get(|Path(id): Path<String>| async move {
-                    Json(json!({
-                        "id":id,
-                        "short_name":"Selected context",
-                        "short_description":"Not sent",
-                        "long_description":"Exact selected long description.",
-                        "fixed_connections":[],
-                        "recent_connections":[],
-                    }))
-                }),
-            )
-            .route(
-                "/api/v1/generate",
-                post(move |Json(body): Json<Value>| {
-                    let submitted = submitted_for_route.clone();
-                    async move {
-                        *submitted.lock().unwrap() = Some(body);
-                        Json(json!({
-                            "response_id":"subagent-response",
-                            "message":{"content":"Exact terminal response."},
-                            "usage":{
-                                "input_tokens":12,
-                                "output_tokens":3,
-                                "cached_tokens":0,
-                                "reasoning_tokens":0,
-                            },
-                        }))
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let config = super::super::Config {
-            system_prompts_directory: PathBuf::new(),
-            kweb_base: base.clone(),
-            intelligence_base: base.clone(),
-            session_history_base: base.clone(),
-            telegram_relay_base: base,
-            telegram_max_media_bytes: 1_024,
-            telegram_web_user_handle: "@test".into(),
-            runtime_model: RuntimeModel::testing(),
-        };
-        let api = Api::new(&config).unwrap();
-        let (path, journal) = test_journal("subagent-terminal", 1_000_000);
-        let root = "AAECAwQF".to_owned();
-        let context = KmapContext::new(api.clone(), vec![root.clone()]).unwrap();
-        let mut session = Session {
-            api,
-            runtime: RuntimeModel::testing(),
-            journal,
-            plan: KwebPlan::default(),
-            session_type: "conversation".into(),
-            channel: Value::Null,
-            free_time: Value::Null,
-            orchestration: Value::Null,
-            provenance_id: None,
-            rust_lib_session_id: format!("subagent-test:{}", Uuid::new_v4()),
-            root_node_ids: vec![root],
-            reference_root_node_ids: Vec::new(),
-            started_at: "2026-07-27T00:00:00Z".into(),
-            transcript: Vec::new(),
-            pending_turn: true,
-            pending_external_event_id: None,
-            completed: false,
-            rounds_used: 0,
-            commit_receipt: None,
-            commit_author: "test-model".into(),
-            mode: AgentMode::Conversation,
-            source_session_type: None,
-            group_context: Value::Null,
-            context,
-            free_time_end_reason: None,
-            fatal_persistence_error: None,
-        };
-
-        let outcome = session
-            .execute_tool(
-                &ToolCall {
-                    name: "RunSubagent".into(),
-                    arguments: json!({
-                    "model":"gpt-5.6",
-                    "reasoningEffort":"high",
-                    "contextNodeIds":["AAECAwQG"],
-                    "task":"Do exactly this task.",
-                    }),
-                },
-                Uuid::new_v4(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.text, "Exact terminal response.");
-        assert!(outcome.ok);
-        assert!(outcome.store_result);
-        let request = submitted.lock().unwrap().clone().unwrap();
-        assert_eq!(request["model"], "gpt-5.6");
-        assert_eq!(
-            request["chatend"],
-            "Exact selected long description.\n\nDo exactly this task."
-        );
-        assert!(!request["chatend"].as_str().unwrap().contains("[box"));
-        assert!(
-            !request["chatend"]
-                .as_str()
-                .unwrap()
-                .contains("Kennedy system prompt")
-        );
-        server.abort();
-        std::fs::remove_file(path).unwrap();
-    }
-
     #[test]
     fn media_enrichment_reads_exact_staged_bytes_and_validates_provider_matrix() {
         let label = format!(
@@ -5764,6 +5445,28 @@ mod tests {
         assert!(validate_transcribable_audio("audio/webm").is_ok());
         assert!(validate_transcribable_audio("image/png").is_err());
         assert!(validate_transcribable_audio("audio/aiff").is_err());
+        assert!(validate_image_model("gpt-image-2").is_ok());
+        assert!(validate_image_model("gemini-3-pro-image").is_ok());
+        assert!(validate_image_model("gemini-3.1-pro-preview").is_err());
+        assert_eq!(image_extension("image/jpeg"), "jpg");
+        assert_eq!(image_extension("image/webp"), "webp");
+        assert_eq!(
+            optional_object_id_array(
+                &json!({"referenceObjectIds":[staged.to_string()]}),
+                "referenceObjectIds",
+                14,
+            )
+            .unwrap(),
+            vec![staged.to_string()]
+        );
+        assert!(
+            optional_object_id_array(
+                &json!({"referenceObjectIds":[staged.to_string(), staged.to_string()]}),
+                "referenceObjectIds",
+                14,
+            )
+            .is_err()
+        );
         assert_eq!(
             bounded_nonempty_string(&json!({"prompt":"  inspect exactly\n"}), "prompt", 4_000)
                 .unwrap(),

@@ -1,10 +1,6 @@
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::time::Duration;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -28,7 +24,7 @@ pub(crate) struct LocalServices {
     pub audio: crate::audio_ingress::Service,
     pub directory: std::sync::Arc<kcode_telegram_identity::Directory>,
     pub dev_tools: kcode_dev_tools::Service,
-    pub subagents: super::subagent::Providers,
+    pub agents: kcode_agent_runtime::AgentRuntime,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +49,6 @@ pub(crate) struct Api {
     services: ServiceBackend,
     history_sessions: kcode_session_history::SessionHistory,
     telegram: String,
-    child_operations: Arc<Mutex<HashMap<Uuid, HashSet<Uuid>>>>,
 }
 
 #[derive(Clone)]
@@ -64,35 +59,13 @@ enum ServiceBackend {
 }
 
 enum AgentTurnBackend {
-    Local(kcode_intelligence_router::AgentTurn),
-    Api(super::subagent::Turn),
+    Local(Box<kcode_intelligence_router::AgentTurn>),
     #[cfg(test)]
     Http(HttpAgentTurn),
 }
 
 pub(crate) struct AgentTurn {
     backend: AgentTurnBackend,
-    child_operation: Option<ChildOperationRegistration>,
-}
-
-struct ChildOperationRegistration {
-    parent: Uuid,
-    child: Uuid,
-    operations: Arc<Mutex<HashMap<Uuid, HashSet<Uuid>>>>,
-}
-
-impl Drop for ChildOperationRegistration {
-    fn drop(&mut self) {
-        let Ok(mut operations) = self.operations.lock() else {
-            return;
-        };
-        if let Some(children) = operations.get_mut(&self.parent) {
-            children.remove(&self.child);
-            if children.is_empty() {
-                operations.remove(&self.parent);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -134,7 +107,6 @@ impl Api {
             }),
             history_sessions,
             telegram: trim_base(&config.telegram_relay_base),
-            child_operations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -149,7 +121,6 @@ impl Api {
             services: ServiceBackend::Local(std::sync::Arc::new(services)),
             history_sessions,
             telegram: trim_base(telegram_base),
-            child_operations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -210,6 +181,27 @@ impl Api {
         }
     }
 
+    pub(crate) fn save_generated_image(
+        &self,
+        bytes: Vec<u8>,
+        file_name: &str,
+        media_type: &str,
+        model: &str,
+    ) -> Result<String, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .kmap
+                .save_generated_image(bytes, file_name, media_type, model)
+                .map_err(kmap_error),
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "Generated-image storage requires the in-process Kweb service.".into(),
+            }),
+        }
+    }
+
     pub async fn start_agent_turn(
         &self,
         user_id: &str,
@@ -221,11 +213,10 @@ impl Api {
                 .intelligence
                 .for_user(user_id)
                 .map_err(intelligence_error)?
-                .start_agent_turn(operation_id, request)
+                .start_agent_turn(operation_id, None, request)
                 .await
                 .map(|turn| AgentTurn {
-                    backend: AgentTurnBackend::Local(turn),
-                    child_operation: None,
+                    backend: AgentTurnBackend::Local(Box::new(turn)),
                 })
                 .map_err(intelligence_error),
             #[cfg(test)]
@@ -316,144 +307,31 @@ impl Api {
                 )));
                 Ok(AgentTurn {
                     backend: AgentTurnBackend::Http(HttpAgentTurn { events }),
-                    child_operation: None,
                 })
             }
         }
     }
 
-    pub async fn start_subagent_turn(
-        &self,
-        user_id: &str,
-        parent_operation_id: Uuid,
-        child_operation_id: Uuid,
-        model: &super::subagent::Model,
-        request: kcode_codex_runtime_v2::AgentRequest,
-    ) -> Result<AgentTurn, ApiError> {
-        {
-            let mut operations = self.child_operations.lock().map_err(|_| ApiError {
-                status: None,
-                code: "internal_error".into(),
-                message: "Subagent operation registry is unavailable.".into(),
-            })?;
-            operations
-                .entry(parent_operation_id)
-                .or_default()
-                .insert(child_operation_id);
-        }
-        let started = match &self.services {
-            ServiceBackend::Local(local) => match model.backend {
-                super::subagent::Backend::Codex => local
-                    .intelligence
-                    .for_user(user_id)
-                    .map_err(intelligence_error)?
-                    .start_agent_turn(child_operation_id, request)
-                    .await
-                    .map(|turn| AgentTurn {
-                        backend: AgentTurnBackend::Local(turn),
-                        child_operation: None,
-                    })
-                    .map_err(intelligence_error),
-                super::subagent::Backend::OpenAi | super::subagent::Backend::Gemini => local
-                    .subagents
-                    .start_turn(user_id, child_operation_id, model, request)
-                    .await
-                    .map(|turn| AgentTurn {
-                        backend: AgentTurnBackend::Api(turn),
-                        child_operation: None,
-                    })
-                    .map_err(local_api_error),
-            },
-            #[cfg(test)]
-            ServiceBackend::Http(_) => {
-                self.start_agent_turn(user_id, child_operation_id, request)
-                    .await
-            }
-        };
-        match started {
-            Ok(mut turn) => {
-                turn.child_operation = Some(ChildOperationRegistration {
-                    parent: parent_operation_id,
-                    child: child_operation_id,
-                    operations: self.child_operations.clone(),
-                });
-                Ok(turn)
-            }
-            Err(error) => {
-                drop(ChildOperationRegistration {
-                    parent: parent_operation_id,
-                    child: child_operation_id,
-                    operations: self.child_operations.clone(),
-                });
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) async fn resolve_subagent_model(
-        &self,
-        runtime: &super::RuntimeModel,
-        requested: &str,
-    ) -> Result<super::subagent::Model, ApiError> {
-        if let Some(model) = runtime.codex_subagent_model(requested) {
-            return model.map_err(local_api_error);
-        }
+    pub(crate) fn agent_runtime(&self) -> Result<kcode_agent_runtime::AgentRuntime, ApiError> {
         match &self.services {
-            ServiceBackend::Local(local) => local
-                .subagents
-                .resolve(requested)
-                .await
-                .map_err(local_api_error),
+            ServiceBackend::Local(local) => Ok(local.agents.clone()),
             #[cfg(test)]
-            ServiceBackend::Http(_) => {
-                let backend = if requested.starts_with("gemini-") {
-                    super::subagent::Backend::Gemini
-                } else {
-                    super::subagent::Backend::OpenAi
-                };
-                Ok(super::subagent::Model {
-                    requested: requested.to_owned(),
-                    provider_model: requested.to_owned(),
-                    backend,
-                    context_window_tokens: 1_000_000,
-                    max_input_tokens: 700_000,
-                })
-            }
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "Subagents require the in-process agent runtime.".into(),
+            }),
         }
     }
 
     pub fn cancel_intelligence(&self, operation_id: Uuid) -> Result<bool, ApiError> {
-        let children = self
-            .child_operations
-            .lock()
-            .map_err(|_| ApiError {
-                status: None,
-                code: "internal_error".into(),
-                message: "Subagent operation registry is unavailable.".into(),
-            })?
-            .remove(&operation_id)
-            .unwrap_or_default();
         match &self.services {
-            ServiceBackend::Local(local) => {
-                let mut cancelled = local
-                    .intelligence
-                    .cancel(operation_id)
-                    .map_err(intelligence_error)?;
-                cancelled |= local
-                    .subagents
-                    .cancel(operation_id)
-                    .map_err(local_api_error)?;
-                for child in children {
-                    cancelled |= local
-                        .intelligence
-                        .cancel(child)
-                        .map_err(intelligence_error)?;
-                    cancelled |= local.subagents.cancel(child).map_err(local_api_error)?;
-                }
-                Ok(cancelled)
-            }
+            ServiceBackend::Local(local) => local
+                .intelligence
+                .cancel(operation_id)
+                .map_err(intelligence_error),
             #[cfg(test)]
-            ServiceBackend::Http(_) => Ok(!children.is_empty()),
+            ServiceBackend::Http(_) => Ok(false),
         }
     }
 
@@ -1474,6 +1352,45 @@ impl Api {
         }
     }
 
+    pub async fn generate_image(
+        &self,
+        user_id: &str,
+        model: &str,
+        prompt: &str,
+        references: Vec<(Vec<u8>, String, String)>,
+        parent_operation_id: Uuid,
+    ) -> Result<kcode_intelligence_router::ImageResponse, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let references = references
+                    .into_iter()
+                    .map(|(bytes, filename, mime)| {
+                        media_for_image(bytes, filename, &mime).map_err(intelligence_error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                local
+                    .intelligence
+                    .for_user(user_id)
+                    .map_err(intelligence_error)?
+                    .generate_image(kcode_intelligence_router::ImageRequest {
+                        model: model.to_owned(),
+                        prompt: prompt.to_owned(),
+                        references,
+                        operation_id: Uuid::new_v4(),
+                        parent_operation_id: Some(parent_operation_id),
+                    })
+                    .await
+                    .map_err(intelligence_error)
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "Image generation requires the in-process intelligence router.".into(),
+            }),
+        }
+    }
+
     pub async fn synchronize_audio_ingress(&self) -> Result<(), ApiError> {
         match &self.services {
             ServiceBackend::Local(local) => local
@@ -1522,10 +1439,6 @@ impl AgentTurn {
                 Ok(event) => event.map(Ok),
                 Err(error) => Some(Err(intelligence_error(error))),
             },
-            AgentTurnBackend::Api(turn) => turn
-                .next_event()
-                .await
-                .map(|event| event.map_err(local_api_error)),
             #[cfg(test)]
             AgentTurnBackend::Http(turn) => turn.events.pop_front(),
         }
@@ -1541,9 +1454,6 @@ impl AgentTurn {
                 .respond(call_id, result)
                 .await
                 .map_err(intelligence_error),
-            AgentTurnBackend::Api(turn) => {
-                turn.respond(call_id, result).await.map_err(local_api_error)
-            }
             #[cfg(test)]
             AgentTurnBackend::Http(_) => Ok(()),
         }
@@ -1771,6 +1681,30 @@ fn media_for_annotation(
     kcode_intelligence_router::Media::new(kind, bytes, filename, normalized)
 }
 
+fn media_for_image(
+    bytes: Vec<u8>,
+    filename: String,
+    mime: &str,
+) -> kcode_intelligence_router::Result<kcode_intelligence_router::Media> {
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_ascii_lowercase();
+    if !normalized.starts_with("image/") {
+        return Err(kcode_intelligence_router::Error::invalid(
+            "image references must use an image content type",
+        ));
+    }
+    kcode_intelligence_router::Media::new(
+        kcode_intelligence_router::MediaKind::Image,
+        bytes,
+        filename,
+        normalized,
+    )
+}
+
 fn active_connection_ids(node: &Value) -> Vec<String> {
     node.get("recent_connections")
         .and_then(Value::as_array)
@@ -1949,6 +1883,15 @@ mod tests {
         let media = media_for_annotation(vec![1], "voice.ogg".into(), "video/ogg").unwrap();
         assert_eq!(media.kind, kcode_intelligence_router::MediaKind::Audio);
         assert_eq!(media.content_type, "audio/ogg");
+    }
+
+    #[test]
+    fn image_generation_references_require_image_media() {
+        let media =
+            media_for_image(vec![1], "reference.png".into(), "image/png; charset=binary").unwrap();
+        assert_eq!(media.kind, kcode_intelligence_router::MediaKind::Image);
+        assert_eq!(media.content_type, "image/png");
+        assert!(media_for_image(vec![1], "notes.txt".into(), "text/plain").is_err());
     }
 
     #[test]

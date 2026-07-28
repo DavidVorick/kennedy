@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "KennedyServer",
-    "data/kcode/kcode-server-object-envelopes",
     "data/kcode/kcode-session-history",
 ]
 resolver = "2"
@@ -25,12 +24,13 @@ kcode-codex-runtime-v2 = "0.1.2"
 kcode-commit-session = "=0.1.0"
 kcode-kweb-db = "1.0"
 kcode-kmap-size = "=0.1.0"
-kcode-server-object-envelopes = { path = "data/kcode/kcode-server-object-envelopes" }
+kcode-server-object-envelopes = "=0.1.0"
 kcode-audio-ingress = "=0.3.1"
-kcode-dev-tools = "=0.3.0"
+kcode-dev-tools = "=0.3.1"
 kcode-session-history = { path = "data/kcode/kcode-session-history" }
 kcode-telegram-identity = "=0.1.0"
-kcode-intelligence-router = "=0.1.0"
+kcode-agent-runtime = "=0.1.0"
+kcode-intelligence-router = "=0.2.0"
 kcode-web-semver-routing = "0.1.0"
 rand = "0.9"
 rpassword = "7.5.4"
@@ -48,6 +48,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.9"
 futures = "0.3"
 hound = "3.5"
+
+[patch.crates-io]
+kcode-agent-runtime = { path = "data/kcode/kcode-rust-libs/kcode-agent-runtime/generations/g-b1ee-18c6599ad79b5ed9-0" }
+kcode-gemini-api = { path = "data/kcode/kcode-rust-libs/kcode-gemini-api/generations/g-b1ec-18c6599ad74170c6-0" }
+kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-b1ed-18c6599ad774d7a2-0" }
+kcode-openai-api = { path = "data/kcode/kcode-rust-libs/kcode-openai-api/generations/g-b1e7-18c65999c584d09f-0" }
 
 [profile.dev]
 debug = 1

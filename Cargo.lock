@@ -1966,6 +1966,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "kcode-codex-runtime-v2",
+ "kcode-intelligence-router",
+ "serde_json",
+ "sha2 0.10.9",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-audio-ingress"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2028,9 +2041,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-dev-tools"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88d1a0a493fb8a58a3d11338775e809dbccf29fad6755a0d5b977e3bb4def767"
+checksum = "9b9166c4dd8f98bcd7aa96ea2b4c92c2bee7d7323b4b867db97f97852b416edc"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2058,9 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-gemini-api"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d71193636b9ce2bcc7c358bc668cedd4b81ad239b8f0be24eb327536b1a65b3"
+version = "0.4.0"
 dependencies = [
  "base64",
  "chrono",
@@ -2072,9 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-intelligence-router"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29c5e68a0b9a1dc7c307d99c6d674bb4d633e6f9962a5bc6a518d7571502f749"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2118,9 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-openai-api"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c98994e72b1ced33198260fb7f626b52e429470c1a277a10de4b741855dfb8c7"
+version = "0.2.0"
 dependencies = [
  "base64",
  "reqwest 0.13.4",
@@ -2130,9 +2137,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-bins"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad273b7b7fde4caba456f9f8d29555ffeafe45d9bc23806b16eb6a420727cab"
+checksum = "b796dc22a8d19a6359ff9a18534cd9053cdf7a6f093da801861e78654640c671"
 dependencies = [
  "semver",
 ]
@@ -2146,6 +2153,8 @@ checksum = "dbfcb2a46ce2ac2fe8ef732927501ae23a9849dc006fab3d82fd5b603a3fd743"
 [[package]]
 name = "kcode-server-object-envelopes"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cb6dde12f227d9a1e3bb35a247653beb4511ab1148315bd69b8c8e4d513c81"
 dependencies = [
  "chrono",
  "kcode-kweb-db",
@@ -2285,6 +2294,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "kcode-agent-runtime",
  "kcode-audio-ingress",
  "kcode-codex-runtime",
  "kcode-codex-runtime-v2",

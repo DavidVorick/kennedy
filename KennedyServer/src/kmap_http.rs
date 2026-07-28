@@ -24,10 +24,8 @@ use kcode_commit_session::{CommitReceipt, CommitRequest, ErrorKind as CommitErro
 use kcode_kweb_db::{
     Config, Error as KwebError, KwebDb, Node, NodeData, NodeId, ObjectId, Owner, Provenance,
 };
-#[cfg(test)]
-use kcode_server_object_envelopes::encode_file;
 use kcode_server_object_envelopes::{
-    StoredFile, StoredProvenance, decode_file, decode_provenance, encode_provenance,
+    StoredFile, StoredProvenance, decode_file, decode_provenance, encode_file, encode_provenance,
     sanitize_file_name,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -191,6 +189,32 @@ impl Service {
             source: "kennedy-rust-binary".into(),
             source_created_at: Utc::now(),
             data: "Output payload from a managed Rust-binary call.".into(),
+        })?;
+        let id = transaction.create_object(bytes)?;
+        transaction.finalize()?;
+        Ok(id.to_string())
+    }
+
+    pub(crate) fn save_generated_image(
+        &self,
+        bytes: Vec<u8>,
+        file_name: &str,
+        media_type: &str,
+        model: &str,
+    ) -> Result<String, ApiError> {
+        let bytes = encode_file(
+            "generated-image",
+            Some(file_name),
+            media_type,
+            Some("image"),
+            bytes,
+        )
+        .map_err(ApiError::internal)?;
+        let mut transaction = self.database.start_transaction(Provenance {
+            author: model.into(),
+            source: "kennedy-generated-image".into(),
+            source_created_at: Utc::now(),
+            data: "Image generated or modified through Kennedy intelligence.".into(),
         })?;
         let id = transaction.create_object(bytes)?;
         transaction.finalize()?;
@@ -1121,6 +1145,21 @@ mod tests {
         let input = service.get_file(&object_id).unwrap();
         assert_eq!(input.bytes, b"\xff\xd8\xffexact original");
         assert!(input.enveloped);
+
+        let generated_id = service
+            .save_generated_image(
+                b"\x89PNG\r\ngenerated".to_vec(),
+                "generated-image.png",
+                "image/png",
+                "gpt-image-2",
+            )
+            .unwrap();
+        let generated = service.get_file(&generated_id).unwrap();
+        assert_eq!(generated.bytes, b"\x89PNG\r\ngenerated");
+        assert_eq!(generated.file_name, "generated-image.png");
+        assert_eq!(generated.media_type, "image/png");
+        assert_eq!(generated.transport_kind.as_deref(), Some("image"));
+        assert!(generated.enveloped);
 
         drop(service);
         std::fs::remove_dir_all(directory).unwrap();

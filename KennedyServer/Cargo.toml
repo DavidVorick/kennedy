@@ -14,6 +14,7 @@ clap.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 kcode-audio-ingress.workspace = true
+kcode-agent-runtime.workspace = true
 kcode-session-history.workspace = true
 kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true

@@ -18,7 +18,14 @@ This document records user intention with regard to Kennedy.
   Kcode libraries, starting with the least-coupled boundaries. An extracted
   library should normally contain 300-3,000 lines of code, expose a lightweight
   well-defined API, and materially simplify what KennedyServer owns; do not
-  create pass-through crates that merely relocate server-specific glue.
+  create pass-through crates that merely relocate server-specific glue. Prefer
+  focused new libraries over casually making an existing managed library
+  larger, but optimize for the simplest total architecture: extend the clear
+  owner of a capability when doing so removes duplicate implementation or
+  parallel ownership and leaves a lighter boundary between components. Judge an
+  extraction by total first-party implementation as well as server size: move
+  code and tests rather than copying them, reuse existing transports, and do not
+  add abstraction or supporting code that consumes the deduplication benefit.
 - Managed libraries maintained only by LLMs are source-first: their code and
   tests are the specification. Do not add a separate `Specification.md` that
   duplicates an ingestible codebase; retain only documentation required by the
@@ -37,15 +44,20 @@ This document records user intention with regard to Kennedy.
 
 ## Kmap and Durable Knowledge
 
-- Kweb is a generic transactional graph and object store. It should not acquire
-  Kennedy-specific concepts such as users, roots, active connections, fanout,
-  UI policy, or model behavior.
+- Kweb is a privacy-enforcing transactional graph and object store. Every node
+  and object has an immutable-user-ID owner and independently stored audience
+  policy, and Kweb includes those facts in signed transactions and enforces
+  them on reads and writes. It does not resolve Kennedy-specific transport
+  groups, roots, active connections, fanout, UI policy, or session behavior;
+  callers supply the exact user and model audience for an operation.
 - Kweb's root files and binary database records are private to
   `kcode-kweb-db`. KennedyServer and offline application tooling must use its
   public API rather than parsing or mutating those formats behind the
   library's lock and recovery boundary.
-- Kennedy owns graph policy, including roots, ownership, fixed connections,
-  active/fanout interpretation, validation, and model attribution.
+- Kennedy owns application graph policy, including roots, fixed connections,
+  active/fanout interpretation, application validation, and model attribution.
+  Kweb owns durable resource ownership, privacy evaluation, and owner-only
+  mutation enforcement.
 - Fixed connections are deliberately placed references, not task slots or a
   priority system. Graph hygiene belongs to Kennedy; the harness should not
   silently promote or rearrange connections.
@@ -55,9 +67,45 @@ This document records user intention with regard to Kennedy.
   nodes; explicit loading and provider context capacity govern expansion.
 - Use canonical Kweb node and object identifiers at every Kennedy boundary.
   Do not introduce session-local aliases for already-durable resources.
-- Trusted Kennedy users share one graph. Node ownership records provenance and
-  organizational intent; it is not a confidentiality boundary or per-node
-  access-control system.
+- Kennedy users share one graph, but Kweb itself filters every node and object
+  read against the supplied audience. Its ordinary public API must not expose
+  an unfiltered read path that application code can accidentally use. Ownership
+  and privacy-policy data replicate transactionally with each resource;
+  Kennedy resolves transport identities and session participation into the
+  exact audience supplied to Kweb.
+- A resource has six independently optional privacy rules: strict whitelist,
+  permissive whitelist, and blacklist for users, plus the same three rules for
+  models. Every configured rule must pass. Strict whitelist requires every
+  present subject of that type to match, permissive whitelist requires at least
+  one present subject of that type to match, and blacklist requires no present
+  subject of that type to match. A resource with no configured rules is
+  visible.
+- Users are represented in privacy policy only by immutable exact identifiers.
+  A group is not itself a policy subject: its audience is the complete set of
+  users known to be present in the session, supplied as an array by Telegram or
+  another transport. Group selectors are not supported.
+- Model selectors use a bounded glob-like syntax rather than general regular
+  expressions. With no `*` they match exactly; one `*` may appear only at the
+  beginning, the end, or both to request suffix, prefix, or substring matching
+  respectively. A `*` anywhere else is invalid.
+- A node hidden from an audience behaves exactly like a nonexistent node:
+  direct lookup returns the ordinary not-found result, and every visible
+  node's fixed and recent connections, including their summaries and derived
+  context, omit hidden targets without revealing that filtering occurred.
+- Kweb's audience-scoped read API always filters its results while retaining
+  the ordinary read method signatures. Policy changes are separate writes whose
+  policy data is included in the resulting Kweb transaction. Each object has
+  its own owner and independent privacy policy rather than inheriting either
+  from a node.
+- Every node and object records its owning immutable user identifier directly;
+  ownership is not inferred through a root node. Kweb permits only that owner
+  to mutate the resource or its privacy policy, and a valid policy must not deny
+  its owner access.
+- Privacy changes govern future reads but do not revoke a node already loaded
+  into an existing session or rewrite durable session history.
+- The database privacy upgrade is intentionally deferred. Its complete handoff
+  is recorded in `kweb-privacy-upgrade.txt`; do not begin the implementation
+  until the user explicitly resumes it.
 - Kennedy and the relevant user or group each have durable roots. Those roots
   are the starting points for memory, identity, tool discovery, and operating
   knowledge.
@@ -121,6 +169,19 @@ This document records user intention with regard to Kennedy.
 - All model-backed operations go through one typed intelligence boundary.
   Audio and other background libraries receive callbacks rather than owning
   provider clients or credentials.
+- Provider API libraries own provider-specific transport, validation, and
+  response normalization. `kcode-intelligence-router` is the application-facing
+  entry point for every direct model call and owns provider selection,
+  credentials, cancellation, model limits, and durable usage accounting.
+  Higher-level agent and subagent libraries build on that router and own agent
+  loops, context projection, and tool-callback semantics; they do not construct
+  parallel provider clients or persist a second usage ledger.
+- Kennedy exposes image creation and image modification as one model-call tool,
+  analogous to media annotation. The caller chooses an exact supported image
+  model and may supply existing image objects as references; generated images
+  return through Kennedy's ordinary object and delivery paths. Provider-specific
+  image transport and normalization remain below the intelligence router, and
+  the router retains user attribution, cancellation, limits, and accounting.
 - Kennedy chooses exact supported models and capabilities. Avoid vague
   fast/balanced/quality aliases and do not infer media capability solely from a
   MIME string.
@@ -221,6 +282,10 @@ This document records user intention with regard to Kennedy.
 - Application-level file and provenance payload envelopes stored inside opaque
   Kweb objects have one small typed library owner. KennedyServer decides when
   to store and transport them, but does not duplicate their binary codecs.
+- Envelope codecs are canonical and fail closed: every encoder output must be
+  accepted by its decoder, filenames are bounded and platform-independent,
+  reserved markers never fall back to raw-payload interpretation, and
+  untrusted declared sizes use checked arithmetic and fallible allocation.
 - Native media delivery and generic-document delivery are intentional distinct
   actions. A failed native send must remain visible as that failure rather than
   silently changing the semantic delivery type.
@@ -345,6 +410,10 @@ This document records user intention with regard to Kennedy.
   flow into later binary calls or normal channel delivery. Preserve recognizable
   file payloads exactly so existing file decoding and transport selection can
   identify and emit them without a binary-specific wrapper or conversion step.
+- Prefer headless Chromium's browser-native rendering for fidelity-sensitive
+  HTML-to-PDF work instead of a standalone HTML layout library. The managed
+  Rust-binary runtime must provide Chromium and baseline fonts so a rendering
+  binary can depend on that capability without bundling its own browser.
 - Runtime networking and timeout choices belong to the managed binary call,
   not to a broad build-time restriction or an unnecessary global concurrency
   policy.

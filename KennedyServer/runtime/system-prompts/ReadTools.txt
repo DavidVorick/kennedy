@@ -15,3 +15,7 @@ HydrateEvent
 
 DehydrateEvent
   This is available only during history ingress. Give it the numeric eventId. It retires the active inspection box for that previously hydrated source event. It does not mutate source history.
+
+GenerateImage
+  Call: {"model":"gpt-image-2","prompt":"Create the requested image.","referenceObjectIds":["pending:47"]}
+  Creates an image when referenceObjectIds is omitted or empty, and modifies or uses the listed images as references when it is present. The exact supported models are gpt-image-2 and gemini-3-pro-image. referenceObjectIds accepts up to 14 distinct pending or canonical image-object IDs. The result is an ordinary canonical Kweb object; call EmitObject with its returned identifier to deliver it.
