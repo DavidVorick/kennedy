@@ -22,7 +22,7 @@ use kcode_kweb_context::{
     Context as KwebContext, Node as KwebNode, NodeDraft, StagedCreate as KwebStagedCreate,
 };
 use kcode_kweb_db::{NodeId, ObjectId};
-use kcode_server_object_envelopes::encode_file;
+use kcode_server_object_envelopes::{StoredFile, encode_file};
 use kcode_session_history::{
     NewSession, Session as HistorySession,
     chatend::{
@@ -365,7 +365,7 @@ fn render_web_fetch_result(result: &Value) -> anyhow::Result<String> {
 }
 
 fn render_media_annotation_result(
-    object_id: &PendingId,
+    object_id: &str,
     file_name: &str,
     content_type: &str,
     result: &Value,
@@ -3255,11 +3255,8 @@ impl Session {
                 let model = nonempty_string(&call.arguments, "model", 128)?;
                 let prompt = bounded_nonempty_string(&call.arguments, "prompt", 4_000)?;
                 let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
-                let (pending_id, metadata, bytes) =
-                    read_pending_object(&mut self.journal, &object_id)?;
-                let media_type = normalized_media_type(&metadata.media_type);
-                validate_annotation_media(&model, &media_type)?;
-                let file_name = authoritative_object_filename(&metadata)?.to_owned();
+                let media = read_media_object(&mut self.journal, &self.api, &object_id)?;
+                validate_annotation_media(&model, &media.media_type)?;
                 let user_id = self
                     .root_node_ids
                     .first()
@@ -3270,13 +3267,18 @@ impl Session {
                         user_id,
                         &model,
                         &prompt,
-                        bytes,
-                        file_name.clone(),
-                        &media_type,
+                        media.bytes,
+                        media.file_name.clone(),
+                        &media.media_type,
                         operation_id,
                     )
                     .await?;
-                render_media_annotation_result(&pending_id, &file_name, &media_type, &result)?
+                render_media_annotation_result(
+                    &media.object_id,
+                    &media.file_name,
+                    &media.media_type,
+                    &result,
+                )?
             }
             "GenerateImage" => {
                 validate_arguments(
@@ -4504,34 +4506,80 @@ fn read_pending_object(
     Ok((pending_id, location.metadata, bytes))
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ResolvedMediaObject {
+    object_id: String,
+    bytes: Vec<u8>,
+    file_name: String,
+    media_type: String,
+}
+
+fn read_media_object(
+    journal: &mut HistorySession,
+    api: &Api,
+    object_id: &str,
+) -> anyhow::Result<ResolvedMediaObject> {
+    read_media_object_using(journal, object_id, |canonical_id| {
+        api.kmap_file(canonical_id).map_err(Into::into)
+    })
+}
+
+fn read_media_object_using(
+    journal: &mut HistorySession,
+    object_id: &str,
+    read_canonical: impl FnOnce(&str) -> anyhow::Result<StoredFile>,
+) -> anyhow::Result<ResolvedMediaObject> {
+    let resolved = if object_id.starts_with("pending:") {
+        let (pending_id, metadata, bytes) = read_pending_object(journal, object_id)?;
+        ResolvedMediaObject {
+            object_id: pending_id.to_string(),
+            bytes,
+            file_name: authoritative_object_filename(&metadata)?.to_owned(),
+            media_type: normalized_media_type(&metadata.media_type),
+        }
+    } else {
+        let canonical_id = object_id
+            .parse::<ObjectId>()
+            .with_context(|| format!("{object_id:?} is not an object ID"))?;
+        let file = read_canonical(object_id)?;
+        anyhow::ensure!(
+            file.object_id == canonical_id,
+            "object store returned {} while resolving {canonical_id}",
+            file.object_id
+        );
+        ResolvedMediaObject {
+            object_id: canonical_id.to_string(),
+            bytes: file.bytes,
+            file_name: file.file_name,
+            media_type: normalized_media_type(&file.media_type),
+        }
+    };
+    anyhow::ensure!(
+        !resolved.bytes.is_empty(),
+        "media object {} is empty",
+        resolved.object_id
+    );
+    anyhow::ensure!(
+        resolved.bytes.len() as u64 <= MAX_MEDIA_ENRICHMENT_BYTES,
+        "media object {} is {} bytes, over the {}-byte enrichment limit",
+        resolved.object_id,
+        resolved.bytes.len(),
+        MAX_MEDIA_ENRICHMENT_BYTES
+    );
+    Ok(resolved)
+}
+
 fn read_image_object(
     journal: &mut HistorySession,
     api: &Api,
     object_id: &str,
 ) -> anyhow::Result<(Vec<u8>, String, String)> {
-    let (bytes, file_name, media_type) = if object_id.starts_with("pending:") {
-        let (_, metadata, bytes) = read_pending_object(journal, object_id)?;
-        (
-            bytes,
-            authoritative_object_filename(&metadata)?.to_owned(),
-            normalized_media_type(&metadata.media_type),
-        )
-    } else {
-        object_id
-            .parse::<ObjectId>()
-            .with_context(|| format!("{object_id:?} is not an object ID"))?;
-        let file = api.kmap_file(object_id)?;
-        (
-            file.bytes,
-            file.file_name,
-            normalized_media_type(&file.media_type),
-        )
-    };
+    let resolved = read_media_object(journal, api, object_id)?;
     anyhow::ensure!(
-        media_type.starts_with("image/"),
+        resolved.media_type.starts_with("image/"),
         "GenerateImage reference {object_id} is not an image"
     );
-    Ok((bytes, file_name, media_type))
+    Ok((resolved.bytes, resolved.file_name, resolved.media_type))
 }
 
 fn rust_binary_object_ids(arguments: &Value) -> anyhow::Result<Vec<String>> {
@@ -5577,6 +5625,38 @@ mod tests {
     }
 
     #[test]
+    fn media_enrichment_resolves_canonical_object_bytes_and_metadata() {
+        let (path, mut journal) = test_journal("canonical-media-enrichment", 10_000);
+        let object_id = ObjectId::from_bytes([0x80, 1, 2, 3, 4, 6]).unwrap();
+        let object_id_text = object_id.to_string();
+        let expected = b"\xff\xd8\xffexact-canonical".to_vec();
+
+        let resolved = read_media_object_using(&mut journal, &object_id_text, |requested| {
+            assert_eq!(requested, object_id_text);
+            Ok(StoredFile {
+                object_id,
+                file_name: "stored-photo.jpg".into(),
+                media_type: "image/jpeg".into(),
+                transport_kind: Some("telegram".into()),
+                bytes: expected.clone(),
+                enveloped: true,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            ResolvedMediaObject {
+                object_id: object_id_text,
+                bytes: expected,
+                file_name: "stored-photo.jpg".into(),
+                media_type: "image/jpeg".into(),
+            }
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn telegram_group_media_staging_is_context_bound_and_idempotently_discoverable() {
         let context = json!({
             "chatId":-100123,
@@ -5720,6 +5800,7 @@ mod tests {
     #[test]
     fn media_and_document_results_use_authoritative_staged_filenames() {
         let pending = PendingId::parse("pending:47").unwrap();
+        let pending_text = pending.to_string();
         let annotation_result =
             serde_json::to_value(kcode_intelligence_router::AnnotationResponse {
                 complete: false,
@@ -5731,9 +5812,13 @@ mod tests {
                 usage: None,
             })
             .unwrap();
-        let annotation =
-            render_media_annotation_result(&pending, "scene.png", "image/png", &annotation_result)
-                .unwrap();
+        let annotation = render_media_annotation_result(
+            &pending_text,
+            "scene.png",
+            "image/png",
+            &annotation_result,
+        )
+        .unwrap();
         assert!(annotation.contains("Annotation for pending:47"));
         assert!(annotation.contains("File: scene.png"));
         assert!(annotation.contains("Content type: image/png"));

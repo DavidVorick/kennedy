@@ -197,6 +197,9 @@ This document records user intention with regard to Kennedy.
   return through Kennedy's ordinary object and delivery paths. Provider-specific
   image transport and normalization remain below the intelligence router, and
   the router retains user attribution, cancellation, limits, and accounting.
+- Generated and modified image objects must describe their encoded bytes
+  truthfully end to end. Provider adapters must request a supported output
+  format and must not label or name JPEG bytes as PNG, or vice versa.
 - Kennedy chooses exact supported models and capabilities. Avoid vague
   fast/balanced/quality aliases and do not infer media capability solely from a
   MIME string.
@@ -286,6 +289,10 @@ This document records user intention with regard to Kennedy.
 - User-supplied voice and media reach Kennedy as originals without eager
   transport-generated interpretation. Kennedy chooses whether and how to
   transcribe or annotate them, including the exact model and bounded prompt.
+- `AnnotateMedia` accepts any authorized compatible media object, whether it is
+  staged in the current session or already canonical in the object store.
+  Annotation availability must not depend on when or how the original entered
+  storage.
 - Model-backed media work must validate the actual media kind and capability.
   Treat transcription, translation, visual interpretation, and speaker
   identification as potentially wrong and preserve uncertainty.

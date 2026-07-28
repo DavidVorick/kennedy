@@ -1,0 +1,649 @@
+KWEB PRIVACY UPGRADE
+====================
+
+Status
+------
+
+This is a requirements handoff for a future implementation. Do not implement
+the upgrade merely because this file exists. The privacy work has deliberately
+been deferred.
+
+This file records the intended behavior, the architecture decisions already
+made, the acceptance boundaries, and the few edge cases that still require an
+explicit decision. A future implementation must read Clarifications.md, this
+file, the then-current kcode-kweb-db source, and the current Kennedy call sites
+before changing code.
+
+
+1. Purpose
+----------
+
+Kweb must become a privacy-enforcing transactional graph and object database.
+Privacy is a database invariant, not a KennedyServer convention and not a
+filtering library layered above the database.
+
+The database must:
+
+* store an immutable-user-ID owner directly on every node and every object;
+* store an independent privacy policy on every node and every object;
+* include ownership and privacy changes in signed Kweb transactions;
+* replicate, recover, and history those facts with the rest of Kweb state;
+* filter every ordinary node and object read inside kcode-kweb-db;
+* enforce owner-only resource and policy mutations inside kcode-kweb-db;
+* make a resource hidden by privacy indistinguishable from one that does not
+  exist; and
+* remove references to hidden resources from otherwise visible results.
+
+Filtering never deletes or rewrites the stored resource. It changes only the
+audience-facing projection returned by Kweb. This is one meaning of keeping the
+feature in the database: ownership and policy cannot be lost because a caller
+forgot a sidecar store or bypassed an application filter.
+
+
+2. Architectural boundary
+-------------------------
+
+Kweb owns:
+
+* durable node and object owners;
+* durable node and object privacy policies;
+* transaction encoding, signing, validation, replication, conflict handling,
+  recovery, and history for owner and policy state;
+* evaluation of privacy policies against a supplied audience;
+* filtering direct reads and resource references;
+* identical not-found behavior for hidden and nonexistent resources; and
+* owner-only write enforcement.
+
+Kennedy owns:
+
+* authentication of a human and resolution to an immutable user ID;
+* mapping Telegram, and later Slack, WhatsApp, and other identities to the
+  immutable user IDs supplied to Kweb;
+* determining every user known to be present in a session;
+* determining the canonical model identifier or identifiers receiving a read;
+* supplying that exact audience to Kweb;
+* Kmap roots and all application meanings attached to roots;
+* fixed/recent/active/fanout application behavior; and
+* model and execution provenance beyond the authenticated acting user.
+
+Kweb must not learn Telegram group IDs, Slack channel IDs, WhatsApp chat IDs,
+Kennedy session IDs, or the application meaning of a root. A group is expanded
+by Kennedy into its known immutable user IDs before a Kweb read.
+
+The privacy guarantee is relative to the audience supplied by trusted Kennedy
+code. Kweb cannot discover that Kennedy omitted a Telegram participant. The
+transport and session code must therefore treat construction of the audience
+as security-sensitive.
+
+
+3. Identities, owners, actors, and audiences
+--------------------------------------------
+
+User identity
+~~~~~~~~~~~~~
+
+Privacy rules and owners use immutable user IDs only. Usernames, Telegram
+handles, display names, root node IDs, and model-provided names are not user
+identities for privacy purposes.
+
+The long-term identity should work across transports. Telegram, Slack,
+WhatsApp, and other accounts should resolve to the Kennedy user ID used by
+Kweb. The exact serialized UserId representation has not yet been selected;
+the implementation must choose a bounded, canonical, immutable form and must
+not silently use a mutable handle.
+
+Ownership
+~~~~~~~~~
+
+Every node and every object has exactly one owner stored directly as a user ID.
+Ownership is no longer inferred from a node's owning root. Roots remain useful
+Kmap resources, but they are not the privacy ownership mechanism.
+
+For a new resource, the owner is the authenticated user creating it unless an
+explicit, separately authorized ownership mechanism is later designed. There
+must be no ordinary unowned node or object.
+
+Actor
+~~~~~
+
+Every mutating transaction must carry the authenticated acting user ID
+separately from provenance. The user ID answers "who is authorized to do
+this?" Provenance answers "which model, process, source, and execution context
+produced this?" Model attribution must never be accepted as proof of human
+ownership.
+
+Audience
+~~~~~~~~
+
+A privacy-aware read is evaluated against an audience containing:
+
+* a deduplicated collection of immutable user IDs known to be present; and
+* the canonical model identifier or identifiers that will receive the result.
+
+The ordinary case currently has zero or one active model, but the six-rule
+policy is defined using set semantics so strict and permissive model rules
+remain well-defined.
+
+The audience should be immutable for the duration of one database operation.
+An audience-scoped Kweb handle is the preferred API shape:
+
+    let reader = db.for_audience(audience)?;
+    let node = reader.get_node(node_id)?;
+
+This keeps familiar read signatures such as get_node(id),
+get_node_history(id), and get_object(id), while the filtering still happens
+inside kcode-kweb-db. Passing an audience explicitly to each read is acceptable
+only if the final API makes unscoped application reads impossible.
+
+Ordinary application code must not receive a raw, unfiltered Kweb reader.
+Narrow offline recovery, upgrade, integrity-check, and backup internals may
+need raw storage access, but such access must be explicit and unavailable from
+normal Kennedy read or tool paths.
+
+
+4. Group audience behavior
+--------------------------
+
+Groups are not policy subjects. There is no group whitelist or group blacklist
+in this revision.
+
+For a group session, the user audience is every immutable user ID Kennedy knows
+to be present in that session. The Telegram integration must be changed to pass
+an array when multiple users are present rather than reporting only one user.
+Future Slack, WhatsApp, and other integrations must produce the same
+transport-independent audience.
+
+The audience must not be reduced to:
+
+* only the author of the latest message;
+* only the user who initially created the session; or
+* a group or chat identifier.
+
+The transport may not always know the platform's complete membership. This
+revision deliberately evaluates all users known to Kennedy within the session.
+The implementation must document and test what durable session roster is used.
+If a participant cannot be resolved to an immutable user ID, code must not
+invent an ID or fall back to a handle.
+
+When a newly known user joins an existing session, the larger audience governs
+future database reads. Content already loaded into that session is not revoked;
+see section 11.
+
+
+5. Privacy policy shape
+-----------------------
+
+Every node and every object has an independent policy with six independently
+optional rules:
+
+1. user strict whitelist;
+2. user permissive whitelist;
+3. user blacklist;
+4. model strict whitelist;
+5. model permissive whitelist; and
+6. model blacklist.
+
+The user rules contain immutable user IDs. The model rules contain the bounded
+model patterns described in section 7.
+
+All configured rules are combined with logical AND. A resource is visible only
+if every configured rule passes. Rules are not alternatives and there is no
+"first matching rule wins" behavior.
+
+A resource with no configured rules is visible to every valid audience. This
+is the default for resources without privacy settings.
+
+Privacy is independent per resource:
+
+* a node does not inherit policy from its root, owner, connected nodes, or
+  objects;
+* an object does not inherit policy from a node that mentions or transports
+  it; and
+* changing one resource's policy does not silently rewrite another resource's
+  policy.
+
+
+6. Rule evaluation
+------------------
+
+For a user ID, "matches" means exact equality with a listed immutable user ID.
+
+For a model identifier, "matches" means that at least one configured pattern
+matches according to section 7.
+
+For each subject type, evaluate a configured rule as follows:
+
+Strict whitelist
+~~~~~~~~~~~~~~~~
+
+Every subject of that type present in the audience must match the whitelist.
+
+For users:
+
+    all present user IDs are listed
+
+For models:
+
+    all present model IDs match at least one listed model pattern
+
+Permissive whitelist
+~~~~~~~~~~~~~~~~~~~~
+
+At least one subject of that type present in the audience must match the
+whitelist.
+
+For users:
+
+    at least one present user ID is listed
+
+For models:
+
+    at least one present model ID matches a listed model pattern
+
+Blacklist
+~~~~~~~~~
+
+No subject of that type present in the audience may match the blacklist.
+
+For users:
+
+    no present user ID is listed
+
+For models:
+
+    no present model ID matches a listed model pattern
+
+Combined example
+~~~~~~~~~~~~~~~~
+
+Given:
+
+    user strict whitelist     = <alice, bob, charlie>
+    user permissive whitelist = <alice>
+
+Then:
+
+* <alice, bob> is allowed by both rules;
+* <alice, bob, charlie> is allowed by both rules;
+* <bob, charlie> is denied because the permissive whitelist fails;
+* <alice, dan> is denied because the strict whitelist fails; and
+* a configured user or model blacklist could still deny an audience that
+  passed both whitelists.
+
+All six configured rules must pass in the same way.
+
+Owner invariant
+~~~~~~~~~~~~~~~
+
+The database must not accept a policy that prevents the owner from directly
+viewing their own resource. At minimum, evaluation against a direct owner
+audience containing the owner's user ID and no unrelated users must succeed.
+This invariant must be checked by Kweb when accepting a policy mutation, not
+only by a UI.
+
+The owner invariant does not grant unrelated co-viewers access. An audience
+containing the owner can still be denied because another present user is not
+on a strict whitelist or is on a blacklist.
+
+
+7. Model pattern syntax
+-----------------------
+
+Model selectors are not regular expressions. They use only exact, prefix,
+suffix, or substring matching based on a single wildcard at the bookends.
+
+Given text X:
+
+    X       exact match
+    X*      prefix match
+    *X      suffix match
+    *X*     substring match
+
+Examples:
+
+    codex       matches only the exact canonical model ID "codex"
+    codex*      matches canonical model IDs beginning with "codex"
+    *codex      matches canonical model IDs ending with "codex"
+    *codex*     matches canonical model IDs containing "codex"
+
+A wildcard is invalid anywhere except the beginning and/or end. For example:
+
+    co*dex      invalid
+
+This matcher must be implemented directly and deterministically. Do not
+compile patterns as regular expressions or extend the grammar with `?`,
+character classes, escaping, or multiple internal wildcards.
+
+The model string matched by Kweb must be Kennedy's canonical public model
+identifier, not a display label. Exact namespace conventions must be settled
+before implementation so names such as API models and codex/<catalog-id>
+cannot be confused.
+
+
+8. Database read behavior
+-------------------------
+
+All ordinary Kweb reads are privacy-aware. This includes current and future
+ways of obtaining resource content, metadata, history, search results, list
+results, indexes, or graph traversal results.
+
+Direct lookup
+~~~~~~~~~~~~~
+
+If the requested node or object fails privacy:
+
+* return the same error kind, public code, status, and message that would be
+  returned if that exact identifier did not exist;
+* do not mention privacy, filtering, ownership, or denial in the error; and
+* do not expose different application-visible metadata for hidden versus
+  nonexistent resources.
+
+Internal diagnostics may record a sanitized privacy-denial reason, but it must
+not be returned to the requesting audience.
+
+Connections and references
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a visible node refers to a hidden node, Kweb must omit the hidden target
+from:
+
+* fixed connections;
+* recent connections;
+* connection summaries;
+* derived graph traversal results; and
+* any future index or list response that would reveal the relationship.
+
+The surviving connections retain their stored relative order. Filtering must
+not mutate the stored node.
+
+The intended observable behavior is that the hidden node does not exist and
+nothing connects to it.
+
+Objects have independent privacy. If a Kweb result contains object identifiers
+or object summaries, identifiers for objects hidden from the audience must not
+be exposed through that result. A direct hidden-object lookup returns the
+ordinary object-not-found result.
+
+History
+~~~~~~~
+
+A hidden resource's history must not be readable through an audience-facing
+history API. The current policy gates future access to the resource and its
+history. History and raw transaction APIs must not become a bypass around the
+normal filtered read.
+
+Database health, backup, replication, recovery, and integrity internals may
+inspect raw state only through explicit non-application capabilities.
+
+
+9. Database write behavior
+--------------------------
+
+Node writes
+~~~~~~~~~~~
+
+Only the node's current immutable-user-ID owner may:
+
+* change node content;
+* change its fixed or recent connections;
+* change other mutable node data; or
+* set, replace, or clear its privacy rules.
+
+Kweb must perform the owner check at transaction validation/commit time. A
+KennedyServer precheck is useful for UX but is not the security boundary.
+
+Object writes
+~~~~~~~~~~~~~
+
+Every object has an immutable-user-ID owner and an independent policy. Object
+bytes may remain immutable, but only the owner may change the object's mutable
+privacy metadata. The policy change must be a Kweb transaction.
+
+Policy writes
+~~~~~~~~~~~~~
+
+Privacy settings are written separately from ordinary content writes. Do not
+invent an automatic create-and-policy workflow merely to eliminate the interval
+between transactions. A newly created resource with no rules is public until a
+later policy transaction changes it; this simplicity is intentional.
+
+Policy data must not live only in a sidecar SQLite database, KennedyServer
+memory, session state, or an opaque object that Kweb does not understand.
+
+Read-after-write
+~~~~~~~~~~~~~~~~
+
+Any audience-facing result returned after a successful mutation is a read and
+must be privacy-filtered inside Kweb. A raw mutation response must not leak
+hidden connections or objects.
+
+Transaction actor
+~~~~~~~~~~~~~~~~~
+
+The transaction API must receive an authenticated acting user ID. Local and
+replicated transaction validation must deterministically verify that the actor
+owns every existing resource mutated by the transaction.
+
+The exact authority model for remote writers and the cryptographic binding
+between a trusted writer and its claimed user ID must be designed with the
+existing Kweb writer/signature model. A future implementation must not simply
+trust model-authored transaction fields supplied as tool arguments.
+
+
+10. Transaction, replication, and history requirements
+-------------------------------------------------------
+
+Ownership and policy are first-class signed transaction state.
+
+For nodes, the transaction/history model must retain enough information to
+recover the visible owner and visible policy together with the visible node
+data.
+
+For objects, current Kweb object bytes are immutable, but independently
+modifiable policy introduces mutable object metadata. Kweb therefore needs a
+transactional visible owner/policy state and history for each object, with
+well-defined conflict and recovery behavior. Do not mutate or duplicate the
+authoritative object bytes just to update policy.
+
+Privacy evaluation must use the owner and policy from one coherent visible
+database state. It must not combine a resource from one transaction with stale
+policy from an unrelated side store.
+
+The signed wire format, transaction validation, gossip admission, recovery,
+history projection, backup, and integrity checks must all include the new
+metadata. A transaction accepted on one correct Kweb replica must produce the
+same visible owner, policy, and filtered evaluation on another correct replica
+given the same audience.
+
+Malformed owner IDs, malformed patterns, invalid policies, unauthorized writes,
+and impossible resource references must be rejected before becoming visible.
+
+
+11. Existing sessions and policy changes
+----------------------------------------
+
+Privacy changes apply to future database reads.
+
+Do not attempt to revoke, remove, rewrite, or redact a node or object already
+loaded into an existing Kennedy session. Do not rewrite immutable session
+history or reconstruct old model contexts after a policy change.
+
+For an existing session:
+
+* content already loaded remains available in that session;
+* a later database read uses the current audience and current policy; and
+* newly hidden resources not already loaded are filtered normally.
+
+This behavior is intentional. Retroactive information-flow revocation would be
+too disruptive and is outside this upgrade.
+
+
+12. Upgrade and legacy-data requirements
+----------------------------------------
+
+The current Kweb format does not store direct user owners and independent
+privacy metadata on every node and object. This feature therefore requires a
+deliberate database-format and transaction-format upgrade.
+
+The upgrade must:
+
+* preserve the original database for offline recovery;
+* never assign owners by guessing from mutable handles or model provenance;
+* obtain or deterministically derive an immutable user owner for every existing
+  node;
+* obtain an explicitly chosen immutable user owner for existing objects, which
+  currently do not have one;
+* initialize existing resources with no configured privacy rules unless the
+  migration is given explicit policies;
+* verify every migrated resource has exactly one valid owner;
+* validate the upgraded database before making it live; and
+* avoid keeping a permanent live compatibility loader for the retired format.
+
+Existing root relationships may help an offline Kennedy migration determine a
+node's user owner, but the upgraded Kweb record must store the user ID directly.
+Runtime ownership must not continue to depend on root traversal.
+
+The owner assignment for legacy nodes and objects has not yet been chosen.
+The future implementation must stop and obtain that migration policy rather
+than silently assigning all legacy data to an arbitrary user.
+
+
+13. Required acceptance tests
+-----------------------------
+
+At minimum, tests must cover:
+
+Policy truth table
+~~~~~~~~~~~~~~~~~~
+
+* no rules means visible;
+* each of the six rules independently allows and denies;
+* all configured rules combine with AND;
+* the Alice/Bob/Charlie/Dan example in section 6;
+* multiple present users;
+* zero, one, and multiple model identifiers as supported by the final API;
+* a blacklist denying an audience that passed both whitelists; and
+* owner-policy validation.
+
+Model matching
+~~~~~~~~~~~~~~
+
+* exact match;
+* prefix match;
+* suffix match;
+* substring match;
+* a nonmatching value for each form;
+* rejection of an interior wildcard such as co*dex; and
+* rejection of every other invalid form selected by the final edge-case
+  decisions.
+
+Read filtering
+~~~~~~~~~~~~~~
+
+* hidden-node lookup and nonexistent-node lookup have identical public errors;
+* hidden-object lookup and nonexistent-object lookup have identical public
+  errors;
+* visible nodes retain visible fixed and recent connections;
+* hidden fixed and recent targets disappear;
+* hidden targets disappear from connection summaries and traversal results;
+* hidden object references disappear from audience-facing results;
+* surviving references retain their stored order;
+* hidden histories cannot be read; and
+* filtering never changes stored data.
+
+Write enforcement
+~~~~~~~~~~~~~~~~~
+
+* owner can write their node;
+* non-owner cannot write the node;
+* owner can change a node policy;
+* non-owner cannot change a node policy;
+* equivalent object-policy tests;
+* policy cannot deny direct owner access;
+* owner checks are repeated at commit rather than relying only on an earlier
+  precheck; and
+* provenance/model identity cannot substitute for the authenticated user ID.
+
+Transactions and recovery
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* owner and policy survive reopen;
+* owner and policy replicate in signed transaction packages;
+* replay and recovery preserve the visible policy state;
+* conflicting metadata transactions resolve deterministically under Kweb's
+  chosen conflict rules;
+* malformed or unauthorized policy transactions never become visible; and
+* object bytes remain exact across policy updates.
+
+Kennedy integration
+~~~~~~~~~~~~~~~~~~~
+
+* one-user sessions supply one immutable user ID;
+* Telegram group sessions supply all known immutable user IDs;
+* future transport adapters can supply the same audience type;
+* a model read supplies the canonical active model ID;
+* newly known group participants affect future reads; and
+* already-loaded content is not retroactively revoked.
+
+
+14. Explicit non-goals
+----------------------
+
+This revision does not include:
+
+* group IDs as privacy subjects;
+* Telegram-specific logic inside Kweb;
+* Slack- or WhatsApp-specific logic inside Kweb;
+* general regular expressions for model matching;
+* privacy inherited through roots, nodes, connections, or objects;
+* a privacy sidecar outside Kweb transactions;
+* an application-layer filter as the security boundary;
+* retroactive revocation from existing sessions;
+* rewriting historical session archives after policy changes;
+* hiding policy failures behind a different public error than ordinary
+  not-found; or
+* implementation work at the time this requirements file was written.
+
+
+15. Decisions still required before implementation
+---------------------------------------------------
+
+The main architecture and behavior above are settled. The following narrow
+edge cases were not explicitly decided and must not be guessed:
+
+1. The canonical serialized form and namespace of immutable Kennedy user IDs,
+   including how one human's Telegram, Slack, and WhatsApp identities are
+   linked.
+
+2. The canonical model identifier string matched by policies, including
+   provider and codex/ namespace rules and whether matching is case-sensitive.
+
+3. Whether an empty configured whitelist is invalid, equivalent to an absent
+   rule, or an intentional deny-all rule. The representation must cleanly
+   distinguish "no rules" from any intentionally configured behavior.
+
+4. Whether the model rules are skipped for a direct human-only read with no
+   model recipient, or evaluated using ordinary empty-set semantics. This must
+   remain compatible with the owner's guaranteed direct access.
+
+5. Whether the pattern `*` is a valid match-all selector, and whether forms
+   such as `**`, `**X`, `X**`, an empty string, or whitespace-only strings are
+   rejected. Interior wildcards such as co*dex are already definitively
+   invalid.
+
+6. Whether ownership can ever be transferred, who can authorize a transfer,
+   and how the recipient-owner invariant is checked. Ordinary mutation by a
+   non-owner is definitively forbidden.
+
+7. Who owns nodes associated today with group roots, because group IDs are not
+   owners and every upgraded resource must have one immutable user owner.
+
+8. The explicit migration owner for legacy objects and for any legacy node
+   whose user cannot be derived unambiguously.
+
+9. The exact trusted-writer/authenticated-user binding used to validate actor
+   user IDs in local and replicated transactions.
+
+Resolve these items explicitly before finalizing schemas or wire formats. They
+do not justify moving privacy back out of Kweb or weakening any settled
+requirement above.

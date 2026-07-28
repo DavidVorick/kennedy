@@ -28,7 +28,7 @@ kcode-kmap-size = "=0.1.0"
 kcode-server-object-envelopes = "=0.1.0"
 kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-128e-18c662e17afaea2e-0" }
 kcode-audio-ingress = "=0.3.1"
-kcode-dev-tools = "=0.3.1"
+kcode-dev-tools = "=0.3.2"
 kcode-session-history = "=0.1.2"
 kcode-telegram-identity = "=0.1.0"
 kcode-agent-runtime = "=0.1.0"
@@ -52,6 +52,7 @@ futures = "0.3"
 hound = "3.5"
 
 [patch.crates-io]
+kcode-gemini-api = { path = "data/kcode/kcode-rust-libs/kcode-gemini-api/generations/g-b1ec-18c6599ad74170c6-0" }
 kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-128e-18c662e17afaea2e-0" }
 
 [profile.dev]

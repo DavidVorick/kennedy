@@ -2043,9 +2043,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-dev-tools"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b9166c4dd8f98bcd7aa96ea2b4c92c2bee7d7323b4b867db97f97852b416edc"
+checksum = "559bb954655903f835016831dc0f95ac29a083796b448b10d5540bb1e9aa79a5"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2074,8 +2074,6 @@ dependencies = [
 [[package]]
 name = "kcode-gemini-api"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d23b3e8ed0558e6bd192aa531ee4c420218b14ce89b43997efd2c89caef6d22"
 dependencies = [
  "base64",
  "chrono",
@@ -2156,18 +2154,18 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-bins"
-version = "3.0.1"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b796dc22a8d19a6359ff9a18534cd9053cdf7a6f093da801861e78654640c671"
+checksum = "56f5f7e3117d58beb501b8c3ef24251df3d60af232f4913e98551994c68406cc"
 dependencies = [
  "semver",
 ]
 
 [[package]]
 name = "kcode-rust-libs-v2"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbfcb2a46ce2ac2fe8ef732927501ae23a9849dc006fab3d82fd5b603a3fd743"
+checksum = "22dacf03e90fee0273d91dfdfc3cfc17028402c155d2cf0ad99cfe2dc7ef03e5"
 
 [[package]]
 name = "kcode-server-object-envelopes"
