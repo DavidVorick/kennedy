@@ -3,10 +3,11 @@ use std::{collections::HashMap, path::Path};
 use anyhow::Context;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 
-const PROMPT_FILES: [(&str, &str); 11] = [
+const PROMPT_FILES: [(&str, &str); 12] = [
     ("identity", "KennedyIdentity.txt"),
     ("conversationSession", "ConversationSession.txt"),
     ("freeTimeSession", "SelfTimeSession.txt"),
+    ("wakeupSession", "WakeupSession.txt"),
     ("historyIngressSession", "HistoryIngressSession.txt"),
     ("audioIngressSession", "AudioIngressSession.txt"),
     ("telegramSession", "TelegramSession.txt"),
@@ -74,18 +75,12 @@ impl Manuals {
         session_type: &str,
         session_context: &str,
     ) -> anyhow::Result<String> {
-        let session_key = if session_type == "free-time" {
-            "freeTimeSession"
-        } else {
-            "conversationSession"
+        let (session_key, writes) = match session_type {
+            "free-time" => ("freeTimeSession", true),
+            "wakeup" => ("wakeupSession", true),
+            _ => ("conversationSession", false),
         };
-        self.compose(
-            runtime,
-            session_key,
-            session_type == "free-time",
-            session_context,
-            session_type,
-        )
+        self.compose(runtime, session_key, writes, session_context, session_type)
     }
 
     pub(crate) fn compose_ingress(
@@ -253,6 +248,25 @@ mod tests {
         let audio = manuals.compose_ingress(&runtime, "audio").unwrap();
         assert!(!audio.contains("[telegramSession]"));
         assert!(!audio.contains("[telegramGroupSession]"));
+    }
+
+    #[test]
+    fn wakeup_sessions_have_their_own_autonomous_write_prompt() {
+        let prompt = testing_manuals()
+            .compose_conversation(&RuntimeModel::testing(), "wakeup", "")
+            .unwrap();
+        assert!(prompt.contains("[wakeupSession]"));
+        assert!(prompt.contains("[writeTools]"));
+        assert!(!prompt.contains("[conversationSession]"));
+        assert!(!prompt.contains("[telegramSession]"));
+    }
+
+    #[test]
+    fn wakeup_manual_makes_confident_silence_explicit() {
+        let manual = include_str!("../../runtime/system-prompts/WakeupSession.txt");
+        assert!(manual.contains("only when you are confident"));
+        assert!(manual.contains("choosing silence is a complete and valid outcome"));
+        assert!(manual.contains("call EndSession"));
     }
 
     #[test]

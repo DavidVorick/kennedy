@@ -2225,8 +2225,6 @@ dependencies = [
 [[package]]
 name = "kcode-tg-kennedy-bot"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f34b460af14cf84b1089586135809be463b08d7bf82f45870a51013c642e455"
 dependencies = [
  "anyhow",
  "axum",

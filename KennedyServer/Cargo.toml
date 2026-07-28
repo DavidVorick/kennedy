@@ -25,7 +25,7 @@ kcode-kweb-context.workspace = true
 kcode-kweb-db.workspace = true
 kcode-kmap-size.workspace = true
 kcode-server-object-envelopes.workspace = true
-kcode-tg-kennedy-bot = "=0.3.0"
+kcode-tg-kennedy-bot.workspace = true
 kcode-telegram-identity.workspace = true
 kcode-web-semver-routing.workspace = true
 rusqlite.workspace = true

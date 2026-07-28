@@ -44,6 +44,8 @@ use super::{
 const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
 const BROWSER_CONVERSATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const WAKEUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_TELEGRAM_DM_CHARACTERS: usize = 40_000;
 const INLINE_TOOL_INVOCATION_CHARACTERS: usize = 1_000;
 const MIN_NODE_SHORT_NAME_CHARACTERS: usize = 4;
 const MAX_NODE_SHORT_NAME_CHARACTERS: usize = 50;
@@ -63,6 +65,7 @@ const SUBAGENT_CONTEXT_NODE_LIMIT: usize = 64;
 pub(crate) enum AgentMode {
     Conversation,
     FreeTime,
+    Wakeup,
     Ingress { record_id: Option<String> },
 }
 
@@ -171,6 +174,7 @@ impl KwebPlan {
 
 pub(crate) struct Session {
     api: Api,
+    manuals: Manuals,
     runtime: RuntimeModel,
     journal: HistorySession,
     plan: KwebPlan,
@@ -1288,6 +1292,7 @@ impl Session {
             journal.state().completed_session_object.is_some() || commit_receipt.is_some();
         let mut session = Self {
             api,
+            manuals,
             runtime,
             journal,
             plan,
@@ -1795,7 +1800,7 @@ impl Session {
     fn current_live_capacity_error(&self) -> bool {
         match self.mode {
             AgentMode::Conversation => self.pending_capacity_error(),
-            AgentMode::FreeTime => self.has_live_capacity_error(),
+            AgentMode::FreeTime | AgentMode::Wakeup => self.has_live_capacity_error(),
             AgentMode::Ingress { .. } => false,
         }
     }
@@ -1825,6 +1830,29 @@ impl Session {
         };
         self.pending_turn = matches!(stage, InputStage::Accepted);
         true
+    }
+
+    pub(crate) fn stage_wakeup_opening(&mut self) -> anyhow::Result<bool> {
+        if self.pending_turn {
+            return Ok(false);
+        }
+        let marker = self
+            .channel
+            .get("wakeupMarker")
+            .and_then(Value::as_str)
+            .context("wakeup session is missing its acquired time marker")?;
+        let marker = DateTime::parse_from_rfc3339(marker)
+            .context("wakeup session has an invalid acquired time marker")?
+            .with_timezone(&Utc);
+        let text = wakeup_opening(marker);
+        let Some(stage) = self.stage_user_input(
+            &text,
+            &json!({"kind":"wakeup","wakeupMarker":marker.to_rfc3339()}),
+        ) else {
+            return Ok(false);
+        };
+        self.pending_turn = matches!(stage, InputStage::Accepted);
+        Ok(true)
     }
 
     pub(crate) fn begin_user_turn(&mut self, text: &str, metadata: &Value) -> bool {
@@ -1905,10 +1933,13 @@ impl Session {
                 checkpoint(self.snapshot()?).await?;
                 Ok(Some(answer))
             }
-            AgentMode::FreeTime | AgentMode::Ingress { .. } => {
+            AgentMode::FreeTime | AgentMode::Wakeup | AgentMode::Ingress { .. } => {
                 self.pending_turn = false;
                 self.pending_external_event_id = None;
-                if matches!(self.mode, AgentMode::FreeTime | AgentMode::Ingress { .. }) {
+                if matches!(
+                    self.mode,
+                    AgentMode::FreeTime | AgentMode::Wakeup | AgentMode::Ingress { .. }
+                ) {
                     self.finalize_kweb_session()?;
                     self.completed = true;
                 }
@@ -2702,6 +2733,195 @@ impl Session {
         })
     }
 
+    async fn send_telegram_dm(&mut self, arguments: &Value) -> anyhow::Result<String> {
+        validate_arguments(arguments, &["user", "message"], &[])?;
+        let user_argument = arguments
+            .get("user")
+            .filter(|value| value.is_object())
+            .context("user must be an object")?;
+        validate_arguments(user_argument, &["telegramUserId"], &[])?;
+        let telegram_user_id = positive_integer(user_argument, "telegramUserId")?;
+        let telegram_user_id = i64::try_from(telegram_user_id)
+            .context("telegramUserId exceeds Telegram's supported integer range")?;
+        let message = nonempty_string(arguments, "message", MAX_TELEGRAM_DM_CHARACTERS)?;
+
+        let already_holds_user_lock = self.session_type == "telegram"
+            && self.channel.get("telegramUserId").and_then(Value::as_i64) == Some(telegram_user_id);
+        let _user_guard = if already_holds_user_lock {
+            None
+        } else {
+            Some(
+                self.api
+                    .telegram_user_lock(telegram_user_id)
+                    .await
+                    .lock_owned()
+                    .await,
+            )
+        };
+
+        let private_sessions = self
+            .api
+            .telegram_get("/api/v1/private-sessions")
+            .await
+            .context("discovering established Telegram private chats")?;
+        let private_session = private_sessions
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|session| {
+                session.get("telegramUserId").and_then(Value::as_i64) == Some(telegram_user_id)
+            })
+            .context("This Telegram user has not opened a private chat with Kennedy.")?;
+        let expected_conversation_id = private_session
+            .get("currentConversationId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        let directory_user = self
+            .api
+            .directory_user(telegram_user_id)
+            .await
+            .context("resolving the authorized Telegram user")?;
+        let user_root = directory_user
+            .root_node_id
+            .clone()
+            .context("The Telegram user's Kennedy root is not ready.")?;
+        let histories = self
+            .api
+            .history_list()
+            .await
+            .context("listing Kennedy sessions for the Telegram user")?;
+        let summaries = histories
+            .get("conversations")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let selected = active_direct_session_for_user(
+            summaries,
+            &user_root,
+            expected_conversation_id.as_deref(),
+        );
+        let current_session_id = self.journal.state().metadata.session_id.clone();
+        let metadata = json!({
+            "kind":"telegram-direct-message",
+            "sentByKennedy":true,
+            "telegramUserId":telegram_user_id,
+            "sourceSessionId":current_session_id,
+        });
+
+        let conversation_id = if selected
+            .and_then(|record| record.get("id"))
+            .and_then(Value::as_str)
+            == Some(current_session_id.as_str())
+        {
+            self.stage_source_message(true, &message, metadata)?;
+            current_session_id
+        } else if let Some(summary) = selected {
+            let id = summary
+                .get("id")
+                .and_then(Value::as_str)
+                .context("active session summary is missing its ID")?
+                .to_owned();
+            let record = self
+                .api
+                .history_get_session(&id)
+                .await
+                .context("opening the Telegram user's active Kennedy session")?;
+            let state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+            let session_type = state
+                .get("sessionType")
+                .and_then(Value::as_str)
+                .unwrap_or("conversation")
+                .to_owned();
+            let mut options =
+                SessionOptions::conversation(session_type, string_values(state.get("rootNodeIds")));
+            options.reference_root_node_ids = string_values(state.get("referenceRootNodeIds"));
+            options.channel = state.get("channel").cloned().unwrap_or(Value::Null);
+            options.free_time = state.get("freeTime").cloned().unwrap_or(Value::Null);
+            options.orchestration = state
+                .get("orchestration")
+                .cloned()
+                .unwrap_or_else(|| json!({"owner":"backend","status":"idle"}));
+            let mut target = Session::new(
+                self.api.clone(),
+                self.manuals.clone(),
+                self.runtime.clone(),
+                options,
+                Some(&state),
+            )
+            .await?;
+            target.stage_source_message(true, &message, metadata)?;
+            self.api
+                .history_checkpoint(
+                    &id,
+                    kcode_session_history::Checkpoint {
+                        expected_version: history_record_version(&record)?,
+                        state: target.snapshot()?,
+                        user_activity: false,
+                    },
+                    false,
+                )
+                .await
+                .context("attaching the direct message to the active Kennedy session")?;
+            id
+        } else {
+            let roots = self
+                .api
+                .kmap_get("/api/v1/kmap/roots")
+                .await
+                .context("loading Kennedy's root for a new Telegram session")?;
+            let kennedy_root = roots
+                .get("kennedy_root_node_id")
+                .and_then(Value::as_str)
+                .context("Kmap roots omitted Kennedy's root")?
+                .to_owned();
+            let mut options =
+                SessionOptions::conversation("telegram", vec![user_root, kennedy_root]);
+            options.channel = json!({
+                "kind":"telegram",
+                "telegramUserId":telegram_user_id,
+                "username":directory_user.current_username.or(Some(directory_user.handle)),
+                "displayName":directory_user.display_name,
+            });
+            let mut target = Session::new(
+                self.api.clone(),
+                self.manuals.clone(),
+                self.runtime.clone(),
+                options,
+                None,
+            )
+            .await?;
+            target.stage_source_message(true, &message, metadata)?;
+            let state = target.snapshot()?;
+            let id = target.journal.state().metadata.session_id.clone();
+            self.api
+                .history_register(kcode_session_history::RegisterSession {
+                    id: id.clone(),
+                    started_at: target.started_at.clone(),
+                    state,
+                })
+                .await
+                .context("creating a Telegram session for the direct message")?;
+            id
+        };
+
+        self.api
+            .telegram_post(
+                &format!("/api/v1/private-sessions/{telegram_user_id}/messages"),
+                json!({
+                    "conversationId":conversation_id,
+                    "expectedConversationId":expected_conversation_id,
+                    "text":message,
+                }),
+            )
+            .await
+            .context("sending the Telegram direct message")?;
+        Ok(format!(
+            "Sent a Telegram direct message to user {telegram_user_id} and attached it to session {conversation_id}."
+        ))
+    }
+
     async fn execute_tool(
         &mut self,
         call: &ToolCall,
@@ -2713,6 +2933,7 @@ impl Session {
         let mut freeform_write = None;
         let mut managed_source_snapshot = None;
         let text = match call.name.as_str() {
+            "SendTelegramDM" => self.send_telegram_dm(&call.arguments).await?,
             "RunSubagent" => {
                 store_result = true;
                 let first_event = self.journal.state().events.len();
@@ -2741,7 +2962,7 @@ impl Session {
                 validate_arguments(&call.arguments, &[], &["message"])?;
                 anyhow::ensure!(
                     !matches!(self.mode, AgentMode::Conversation),
-                    "EndSession is only available during history ingress or self time"
+                    "EndSession is only available during an autonomous or history-ingress session"
                 );
                 end_session = true;
                 if matches!(self.mode, AgentMode::FreeTime)
@@ -3850,6 +4071,9 @@ impl Session {
         if matches!(self.mode, AgentMode::Ingress { .. }) {
             return Some(HISTORY_INGRESS_REQUEST_TIMEOUT);
         }
+        if matches!(self.mode, AgentMode::Wakeup) {
+            return Some(WAKEUP_REQUEST_TIMEOUT);
+        }
         if matches!(self.mode, AgentMode::FreeTime) {
             let deadline = deadline(&self.free_time)?;
             return Some(Duration::from_secs(
@@ -3892,7 +4116,10 @@ impl Session {
 
     pub(crate) fn commit_current_write_session(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            matches!(self.mode, AgentMode::FreeTime | AgentMode::Ingress { .. }),
+            matches!(
+                self.mode,
+                AgentMode::FreeTime | AgentMode::Wakeup | AgentMode::Ingress { .. }
+            ),
             "a read-only conversation cannot be committed as a Kweb write session"
         );
         self.finalize_kweb_session()?;
@@ -3964,6 +4191,11 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
             if call.name == "RunSubagent" {
                 return Ok(kcode_agent_runtime::ToolOutcome::failure(
                     "RunSubagent is unavailable inside a subagent. Only Kennedy may launch subagents.",
+                ));
+            }
+            if call.name == "SendTelegramDM" {
+                return Ok(kcode_agent_runtime::ToolOutcome::failure(
+                    "SendTelegramDM is unavailable inside a subagent. Only Kennedy may send a direct message.",
                 ));
             }
             if budget.estimated_tokens() > budget.max_input_tokens() {
@@ -4235,6 +4467,7 @@ fn session_kind(session_type: &str, mode: &AgentMode) -> SessionKind {
         "telegram" => SessionKind::Telegram,
         "telegram-group" => SessionKind::TelegramGroup,
         "free-time" => SessionKind::SelfTime,
+        "wakeup" => SessionKind::Other("wakeup".into()),
         "audio" => SessionKind::AudioIngress,
         other => SessionKind::Other(other.into()),
     }
@@ -4630,10 +4863,62 @@ fn message_metadata_without_attachment_payloads(value: &Value) -> Value {
     value
 }
 
+fn string_values(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn history_record_version(record: &Value) -> anyhow::Result<i64> {
+    record
+        .get("version")
+        .and_then(Value::as_i64)
+        .context("session record is missing its version")
+}
+
+fn active_direct_session_for_user<'a>(
+    records: &'a [Value],
+    user_root: &str,
+    expected_conversation_id: Option<&str>,
+) -> Option<&'a Value> {
+    records
+        .iter()
+        .filter(|record| {
+            if record.get("phase").and_then(Value::as_str) != Some("active") {
+                return false;
+            }
+            let state = record.get("state").unwrap_or(&Value::Null);
+            matches!(
+                state.get("sessionType").and_then(Value::as_str),
+                Some("conversation" | "telegram")
+            ) && string_values(state.get("rootNodeIds"))
+                .iter()
+                .any(|root| root == user_root)
+        })
+        .min_by_key(|record| {
+            let id = record.get("id").and_then(Value::as_str);
+            let session_type = record
+                .get("state")
+                .and_then(|state| state.get("sessionType"))
+                .and_then(Value::as_str);
+            if id == expected_conversation_id {
+                0
+            } else if session_type == Some("telegram") {
+                1
+            } else {
+                2
+            }
+        })
+}
+
 fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
     kcode_codex_runtime_v2::DynamicTool::new(
         "call_ktool",
-        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated.",
+        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may send an authorized user a private Telegram message from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\"}}.",
         json!({
             "type":"object",
             "additionalProperties":false,
@@ -4883,6 +5168,14 @@ fn free_time_opening(value: &Value) -> String {
     }
 }
 
+fn wakeup_opening(marker: DateTime<Utc>) -> String {
+    format!(
+        "The time is {} UTC on {}. Determine whether you have any messages you would like to send the user",
+        marker.format("%H:%M"),
+        marker.format("%Y-%m-%d"),
+    )
+}
+
 fn format_telegram_group_context(value: &Value) -> String {
     let context = value
         .get("groupContext")
@@ -5047,6 +5340,7 @@ fn controller_box_name(mode: &AgentMode) -> &'static str {
     match mode {
         AgentMode::Conversation => "Turn continuation",
         AgentMode::FreeTime => "Self-time continuation",
+        AgentMode::Wakeup => "Wakeup continuation",
         AgentMode::Ingress { .. } => "History-ingress continuation",
     }
 }
@@ -5057,6 +5351,9 @@ fn controller_message(mode: &AgentMode, free_time: &Value) -> String {
             "Continue the turn. Use tools if needed, then answer the user.".into()
         }
         AgentMode::FreeTime => format!("Continue self time. {}", free_time_schedule(free_time)),
+        AgentMode::Wakeup => {
+            "Continue this autonomous wakeup session. Sending no message is a valid outcome; call EndSession when you have finished.".into()
+        }
         AgentMode::Ingress { .. } => {
             "You are in a solo history-ingress session; there is no user to receive a conversational response. If you have completed all useful memory work, call EndSession now through the native call_ktool function with no arguments. A normal response does not end this session. If work remains, continue it with tools, then call EndSession when finished.".into()
         }
@@ -5068,6 +5365,38 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn wakeup_opening_uses_the_acquired_marker_verbatim() {
+        let marker = DateTime::parse_from_rfc3339("2026-07-28T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            wakeup_opening(marker),
+            "The time is 04:00 UTC on 2026-07-28. Determine whether you have any messages you would like to send the user"
+        );
+    }
+
+    #[test]
+    fn cold_dm_prefers_the_transport_binding_then_an_active_private_session() {
+        let records = vec![
+            json!({"id":"browser","phase":"active","state":{"sessionType":"conversation","rootNodeIds":["user"]}}),
+            json!({"id":"telegram","phase":"active","state":{"sessionType":"telegram","rootNodeIds":["user"]}}),
+            json!({"id":"wakeup","phase":"active","state":{"sessionType":"wakeup","rootNodeIds":["user"]}}),
+        ];
+        assert_eq!(
+            active_direct_session_for_user(&records, "user", Some("browser"))
+                .and_then(|record| record.get("id"))
+                .and_then(Value::as_str),
+            Some("browser")
+        );
+        assert_eq!(
+            active_direct_session_for_user(&records, "user", None)
+                .and_then(|record| record.get("id"))
+                .and_then(Value::as_str),
+            Some("telegram")
+        );
+    }
 
     fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, HistorySession) {
         let root = std::env::temp_dir().join(format!(

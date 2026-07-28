@@ -78,6 +78,10 @@ impl Orchestrator {
 
     pub(crate) async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         self.initialize_until_ready().await;
+        let wakeup_worker = self.clone();
+        tokio::spawn(async move {
+            wakeup_worker.run_wakeup_scheduler().await;
+        });
         loop {
             match self.poll_once().await {
                 Ok(()) => *self.last_poll_error.write().await = None,
@@ -141,6 +145,89 @@ impl Orchestrator {
         self.runtime
             .get()
             .context("orchestration runtime is not initialized")
+    }
+
+    async fn run_wakeup_scheduler(self: Arc<Self>) {
+        loop {
+            let marker = next_wakeup_marker(Utc::now());
+            let delay = (marker - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+            tokio::time::sleep(delay).await;
+            if let Err(error) = self.create_wakeup_sessions(marker).await {
+                tracing::warn!(
+                    marker=%marker.to_rfc3339(),
+                    error=%error,
+                    "Scheduled wakeup session creation failed; this marker will not be retried"
+                );
+            }
+        }
+    }
+
+    async fn create_wakeup_sessions(&self, marker: DateTime<Utc>) -> anyhow::Result<()> {
+        let private_sessions = self.api.telegram_get("/api/v1/private-sessions").await?;
+        for private_session in private_sessions
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(telegram_user_id) = private_session
+                .get("telegramUserId")
+                .and_then(Value::as_i64)
+            else {
+                tracing::warn!("Telegram private-session discovery returned no numeric user ID");
+                continue;
+            };
+            if let Err(error) = self.create_wakeup_session(telegram_user_id, marker).await {
+                tracing::warn!(
+                    %telegram_user_id,
+                    marker=%marker.to_rfc3339(),
+                    error=%error,
+                    "Could not create this user's scheduled wakeup session"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn create_wakeup_session(
+        &self,
+        telegram_user_id: i64,
+        marker: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let runtime = self.runtime()?.clone();
+        let user = self.api.directory_user(telegram_user_id).await?;
+        let user_root = user
+            .root_node_id
+            .context("Telegram user root is not ready for a wakeup session")?;
+        let mut options =
+            SessionOptions::conversation("wakeup", vec![user_root, runtime.kennedy_root_node_id]);
+        options.mode = AgentMode::Wakeup;
+        options.channel = json!({
+            "kind":"wakeup",
+            "telegramUserId":telegram_user_id,
+            "username":user.current_username.or(Some(user.handle)),
+            "displayName":user.display_name,
+            "wakeupMarker":marker.to_rfc3339(),
+        });
+        options.orchestration = json!({"owner":"backend","status":"scheduled"});
+        let mut session = Session::new(
+            self.api.clone(),
+            runtime.manuals,
+            runtime.model,
+            options,
+            None,
+        )
+        .await?;
+        session.stage_wakeup_opening()?;
+        let state = session.snapshot()?;
+        self.api
+            .history_register(kcode_session_history::RegisterSession {
+                id: required_string(&state, "sessionId")?,
+                started_at: session.started_at.clone(),
+                state,
+            })
+            .await?;
+        Ok(())
     }
 
     async fn poll_once(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -521,10 +608,10 @@ impl Orchestrator {
             .get("provenanceId")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        options.mode = if session_type == "free-time" {
-            AgentMode::FreeTime
-        } else {
-            AgentMode::Conversation
+        options.mode = match session_type.as_str() {
+            "free-time" => AgentMode::FreeTime,
+            "wakeup" => AgentMode::Wakeup,
+            _ => AgentMode::Conversation,
         };
         Session::new(
             self.api.clone(),
@@ -580,6 +667,22 @@ impl Orchestrator {
 
     async fn schedule_writer_job(self: &Arc<Self>, histories: &[Value]) -> anyhow::Result<()> {
         if self.writer_job_active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(record) = histories
+            .iter()
+            .find(|record| {
+                record.get("phase").and_then(Value::as_str) == Some("active")
+                    && session_type(record) == "wakeup"
+            })
+            .cloned()
+        {
+            self.launch_writer_job("scheduled wakeup", move |worker| async move {
+                let id = required_string(&record, "id")?;
+                let record = worker.get_conversation(&id).await?;
+                worker.process_wakeup(record).await
+            })
+            .await;
             return Ok(());
         }
         if let Some(record) = histories
@@ -901,6 +1004,44 @@ impl Orchestrator {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    async fn process_wakeup(&self, record: Value) -> anyhow::Result<()> {
+        let id = required_string(&record, "id")?;
+        let mut session = self.session_for_record(&record).await?;
+        session.stage_wakeup_opening()?;
+        let record = Arc::new(Mutex::new(record));
+        persist_record(&self.api, &record, session.snapshot()?, false).await?;
+        let operation = Uuid::new_v4();
+        let api = self.api.clone();
+        let saved = record.clone();
+        session
+            .run_pending_turn(operation, move |state| {
+                let api = api.clone();
+                let record = saved.clone();
+                async move {
+                    persist_record(&api, &record, state, false).await?;
+                    Ok(())
+                }
+            })
+            .await?;
+        session.commit_current_write_session()?;
+        persist_record(&self.api, &record, session.snapshot()?, false).await?;
+        session.release_managed_sources().await;
+        let mut locked = record.lock().await;
+        let completed = self
+            .api
+            .history_complete(
+                &id,
+                kcode_session_history::Checkpoint {
+                    expected_version: version(&locked)?,
+                    state: locked.get("state").cloned().unwrap_or(Value::Null),
+                    user_activity: false,
+                },
+            )
+            .await?;
+        *locked = completed;
         Ok(())
     }
 
@@ -1331,6 +1472,22 @@ impl Orchestrator {
         bound_conversation_id: Arc<Mutex<Option<String>>>,
     ) -> anyhow::Result<()> {
         let id = required_string(event, "id")?;
+        let _private_user_guard =
+            if event.get("sessionKind").and_then(Value::as_str) != Some("group") {
+                let telegram_user_id = event
+                    .get("telegramUserId")
+                    .and_then(Value::as_i64)
+                    .context("private Telegram event is missing its numeric user identity")?;
+                Some(
+                    self.api
+                        .telegram_user_lock(telegram_user_id)
+                        .await
+                        .lock_owned()
+                        .await,
+                )
+            } else {
+                None
+            };
         self.directory_user(event).await?;
         if event.get("kind").and_then(Value::as_str) == Some("reset") {
             return self.process_telegram_reset(event).await;
@@ -2185,6 +2342,21 @@ fn session_type(record: &Value) -> String {
         .into()
 }
 
+fn next_wakeup_marker(now: DateTime<Utc>) -> DateTime<Utc> {
+    let day_start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always a valid UTC time")
+        .and_utc();
+    for hour in [0_i64, 4, 8, 12, 16, 20] {
+        let candidate = day_start + ChronoDuration::hours(hour);
+        if candidate > now {
+            return candidate;
+        }
+    }
+    day_start + ChronoDuration::days(1)
+}
+
 fn next_ingress(histories: &[Value], now: DateTime<Utc>) -> Option<&Value> {
     histories
         .iter()
@@ -2337,6 +2509,24 @@ fn telegram_timeout(event: &Value) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wakeup_markers_are_strictly_future_four_hour_utc_boundaries() {
+        let before = DateTime::parse_from_rfc3339("2026-07-28T03:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            next_wakeup_marker(before).to_rfc3339(),
+            "2026-07-28T04:00:00+00:00"
+        );
+        let exactly = DateTime::parse_from_rfc3339("2026-07-28T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            next_wakeup_marker(exactly).to_rfc3339(),
+            "2026-07-29T00:00:00+00:00"
+        );
+    }
 
     #[test]
     fn browser_and_telegram_sessions_are_classified_from_current_control_state() {

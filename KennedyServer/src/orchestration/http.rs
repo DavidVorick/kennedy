@@ -1,6 +1,6 @@
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -48,6 +48,7 @@ pub(crate) struct Api {
     services: ServiceBackend,
     history_sessions: kcode_session_history::SessionHistory,
     telegram: String,
+    telegram_user_locks: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -106,6 +107,7 @@ impl Api {
             }),
             history_sessions,
             telegram: trim_base(&config.telegram_relay_base),
+            telegram_user_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -120,7 +122,20 @@ impl Api {
             services: ServiceBackend::Local(std::sync::Arc::new(services)),
             history_sessions,
             telegram: trim_base(telegram_base),
+            telegram_user_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    pub(crate) async fn telegram_user_lock(
+        &self,
+        telegram_user_id: i64,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.telegram_user_locks
+            .lock()
+            .await
+            .entry(telegram_user_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub(crate) fn create_history_session(

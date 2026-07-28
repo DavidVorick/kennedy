@@ -336,6 +336,16 @@ This document records user intention with regard to Kennedy.
 - Keep a separate durable session for each participant and group, distinct from
   direct messages and from the participant's sessions in other groups. Preserve
   strict order within a stream while allowing unrelated streams to progress.
+- Kennedy's main agent may initiate a private Telegram message to any explicitly
+  targeted authorized user from any session, but only after that user has
+  opened a private chat with the bot. The tool accepts the stable numeric user
+  identity; Telegram transport resolves the private chat without exposing chat
+  IDs to Kennedy or KennedyServer.
+- An initiated private message belongs to the targeted user's already-active
+  direct Kennedy session when one exists, preferring the transport's current
+  session and then another private Telegram session; create a new private
+  Telegram session when none is active. Record the Kennedy-authored message in
+  that session and atomically bind successful delivery to it.
 - Invocation controls when Kennedy responds, not which accepted bounded group
   context she may inspect. Passive group discussion and retained media should
   be available to an open participant session without pretending that messages
@@ -386,6 +396,18 @@ This document records user intention with regard to Kennedy.
 
 - Self time is genuinely autonomous and may use the complete read, research,
   and Kmap-write tool set within an explicit user-selected run.
+- At 00:00, 04:00, 08:00, 12:00, 16:00, and 20:00 UTC, create one autonomous
+  wakeup opportunity for each authorized user who has already opened a private
+  Telegram chat. The acquired per-user marker, rather than the later model
+  start time, supplies the time and date in the opening message.
+- Wakeup opportunities are deliberately ephemeral scheduling: if the server is
+  not running at a marker, do not backfill it or add scheduler state. Once
+  created, the ordinary durable session may finish after the marker and must
+  retain that acquired marker.
+- A wakeup session has the autonomous read, research, direct-message, and
+  Kmap-write capabilities. Silence is a complete and valid outcome; Kennedy
+  should send a message only when confident that something is worth sending
+  that user at that hour.
 - A self-time run has one persisted absolute deadline shared by all of its
   clean-slate slices. Starting a new slice must not reset or shorten that
   deadline.
@@ -413,6 +435,11 @@ This document records user intention with regard to Kennedy.
   writes revise it; exact writes remain durable; failed writes leave it alone.
 - Kennedy's managed check and publication tools own the workflow. Avoid adding
   deployment scripts or another publication path around them.
+- Managed Rust checks and publications automatically apply rustfmt to their
+  disposable source before the remaining validation. Formatting differences
+  that rustfmt can repair must not become model-facing failures or consume
+  another Kennedy turn; failure to run rustfmt or source that rustfmt cannot
+  parse remains actionable.
 - Managed binaries preserve text output exactly and place binary output in the
   object store. Do not pretty-print or wrap exact output merely for consistency
   with an unrelated API.
