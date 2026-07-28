@@ -281,10 +281,9 @@ mod tests {
         assert!(
             read_tools.contains(r#"{"name":"BoxesIntoObjects","arguments":{"boxIds":[12,15]}}"#)
         );
-        let guidance = include_str!("../../../boxes-into-objects.txt");
-        assert!(guidance.contains("codebases"));
-        assert!(guidance.contains("transcripts"));
-        assert!(guidance.contains("Granola notes"));
-        assert!(guidance.contains("copy-pastes"));
+        assert!(read_tools.contains("codebases"));
+        assert!(read_tools.contains("transcripts"));
+        assert!(read_tools.contains("Granola notes"));
+        assert!(read_tools.contains("copy-pastes"));
     }
 }

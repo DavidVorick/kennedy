@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
@@ -41,6 +41,12 @@ enum MissingGroupSessionRecovery {
     },
 }
 
+struct TelegramEventRetry {
+    failures: u32,
+    not_before: Instant,
+    last_error: String,
+}
+
 pub(crate) struct Orchestrator {
     config: Config,
     api: Api,
@@ -49,6 +55,7 @@ pub(crate) struct Orchestrator {
     writer_job_active: AtomicBool,
     commands_in_flight: Mutex<HashSet<String>>,
     events_in_flight: Mutex<HashSet<String>>,
+    event_retries: Mutex<HashMap<String, TelegramEventRetry>>,
     group_updates_in_flight: Mutex<HashSet<String>>,
     group_ingress_in_flight: Mutex<HashSet<String>>,
     directory_in_flight: Mutex<HashSet<String>>,
@@ -67,6 +74,7 @@ impl Orchestrator {
             writer_job_active: AtomicBool::new(false),
             commands_in_flight: Mutex::new(HashSet::new()),
             events_in_flight: Mutex::new(HashSet::new()),
+            event_retries: Mutex::new(HashMap::new()),
             group_updates_in_flight: Mutex::new(HashSet::new()),
             group_ingress_in_flight: Mutex::new(HashSet::new()),
             directory_in_flight: Mutex::new(HashSet::new()),
@@ -1400,8 +1408,26 @@ impl Orchestrator {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let listed_ids = events
+            .iter()
+            .filter_map(|event| event.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        self.event_retries
+            .lock()
+            .await
+            .retain(|id, _| listed_ids.contains(id));
         for event in events {
             let id = required_string(&event, "id")?;
+            if self
+                .event_retries
+                .lock()
+                .await
+                .get(&id)
+                .is_some_and(|retry| Instant::now() < retry.not_before)
+            {
+                continue;
+            }
             let mut set = self.events_in_flight.lock().await;
             if !set.insert(id.clone()) {
                 continue;
@@ -1443,11 +1469,33 @@ impl Orchestrator {
             .await
             .remove(&format!("telegram:{id}"));
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                self.event_retries.lock().await.remove(&id);
+            }
             Ok(Err(error)) => {
-                tracing::warn!(event_id=%id,error=%error,"Telegram event will retry")
+                let message = bounded_error(&error);
+                let (attempt, delay, should_warn) =
+                    self.record_telegram_event_retry(&id, &message).await;
+                if should_warn {
+                    tracing::warn!(
+                        event_id=%id,
+                        attempt,
+                        retry_in_seconds=delay.as_secs(),
+                        error=%message,
+                        "Telegram event will retry"
+                    );
+                } else {
+                    tracing::debug!(
+                        event_id=%id,
+                        attempt,
+                        retry_in_seconds=delay.as_secs(),
+                        error=%message,
+                        "Telegram event retry remains unsuccessful"
+                    );
+                }
             }
             Err(_) => {
+                self.event_retries.lock().await.remove(&id);
                 let _ = self.api.cancel_intelligence(operation);
                 let conversation = conversation_id.lock().await.clone();
                 if let Some(conversation_id) = &conversation
@@ -1467,6 +1515,28 @@ impl Orchestrator {
                 tracing::error!(event_id=%id,"Telegram event reached its 30-minute deadline and was aborted");
             }
         }
+    }
+
+    async fn record_telegram_event_retry(&self, id: &str, error: &str) -> (u32, Duration, bool) {
+        let mut retries = self.event_retries.lock().await;
+        let failures = retries
+            .get(id)
+            .map_or(1, |retry| retry.failures.saturating_add(1));
+        let delay = telegram_event_retry_delay(failures);
+        let should_warn = telegram_event_retry_should_warn(
+            retries.get(id).map(|retry| retry.last_error.as_str()),
+            error,
+            failures,
+        );
+        retries.insert(
+            id.to_owned(),
+            TelegramEventRetry {
+                failures,
+                not_before: Instant::now() + delay,
+                last_error: error.to_owned(),
+            },
+        );
+        (failures, delay, should_warn)
     }
 
     async fn process_telegram_event(
@@ -2491,6 +2561,17 @@ fn value_string(value: &Value) -> String {
 fn bounded_error(error: &anyhow::Error) -> String {
     format!("{error:#}").chars().take(1_000).collect()
 }
+fn telegram_event_retry_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(5);
+    Duration::from_secs((2_u64 << exponent).min(60))
+}
+fn telegram_event_retry_should_warn(
+    previous_error: Option<&str>,
+    error: &str,
+    failures: u32,
+) -> bool {
+    previous_error != Some(error) || failures.is_multiple_of(10)
+}
 fn is_cancelled(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<super::ApiError>()
@@ -2631,6 +2712,38 @@ mod tests {
     fn bounded_errors_include_the_cause_chain() {
         let error = anyhow::anyhow!("inner cause").context("outer context");
         assert_eq!(bounded_error(&error), "outer context: inner cause");
+    }
+
+    #[test]
+    fn telegram_event_retries_back_off_to_one_per_minute() {
+        assert_eq!(telegram_event_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(telegram_event_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(telegram_event_retry_delay(3), Duration::from_secs(8));
+        assert_eq!(telegram_event_retry_delay(6), Duration::from_secs(60));
+        assert_eq!(
+            telegram_event_retry_delay(u32::MAX),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn identical_telegram_retry_warnings_are_periodic() {
+        assert!(telegram_event_retry_should_warn(None, "failure", 1));
+        assert!(!telegram_event_retry_should_warn(
+            Some("failure"),
+            "failure",
+            2
+        ));
+        assert!(telegram_event_retry_should_warn(
+            Some("old failure"),
+            "new failure",
+            2
+        ));
+        assert!(telegram_event_retry_should_warn(
+            Some("failure"),
+            "failure",
+            10
+        ));
     }
 
     #[test]

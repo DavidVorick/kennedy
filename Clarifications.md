@@ -437,7 +437,9 @@ This document records user intention with regard to Kennedy.
 - Completed self-time work does not need a second ordinary history-ingress pass
   because the session already performs its own Kmap work.
 - Background queues must release retrying or failed claims so one bad item does
-  not block unrelated conversation, Telegram, audio, or ingress work.
+  not block unrelated conversation, Telegram, audio, or ingress work. Retrying
+  work must use explicit backoff rather than hot-looping the same operation and
+  warning; keep failures actionable without flooding operational logs.
 
 ## Managed Code and Publication
 
