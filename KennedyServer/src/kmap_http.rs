@@ -479,7 +479,11 @@ pub(crate) fn initialize(
                 })
                 .map_err(anyhow::Error::new)?;
             let user = transaction
-                .create_node(root_data("Initial User Root", "", ""))
+                .create_node(root_data(
+                    "Initial User Root",
+                    "The root of the primary user's Kmap knowledge.",
+                    "This root anchors durable knowledge associated with the primary Kennedy user.",
+                ))
                 .map_err(anyhow::Error::new)?;
             let kennedy = transaction
                 .create_node(root_data(

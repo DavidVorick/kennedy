@@ -32,6 +32,10 @@ This document records user intention with regard to Kennedy.
   managed-library or publication boundary.
 - The Rust backend owns orchestration. Browser code owns presentation and local
   input concerns only. Do not add a server-side JavaScript runtime.
+- Start dependent background workers only after their prerequisite services
+  have positively reported readiness. Expected startup sequencing must not be
+  surfaced as retry warnings or handled by launching workers into known
+  unavailable dependencies.
 - Prefer explicit, visible behavior over hidden automation. Failures should be
   actionable, state transitions inspectable, and destructive recovery steps
   deliberate.
@@ -50,10 +54,12 @@ This document records user intention with regard to Kennedy.
   them on reads and writes. It does not resolve Kennedy-specific transport
   groups, roots, fixed/recent context layout, UI policy, or session behavior;
   callers supply the exact user and model audience for an operation.
-- Kweb's root files and binary database records are private to
-  `kcode-kweb-db`. KennedyServer and offline application tooling must use its
-  public API rather than parsing or mutating those formats behind the
-  library's lock and recovery boundary.
+- KennedyServer must use `kcode-kweb-db`'s public API for live database access
+  rather than parsing or mutating Kweb's binary formats behind the library's
+  lock and recovery boundary. When the server is stopped, offline diagnostics
+  and narrowly scoped recovery may inspect or repair persisted records in
+  `data/`, provided the original records are backed up and the format's
+  checksums and invariants are validated.
 - Kennedy owns application graph policy, including roots, fixed/recent context
   layout, application validation, and model attribution.
   Kweb owns durable resource ownership, privacy evaluation, and owner-only
@@ -451,6 +457,24 @@ This document records user intention with regard to Kennedy.
   exact immutable artifact.
 - Keep one complete active source box per managed project. Successful complete
   writes revise it; exact writes remain durable; failed writes leave it alone.
+- Managed Web libraries may attach any staged or canonical Kweb object as an
+  opaque file at a chosen safe relative path. Fonts, images, icons, and other
+  static assets use this one general path rather than format-specific tools or
+  base64 source workarounds. The filename extension determines whether a path
+  is opaque, so Kennedy must choose an asset extension that reflects the
+  resource and retain that convention in her Kmap guidance; do not add private
+  per-generation metadata to remember the distinction. Source generations,
+  browser checks, and immutable publications include the exact asset bytes
+  atomically, while model-facing source snapshots identify opaque assets only
+  by path and byte size instead of injecting their contents or hashes into
+  context. Do not impose arbitrary file-count, per-file-size, or whole-tree
+  size ceilings on managed Web libraries; Kennedy chooses practical project
+  boundaries.
+- Dependency declarations accept SemVer-compatible upgrades by default. Use an
+  exact version pin only when a dependency is directly entrusted with API
+  credentials or comparably critical data and the narrower trust boundary has
+  a concrete justification. Ordinary source, rendering, routing, and Web
+  library dependencies are not exact-pinned merely for predictability.
 - Kennedy's managed check and publication tools own the workflow. Avoid adding
   deployment scripts or another publication path around them.
 - Managed Rust checks and publications automatically apply rustfmt to their
@@ -458,6 +482,10 @@ This document records user intention with regard to Kennedy.
   that rustfmt can repair must not become model-facing failures or consume
   another Kennedy turn; failure to run rustfmt or source that rustfmt cannot
   parse remains actionable.
+- Managed checks and publications must provide the first-party runtimes needed
+  by their release tests and return bounded actionable diagnostics from both
+  stdout and stderr. A generic command-runner footer must not hide the actual
+  test failure emitted on the other stream.
 - Managed binaries preserve text output exactly and place binary output in the
   object store. Do not pretty-print or wrap exact output merely for consistency
   with an unrelated API.

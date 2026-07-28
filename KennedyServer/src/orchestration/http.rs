@@ -15,6 +15,8 @@ use uuid::Uuid;
 #[cfg(test)]
 use super::Config;
 
+const TELEGRAM_STARTUP_RETRY: Duration = Duration::from_millis(100);
+
 #[derive(Clone)]
 pub(crate) struct LocalServices {
     pub kmap: crate::kmap_http::Service,
@@ -1089,6 +1091,12 @@ impl Api {
         self.telegram_get("/health").await.map(|_| ())
     }
 
+    pub async fn wait_until_telegram_ready(&self) {
+        while self.telegram_health().await.is_err() {
+            tokio::time::sleep(TELEGRAM_STARTUP_RETRY).await;
+        }
+    }
+
     async fn request(
         &self,
         method: Method,
@@ -1203,12 +1211,13 @@ impl Api {
     }
 
     pub async fn bootstrap_node(&self, short_name: Option<&str>) -> Result<Value, ApiError> {
+        let (short_name, short_description, long_description) = bootstrap_root_metadata(short_name);
         let provenance = self
             .kmap_post(
                 "/api/v1/kmap/provenance",
                 json!({
                     "idempotency_id": idempotency_id(),
-                    "data": "Automatically provisioned blank Kmap root node.",
+                    "data": "Automatically provisioned Kmap root node.",
                     "source": "system-bootstrap",
                     "source_created_at": chrono::Utc::now().to_rfc3339(),
                 }),
@@ -1221,9 +1230,9 @@ impl Api {
                 "provenance_id": string_at(&provenance, "id")?,
                 "owner_node_id": "self",
                 "model_attribution": "system-bootstrap",
-                "short_name": short_name.unwrap_or("User Root"),
-                "short_description": "",
-                "long_description": "",
+                "short_name": short_name,
+                "short_description": short_description,
+                "long_description": long_description,
                 "fixed_connections": [],
                 "recent_connections": [],
             }),
@@ -1433,6 +1442,26 @@ impl Api {
             #[cfg(test)]
             ServiceBackend::Http(bases) => self.request(method, &bases.kweb, path, body).await,
         }
+    }
+}
+
+fn bootstrap_root_metadata(short_name: Option<&str>) -> (&str, &'static str, &'static str) {
+    match short_name {
+        Some("Group Root") => (
+            "Group Root",
+            "The root of this Telegram group's shared Kmap knowledge.",
+            "This root anchors durable knowledge shared in this Telegram group.",
+        ),
+        Some(short_name) => (
+            short_name,
+            "An automatically provisioned Kmap root.",
+            "This root anchors durable Kmap knowledge.",
+        ),
+        None => (
+            "User Root",
+            "The root of this Telegram user's Kmap knowledge.",
+            "This root anchors durable knowledge associated with this Telegram user.",
+        ),
     }
 }
 
@@ -1879,6 +1908,26 @@ mod tests {
     }
 
     #[test]
+    fn provisioned_roots_have_complete_context_summaries() {
+        let (user_name, user_description, user_long_description) = bootstrap_root_metadata(None);
+        assert_eq!(user_name, "User Root");
+        assert!(!user_description.trim().is_empty());
+        assert!(!user_long_description.trim().is_empty());
+
+        let (group_name, group_description, group_long_description) =
+            bootstrap_root_metadata(Some("Group Root"));
+        assert_eq!(group_name, "Group Root");
+        assert!(!group_description.trim().is_empty());
+        assert!(!group_long_description.trim().is_empty());
+
+        let (custom_name, custom_description, custom_long_description) =
+            bootstrap_root_metadata(Some("Custom Root"));
+        assert_eq!(custom_name, "Custom Root");
+        assert!(!custom_description.trim().is_empty());
+        assert!(!custom_long_description.trim().is_empty());
+    }
+
+    #[test]
     fn mutation_nodes_are_normalized_for_immediate_agent_rendering() {
         let recent = (0..9).map(|index| format!("recent-{index}"));
         let summaries = std::iter::once(json!({
@@ -1942,6 +1991,40 @@ mod tests {
             telegram_native_kind("application/pdf", Some("document")),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn orchestration_waits_until_the_telegram_relay_serves_health() {
+        use axum::{Json, Router, routing::get};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let config = Config {
+            system_prompts_directory: std::path::PathBuf::new(),
+            kweb_base: base.clone(),
+            intelligence_base: base.clone(),
+            session_history_base: base.clone(),
+            telegram_relay_base: base,
+            telegram_max_media_bytes: 1024,
+            telegram_web_user_handle: "@test".into(),
+            runtime_model: crate::orchestration::RuntimeModel::testing(),
+        };
+        let api = Api::new(&config).unwrap();
+        let waiting = tokio::spawn(async move {
+            api.wait_until_telegram_ready().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        let app = Router::new().route("/health", get(|| async { Json(json!({"status":"ok"})) }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("readiness wait should finish once health is served")
+            .unwrap();
+
+        server.abort();
     }
 
     #[tokio::test]

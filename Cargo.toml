@@ -28,12 +28,13 @@ kcode-kmap-size = "=0.1.0"
 kcode-server-object-envelopes = "=0.1.0"
 kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-128e-18c662e17afaea2e-0" }
 kcode-audio-ingress = "=0.3.1"
-kcode-dev-tools = "=0.3.2"
+# Exact because this crate is directly entrusted with the crates.io publication token.
+kcode-dev-tools = "=0.4.1"
 kcode-session-history = "=0.1.2"
 kcode-telegram-identity = "=0.1.0"
 kcode-agent-runtime = "=0.1.1"
 kcode-intelligence-router = "=0.2.1"
-kcode-web-semver-routing = "0.1.0"
+kcode-web-semver-routing = "0.2.0"
 rand = "0.9"
 rpassword = "7.5.4"
 reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "multipart", "rustls-no-provider"] }
@@ -52,7 +53,12 @@ futures = "0.3"
 hound = "3.5"
 
 [patch.crates-io]
+kcode-dev-tools = { path = "data/kcode/kcode-rust-libs/kcode-dev-tools/generations/g-e5e-18c6887997236787-0" }
+kcode-rust-bins = { path = "data/kcode/kcode-rust-libs/kcode-rust-bins/generations/g-e5c-18c688799653cb78-0" }
+kcode-rust-libs-v2 = { path = "data/kcode/kcode-rust-libs/kcode-rust-libs-v2/generations/g-ac0-18c68844993f888c-0" }
 kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-128e-18c662e17afaea2e-0" }
+kcode-web-libs = { path = "data/kcode/kcode-rust-libs/kcode-web-libs/generations/g-281d1e-18c687bf9991dd9a-e" }
+kcode-web-semver-routing = { path = "data/kcode/kcode-rust-libs/kcode-web-semver-routing/generations/g-467c-18c68205f20d097d-0" }
 
 [profile.dev]
 debug = 1

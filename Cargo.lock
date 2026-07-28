@@ -2043,9 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-dev-tools"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "559bb954655903f835016831dc0f95ac29a083796b448b10d5540bb1e9aa79a5"
+version = "0.4.1"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2156,18 +2154,14 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-bins"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56f5f7e3117d58beb501b8c3ef24251df3d60af232f4913e98551994c68406cc"
+version = "3.1.1"
 dependencies = [
  "semver",
 ]
 
 [[package]]
 name = "kcode-rust-libs-v2"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22dacf03e90fee0273d91dfdfc3cfc17028402c155d2cf0ad99cfe2dc7ef03e5"
+version = "1.2.1"
 
 [[package]]
 name = "kcode-server-object-envelopes"
@@ -2254,24 +2248,19 @@ dependencies = [
 
 [[package]]
 name = "kcode-web-libs"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed9dbb5a6cc5b846282968e11e129f59282faa1e0c504fff2d27070077fb5676"
+version = "0.3.0"
 dependencies = [
  "fs2",
  "semver",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "uuid",
 ]
 
 [[package]]
 name = "kcode-web-semver-routing"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30c9f224d48dd15088478a2124f984375ef101cda23882542be1a2c8befdb2ae"
+version = "0.2.0"
 dependencies = [
  "axum",
  "semver",

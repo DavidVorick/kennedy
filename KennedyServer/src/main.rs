@@ -882,6 +882,27 @@ mod tests {
                 .unwrap();
             assert_eq!(open_result.snapshot.unwrap().kind, kind);
         }
+        let asset = service
+            .execute(
+                "create-session",
+                kcode_dev_tools::ATTACH_OBJECT_WEB_LIB_TOOL,
+                serde_json::json!({
+                    "name":"kennedy-test-web",
+                    "path":"assets/fonts/display.woff2",
+                    "objectId":"pending:1",
+                }),
+                vec![vec![0, 159, 146, 150, 255]],
+            )
+            .await
+            .unwrap();
+        let snapshot = asset.snapshot.unwrap();
+        assert_eq!(
+            snapshot.kind,
+            kcode_dev_tools::ManagedSourceKind::WebLibrary
+        );
+        assert!(snapshot.text.contains("Asset: assets/fonts/display.woff2"));
+        assert!(snapshot.text.contains("Bytes: 5"));
+        assert!(!snapshot.text.contains("SHA-256:"));
         assert_eq!(service.release("create-session").await.unwrap(), 3);
         assert_eq!(service.release("open-session").await.unwrap(), 3);
         drop(service);

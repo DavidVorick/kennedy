@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use kcode_commit_session::{CommitReceipt, CommitRequest, PlannedNode};
 use kcode_dev_tools::{
-    CALL_RUST_BIN_TOOL, ManagedSourceKind as BackendManagedSourceKind,
+    ATTACH_OBJECT_WEB_LIB_TOOL, CALL_RUST_BIN_TOOL, ManagedSourceKind as BackendManagedSourceKind,
     PREVIEW_WRITE_FILE_RUST_BIN_TOOL, PREVIEW_WRITE_FILE_RUST_LIB_TOOL,
     PREVIEW_WRITE_FILE_WEB_LIB_TOOL, RUST_BIN_TOOLS, RUST_LIB_TOOLS, SourceSnapshot, WEB_LIB_TOOLS,
     WRITE_FILE_FREEFORM_RUST_BIN_TOOL, WRITE_FILE_FREEFORM_RUST_LIB_TOOL,
@@ -3389,6 +3389,14 @@ impl Session {
                         };
                         objects.push(bytes);
                     }
+                } else if name == ATTACH_OBJECT_WEB_LIB_TOOL {
+                    let object_id = web_library_object_id(&call.arguments)?;
+                    let bytes = if object_id.starts_with("pending:") {
+                        read_pending_binary_object(&mut self.journal, &object_id)?
+                    } else {
+                        self.api.kmap_file(&object_id)?.bytes
+                    };
+                    objects.push(bytes);
                 }
                 let execution = self
                     .api
@@ -4607,6 +4615,15 @@ fn rust_binary_object_ids(arguments: &Value) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
+fn web_library_object_id(arguments: &Value) -> anyhow::Result<String> {
+    arguments
+        .get("objectId")
+        .and_then(Value::as_str)
+        .filter(|object_id| !object_id.trim().is_empty())
+        .map(str::to_owned)
+        .context("Web-library attachment objectId must be a nonempty string")
+}
+
 fn read_pending_binary_object(
     journal: &mut HistorySession,
     object_id: &str,
@@ -5802,6 +5819,11 @@ mod tests {
             .unwrap(),
             vec![staged.to_string(), "AAECAwQF".to_owned()]
         );
+        assert_eq!(
+            web_library_object_id(&json!({"objectId":staged.to_string()})).unwrap(),
+            staged.to_string()
+        );
+        assert!(web_library_object_id(&json!({"objectId":"  "})).is_err());
         assert_eq!(
             read_pending_binary_object(&mut journal, &staged.to_string()).unwrap(),
             expected

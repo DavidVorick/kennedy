@@ -28,9 +28,11 @@ pub(crate) struct Config {
 /// Run Kennedy's native backend coordinator for the lifetime of the server.
 ///
 /// Kennedy-owned services are already open and are called through cloned
-/// in-process handles. Readiness retries remain for the separately published
-/// Telegram relay, whose current crate API still owns a loopback listener.
+/// in-process handles. The separately published Telegram relay still owns its
+/// loopback listener, so do not construct the worker until its health endpoint
+/// confirms that the listener is serving requests.
 pub(crate) async fn run(config: Config, api: Api) -> anyhow::Result<()> {
+    api.wait_until_telegram_ready().await;
     let worker = Arc::new(worker::Orchestrator::new(config, api));
     worker.run().await
 }
