@@ -274,4 +274,17 @@ mod tests {
         let manual = include_str!("../../runtime/system-prompts/ReadTools.txt");
         assert!(manual.contains(r#"{"name":"LoadNode","arguments":{"identifier":"Nl_hWdsl"}}"#));
     }
+
+    #[test]
+    fn boxes_into_objects_guidance_covers_the_call_and_requested_use_cases() {
+        let read_tools = include_str!("../../runtime/system-prompts/ReadTools.txt");
+        assert!(
+            read_tools.contains(r#"{"name":"BoxesIntoObjects","arguments":{"boxIds":[12,15]}}"#)
+        );
+        let guidance = include_str!("../../../boxes-into-objects.txt");
+        assert!(guidance.contains("codebases"));
+        assert!(guidance.contains("transcripts"));
+        assert!(guidance.contains("Granola notes"));
+        assert!(guidance.contains("copy-pastes"));
+    }
 }

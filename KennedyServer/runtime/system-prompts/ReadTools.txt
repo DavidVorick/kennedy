@@ -10,6 +10,9 @@ SummarizeBox
 HydrateBox
   Give it the numeric boxId. It restores the latest canonical contents of an active box without rerunning its owner. Hydration is rejected if the projected context would exceed the session's applicable limit.
 
+BoxesIntoObjects
+  Call through call_ktool with one or more distinct numeric box IDs: {"name":"BoxesIntoObjects","arguments":{"boxIds":[12,15]}}. It stages one UTF-8 plain-text object per selected active box using that box's complete latest canonical text, even when its current representation is summarized, dehydrated, or stale. It does not save the visible box header, summary, metadata, or attached objects. The returned pending object references resolve to canonical object IDs when the logical session commits; those pending references may be used by other staged operations in the same session. This is helpful for preserving complete codebases, transcripts, Granola notes, and any other large, meaningful text the user copy-pastes.
+
 HydrateEvent
   This is available only during history ingress. Give it the numeric eventId. It hydrates that exact persisted source event into an ingress inspection box. The dehydrated history skeleton reports approximate hydration costs.
 

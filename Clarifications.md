@@ -145,6 +145,15 @@ This document records user intention with regard to Kennedy.
 - Every item visible to Kennedy belongs to the box model. Canonical content,
   its current representation, and the history of changes to that representation
   are distinct concerns.
+- Kennedy may deliberately preserve the complete text of selected active boxes
+  as durable objects. Each selected box becomes one separate UTF-8 plain-text
+  object containing its latest canonical text, regardless of whether the
+  visible representation is hydrated, summarized, dehydrated, or stale. Do not
+  substitute a summary, serialize a box header or metadata, concatenate
+  independently selected boxes, or create a second Kweb transaction; stage the
+  objects in Session History and resolve their pending references in the
+  logical session's ordinary commit. Repeating the operation for the same
+  canonical box revision should reuse its staged object.
 - When updating a box moves its current representation to a later position in
   the projected history, leave a minimal generic `[box updated]` placeholder at
   its earlier occurrence. This preserves visible tool-call/result continuity

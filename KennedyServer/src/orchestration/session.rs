@@ -60,6 +60,8 @@ const RUST_BIN_TOOL_INSTANCE: &str = "managed-rust-binaries";
 const CAPACITY_ERROR_BOX_NAME: &str = "Context capacity error";
 const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
 const SUBAGENT_CONTEXT_NODE_LIMIT: usize = 64;
+const BOX_TEXT_OBJECT_SOURCE: &str = "kennedy-box-text";
+const BOX_TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -2996,6 +2998,12 @@ impl Session {
                 self.journal.rehydrate_box(now(), id)?;
                 format!("Hydrated box {id}.")
             }
+            "BoxesIntoObjects" => {
+                validate_arguments(&call.arguments, &["boxIds"], &[])?;
+                let ids = box_id_array(&call.arguments, "boxIds")?;
+                let objects = stage_box_text_objects(&mut self.journal, &ids, &now())?;
+                render_box_text_objects(&objects)
+            }
             "HydrateEvent" => {
                 anyhow::ensure!(
                     matches!(self.mode, AgentMode::Ingress { .. }),
@@ -4963,6 +4971,102 @@ fn active_direct_session_for_user<'a>(
         })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct BoxTextObject {
+    box_id: BoxId,
+    pending_id: PendingId,
+    reused: bool,
+}
+
+fn stage_box_text_objects(
+    journal: &mut HistorySession,
+    box_ids: &[BoxId],
+    recorded_at: &str,
+) -> anyhow::Result<Vec<BoxTextObject>> {
+    let selections = box_ids
+        .iter()
+        .map(|box_id| {
+            let state = journal
+                .state()
+                .box_state(*box_id)
+                .with_context(|| format!("box {box_id} does not exist"))?;
+            anyhow::ensure!(state.active, "box {box_id} is not active");
+            anyhow::ensure!(
+                !state.canonical.content.text.is_empty(),
+                "box {box_id} has no text content"
+            );
+            Ok((
+                *box_id,
+                state.name.clone(),
+                state.canonical.event_id,
+                state.canonical.content.text.clone(),
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut objects = Vec::with_capacity(selections.len());
+    for (box_id, box_name, canonical_event_id, text) in selections {
+        if let Some(pending_id) = existing_box_text_object(journal, box_id, canonical_event_id) {
+            objects.push(BoxTextObject {
+                box_id,
+                pending_id,
+                reused: true,
+            });
+            continue;
+        }
+        let pending_id = journal.stage_object(
+            recorded_at,
+            BOX_TEXT_MEDIA_TYPE,
+            Some(format!("box-{box_id}.txt")),
+            json!({
+                "source":BOX_TEXT_OBJECT_SOURCE,
+                "boxId":box_id.0,
+                "boxName":box_name,
+                "canonicalEventId":canonical_event_id.0,
+            }),
+            text.as_bytes(),
+        )?;
+        objects.push(BoxTextObject {
+            box_id,
+            pending_id,
+            reused: false,
+        });
+    }
+    Ok(objects)
+}
+
+fn existing_box_text_object(
+    journal: &HistorySession,
+    box_id: BoxId,
+    canonical_event_id: EventId,
+) -> Option<PendingId> {
+    journal
+        .objects()
+        .iter()
+        .find(|(_, location)| {
+            let transport = &location.metadata.transport;
+            transport.get("source").and_then(Value::as_str) == Some(BOX_TEXT_OBJECT_SOURCE)
+                && transport.get("boxId").and_then(Value::as_u64) == Some(box_id.0)
+                && transport.get("canonicalEventId").and_then(Value::as_u64)
+                    == Some(canonical_event_id.0)
+        })
+        .map(|(pending_id, _)| pending_id.clone())
+}
+
+fn render_box_text_objects(objects: &[BoxTextObject]) -> String {
+    let mut text = String::from("Box text objects:");
+    for object in objects {
+        text.push_str(&format!("\nBox {}: {}", object.box_id, object.pending_id));
+        if object.reused {
+            text.push_str(" (already staged)");
+        }
+    }
+    text.push_str(
+        "\nThese pending object references resolve to canonical object IDs when the logical session commits.",
+    );
+    text
+}
+
 fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
     kcode_codex_runtime_v2::DynamicTool::new(
         "call_ktool",
@@ -5026,6 +5130,29 @@ fn positive_integer(value: &Value, key: &str) -> anyhow::Result<u64> {
 
 fn box_id(value: &Value, key: &str) -> anyhow::Result<BoxId> {
     positive_integer(value, key).map(BoxId)
+}
+
+fn box_id_array(value: &Value, key: &str) -> anyhow::Result<Vec<BoxId>> {
+    let ids = value
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("{key} must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .map(BoxId)
+                .with_context(|| format!("{key} must contain only positive integers"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(!ids.is_empty(), "{key} must contain at least one box ID");
+    let unique = ids.iter().copied().collect::<HashSet<_>>();
+    anyhow::ensure!(
+        unique.len() == ids.len(),
+        "{key} must not contain duplicate box IDs"
+    );
+    Ok(ids)
 }
 
 fn event_id(value: &Value, key: &str) -> anyhow::Result<EventId> {
@@ -5538,6 +5665,108 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn selected_boxes_stage_exact_canonical_text_once_per_revision() {
+        let (path, mut journal) = test_journal("boxes-into-objects", 10_000);
+        let codebase = journal
+            .create_box(
+                "t1",
+                "Managed source",
+                BoxOwner::Tool {
+                    tool_instance: "managed-source".into(),
+                    slot: "example".into(),
+                },
+                BoxContent::text("old source"),
+            )
+            .unwrap();
+        journal
+            .summarize_box("t2", codebase, "Kennedy's source summary")
+            .unwrap();
+        journal
+            .update_box(
+                "t3",
+                codebase,
+                BoxContent::text("fn main() {\n    println!(\"exact\");\n}\n"),
+            )
+            .unwrap();
+        let transcript = journal
+            .create_box(
+                "t4",
+                "Pasted transcript",
+                BoxOwner::User,
+                BoxContent::text("Speaker 1: hello\nSpeaker 2: goodbye\n"),
+            )
+            .unwrap();
+        let selected =
+            box_id_array(&json!({"boxIds":[codebase.0, transcript.0]}), "boxIds").unwrap();
+
+        let first = stage_box_text_objects(&mut journal, &selected, "t5").unwrap();
+        assert_eq!(
+            first.iter().map(|object| object.box_id).collect::<Vec<_>>(),
+            vec![codebase, transcript]
+        );
+        assert!(first.iter().all(|object| !object.reused));
+        assert_eq!(
+            journal.read_object(&first[0].pending_id).unwrap(),
+            b"fn main() {\n    println!(\"exact\");\n}\n"
+        );
+        assert_eq!(
+            journal.read_object(&first[1].pending_id).unwrap(),
+            b"Speaker 1: hello\nSpeaker 2: goodbye\n"
+        );
+        let metadata = &journal.objects()[&first[0].pending_id].metadata;
+        assert_eq!(metadata.media_type, BOX_TEXT_MEDIA_TYPE);
+        assert_eq!(
+            metadata.file_name.as_deref(),
+            Some(format!("box-{codebase}.txt").as_str())
+        );
+        assert_eq!(
+            metadata.transport.get("source").and_then(Value::as_str),
+            Some(BOX_TEXT_OBJECT_SOURCE)
+        );
+        assert_eq!(
+            metadata.transport.get("boxId").and_then(Value::as_u64),
+            Some(codebase.0)
+        );
+
+        let repeated = stage_box_text_objects(&mut journal, &selected, "t6").unwrap();
+        assert!(repeated.iter().all(|object| object.reused));
+        assert_eq!(
+            repeated
+                .iter()
+                .map(|object| object.pending_id.clone())
+                .collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|object| object.pending_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(journal.objects().len(), 2);
+
+        for object in &first {
+            std::fs::remove_file(path.with_file_name(format!(
+                "{}-{}.pending-object",
+                path.file_stem().unwrap().to_string_lossy(),
+                object.pending_id.number() - 1
+            )))
+            .unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn box_object_selection_requires_distinct_positive_ids() {
+        assert!(
+            box_id_array(&json!({"boxIds":[]}), "boxIds")
+                .unwrap_err()
+                .to_string()
+                .contains("at least one")
+        );
+        assert!(box_id_array(&json!({"boxIds":[1, 1]}), "boxIds").is_err());
+        assert!(box_id_array(&json!({"boxIds":[0]}), "boxIds").is_err());
+        assert!(box_id_array(&json!({"boxIds":["1"]}), "boxIds").is_err());
     }
 
     #[test]

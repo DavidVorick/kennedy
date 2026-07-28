@@ -1967,9 +1967,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-agent-runtime"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48be15e4e97cf4874e9d4760ca4fd9f4549a1a941db8eb461455b467711ee85c"
+checksum = "70832a25d8ca759bf7235f78679844beedf8502c649d40eea986dfae09a4c0a8"
 dependencies = [
  "anyhow",
  "hex",
@@ -2073,7 +2073,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-gemini-api"
-version = "0.4.0"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d54bd133528f3f826df617c6f55c8d69e275692157086571eea22c640708dee"
 dependencies = [
  "base64",
  "chrono",
@@ -2085,9 +2087,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-intelligence-router"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d3e32b74e3e9a9a399ed241bfa390f638c86ea24f0d376e6fce128b504f7e33"
+checksum = "7125dd061a388224ec60317f437673b21eb8c3ceb60a1c5d8a1298db8bb60172"
 dependencies = [
  "anyhow",
  "chrono",

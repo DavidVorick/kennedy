@@ -728,7 +728,11 @@ impl Orchestrator {
         tokio::spawn(async move {
             let _writer_guard = worker.writer.lock().await;
             if let Err(error) = task(worker.clone()).await {
-                tracing::warn!(%label, error=%error, "Kmap writer job will retry");
+                tracing::warn!(
+                    %label,
+                    error=%bounded_error(&error),
+                    "Kmap writer job will retry"
+                );
             }
             worker.writer_job_active.store(false, Ordering::Release);
         });
@@ -2485,7 +2489,7 @@ fn value_string(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 fn bounded_error(error: &anyhow::Error) -> String {
-    error.to_string().chars().take(1_000).collect()
+    format!("{error:#}").chars().take(1_000).collect()
 }
 fn is_cancelled(error: &anyhow::Error) -> bool {
     error
@@ -2621,6 +2625,12 @@ mod tests {
                 .and_then(Value::as_str),
             Some("oldest-due")
         );
+    }
+
+    #[test]
+    fn bounded_errors_include_the_cause_chain() {
+        let error = anyhow::anyhow!("inner cause").context("outer context");
+        assert_eq!(bounded_error(&error), "outer context: inner cause");
     }
 
     #[test]
