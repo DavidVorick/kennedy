@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-age.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
@@ -19,6 +18,7 @@ kcode-session-history.workspace = true
 kcode-codex-runtime.workspace = true
 kcode-codex-runtime-v2.workspace = true
 kcode-commit-session.workspace = true
+kcode-credential-vault.workspace = true
 kcode-dev-tools.workspace = true
 kcode-intelligence-router.workspace = true
 kcode-kweb-context.workspace = true

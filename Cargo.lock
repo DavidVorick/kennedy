@@ -2042,8 +2042,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-credential-vault"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d8545b81d1495f70170784e2087ae671b10a1f38a332049e1a4b614528b38c"
+dependencies = [
+ "age",
+ "serde",
+ "serde_json",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "kcode-dev-tools"
-version = "0.4.1"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73d21714fc695a6c74a8b2510c2d14d12f1e54fd7f31e47ec4c002ed13bbd6aa"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2161,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-libs-v2"
-version = "1.2.1"
+version = "1.2.2"
 
 [[package]]
 name = "kcode-server-object-envelopes"
@@ -2176,8 +2191,6 @@ dependencies = [
 [[package]]
 name = "kcode-session-history"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0503dcc6f25c9ad963252f50ddca910b1a31141f930808ad819aa1cde0d10ca"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2249,6 +2262,8 @@ dependencies = [
 [[package]]
 name = "kcode-web-libs"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8ad273f6988cb8ce0fdfa6615667c9f4f5ef4867f71a55c98b11e9ed0f85d88"
 dependencies = [
  "fs2",
  "semver",
@@ -2261,6 +2276,8 @@ dependencies = [
 [[package]]
 name = "kcode-web-semver-routing"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fcfaecb9e606a85fa65cfcbf1d58ae375432a40afa5afa2227e1949b6890f36"
 dependencies = [
  "axum",
  "semver",
@@ -2293,7 +2310,6 @@ dependencies = [
 name = "kennedy-server"
 version = "0.2.1"
 dependencies = [
- "age",
  "anyhow",
  "axum",
  "base64",
@@ -2306,6 +2322,7 @@ dependencies = [
  "kcode-codex-runtime",
  "kcode-codex-runtime-v2",
  "kcode-commit-session",
+ "kcode-credential-vault",
  "kcode-dev-tools",
  "kcode-intelligence-router",
  "kcode-kmap-size",

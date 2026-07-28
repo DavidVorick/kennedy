@@ -1,5 +1,4 @@
 mod audio_ingress;
-mod credentials;
 mod kmap_http;
 mod orchestration;
 mod session_history_http;
@@ -11,10 +10,9 @@ use std::{
     sync::Arc,
 };
 
-use age::secrecy::{ExposeSecret, SecretString};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use credentials::CredentialVault;
+use kcode_credential_vault::{CredentialVault, ExposeSecret, SecretString};
 use kcode_kweb_db::{Config as KwebConfig, NoopGossip, WriterId};
 use zeroize::{Zeroize, Zeroizing};
 

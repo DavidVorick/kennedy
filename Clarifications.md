@@ -143,6 +143,10 @@ This document records user intention with regard to Kennedy.
 - Session History exclusively owns active session logs, lifecycle/control
   journals, pending session objects, and completion receipts. KennedyServer uses
   its typed API and must not manipulate the same files independently.
+- Session completion synchronizes its immutable receipt before removing active
+  files. Concurrent readers must treat a journal that disappears after
+  enumeration as a completed lifecycle transition, not as storage corruption
+  or a request-wide failure; other I/O failures remain visible and actionable.
 - A source conversation and its later history ingress are one logical session
   and one ordered event history. UI and model views are projections of that
   history, not independently authoritative transcript copies.
@@ -486,6 +490,10 @@ This document records user intention with regard to Kennedy.
   by their release tests and return bounded actionable diagnostics from both
   stdout and stderr. A generic command-runner footer must not hide the actual
   test failure emitted on the other stream.
+- A nested runtime may disable an incompatible inner sandbox only when its
+  owning runner positively places it inside a hardened, disposable outer
+  sandbox. Keep the override scoped to that image; do not weaken the same
+  runtime when it executes directly on the host.
 - Managed binaries preserve text output exactly and place binary output in the
   object store. Do not pretty-print or wrap exact output merely for consistency
   with an unrelated API.
@@ -557,6 +565,11 @@ This document records user intention with regard to Kennedy.
   responsibility.
 - Keep reusable credentials in the human-unlocked encrypted vault. Never expose
   secret values through HTTP, frontend state, model context, logs, or source.
+- One small typed credential-vault library owns encryption, payload validation,
+  plaintext zeroization, and durable atomic file replacement. KennedyServer
+  owns the vault path, human passphrase prompts, application secret names,
+  feature policy, maintenance exclusion, and backup decisions; it must not
+  duplicate or bypass the library's encrypted persistence format.
 - A library that receives a reusable credential is security-critical. Pin and
   inspect the exact source used, and repeat that review before upgrading it.
 - Maintenance operations that require exclusive persistence access must fail
