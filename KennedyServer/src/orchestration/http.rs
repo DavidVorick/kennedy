@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use super::Config;
+use super::session::ResolvedObject;
 
 const TELEGRAM_STARTUP_RETRY: Duration = Duration::from_millis(100);
 
@@ -1146,6 +1147,36 @@ impl Api {
         Ok((bytes.to_vec(), content_type))
     }
 
+    pub async fn telegram_file_metadata(&self, path: &str) -> Result<(u64, String), ApiError> {
+        let base = &self.telegram;
+        let response = self
+            .client
+            .head(format!("{base}{path}"))
+            .send()
+            .await
+            .map_err(|_| ApiError {
+                status: None,
+                code: "network_error".into(),
+                message: format!("Could not reach {base}."),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(decode_error(response).await);
+        }
+        let size_bytes = response.content_length().ok_or_else(|| ApiError {
+            status: Some(status),
+            code: "invalid_response".into(),
+            message: "Telegram media metadata omitted its exact byte length.".into(),
+        })?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        Ok((size_bytes, content_type))
+    }
+
     async fn multipart(
         &self,
         base: &str,
@@ -1170,7 +1201,7 @@ impl Api {
         &self,
         event_id: &str,
         conversation_id: &str,
-        file: &StoredFile,
+        file: &ResolvedObject,
         complete: bool,
     ) -> Result<Value, ApiError> {
         if let Some(kind) = telegram_native_kind(&file.media_type, file.transport_kind.as_deref()) {
@@ -1838,7 +1869,7 @@ fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Optio
 
 fn telegram_file_form(
     conversation_id: &str,
-    file: &StoredFile,
+    file: &ResolvedObject,
     complete: bool,
     kind: Option<&str>,
 ) -> Result<multipart::Form, ApiError> {

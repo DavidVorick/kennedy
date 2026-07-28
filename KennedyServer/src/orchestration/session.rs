@@ -22,7 +22,7 @@ use kcode_kweb_context::{
     Context as KwebContext, Node as KwebNode, NodeDraft, StagedCreate as KwebStagedCreate,
 };
 use kcode_kweb_db::{NodeId, ObjectId};
-use kcode_server_object_envelopes::{StoredFile, encode_file};
+use kcode_server_object_envelopes::{StoredFile, encode_file, sanitize_file_name};
 use kcode_session_history::{
     NewSession, Session as HistorySession,
     chatend::{
@@ -202,6 +202,15 @@ pub(crate) struct Session {
     context: KwebContext,
     free_time_end_reason: Option<String>,
     fatal_persistence_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedObject {
+    pub object_id: String,
+    pub bytes: Vec<u8>,
+    pub file_name: String,
+    pub media_type: String,
+    pub transport_kind: Option<String>,
 }
 
 struct DesiredKwebBox {
@@ -407,7 +416,7 @@ fn render_media_annotation_result(
 }
 
 fn render_audio_transcription_result(
-    object_id: &PendingId,
+    object_id: &str,
     file_name: &str,
     content_type: &str,
     result: &Value,
@@ -427,7 +436,7 @@ fn render_audio_transcription_result(
 }
 
 fn render_document_extraction_result(
-    object_id: &PendingId,
+    object_id: &str,
     file_name: &str,
     result: &Value,
 ) -> anyhow::Result<String> {
@@ -1475,12 +1484,13 @@ impl Session {
         content.metadata = message_metadata_without_attachment_payloads(metadata);
         let mut attachment_boxes = Vec::new();
         let mut attachment_names = Vec::new();
-        for attachment in &attachments {
-            let file_name = ingress_object_filename(
+        let mut canonical_attachments = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let mut descriptor = attachment_metadata_without_payload(&attachment);
+            let mut file_name = ingress_object_filename(
                 attachment.get("fileName").and_then(Value::as_str),
                 "document",
             );
-            attachment_names.push(file_name.clone());
             if let Some(pending_id) = attachment.get("pendingId").and_then(Value::as_str) {
                 let pending_id = PendingId::parse(pending_id.to_owned())?;
                 anyhow::ensure!(
@@ -1488,17 +1498,25 @@ impl Session {
                     "attached object {pending_id} is not staged in this session"
                 );
                 content.objects.push(pending_id.to_string());
+                file_name = canonicalize_staged_file_descriptor(
+                    &self.journal,
+                    &pending_id,
+                    &mut descriptor,
+                )?;
             } else if let Some(data_url) = attachment.get("dataUrl").and_then(Value::as_str) {
                 let (media_type, bytes) = decode_data_url(data_url)?;
                 let id = self.journal.stage_object(
                     now(),
                     media_type,
                     Some(file_name.clone()),
-                    attachment_metadata_without_payload(attachment),
+                    descriptor.clone(),
                     &bytes,
                 )?;
                 content.objects.push(id.to_string());
+                file_name =
+                    canonicalize_staged_file_descriptor(&self.journal, &id, &mut descriptor)?;
             }
+            attachment_names.push(file_name.clone());
             if let Some(extracted) = attachment
                 .get("text")
                 .and_then(Value::as_str)
@@ -1511,13 +1529,19 @@ impl Session {
                         objects: Vec::new(),
                         metadata: json!({
                             "boxKind":"attachmentText",
-                            "attachment":attachment_metadata_without_payload(attachment),
+                            "attachment":descriptor.clone(),
                         }),
                     },
                 ));
             }
+            canonical_attachments.push(descriptor);
         }
+        if !content.metadata.is_object() {
+            content.metadata = json!({});
+        }
+        content.metadata["attachments"] = json!(canonical_attachments);
         if let Some(media) = metadata.get("media") {
+            let mut descriptor = attachment_metadata_without_payload(media);
             if let Some(pending_id) = media.get("pendingId").and_then(Value::as_str) {
                 let pending_id = PendingId::parse(pending_id.to_owned())?;
                 anyhow::ensure!(
@@ -1525,6 +1549,7 @@ impl Session {
                     "voice object {pending_id} is not staged in this session"
                 );
                 content.objects.push(pending_id.to_string());
+                canonicalize_staged_file_descriptor(&self.journal, &pending_id, &mut descriptor)?;
             } else if let Some(data_url) = media.get("dataUrl").and_then(Value::as_str) {
                 let (media_type, bytes) = decode_data_url(data_url)?;
                 let file_name =
@@ -1533,11 +1558,13 @@ impl Session {
                     now(),
                     media_type,
                     Some(file_name),
-                    attachment_metadata_without_payload(media),
+                    descriptor.clone(),
                     &bytes,
                 )?;
                 content.objects.push(id.to_string());
+                canonicalize_staged_file_descriptor(&self.journal, &id, &mut descriptor)?;
             }
+            content.metadata["media"] = descriptor;
         }
         if content.text.trim().is_empty()
             && content.objects.is_empty()
@@ -1559,6 +1586,13 @@ impl Session {
         } else {
             content.text.clone()
         };
+        if !content.objects.is_empty() {
+            if !content.metadata.is_object() {
+                content.metadata = json!({});
+            }
+            content.metadata["transcriptText"] = json!(visible);
+        }
+        append_user_file_metadata(&self.journal, &mut content)?;
         let mut prospective_boxes =
             vec![("User message".to_owned(), BoxOwner::User, content.clone())];
         prospective_boxes.extend(
@@ -1670,6 +1704,43 @@ impl Session {
                 ) && entry.get("externalEventId").and_then(Value::as_str) == Some(id)
             })
             .collect()
+    }
+
+    pub(crate) fn resolve_object(&mut self, object_id: &str) -> anyhow::Result<ResolvedObject> {
+        let api = self.api.clone();
+        resolve_object_using(&mut self.journal, object_id, move |canonical_id| {
+            api.kmap_file(canonical_id).map_err(Into::into)
+        })
+    }
+
+    fn resolve_media_object(&mut self, object_id: &str) -> anyhow::Result<ResolvedObject> {
+        let mut resolved = self.resolve_object(object_id)?;
+        resolved.media_type = normalized_media_type(&resolved.media_type);
+        anyhow::ensure!(
+            !resolved.bytes.is_empty(),
+            "media object {} is empty",
+            resolved.object_id
+        );
+        anyhow::ensure!(
+            resolved.bytes.len() as u64 <= MAX_MEDIA_ENRICHMENT_BYTES,
+            "media object {} is {} bytes, over the {}-byte enrichment limit",
+            resolved.object_id,
+            resolved.bytes.len(),
+            MAX_MEDIA_ENRICHMENT_BYTES
+        );
+        Ok(resolved)
+    }
+
+    fn resolve_image_object(
+        &mut self,
+        object_id: &str,
+    ) -> anyhow::Result<(Vec<u8>, String, String)> {
+        let resolved = self.resolve_media_object(object_id)?;
+        anyhow::ensure!(
+            resolved.media_type.starts_with("image/"),
+            "GenerateImage reference {object_id} is not an image"
+        );
+        Ok((resolved.bytes, resolved.file_name, resolved.media_type))
     }
 
     fn record_live_capacity_error(
@@ -3064,27 +3135,24 @@ impl Session {
                     matches!(self.mode, AgentMode::Conversation),
                     "EmitObject is only available in a conversation"
                 );
-                let object_id = nonempty_string(&call.arguments, "objectId", 8)?;
-                object_id
-                    .parse::<ObjectId>()
-                    .with_context(|| format!("{object_id:?} is not a canonical object ID"))?;
-                let file = self.api.kmap_file(&object_id)?;
+                let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
+                let object = self.resolve_object(&object_id)?;
                 if let Some(maximum) = self.channel.get("maxObjectBytes").and_then(Value::as_u64) {
                     anyhow::ensure!(
-                        !file.bytes.is_empty(),
+                        !object.bytes.is_empty(),
                         "object {object_id} is empty and cannot be sent through this channel"
                     );
                     anyhow::ensure!(
-                        file.bytes.len() as u64 <= maximum,
+                        object.bytes.len() as u64 <= maximum,
                         "object {object_id} is {} bytes, over this channel's {maximum}-byte limit",
-                        file.bytes.len()
+                        object.bytes.len()
                     );
                 }
                 let descriptor = json!({
                     "objectId":object_id,
-                    "fileName":file.file_name,
-                    "mediaType":file.media_type,
-                    "byteLength":file.bytes.len(),
+                    "fileName":object.file_name,
+                    "mediaType":object.media_type,
+                    "byteLength":object.bytes.len(),
                 });
                 let mut metadata = json!({
                     "outputKind":"object",
@@ -3234,12 +3302,9 @@ impl Session {
                 let model = nonempty_string(&call.arguments, "model", 128)?;
                 let prompt = bounded_nonempty_string(&call.arguments, "prompt", 4_000)?;
                 let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
-                let (pending_id, metadata, bytes) =
-                    read_pending_object(&mut self.journal, &object_id)?;
-                let media_type = normalized_media_type(&metadata.media_type);
-                validate_transcribable_audio(&media_type)?;
+                let object = self.resolve_media_object(&object_id)?;
+                validate_transcribable_audio(&object.media_type)?;
                 validate_transcription_model(&model)?;
-                let file_name = authoritative_object_filename(&metadata)?.to_owned();
                 let user_id = self
                     .root_node_ids
                     .first()
@@ -3250,20 +3315,25 @@ impl Session {
                         user_id,
                         &model,
                         &prompt,
-                        bytes,
-                        file_name.clone(),
-                        &media_type,
+                        object.bytes,
+                        object.file_name.clone(),
+                        &object.media_type,
                         operation_id,
                     )
                     .await?;
-                render_audio_transcription_result(&pending_id, &file_name, &media_type, &result)?
+                render_audio_transcription_result(
+                    &object.object_id,
+                    &object.file_name,
+                    &object.media_type,
+                    &result,
+                )?
             }
             "AnnotateMedia" => {
                 validate_arguments(&call.arguments, &["objectId", "model", "prompt"], &[])?;
                 let model = nonempty_string(&call.arguments, "model", 128)?;
                 let prompt = bounded_nonempty_string(&call.arguments, "prompt", 4_000)?;
                 let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
-                let media = read_media_object(&mut self.journal, &self.api, &object_id)?;
+                let media = self.resolve_media_object(&object_id)?;
                 validate_annotation_media(&model, &media.media_type)?;
                 let user_id = self
                     .root_node_ids
@@ -3301,7 +3371,7 @@ impl Session {
                     optional_object_id_array(&call.arguments, "referenceObjectIds", 14)?;
                 let mut references = Vec::with_capacity(reference_ids.len());
                 for object_id in &reference_ids {
-                    references.push(read_image_object(&mut self.journal, &self.api, object_id)?);
+                    references.push(self.resolve_image_object(object_id)?);
                 }
                 let user_id = self
                     .root_node_ids
@@ -3329,19 +3399,13 @@ impl Session {
             "ExtractDocumentText" => {
                 validate_arguments(&call.arguments, &["objectId"], &[])?;
                 let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
-                let (pending_id, metadata, bytes) =
-                    read_pending_object(&mut self.journal, &object_id)?;
-                validate_extractable_document(&metadata)?;
-                let file_name = authoritative_object_filename(&metadata)?.to_owned();
+                let object = self.resolve_media_object(&object_id)?;
+                validate_extractable_document(&object.media_type, &object.file_name)?;
                 let result = self
                     .api
-                    .extract_document(
-                        bytes,
-                        file_name.clone(),
-                        &normalized_media_type(&metadata.media_type),
-                    )
+                    .extract_document(object.bytes, object.file_name.clone(), &object.media_type)
                     .await?;
-                render_document_extraction_result(&pending_id, &file_name, &result)?
+                render_document_extraction_result(&object.object_id, &object.file_name, &result)?
             }
             "ConnectNodes" => self.connect_nodes(&call.arguments)?,
             "ConsolidateFanout" => self.consolidate_fanout(&call.arguments)?,
@@ -3382,21 +3446,11 @@ impl Session {
                     let object_ids = rust_binary_object_ids(&call.arguments)?;
                     objects.reserve(object_ids.len());
                     for object_id in object_ids {
-                        let bytes = if object_id.starts_with("pending:") {
-                            read_pending_binary_object(&mut self.journal, &object_id)?
-                        } else {
-                            self.api.kmap_file(&object_id)?.bytes
-                        };
-                        objects.push(bytes);
+                        objects.push(self.resolve_object(&object_id)?.bytes);
                     }
                 } else if name == ATTACH_OBJECT_WEB_LIB_TOOL {
                     let object_id = web_library_object_id(&call.arguments)?;
-                    let bytes = if object_id.starts_with("pending:") {
-                        read_pending_binary_object(&mut self.journal, &object_id)?
-                    } else {
-                        self.api.kmap_file(&object_id)?.bytes
-                    };
-                    objects.push(bytes);
+                    objects.push(self.resolve_object(&object_id)?.bytes);
                 }
                 let execution = self
                     .api
@@ -4371,9 +4425,16 @@ fn transcript_from_journal(journal: &HistorySession) -> Vec<Value> {
                 }
                 _ => return None,
             };
+            let transcript_text = state
+                .canonical
+                .content
+                .metadata
+                .get("transcriptText")
+                .and_then(Value::as_str)
+                .unwrap_or(&state.canonical.content.text);
             let mut entry = json!({
                 "role":role,
-                "content":state.canonical.content.text,
+                "content":transcript_text,
             });
             if !state.canonical.content.objects.is_empty() {
                 entry["objects"] = json!(state.canonical.content.objects);
@@ -4407,14 +4468,14 @@ fn staged_object_transport_kind(
     journal: &HistorySession,
     pending_id: &PendingId,
 ) -> Option<String> {
-    let pending_id = pending_id.to_string();
+    let pending_id_text = pending_id.to_string();
     for state in journal.state().boxes.values() {
         let Some(index) = state
             .canonical
             .content
             .objects
             .iter()
-            .position(|object_id| object_id == &pending_id)
+            .position(|object_id| object_id == &pending_id_text)
         else {
             continue;
         };
@@ -4427,7 +4488,7 @@ fn staged_object_transport_kind(
                     .iter()
                     .find(|attachment| {
                         attachment.get("pendingId").and_then(Value::as_str)
-                            == Some(pending_id.as_str())
+                            == Some(pending_id_text.as_str())
                     })
                     .or_else(|| attachments.get(index))
             })
@@ -4440,7 +4501,13 @@ fn staged_object_transport_kind(
             return Some(kind.to_owned());
         }
     }
-    None
+    journal
+        .objects()
+        .get(pending_id)
+        .and_then(|location| location.metadata.transport.get("kind"))
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .map(str::to_owned)
 }
 
 fn kweb_node_draft(node: &PlannedNode) -> NodeDraft {
@@ -4498,61 +4565,39 @@ fn tool_instance(name: &str) -> String {
     format!("{name}:{}", Uuid::new_v4())
 }
 
-fn read_pending_object(
-    journal: &mut HistorySession,
-    object_id: &str,
-) -> anyhow::Result<(PendingId, ObjectMetadata, Vec<u8>)> {
-    let pending_id = PendingId::parse(object_id.to_owned())?;
-    let location = journal
-        .objects()
-        .get(&pending_id)
-        .cloned()
-        .with_context(|| format!("staged object {pending_id} does not exist in this session"))?;
-    anyhow::ensure!(
-        location.payload_len > 0,
-        "staged object {pending_id} is empty"
-    );
-    anyhow::ensure!(
-        location.payload_len <= MAX_MEDIA_ENRICHMENT_BYTES,
-        "staged object {pending_id} is {} bytes, over the {}-byte enrichment limit",
-        location.payload_len,
-        MAX_MEDIA_ENRICHMENT_BYTES
-    );
-    let bytes = journal.read_object(&pending_id)?;
-    Ok((pending_id, location.metadata, bytes))
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ResolvedMediaObject {
-    object_id: String,
-    bytes: Vec<u8>,
-    file_name: String,
-    media_type: String,
-}
-
-fn read_media_object(
-    journal: &mut HistorySession,
-    api: &Api,
-    object_id: &str,
-) -> anyhow::Result<ResolvedMediaObject> {
-    read_media_object_using(journal, object_id, |canonical_id| {
-        api.kmap_file(canonical_id).map_err(Into::into)
-    })
-}
-
-fn read_media_object_using(
+fn resolve_object_using(
     journal: &mut HistorySession,
     object_id: &str,
     read_canonical: impl FnOnce(&str) -> anyhow::Result<StoredFile>,
-) -> anyhow::Result<ResolvedMediaObject> {
-    let resolved = if object_id.starts_with("pending:") {
-        let (pending_id, metadata, bytes) = read_pending_object(journal, object_id)?;
-        ResolvedMediaObject {
+) -> anyhow::Result<ResolvedObject> {
+    if object_id.starts_with("pending:") {
+        let pending_id = PendingId::parse(object_id.to_owned())?;
+        let location = journal
+            .objects()
+            .get(&pending_id)
+            .cloned()
+            .with_context(|| {
+                format!("staged object {pending_id} does not exist in this session")
+            })?;
+        let transport_kind = staged_object_transport_kind(journal, &pending_id);
+        let bytes = journal.read_object(&pending_id)?;
+        anyhow::ensure!(
+            bytes.len() as u64 == location.payload_len,
+            "staged object {pending_id} declared {} bytes but resolved to {}",
+            location.payload_len,
+            bytes.len()
+        );
+        let fallback = format!("object-{}.bin", pending_id.number());
+        Ok(ResolvedObject {
             object_id: pending_id.to_string(),
             bytes,
-            file_name: authoritative_object_filename(&metadata)?.to_owned(),
-            media_type: normalized_media_type(&metadata.media_type),
-        }
+            file_name: sanitize_file_name(
+                location.metadata.file_name.as_deref().unwrap_or_default(),
+                &fallback,
+            ),
+            media_type: location.metadata.media_type,
+            transport_kind,
+        })
     } else {
         let canonical_id = object_id
             .parse::<ObjectId>()
@@ -4563,39 +4608,14 @@ fn read_media_object_using(
             "object store returned {} while resolving {canonical_id}",
             file.object_id
         );
-        ResolvedMediaObject {
+        Ok(ResolvedObject {
             object_id: canonical_id.to_string(),
             bytes: file.bytes,
             file_name: file.file_name,
-            media_type: normalized_media_type(&file.media_type),
-        }
-    };
-    anyhow::ensure!(
-        !resolved.bytes.is_empty(),
-        "media object {} is empty",
-        resolved.object_id
-    );
-    anyhow::ensure!(
-        resolved.bytes.len() as u64 <= MAX_MEDIA_ENRICHMENT_BYTES,
-        "media object {} is {} bytes, over the {}-byte enrichment limit",
-        resolved.object_id,
-        resolved.bytes.len(),
-        MAX_MEDIA_ENRICHMENT_BYTES
-    );
-    Ok(resolved)
-}
-
-fn read_image_object(
-    journal: &mut HistorySession,
-    api: &Api,
-    object_id: &str,
-) -> anyhow::Result<(Vec<u8>, String, String)> {
-    let resolved = read_media_object(journal, api, object_id)?;
-    anyhow::ensure!(
-        resolved.media_type.starts_with("image/"),
-        "GenerateImage reference {object_id} is not an image"
-    );
-    Ok((resolved.bytes, resolved.file_name, resolved.media_type))
+            media_type: file.media_type,
+            transport_kind: file.transport_kind,
+        })
+    }
 }
 
 fn rust_binary_object_ids(arguments: &Value) -> anyhow::Result<Vec<String>> {
@@ -4624,21 +4644,100 @@ fn web_library_object_id(arguments: &Value) -> anyhow::Result<String> {
         .context("Web-library attachment objectId must be a nonempty string")
 }
 
-fn read_pending_binary_object(
-    journal: &mut HistorySession,
-    object_id: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let pending_id = PendingId::parse(object_id.to_owned())?;
-    journal
-        .read_object(&pending_id)
-        .with_context(|| format!("reading Rust-binary input object {pending_id}"))
-}
-
 fn ingress_object_filename(value: Option<&str>, fallback: &str) -> String {
     value
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(fallback)
         .to_owned()
+}
+
+fn file_name_extension(file_name: &str) -> String {
+    file_name
+        .rsplit_once('.')
+        .and_then(|(stem, extension)| {
+            (!stem.is_empty() && !extension.is_empty()).then_some(extension)
+        })
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_else(|| "(none)".into())
+}
+
+fn render_user_file_metadata(
+    ordinal: usize,
+    object_id: &str,
+    file_name: &str,
+    media_type: &str,
+    size_bytes: u64,
+) -> String {
+    format!(
+        "User-provided file {ordinal}\nObject reference: {object_id}\nOriginal filename: {file_name}\nExtension: {}\nMIME type: {}\nSize: {size_bytes} bytes",
+        file_name_extension(file_name),
+        normalized_media_type(media_type),
+    )
+}
+
+fn authoritative_staged_file_metadata(
+    journal: &HistorySession,
+    pending_id: &PendingId,
+) -> anyhow::Result<(String, String, u64)> {
+    let location = journal
+        .objects()
+        .get(pending_id)
+        .with_context(|| format!("user-provided object {pending_id} is not staged"))?;
+    let fallback = format!("object-{}.bin", pending_id.number());
+    let file_name = sanitize_file_name(
+        location.metadata.file_name.as_deref().unwrap_or_default(),
+        &fallback,
+    );
+    Ok((
+        file_name,
+        normalized_media_type(&location.metadata.media_type),
+        location.payload_len,
+    ))
+}
+
+fn canonicalize_staged_file_descriptor(
+    journal: &HistorySession,
+    pending_id: &PendingId,
+    descriptor: &mut Value,
+) -> anyhow::Result<String> {
+    let (file_name, media_type, size_bytes) =
+        authoritative_staged_file_metadata(journal, pending_id)?;
+    if !descriptor.is_object() {
+        *descriptor = json!({});
+    }
+    descriptor["pendingId"] = json!(pending_id.to_string());
+    descriptor["fileName"] = json!(file_name);
+    descriptor["extension"] = json!(file_name_extension(&file_name));
+    descriptor["mimeType"] = json!(media_type);
+    descriptor["sizeBytes"] = json!(size_bytes);
+    Ok(file_name)
+}
+
+fn append_user_file_metadata(
+    journal: &HistorySession,
+    content: &mut BoxContent,
+) -> anyhow::Result<()> {
+    let mut blocks = Vec::with_capacity(content.objects.len());
+    for (index, object_id) in content.objects.iter().enumerate() {
+        let pending_id = PendingId::parse(object_id.clone())?;
+        let (file_name, media_type, size_bytes) =
+            authoritative_staged_file_metadata(journal, &pending_id)?;
+        blocks.push(render_user_file_metadata(
+            index + 1,
+            object_id,
+            &file_name,
+            &media_type,
+            size_bytes,
+        ));
+    }
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    if !content.text.is_empty() && !content.text.ends_with('\n') {
+        content.text.push_str("\n\n");
+    }
+    content.text.push_str(&blocks.join("\n\n"));
+    Ok(())
 }
 
 fn authoritative_object_filename(metadata: &ObjectMetadata) -> anyhow::Result<&str> {
@@ -4750,7 +4849,7 @@ fn render_staged_telegram_group_media(
     reused: bool,
 ) -> anyhow::Result<String> {
     Ok(format!(
-        "{} Telegram group media\nMessage ID: {message_id}\nObject: {pending_id}\nKind: {}\nFile: {}\nContent type: {}\nSize: {size_bytes} bytes\n\nUse Object {pending_id} with AnnotateMedia, GenerateImage (for images), TranscribeAudio, or ExtractDocumentText as appropriate.",
+        "{} Telegram group media\nMessage ID: {message_id}\nObject: {pending_id}\nKind: {}\nOriginal filename: {}\nExtension: {}\nMIME type: {}\nSize: {size_bytes} bytes\n\nUse Object {pending_id} with AnnotateMedia, GenerateImage (for images), TranscribeAudio, or ExtractDocumentText as appropriate.",
         if reused {
             "Reused already-staged"
         } else {
@@ -4762,6 +4861,7 @@ fn render_staged_telegram_group_media(
             .and_then(Value::as_str)
             .unwrap_or("media"),
         authoritative_object_filename(metadata)?,
+        file_name_extension(authoritative_object_filename(metadata)?),
         normalized_media_type(&metadata.media_type),
     ))
 }
@@ -4881,12 +4981,11 @@ fn validate_transcribable_audio(media_type: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_extractable_document(metadata: &ObjectMetadata) -> anyhow::Result<()> {
-    let media_type = normalized_media_type(&metadata.media_type);
-    let extension = metadata
-        .file_name
-        .as_deref()
-        .and_then(|value| value.rsplit_once('.').map(|(_, extension)| extension))
+fn validate_extractable_document(media_type: &str, file_name: &str) -> anyhow::Result<()> {
+    let media_type = normalized_media_type(media_type);
+    let extension = file_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
         .map(str::to_ascii_lowercase);
     anyhow::ensure!(
         matches!(
@@ -5787,7 +5886,7 @@ mod tests {
     }
 
     #[test]
-    fn media_enrichment_reads_exact_staged_bytes_and_validates_provider_matrix() {
+    fn object_resolution_reads_exact_staged_bytes_and_validates_provider_matrix() {
         let label = format!(
             "media-enrichment-{}-{}",
             std::process::id(),
@@ -5803,15 +5902,24 @@ mod tests {
                 "t1",
                 "image/png",
                 Some("diagram.png".into()),
-                json!({"source":"test"}),
+                json!({"source":"test","kind":"photo"}),
                 &expected,
             )
             .unwrap();
-        let (object_id, metadata, bytes) =
-            read_pending_object(&mut journal, &staged.to_string()).unwrap();
-        assert_eq!(object_id, staged);
-        assert_eq!(metadata.file_name.as_deref(), Some("diagram.png"));
-        assert_eq!(bytes, expected);
+        let resolved = resolve_object_using(&mut journal, &staged.to_string(), |_| {
+            unreachable!("pending object resolution must not read the canonical store")
+        })
+        .unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedObject {
+                object_id: staged.to_string(),
+                bytes: expected.clone(),
+                file_name: "diagram.png".into(),
+                media_type: "image/png".into(),
+                transport_kind: Some("photo".into()),
+            }
+        );
         assert_eq!(
             rust_binary_object_ids(&json!({
                 "objectIds":[staged.to_string(), "AAECAwQF"]
@@ -5824,10 +5932,6 @@ mod tests {
             staged.to_string()
         );
         assert!(web_library_object_id(&json!({"objectId":"  "})).is_err());
-        assert_eq!(
-            read_pending_binary_object(&mut journal, &staged.to_string()).unwrap(),
-            expected
-        );
         assert!(validate_annotation_media("gpt-5.6", "image/png").is_ok());
         assert!(validate_annotation_media("gpt-5.6-sol", "image/webp").is_ok());
         assert!(validate_annotation_media("gemini-2.5-flash", "audio/mpeg").is_ok());
@@ -5876,13 +5980,43 @@ mod tests {
     }
 
     #[test]
-    fn media_enrichment_resolves_canonical_object_bytes_and_metadata() {
+    fn object_resolution_is_independent_of_tool_specific_media_requirements() {
+        let (path, mut journal) = test_journal("metadata-light-object-resolution", 10_000);
+        let staged = journal
+            .stage_object("t1", "application/octet-stream", None, Value::Null, &[])
+            .unwrap();
+
+        let resolved = resolve_object_using(&mut journal, &staged.to_string(), |_| {
+            unreachable!("pending object resolution must not read the canonical store")
+        })
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            ResolvedObject {
+                object_id: staged.to_string(),
+                bytes: Vec::new(),
+                file_name: format!("object-{}.bin", staged.number()),
+                media_type: "application/octet-stream".into(),
+                transport_kind: None,
+            }
+        );
+        std::fs::remove_file(path.with_file_name(format!(
+            "{}-0.pending-object",
+            path.file_stem().unwrap().to_string_lossy()
+        )))
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn object_resolution_reads_canonical_bytes_and_preserves_metadata() {
         let (path, mut journal) = test_journal("canonical-media-enrichment", 10_000);
         let object_id = ObjectId::from_bytes([0x80, 1, 2, 3, 4, 6]).unwrap();
         let object_id_text = object_id.to_string();
         let expected = b"\xff\xd8\xffexact-canonical".to_vec();
 
-        let resolved = read_media_object_using(&mut journal, &object_id_text, |requested| {
+        let resolved = resolve_object_using(&mut journal, &object_id_text, |requested| {
             assert_eq!(requested, object_id_text);
             Ok(StoredFile {
                 object_id,
@@ -5897,11 +6031,12 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedMediaObject {
+            ResolvedObject {
                 object_id: object_id_text,
                 bytes: expected,
                 file_name: "stored-photo.jpg".into(),
                 media_type: "image/jpeg".into(),
+                transport_kind: Some("telegram".into()),
             }
         );
         std::fs::remove_file(path).unwrap();
@@ -5984,6 +6119,10 @@ mod tests {
             render_staged_telegram_group_media(&found, &metadata, size_bytes, 77, true).unwrap();
         assert!(rendered.contains("Reused already-staged Telegram group media"));
         assert!(rendered.contains(&format!("Object: {pending_id}")));
+        assert!(rendered.contains("Original filename: thread-photo.jpg"));
+        assert!(rendered.contains("Extension: .jpg"));
+        assert!(rendered.contains("MIME type: image/jpeg"));
+        assert!(rendered.contains("Size: 18 bytes"));
         assert!(staged_telegram_group_media(&journal, -100123, 78).is_none());
 
         std::fs::remove_file(path.with_file_name(format!(
@@ -5996,27 +6135,16 @@ mod tests {
 
     #[test]
     fn document_enrichment_accepts_only_pdf_doc_and_docx() {
-        let metadata = |media_type: &str, file_name: &str| ObjectMetadata {
-            pending_id: PendingId::parse("pending:1").unwrap(),
-            event_id: EventId(1),
-            recorded_at: "t1".into(),
-            media_type: media_type.into(),
-            file_name: Some(file_name.into()),
-            transport: Value::Null,
-        };
-        assert!(validate_extractable_document(&metadata("application/pdf", "file.bin")).is_ok());
+        assert!(validate_extractable_document("application/pdf", "file.bin").is_ok());
+        assert!(validate_extractable_document("application/octet-stream", "legacy.doc").is_ok());
         assert!(
-            validate_extractable_document(&metadata("application/octet-stream", "legacy.doc"))
-                .is_ok()
-        );
-        assert!(
-            validate_extractable_document(&metadata(
+            validate_extractable_document(
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "file"
-            ))
+                "file",
+            )
             .is_ok()
         );
-        assert!(validate_extractable_document(&metadata("text/plain", "notes.txt")).is_err());
+        assert!(validate_extractable_document("text/plain", "notes.txt").is_err());
     }
 
     #[test]
@@ -6080,7 +6208,7 @@ mod tests {
         assert!(annotation.ends_with("A sign reads \"Kennedy\"."));
 
         let transcription = render_audio_transcription_result(
-            &pending,
+            &pending_text,
             "voice-note.ogg",
             "audio/ogg",
             &json!({
@@ -6104,7 +6232,8 @@ mod tests {
             })
             .unwrap();
         let extraction =
-            render_document_extraction_result(&pending, "brief.doc", &extraction_result).unwrap();
+            render_document_extraction_result(&pending_text, "brief.doc", &extraction_result)
+                .unwrap();
         assert!(extraction.contains("File: brief.doc"));
         assert!(extraction.contains("Format: doc"));
         assert!(!extraction.contains("adapter-reconstructed.doc"));
@@ -7040,6 +7169,60 @@ mod tests {
                 .as_deref(),
             Some("document")
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn user_file_metadata_is_authoritative_model_context_not_transcript_text() {
+        let (path, mut journal) = test_journal("user-file-metadata", 1_000);
+        let pending_id = journal
+            .stage_object(
+                "t1",
+                "application/pdf; charset=binary",
+                Some("../quarterly.Report.PDF".into()),
+                Value::Null,
+                b"pdf",
+            )
+            .unwrap();
+        let mut descriptor = json!({
+            "pendingId":pending_id.to_string(),
+            "fileName":"spoofed.txt",
+            "mimeType":"text/plain",
+            "sizeBytes":999,
+        });
+        canonicalize_staged_file_descriptor(&journal, &pending_id, &mut descriptor).unwrap();
+        assert_eq!(descriptor["fileName"], "quarterly.Report.PDF");
+        assert_eq!(descriptor["extension"], ".PDF");
+        assert_eq!(descriptor["mimeType"], "application/pdf");
+        assert_eq!(descriptor["sizeBytes"], 3);
+        let mut content = BoxContent {
+            text: "Please review this.".into(),
+            objects: vec![pending_id.to_string()],
+            metadata: json!({"transcriptText":"Please review this."}),
+        };
+        append_user_file_metadata(&journal, &mut content).unwrap();
+        journal
+            .create_box("t2", "User message", BoxOwner::User, content)
+            .unwrap();
+
+        let projected = &journal.state().projection().items[0].text;
+        assert!(projected.contains("User-provided file 1"));
+        assert!(projected.contains(&format!("Object reference: {pending_id}")));
+        assert!(projected.contains("Original filename: quarterly.Report.PDF"));
+        assert!(projected.contains("Extension: .PDF"));
+        assert!(projected.contains("MIME type: application/pdf"));
+        assert!(projected.contains("Size: 3 bytes"));
+        assert!(projected.contains(&format!("Object provided: {pending_id}")));
+        assert_eq!(
+            transcript_from_journal(&journal)[0]["content"],
+            "Please review this."
+        );
+
+        std::fs::remove_file(path.with_file_name(format!(
+            "{}-0.pending-object",
+            path.file_stem().unwrap().to_string_lossy()
+        )))
+        .unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

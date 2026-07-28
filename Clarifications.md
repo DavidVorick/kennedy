@@ -300,6 +300,12 @@ This document records user intention with regard to Kennedy.
 - Once staged, filename, media type, transport kind, and object identity have
   one authoritative value. Downstream adapters must not independently
   reconstruct them.
+- Whenever Kennedy receives a user-supplied file, every model-facing session
+  type shows a bounded metadata block sourced from that authoritative custody
+  record: original filename, filename extension, MIME type, and exact byte
+  size, plus the object reference when one exists. Accompanying message text
+  must not hide file metadata, and client-repeated descriptors are not a second
+  source of truth.
 - Keep raw media bytes out of model-readable prose. Kennedy sees bounded
   metadata and an object reference, then explicitly chooses an appropriate tool
   when the contents matter.
@@ -308,10 +314,13 @@ This document records user intention with regard to Kennedy.
 - User-supplied voice and media reach Kennedy as originals without eager
   transport-generated interpretation. Kennedy chooses whether and how to
   transcribe or annotate them, including the exact model and bounded prompt.
-- `AnnotateMedia` accepts any authorized compatible media object, whether it is
-  staged in the current session or already canonical in the object store.
-  Annotation availability must not depend on when or how the original entered
-  storage.
+- Every object-consuming Ktool accepts both a pending object staged in the
+  current logical session and an authorized canonical object from the object
+  store. Resolve both forms through the same session boundary before applying
+  tool-specific capability or size checks; object availability must not depend
+  on its storage phase. This includes Ktools run by subagents, which share the
+  parent session's pending objects and may return any useful object ID in their
+  ordinary text response.
 - Model-backed media work must validate the actual media kind and capability.
   Treat transcription, translation, visual interpretation, and speaker
   identification as potentially wrong and preserve uncertainty.

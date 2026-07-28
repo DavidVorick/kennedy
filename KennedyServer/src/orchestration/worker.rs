@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use kcode_server_object_envelopes::sanitize_file_name;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 use uuid::Uuid;
@@ -1363,34 +1364,60 @@ impl Orchestrator {
                         | "sticker"
                 )
             {
-                if message.get("hasMedia").and_then(Value::as_bool) == Some(true) {
-                    message["mediaRef"] = json!({"kind":kind,"source":"telegram-group","chatId":context.get("chatId").cloned().unwrap_or(Value::Null),"messageId":message.get("messageId").cloned().unwrap_or(Value::Null),"fileName":message.get("fileName").cloned().unwrap_or(Value::Null),"mimeType":message.get("mimeType").cloned().unwrap_or(Value::Null),"durationSeconds":message.get("durationSeconds").cloned().unwrap_or(Value::Null)});
+                let has_media = message.get("hasMedia").and_then(Value::as_bool) == Some(true);
+                if has_media {
+                    let media_path = format!(
+                        "/api/v1/group-messages/{}/{}/media",
+                        encode_path(&chat_id),
+                        encode_path(&message_id)
+                    );
+                    let (size_bytes, downloaded_mime_type) =
+                        self.api.telegram_file_metadata(&media_path).await?;
+                    let mime_type = normalized_file_mime_type(
+                        message
+                            .get("mimeType")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&downloaded_mime_type),
+                    );
+                    let supplied_file_name = message
+                        .get("fileName")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    let file_name_supplied = supplied_file_name.is_some();
+                    let file_name = telegram_group_context_file_name(
+                        supplied_file_name,
+                        &kind,
+                        &mime_type,
+                        &message_id,
+                    );
+                    message["fileName"] = json!(file_name);
+                    message["fileNameSource"] = json!(if file_name_supplied {
+                        "transport"
+                    } else {
+                        "synthesized"
+                    });
+                    message["mimeType"] = json!(mime_type);
+                    message["sizeBytes"] = json!(size_bytes);
+                    message["mediaRef"] = json!({"kind":kind,"source":"telegram-group","chatId":context.get("chatId").cloned().unwrap_or(Value::Null),"messageId":message.get("messageId").cloned().unwrap_or(Value::Null),"fileName":file_name,"fileNameSource":message.get("fileNameSource").cloned().unwrap_or(Value::Null),"mimeType":mime_type,"sizeBytes":size_bytes,"durationSeconds":message.get("durationSeconds").cloned().unwrap_or(Value::Null)});
                 }
                 let base = message.get("text").and_then(Value::as_str).unwrap_or("");
                 let prepared = message
                     .get("preparedText")
                     .and_then(Value::as_str)
                     .unwrap_or("Document text extraction unavailable.");
-                message["text"] = json!(if kind == "voice" {
-                    format!(
-                        "{base}\n\n[Telegram voice note attached; it was not automatically transcribed.]"
-                    )
-                } else if kind == "document" {
-                    format!(
-                        "{base}\n\n[Document: {}]\n{prepared}",
-                        message
-                            .get("fileName")
-                            .and_then(Value::as_str)
-                            .unwrap_or("telegram-document")
-                    )
+                message["text"] = json!(if has_media {
+                    let file_metadata = telegram_group_context_file_metadata(&message);
+                    if kind == "voice" {
+                        format!(
+                            "{base}\n\n{file_metadata}\nThe voice note was not automatically transcribed."
+                        )
+                    } else if kind == "document" {
+                        format!("{base}\n\n{file_metadata}\n\n{prepared}")
+                    } else {
+                        format!("{base}\n\n{file_metadata}")
+                    }
                 } else {
-                    format!(
-                        "{base}\n\n[Telegram {kind} attached: {}]",
-                        message
-                            .get("fileName")
-                            .and_then(Value::as_str)
-                            .unwrap_or("media")
-                    )
+                    format!("{base}\n\n[The Telegram {kind} file is unavailable.]")
                 });
             }
             messages.push(message);
@@ -1618,7 +1645,7 @@ impl Orchestrator {
                 persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
                 self.request_conversation_ingress(&record_arc, None).await?;
                 self.deliver_telegram_responses(
-                    &session,
+                    &mut session,
                     &id,
                     &conversation_id,
                     Some("session ended after crossing the 75% forced-ingress threshold"),
@@ -1627,13 +1654,13 @@ impl Orchestrator {
                 return Ok(());
             }
         }
-        self.deliver_telegram_responses(&session, &id, &conversation_id, None)
+        self.deliver_telegram_responses(&mut session, &id, &conversation_id, None)
             .await
     }
 
     async fn deliver_telegram_responses(
         &self,
-        session: &Session,
+        session: &mut Session,
         event_id: &str,
         conversation_id: &str,
         forced_context_warning: Option<&str>,
@@ -1685,7 +1712,7 @@ impl Orchestrator {
             let complete = index + 1 == delivery_count;
             match delivery {
                 Delivery::Object(object_id) => {
-                    let file = self.api.kmap_file(&object_id)?;
+                    let file = session.resolve_object(&object_id)?;
                     anyhow::ensure!(
                         file.bytes.len() <= self.config.telegram_max_media_bytes,
                         "object {object_id} is {} bytes, over the configured {}-byte Telegram media limit",
@@ -2514,6 +2541,83 @@ fn participant_references(context: &Value, roots: &[String]) -> Vec<String> {
     values.dedup();
     values
 }
+fn normalized_file_mime_type(value: &str) -> String {
+    let value = value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase();
+    if value.contains('/')
+        && !value.is_empty()
+        && !value.chars().any(char::is_whitespace)
+        && !value.chars().any(char::is_control)
+    {
+        value
+    } else {
+        "application/octet-stream".into()
+    }
+}
+fn file_extension_for_mime_type(mime_type: &str) -> &'static str {
+    match normalized_file_mime_type(mime_type).as_str() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "audio/ogg" | "audio/opus" | "application/ogg" => "ogg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "video/mp4" => "mp4",
+        "audio/webm" | "video/webm" => "webm",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+fn telegram_group_context_file_name(
+    supplied: Option<&str>,
+    kind: &str,
+    mime_type: &str,
+    message_id: &str,
+) -> String {
+    let fallback = format!(
+        "telegram-group-{kind}-{message_id}.{}",
+        file_extension_for_mime_type(mime_type)
+    );
+    sanitize_file_name(supplied.unwrap_or_default(), &fallback)
+}
+fn file_name_extension(file_name: &str) -> String {
+    file_name
+        .rsplit_once('.')
+        .and_then(|(stem, extension)| {
+            (!stem.is_empty() && !extension.is_empty()).then_some(extension)
+        })
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_else(|| "(none)".into())
+}
+fn telegram_group_context_file_metadata(message: &Value) -> String {
+    let file_name = message
+        .get("fileName")
+        .and_then(Value::as_str)
+        .unwrap_or("telegram-file");
+    let source_note = (message.get("fileNameSource").and_then(Value::as_str)
+        == Some("synthesized"))
+    .then_some(" (synthesized because Telegram supplied no filename)")
+    .unwrap_or_default();
+    let mime_type = normalized_file_mime_type(
+        message
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream"),
+    );
+    let size_bytes = message
+        .get("sizeBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    format!(
+        "User-provided file\nOriginal filename: {file_name}{source_note}\nExtension: {}\nMIME type: {mime_type}\nSize: {size_bytes} bytes",
+        file_name_extension(file_name),
+    )
+}
 fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
     value
         .get(key)
@@ -2712,6 +2816,24 @@ mod tests {
     fn bounded_errors_include_the_cause_chain() {
         let error = anyhow::anyhow!("inner cause").context("outer context");
         assert_eq!(bounded_error(&error), "outer context: inner cause");
+    }
+
+    #[test]
+    fn retained_group_files_use_the_same_complete_metadata_contract() {
+        let file_name = telegram_group_context_file_name(None, "voice", "audio/ogg", "77");
+        assert_eq!(file_name, "telegram-group-voice-77.ogg");
+        let rendered = telegram_group_context_file_metadata(&json!({
+            "fileName":file_name,
+            "fileNameSource":"synthesized",
+            "mimeType":"audio/ogg; codecs=opus",
+            "sizeBytes":42,
+        }));
+        assert!(rendered.contains(
+            "Original filename: telegram-group-voice-77.ogg (synthesized because Telegram supplied no filename)"
+        ));
+        assert!(rendered.contains("Extension: .ogg"));
+        assert!(rendered.contains("MIME type: audio/ogg"));
+        assert!(rendered.contains("Size: 42 bytes"));
     }
 
     #[test]

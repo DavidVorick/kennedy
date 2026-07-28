@@ -597,6 +597,9 @@ fn audio_piece_metadata(recording: &RecordingStatus, piece_index: u32, piece_cou
         "recordingId":recording.id,
         "sha256":recording.sha256,
         "originalFilename":recording.original_filename,
+        "extension":file_name_extension(&recording.original_filename),
+        "mimeType":"audio/wav",
+        "sizeBytes":recording.size_bytes,
         "sourceCreatedAt":recording.recorded_at.to_rfc3339(),
         "pieceIndex":piece_index,
         "pieceCount":piece_count,
@@ -610,14 +613,26 @@ fn format_ingress_piece(
     transcript: &str,
 ) -> String {
     format!(
-        "Vnote final transcript piece\n\nRecording began: {}\nRecording SHA-256: {}\nOriginal filename: {}\nTranscript piece: {} of {}\n\n{}",
+        "Vnote final transcript piece\n\nRecording began: {}\nRecording SHA-256: {}\nOriginal filename: {}\nExtension: {}\nMIME type: audio/wav\nSize: {} bytes\nTranscript piece: {} of {}\n\n{}",
         recording.recorded_at.to_rfc3339(),
         recording.sha256,
         recording.original_filename,
+        file_name_extension(&recording.original_filename),
+        recording.size_bytes,
         piece_index + 1,
         piece_count,
         transcript,
     )
+}
+
+fn file_name_extension(file_name: &str) -> String {
+    file_name
+        .rsplit_once('.')
+        .and_then(|(stem, extension)| {
+            (!stem.is_empty() && !extension.is_empty()).then_some(extension)
+        })
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_else(|| "(none)".into())
 }
 
 fn processing_stage(status: &kcode_audio_ingress::TranscriptionStatus) -> &'static str {
@@ -726,6 +741,37 @@ mod tests {
             audio_piece_id(recording_id, 2),
             format!("audio:{recording_id}:2")
         );
+    }
+
+    #[test]
+    fn audio_ingress_exposes_the_complete_file_metadata_contract() {
+        let now = Utc::now();
+        let recording = RecordingStatus {
+            id: Uuid::new_v4(),
+            user_id: "user".into(),
+            sha256: "0".repeat(64),
+            original_filename: "meeting.final.WAV".into(),
+            size_bytes: 42,
+            recorded_at: now,
+            received_at: now,
+            transcription_model: "transcription-model".into(),
+            reconciliation_model: "reconciliation-model".into(),
+            reconciliation_reasoning: "xhigh".into(),
+            state: RecordingState::Complete {
+                transcript: "Transcript".into(),
+            },
+        };
+
+        let metadata = audio_piece_metadata(&recording, 0, 1);
+        assert_eq!(metadata["originalFilename"], "meeting.final.WAV");
+        assert_eq!(metadata["extension"], ".WAV");
+        assert_eq!(metadata["mimeType"], "audio/wav");
+        assert_eq!(metadata["sizeBytes"], 42);
+        let text = format_ingress_piece(&recording, 0, 1, "Transcript");
+        assert!(text.contains("Original filename: meeting.final.WAV"));
+        assert!(text.contains("Extension: .WAV"));
+        assert!(text.contains("MIME type: audio/wav"));
+        assert!(text.contains("Size: 42 bytes"));
     }
 
     #[test]
