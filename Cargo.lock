@@ -2119,6 +2119,8 @@ dependencies = [
 [[package]]
 name = "kcode-kweb-context"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d12d5cec8d389104d84054a5371cec4e8375c2a75b1128ec673404079be92b09"
 dependencies = [
  "kcode-kweb-db",
  "serde",
@@ -2180,6 +2182,8 @@ dependencies = [
 [[package]]
 name = "kcode-session-history"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0503dcc6f25c9ad963252f50ddca910b1a31141f930808ad819aa1cde0d10ca"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2187,7 +2191,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tokio",
  "tracing",
  "uuid",
 ]
