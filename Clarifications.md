@@ -48,23 +48,32 @@ This document records user intention with regard to Kennedy.
   and object has an immutable-user-ID owner and independently stored audience
   policy, and Kweb includes those facts in signed transactions and enforces
   them on reads and writes. It does not resolve Kennedy-specific transport
-  groups, roots, active connections, fanout, UI policy, or session behavior;
+  groups, roots, fixed/recent context layout, UI policy, or session behavior;
   callers supply the exact user and model audience for an operation.
 - Kweb's root files and binary database records are private to
   `kcode-kweb-db`. KennedyServer and offline application tooling must use its
   public API rather than parsing or mutating those formats behind the
   library's lock and recovery boundary.
-- Kennedy owns application graph policy, including roots, fixed connections,
-  active/fanout interpretation, application validation, and model attribution.
+- Kennedy owns application graph policy, including roots, fixed/recent context
+  layout, application validation, and model attribution.
   Kweb owns durable resource ownership, privacy evaluation, and owner-only
   mutation enforcement.
 - Fixed connections are deliberately placed references, not task slots or a
   priority system. Graph hygiene belongs to Kennedy; the harness should not
   silently promote or rearrange connections.
-- Loading a node loads all of its fixed connections in full, without an
-  arbitrary fixed-connection count cap. Recent connections remain fanout
-  summaries and are not automatically promoted into full active-connection
-  nodes; explicit loading and provider context capacity govern expansion.
+- The context projection gives each explicitly loaded node one full box and
+  each of its fixed connections one full box, without an arbitrary
+  fixed-connection count cap. There is no active-connection category. All
+  recent connections included in the projection are fanout-only and appear
+  together in one globally deduplicated summary box containing each node's name
+  and short description; they are never automatically promoted to full nodes.
+  An explicitly loaded node uses the concise header
+  `[box {box_id} | Kweb loaded node | hydrated]`: its identifier and short name
+  belong in the node body rather than being duplicated in the header, and its
+  Kweb resource owner belongs in that node data rather than exposing Chatend's
+  internal tool ownership in the header. Loaded-node, fixed-connection, and
+  staged-node boxes use the same full node-body representation and differ only
+  in their declared box type. Full node text has no active-connection field.
 - Use canonical Kweb node and object identifiers at every Kennedy boundary.
   Do not introduce session-local aliases for already-durable resources.
 - Kennedy users share one graph, but Kweb itself filters every node and object
@@ -136,6 +145,12 @@ This document records user intention with regard to Kennedy.
 - Every item visible to Kennedy belongs to the box model. Canonical content,
   its current representation, and the history of changes to that representation
   are distinct concerns.
+- When updating a box moves its current representation to a later position in
+  the projected history, leave a minimal generic `[box updated]` placeholder at
+  its earlier occurrence. This preserves visible tool-call/result continuity
+  and makes clear that the call succeeded but its stateful output was superseded
+  and moved forward. The marker is generic Chatend projection behavior, not a
+  Kmap-specific notice box.
 - Hydration, dehydration, and Kennedy-authored summaries must never destroy
   canonical content. If canonical state changes behind a compact
   representation, preserve Kennedy's representation choice and mark it stale.
@@ -432,18 +447,22 @@ This document records user intention with regard to Kennedy.
   prompt.
 - New capability manuals, including delegation and subagent tooling, must be
   delivered as standalone ingress material for Kmap and must not be added to
-  runtime system-prompt files. A feature implementation does not authorize
-  expanding the system prompt with its usage documentation. Keeping manuals in
-  Kmap lets Kennedy revise them, connect them to related operating knowledge,
-  and select them only when relevant. Runtime prompts may retain only the small
-  bootstrapping and navigation instructions needed for Kennedy to reach Kmap.
+  runtime system-prompt files. Never modify any runtime system-prompt file
+  without the user's explicit permission; a feature implementation does not
+  imply that permission. Keeping manuals in Kmap lets Kennedy revise them,
+  connect them to related operating knowledge, and select them only when
+  relevant. Runtime prompts may retain only the small bootstrapping and
+  navigation instructions needed for Kennedy to reach Kmap.
 - The Kmap introduction must be sufficient for a model with no prior knowledge
   of Kennedy to find the automatic roots, understand canonical identifiers,
   navigate connections, and discover further manuals.
 - Keep Telegram instructions out of non-Telegram sessions, and group-only
   instructions out of private Telegram sessions.
 - Prefer concise natural language to JSON in model context when no exact machine
-  protocol requires structure.
+  protocol requires structure. When a critical navigation tool does require a
+  strict machine protocol, give Kennedy a compact canonical example showing the
+  bridge nesting and exact argument keys rather than requiring her to infer
+  them from prose.
 - State the current model, thinking mode, date, time, and timezone
   unambiguously in dynamic context.
 

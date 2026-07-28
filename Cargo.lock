@@ -1968,6 +1968,8 @@ dependencies = [
 [[package]]
 name = "kcode-agent-runtime"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48be15e4e97cf4874e9d4760ca4fd9f4549a1a941db8eb461455b467711ee85c"
 dependencies = [
  "anyhow",
  "hex",
@@ -2072,6 +2074,8 @@ dependencies = [
 [[package]]
 name = "kcode-gemini-api"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d23b3e8ed0558e6bd192aa531ee4c420218b14ce89b43997efd2c89caef6d22"
 dependencies = [
  "base64",
  "chrono",
@@ -2084,6 +2088,8 @@ dependencies = [
 [[package]]
 name = "kcode-intelligence-router"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d3e32b74e3e9a9a399ed241bfa390f638c86ea24f0d376e6fce128b504f7e33"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2111,6 +2117,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-kweb-context"
+version = "0.1.0"
+dependencies = [
+ "kcode-kweb-db",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kcode-kweb-db"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2128,6 +2143,8 @@ dependencies = [
 [[package]]
 name = "kcode-openai-api"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490723cf2d3bb2e81f76d58970eb26e981039b1c1cb3315a5ab7a7ed1b5732bd"
 dependencies = [
  "base64",
  "reqwest 0.13.4",
@@ -2162,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-session-history"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2302,6 +2319,7 @@ dependencies = [
  "kcode-dev-tools",
  "kcode-intelligence-router",
  "kcode-kmap-size",
+ "kcode-kweb-context",
  "kcode-kweb-db",
  "kcode-server-object-envelopes",
  "kcode-session-history",

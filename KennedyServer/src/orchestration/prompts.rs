@@ -254,4 +254,10 @@ mod tests {
         assert!(!audio.contains("[telegramSession]"));
         assert!(!audio.contains("[telegramGroupSession]"));
     }
+
+    #[test]
+    fn load_node_manual_shows_the_exact_bridge_payload() {
+        let manual = include_str!("../../runtime/system-prompts/ReadTools.txt");
+        assert!(manual.contains(r#"{"name":"LoadNode","arguments":{"identifier":"Nl_hWdsl"}}"#));
+    }
 }

@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::ACTIVE_CONNECTION_LIMIT;
 #[cfg(test)]
 use super::Config;
 
@@ -1175,7 +1174,6 @@ impl Api {
             .kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
             .await?;
         let fixed_ids = fixed_connection_ids(&requested);
-        let active_ids = active_connection_ids(&requested);
         let mut seen = std::collections::HashSet::from([node_id.to_owned()]);
         let mut fixed = Vec::with_capacity(fixed_ids.len());
         for id in fixed_ids {
@@ -1183,16 +1181,9 @@ impl Api {
                 fixed.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
             }
         }
-        let mut active = Vec::with_capacity(active_ids.len());
-        for id in active_ids {
-            if seen.insert(id.clone()) {
-                active.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
-            }
-        }
         Ok(json!({
             "requested_node": normalize_node(requested),
             "fixed_connection_nodes": fixed.into_iter().map(normalize_node).collect::<Vec<_>>(),
-            "active_connection_nodes": active.into_iter().map(normalize_node).collect::<Vec<_>>(),
         }))
     }
 
@@ -1705,21 +1696,6 @@ fn media_for_image(
     )
 }
 
-fn active_connection_ids(node: &Value) -> Vec<String> {
-    node.get("recent_connections")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(ACTIVE_CONNECTION_LIMIT)
-        .filter_map(|entry| {
-            entry
-                .as_str()
-                .or_else(|| entry.get("id").and_then(Value::as_str))
-                .map(str::to_owned)
-        })
-        .collect()
-}
-
 fn fixed_connection_ids(node: &Value) -> Vec<String> {
     node.get("fixed_connections")
         .and_then(Value::as_array)
@@ -1781,26 +1757,7 @@ pub(super) fn normalize_node(mut node: Value) -> Value {
     if let Some(object) = node.as_object_mut() {
         object.insert("owner_root_node_id".into(), owner);
         object.insert("fixed_connections".into(), json!(fixed));
-        object.insert(
-            "active_connections".into(),
-            json!(
-                recent
-                    .iter()
-                    .take(ACTIVE_CONNECTION_LIMIT)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            ),
-        );
-        object.insert(
-            "fanout_connections".into(),
-            json!(
-                recent
-                    .iter()
-                    .skip(ACTIVE_CONNECTION_LIMIT)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            ),
-        );
+        object.insert("recent_connections".into(), json!(recent));
     }
     node
 }
@@ -1938,17 +1895,10 @@ mod tests {
         assert_eq!(node["owner_root_node_id"], "root");
         assert_eq!(node["fixed_connections"][0]["id"], "fixed");
         assert_eq!(node["fixed_connections"][0]["slot"], 1);
-        assert!(node["active_connections"].as_array().unwrap().is_empty());
-        assert_eq!(node["fanout_connections"].as_array().unwrap().len(), 9);
-        assert_eq!(node["fanout_connections"][0]["short_name"], "Recent 0");
-    }
-
-    #[test]
-    fn context_fetch_does_not_expand_recent_connections() {
-        let recent = (0..12)
-            .map(|index| json!({"id":format!("recent-{index}")}))
-            .collect::<Vec<_>>();
-        assert!(active_connection_ids(&json!({"recent_connections":recent})).is_empty());
+        assert_eq!(node["recent_connections"].as_array().unwrap().len(), 9);
+        assert_eq!(node["recent_connections"][0]["short_name"], "Recent 0");
+        assert!(node.get("active_connections").is_none());
+        assert!(node.get("fanout_connections").is_none());
     }
 
     #[test]

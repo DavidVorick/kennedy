@@ -1,5 +1,5 @@
 LoadNode
-  Give it the exact canonical eight-character identifier of a node. It loads or refreshes that node and the nearby fixed and fanout context that helps navigate from it. Repeated loads refresh existing boxes instead of duplicating them. A summarized or dehydrated box keeps that representation and becomes stale if the canonical node changed. There is no fixed LoadNode count; the active context budget is the limit.
+  Call through call_ktool with exactly this shape: {"name":"LoadNode","arguments":{"identifier":"Nl_hWdsl"}}. Replace the example identifier with the exact canonical eight-character identifier of the node. It loads or refreshes that node and the nearby fixed and fanout context that helps navigate from it. Repeated loads refresh existing boxes instead of duplicating them. A summarized or dehydrated box keeps that representation and becomes stale if the canonical node changed. There is no fixed LoadNode count; the active context budget is the limit.
 
 DehydrateBox
   Give it the numeric boxId. It removes that box's substantive contents from active context while retaining its identity, lineage, revision, restoration metadata, and chronological continuation markers. This does not unload tool state or change canonical contents.
@@ -15,7 +15,3 @@ HydrateEvent
 
 DehydrateEvent
   This is available only during history ingress. Give it the numeric eventId. It retires the active inspection box for that previously hydrated source event. It does not mutate source history.
-
-GenerateImage
-  Call: {"model":"gpt-image-2","prompt":"Create the requested image.","referenceObjectIds":["pending:47"]}
-  Creates an image when referenceObjectIds is omitted or empty, and modifies or uses the listed images as references when it is present. The exact supported models are gpt-image-2 and gemini-3-pro-image. referenceObjectIds accepts up to 14 distinct pending or canonical image-object IDs. The result is an ordinary canonical Kweb object; call EmitObject with its returned identifier to deliver it.

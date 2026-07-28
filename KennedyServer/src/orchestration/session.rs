@@ -18,6 +18,9 @@ use kcode_dev_tools::{
     WRITE_FILE_FREEFORM_WEB_LIB_TOOL, WRITE_RUST_BIN_TOOL, WRITE_RUST_LIB_TOOL, WRITE_WEB_LIB_TOOL,
     proposed_write_snapshot,
 };
+use kcode_kweb_context::{
+    Context as KwebContext, Node as KwebNode, NodeDraft, StagedCreate as KwebStagedCreate,
+};
 use kcode_kweb_db::{NodeId, ObjectId};
 use kcode_server_object_envelopes::encode_file;
 use kcode_session_history::{
@@ -33,10 +36,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ACTIVE_CONNECTION_LIMIT, Api, Manuals, RuntimeModel,
-    context::{
-        KmapContext, format_context_node, stored_active_ids, stored_fixed_ids, stored_recent_ids,
-    },
+    Api, Manuals, RuntimeModel,
+    context::{load_durable, load_durable_batch, node_from_value},
     human_utc_datetime, runtime_description,
 };
 
@@ -192,7 +193,7 @@ pub(crate) struct Session {
     mode: AgentMode,
     source_session_type: Option<String>,
     group_context: Value,
-    context: KmapContext,
+    context: KwebContext,
     free_time_end_reason: Option<String>,
     fatal_persistence_error: Option<String>,
 }
@@ -207,41 +208,6 @@ struct DesiredKwebBox {
 enum InputStage {
     Accepted,
     RejectedForCapacity,
-}
-
-#[derive(Clone, Copy)]
-enum SummaryDetail {
-    Summary,
-    NameAndSummary,
-    Name,
-}
-
-fn format_summary_entries(heading: &str, entries: &[Value], detail: SummaryDetail) -> String {
-    let mut lines = vec![heading.to_owned()];
-    if entries.is_empty() {
-        lines.push("None.".into());
-        return lines.join("\n");
-    }
-    for entry in entries {
-        let identifier = entry
-            .get("identifier")
-            .and_then(Value::as_str)
-            .unwrap_or("invalid");
-        let name = entry
-            .get("shortName")
-            .and_then(Value::as_str)
-            .unwrap_or("Unloaded node");
-        let summary = entry
-            .get("shortDescription")
-            .and_then(Value::as_str)
-            .unwrap_or("(none)");
-        lines.push(match detail {
-            SummaryDetail::Summary => format!("{identifier}: {summary}"),
-            SummaryDetail::NameAndSummary => format!("{identifier} · {name}: {summary}"),
-            SummaryDetail::Name => format!("{identifier}: {name}"),
-        });
-    }
-    lines.join("\n")
 }
 
 fn mark_kweb_content(content: &mut BoxContent, logical_slot: &str, role: &str) {
@@ -261,23 +227,6 @@ fn kweb_logical_slot(state: &BoxState, actual_slot: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or(actual_slot)
         .to_owned()
-}
-
-fn kweb_node_identifier(state: &BoxState) -> Option<&str> {
-    state
-        .canonical
-        .content
-        .metadata
-        .get("canonicalNodeId")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            state
-                .canonical
-                .content
-                .metadata
-                .get("identifier")
-                .and_then(Value::as_str)
-        })
 }
 
 type KwebBoxVersions = BTreeMap<BoxId, (String, EventId)>;
@@ -1293,7 +1242,8 @@ impl Session {
                 channel: metadata.channel,
             })?
         };
-        let mut context = KmapContext::new(api.clone(), options.root_node_ids.clone())?;
+        let mut context =
+            KwebContext::new(options.root_node_ids.clone()).map_err(anyhow::Error::new)?;
         restore_kweb_context(&journal, &mut context)?;
         let plan = KwebPlan::restore(restored, &journal)?;
         let transcript = transcript_from_journal(&journal);
@@ -1404,7 +1354,7 @@ impl Session {
                 invocations
                     .push(session.record_tool_invocation("LoadNode", json!({"identifier":root}))?);
             }
-            let result = session.context.load_durable_batch(&roots).await?;
+            let result = load_durable_batch(&session.api, &mut session.context, &roots).await?;
             session.sync_kweb_boxes()?;
             for invocation in &invocations {
                 session.record_tool_completion(
@@ -1479,60 +1429,11 @@ impl Session {
     }
 
     async fn revalidate_loaded_nodes(&mut self) -> anyhow::Result<()> {
-        let previous = self
-            .context
-            .ordered_full_node_ids()
-            .into_iter()
-            .filter_map(|id| {
-                self.context
-                    .nodes_by_id
-                    .get(&id)
-                    .cloned()
-                    .map(|node| (id, node))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let direct = self.context.loaded_node_ids.clone();
+        let direct = self.context.loaded_node_ids().to_vec();
         for id in &direct {
-            self.context.load_durable(id).await?;
-        }
-        let direct = direct.into_iter().collect::<HashSet<_>>();
-        for id in self.context.ordered_full_node_ids() {
-            if direct.contains(&id) {
-                continue;
-            }
-            let latest = self.api.kmap_node(&id).await?;
-            self.context.refresh(vec![latest])?;
+            load_durable(&self.api, &mut self.context, id).await?;
         }
         self.sync_kweb_boxes()?;
-        let changed = previous
-            .iter()
-            .filter(|(id, before)| self.context.nodes_by_id.get(*id) != Some(*before))
-            .map(|(id, _)| id.as_str())
-            .collect::<HashSet<_>>();
-        let affected = self
-            .journal
-            .state()
-            .tools
-            .get(KWEB_TOOL_INSTANCE)
-            .into_iter()
-            .flat_map(|tool| &tool.slots)
-            .filter_map(|slot| {
-                let state = self.journal.state().box_state(slot.box_id)?;
-                let id = kweb_node_identifier(state)?;
-                (state.active && changed.contains(id)).then_some(slot.box_id)
-            })
-            .collect::<Vec<_>>();
-        for box_id in affected {
-            let notice = self.journal.create_box(
-                now(),
-                format!("Kweb update for box {box_id}"),
-                BoxOwner::Controller,
-                BoxContent::text(format!(
-                    "The canonical Kweb revision underlying box {box_id} changed."
-                )),
-            )?;
-            self.journal.dehydrate_box(now(), notice)?;
-        }
         Ok(())
     }
 
@@ -2923,7 +2824,7 @@ impl Session {
             "LoadNode" => {
                 validate_arguments(&call.arguments, &["identifier"], &[])?;
                 let id = canonical_node_id(&call.arguments, "identifier")?;
-                self.context.load_durable(&id).await?;
+                load_durable(&self.api, &mut self.context, &id).await?;
                 let changed = self.sync_kweb_boxes()?;
                 store_result = false;
                 render_load_node_result(&self.journal, &changed)?
@@ -3409,102 +3310,48 @@ impl Session {
 
     fn sync_kweb_boxes(&mut self) -> anyhow::Result<Vec<BoxId>> {
         let previous = kweb_box_versions(&self.journal);
-        let layout = self.context.box_layout()?;
-        let mut desired = Vec::new();
-        for role in ["direct", "fixed", "active"] {
-            for full in layout.full_nodes.iter().filter(|entry| entry.role == role) {
-                let staged = self.plan.updates.get(&full.identifier);
-                let mut content = if let Some(data) = staged {
-                    self.staged_kweb_box_content(&full.identifier, data)?
-                } else {
-                    let stored = self
-                        .context
-                        .nodes_by_id
-                        .get(&full.identifier)
-                        .context("full Kweb node is missing")?;
-                    self.kweb_box_content(stored)?
-                };
-                mark_kweb_content(&mut content, &full.identifier, role);
-                desired.push(DesiredKwebBox {
-                    logical_slot: full.identifier.clone(),
-                    name: format!(
-                        "Kweb {role} node {} · {}",
-                        full.identifier,
-                        full.node
-                            .get("shortName")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Unnamed")
-                    ),
-                    content,
-                });
-            }
-            if role == "direct" {
-                for create in &self.plan.creates {
-                    let mut content =
-                        self.staged_kweb_box_content(&create.pending_id, &create.data)?;
-                    mark_kweb_content(&mut content, &create.pending_id, "direct");
-                    desired.push(DesiredKwebBox {
-                        logical_slot: create.pending_id.clone(),
-                        name: format!(
-                            "Kweb staged node {} · {}",
-                            create.pending_id, create.data.short_name
-                        ),
-                        content,
-                    });
-                }
-            }
-        }
-        for fanout in layout.loaded_fanouts {
-            let logical_slot = format!("loaded-fanout:{}", fanout.parent_identifier);
-            let mut content = BoxContent {
-                text: format_summary_entries(
-                    &format!(
-                        "Fanout connections of loaded node {} · {}",
-                        fanout.parent_identifier, fanout.parent_name
-                    ),
-                    &fanout.connections,
-                    SummaryDetail::Summary,
-                ),
-                ..BoxContent::default()
-            };
-            mark_kweb_content(&mut content, &logical_slot, "loaded-fanout");
-            desired.push(DesiredKwebBox {
-                logical_slot,
-                name: format!("Kweb fanout · {}", fanout.parent_identifier),
-                content,
+        let updates = self
+            .plan
+            .updates
+            .iter()
+            .map(|(id, node)| (id.clone(), kweb_node_draft(node)))
+            .collect::<BTreeMap<_, _>>();
+        let creates = self
+            .plan
+            .creates
+            .iter()
+            .map(|create| KwebStagedCreate {
+                pending_id: create.pending_id.clone(),
+                data: kweb_node_draft(&create.data),
+            })
+            .collect::<Vec<_>>();
+        let specs = self
+            .context
+            .box_specs(&updates, &creates)
+            .map_err(anyhow::Error::new)?;
+        let mut desired = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let mut metadata = json!({
+                "revisionHash":hex::encode(Sha256::digest(spec.text.as_bytes())),
             });
-        }
-        for (logical_slot, name, heading, entries, detail) in [
-            (
-                "fixed-node-connections",
-                "Fixed-node fixed and active connections",
-                "Fixed and active connections of fixed nodes",
-                &layout.fixed_neighbors,
-                SummaryDetail::NameAndSummary,
-            ),
-            (
-                "active-node-connections",
-                "Active-node fixed and active connections",
-                "Fixed and active connections of active nodes",
-                &layout.active_neighbors,
-                SummaryDetail::NameAndSummary,
-            ),
-            (
-                "connection-node-fanout",
-                "Fanout of fixed and active nodes",
-                "Fanout connections of fixed and active nodes",
-                &layout.connection_fanouts,
-                SummaryDetail::Name,
-            ),
-        ] {
+            if let Some(node) = spec.stored_node {
+                metadata["canonicalNodeId"] = json!(node.id);
+                metadata["storedNode"] = serde_json::to_value(node)?;
+            }
+            if let Some(node) = spec.staged_node {
+                metadata["staged"] = json!(true);
+                metadata["nodeData"] = serde_json::to_value(node)?;
+            }
             let mut content = BoxContent {
-                text: format_summary_entries(heading, entries, detail),
-                ..BoxContent::default()
+                text: spec.text,
+                objects: Vec::new(),
+                metadata,
             };
-            mark_kweb_content(&mut content, logical_slot, "aggregate");
+            content.use_concise_header();
+            mark_kweb_content(&mut content, &spec.logical_slot, spec.kind.metadata_name());
             desired.push(DesiredKwebBox {
-                logical_slot: logical_slot.into(),
-                name: name.into(),
+                logical_slot: spec.logical_slot,
+                name: spec.kind.name().into(),
                 content,
             });
         }
@@ -3591,66 +3438,6 @@ impl Session {
         Ok(())
     }
 
-    fn staged_kweb_box_content(
-        &self,
-        identifier: &str,
-        data: &PlannedNode,
-    ) -> anyhow::Result<BoxContent> {
-        let active = data
-            .recent_connections
-            .iter()
-            .take(ACTIVE_CONNECTION_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>();
-        let fanout = data
-            .recent_connections
-            .iter()
-            .skip(ACTIVE_CONNECTION_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>();
-        let text = format!(
-            concat!(
-                "Node ID: {identifier}\n",
-                "Node name: {short_name}\n",
-                "Node summary: {short_description}\n",
-                "Node long description:\n  {long_description}\n",
-                "Fixed connection IDs: {fixed}\n",
-                "Active connection IDs: {active}\n",
-                "Fanout connection IDs: {fanout}"
-            ),
-            identifier = identifier,
-            short_name = data.short_name,
-            short_description = data.short_description,
-            long_description = data.long_description,
-            fixed = data.fixed_connections.join(", "),
-            active = active.join(", "),
-            fanout = fanout.join(", "),
-        );
-        Ok(BoxContent {
-            text,
-            objects: Vec::new(),
-            metadata: json!({
-                "staged":true,
-                "identifier":identifier,
-                "nodeData":data,
-                "revisionHash":hex::encode(Sha256::digest(serde_json::to_vec(data)?)),
-            }),
-        })
-    }
-
-    fn kweb_box_content(&self, node: &Value) -> anyhow::Result<BoxContent> {
-        let projected = self.context.context_node(node)?;
-        Ok(BoxContent {
-            text: format_context_node(&projected, true),
-            objects: Vec::new(),
-            metadata: json!({
-                "storedNode":node,
-                "canonicalNodeId":node.get("id"),
-                "revisionHash":hex::encode(Sha256::digest(serde_json::to_vec(node)?)),
-            }),
-        })
-    }
-
     fn record_tool_invocation(
         &mut self,
         name: &str,
@@ -3710,8 +3497,11 @@ impl Session {
         if let Some(data) = self.plan.updates.get(id) {
             return Ok(data.clone());
         }
-        let node = self.context.stored_node(id)?;
-        Ok(session_node_data(&node))
+        let node = self
+            .context
+            .node(id)
+            .with_context(|| format!("Kweb context does not contain node {id}"))?;
+        Ok(planned_node(node))
     }
 
     fn put_node_data(&mut self, id: &str, data: PlannedNode) -> anyhow::Result<()> {
@@ -3921,7 +3711,7 @@ impl Session {
         } else {
             canonical_id(id)?;
             anyhow::ensure!(
-                self.context.full_node_ids.contains(id) || self.plan.updates.contains_key(id),
+                self.context.contains_full_node(id) || self.plan.updates.contains_key(id),
                 "node {id} is not loaded; call LoadNode first"
             );
         }
@@ -4265,39 +4055,24 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
     }
 }
 
-fn restore_kweb_context(journal: &HistorySession, context: &mut KmapContext) -> anyhow::Result<()> {
+fn restore_kweb_context(journal: &HistorySession, context: &mut KwebContext) -> anyhow::Result<()> {
     let Some(tool) = journal.state().tools.get(KWEB_TOOL_INSTANCE) else {
         return Ok(());
     };
-    let mut nodes = Vec::new();
-    let mut fixed = Vec::new();
-    let mut active = Vec::new();
+    let mut nodes = BTreeMap::new();
     for slot in &tool.slots {
         let state = journal
             .state()
             .box_state(slot.box_id)
             .context("Kweb slot references a missing box")?;
         if let Some(node) = state.canonical.content.metadata.get("storedNode") {
-            let node = super::http::normalize_node(node.clone());
-            let identifier = node
-                .get("id")
-                .and_then(Value::as_str)
-                .context("stored Kweb node has no identifier")?
-                .to_owned();
-            nodes.push(node);
-            if state
-                .canonical
-                .content
-                .metadata
-                .get("kwebRole")
-                .and_then(Value::as_str)
-                == Some("fixed")
-            {
-                fixed.push(identifier);
-            }
+            let node = match serde_json::from_value::<KwebNode>(node.clone()) {
+                Ok(node) => node,
+                Err(_) => node_from_value(node).context("decoding a stored Kweb context node")?,
+            };
+            nodes.insert(node.id.clone(), node);
         }
     }
-    context.refresh(nodes)?;
     let mut direct = journal
         .state()
         .events
@@ -4317,16 +4092,11 @@ fn restore_kweb_context(journal: &HistorySession, context: &mut KmapContext) -> 
         })
         .collect::<Vec<_>>();
     if direct.is_empty() {
-        direct = context.root_node_ids.clone();
+        direct = context.root_node_ids().to_vec();
     }
-    for identifier in &direct {
-        let Some(node) = context.nodes_by_id.get(identifier) else {
-            continue;
-        };
-        fixed.extend(stored_fixed_ids(node));
-        active.extend(stored_active_ids(node));
-    }
-    context.restore_roles(direct, fixed, active)
+    context
+        .restore(nodes.into_values(), direct)
+        .map_err(anyhow::Error::new)
 }
 
 fn transcript_from_journal(journal: &HistorySession) -> Vec<Value> {
@@ -4423,38 +4193,35 @@ fn staged_object_transport_kind(
     None
 }
 
-fn session_node_data(node: &Value) -> PlannedNode {
+fn kweb_node_draft(node: &PlannedNode) -> NodeDraft {
+    NodeDraft {
+        short_name: node.short_name.clone(),
+        short_description: node.short_description.clone(),
+        long_description: node.long_description.clone(),
+        owner: node.owner.clone(),
+        fixed_connections: node.fixed_connections.clone(),
+        recent_connections: node.recent_connections.clone(),
+        objects: node.objects.clone(),
+    }
+}
+
+fn planned_node(node: &KwebNode) -> PlannedNode {
     PlannedNode {
-        short_name: node
-            .get("short_name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .into(),
-        short_description: node
-            .get("short_description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .into(),
-        long_description: node
-            .get("long_description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .into(),
-        owner: node
-            .get("owner_node_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unowned")
-            .into(),
-        fixed_connections: stored_fixed_ids(node),
-        recent_connections: stored_recent_ids(node),
-        objects: node
-            .get("objects")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
+        short_name: node.short_name.clone(),
+        short_description: node.short_description.clone(),
+        long_description: node.long_description.clone(),
+        owner: node.owner.clone(),
+        fixed_connections: node
+            .fixed_connections
+            .iter()
+            .map(|connection| connection.id.clone())
             .collect(),
+        recent_connections: node
+            .recent_connections
+            .iter()
+            .map(|connection| connection.id.clone())
+            .collect(),
+        objects: node.objects.clone(),
         attach_session_archive: true,
     }
 }
@@ -5813,80 +5580,72 @@ mod tests {
     #[test]
     fn load_node_result_is_exact_changed_kweb_projection_in_layout_order() {
         let (path, mut journal) = test_journal("load-node-result", 10_000);
-        let mut direct = BoxContent::text("Node ID: direct\nNode name: Direct");
-        mark_kweb_content(&mut direct, "direct", "direct");
-        let mut fanout = BoxContent::text("old fanout");
-        mark_kweb_content(&mut fanout, "loaded-fanout:direct", "loaded-fanout");
+        let mut loaded = BoxContent::text("Node ID: loaded\nNode name: Loaded");
+        mark_kweb_content(&mut loaded, "loaded", "loaded");
+        let mut recent = BoxContent::text("old recent connections");
+        mark_kweb_content(&mut recent, "recent-connections", "recent");
         journal
             .apply_tool_slots_with_layout(
                 "t1",
                 KWEB_TOOL_INSTANCE,
                 vec![
                     ToolSlotInput {
-                        slot: "direct".into(),
-                        name: "Kweb direct node direct · Direct".into(),
-                        content: direct.clone(),
+                        slot: "loaded".into(),
+                        name: "Kweb loaded node".into(),
+                        content: loaded.clone(),
                         retired: false,
                     },
                     ToolSlotInput {
-                        slot: "loaded-fanout:direct".into(),
-                        name: "Kweb fanout · direct".into(),
-                        content: fanout,
+                        slot: "recent-connections".into(),
+                        name: "Kweb recent connections".into(),
+                        content: recent,
                         retired: false,
                     },
                 ],
-                &["direct".into(), "loaded-fanout:direct".into()],
+                &["loaded".into(), "recent-connections".into()],
             )
             .unwrap();
-        let fanout_id = journal.state().tool_layouts[KWEB_TOOL_INSTANCE][1];
+        let recent_id = journal.state().tool_layouts[KWEB_TOOL_INSTANCE][1];
         journal
-            .summarize_box("t2", fanout_id, "Kennedy's retained fanout summary")
+            .summarize_box("t2", recent_id, "Kennedy's retained recent-node summary")
             .unwrap();
         let previous = kweb_box_versions(&journal);
 
-        let mut refreshed_fanout = BoxContent::text("new canonical fanout");
-        mark_kweb_content(
-            &mut refreshed_fanout,
-            "loaded-fanout:direct",
-            "loaded-fanout",
-        );
-        let mut active = BoxContent::text("Node ID: active\nNode name: Active");
-        mark_kweb_content(&mut active, "active", "active");
+        let mut refreshed_recent = BoxContent::text("new canonical recent connections");
+        mark_kweb_content(&mut refreshed_recent, "recent-connections", "recent");
+        let mut fixed = BoxContent::text("Node ID: fixed\nNode name: Fixed");
+        mark_kweb_content(&mut fixed, "fixed", "fixed");
         journal
             .apply_tool_slots_with_layout(
                 "t3",
                 KWEB_TOOL_INSTANCE,
                 vec![
                     ToolSlotInput {
-                        slot: "direct".into(),
-                        name: "Kweb direct node direct · Direct".into(),
-                        content: direct,
+                        slot: "loaded".into(),
+                        name: "Kweb loaded node".into(),
+                        content: loaded,
                         retired: false,
                     },
                     ToolSlotInput {
-                        slot: "loaded-fanout:direct".into(),
-                        name: "Kweb fanout · direct".into(),
-                        content: refreshed_fanout,
+                        slot: "recent-connections".into(),
+                        name: "Kweb recent connections".into(),
+                        content: refreshed_recent,
                         retired: false,
                     },
                     ToolSlotInput {
-                        slot: "active".into(),
-                        name: "Kweb active node active · Active".into(),
-                        content: active,
+                        slot: "fixed".into(),
+                        name: "Kweb fixed connection".into(),
+                        content: fixed,
                         retired: false,
                     },
                 ],
-                &[
-                    "direct".into(),
-                    "active".into(),
-                    "loaded-fanout:direct".into(),
-                ],
+                &["loaded".into(), "fixed".into(), "recent-connections".into()],
             )
             .unwrap();
 
         let changed = changed_kweb_box_ids(&journal, &previous);
-        let active_id = journal.state().tool_layouts[KWEB_TOOL_INSTANCE][1];
-        assert_eq!(changed, vec![active_id, fanout_id]);
+        let fixed_id = journal.state().tool_layouts[KWEB_TOOL_INSTANCE][1];
+        assert_eq!(changed, vec![fixed_id, recent_id]);
 
         let projected = journal
             .state()
@@ -5898,9 +5657,9 @@ mod tests {
             .collect::<Vec<_>>();
         let result = render_load_node_result(&journal, &changed).unwrap();
         assert_eq!(result, projected.join("\n\n"));
-        assert!(result.find("Node ID: active").unwrap() < result.find("retained fanout").unwrap());
+        assert!(result.find("Node ID: fixed").unwrap() < result.find("retained recent").unwrap());
         assert!(result.contains("| summarized | stale]"));
-        assert!(!result.contains("new canonical fanout"));
+        assert!(!result.contains("new canonical recent connections"));
         assert!(!result.contains("\"updatedBoxIds\""));
 
         let current = kweb_box_versions(&journal);
