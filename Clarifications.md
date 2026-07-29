@@ -161,6 +161,10 @@ This document records user intention with regard to Kennedy.
 - Every item visible to Kennedy belongs to the box model. Canonical content,
   its current representation, and the history of changes to that representation
   are distinct concerns.
+- Chatend box headers expose the box identity, name/type, representation, and
+  staleness needed to manage context, but never expose Chatend's internal box
+  owner. Every projected user message and user-visible Kennedy message carries
+  its recorded timestamp including the year.
 - Kennedy may deliberately preserve the complete text of selected active boxes
   as durable objects. Each selected box becomes one separate UTF-8 plain-text
   object containing its latest canonical text, regardless of whether the
@@ -233,10 +237,12 @@ This document records user intention with regard to Kennedy.
   them only from new provider usage results, including multiple inference
   steps within one Kennedy turn.
 - The model-visible context footer lists stale boxes first and the context
-  budget last, so the budget is always the final line. Recalculate and attach
-  that footer after every Ktool result before allowing the provider's next
-  inference; sequential tool use must expose the remaining budget between
-  calls rather than showing only the value from the beginning of the turn.
+  budget last, so the budget is always the final line. Immediately above the
+  budget, show the current time including the year, refreshed whenever Chatend
+  is projected. Recalculate and attach that footer after every Ktool result
+  before allowing the provider's next inference; sequential tool use must
+  expose the current time and remaining budget between calls rather than
+  showing only the values from the beginning of the turn.
 - Conversation sessions read the Kmap but do not mutate it. Durable graph
   changes happen in explicitly writable history-ingress, audio-ingress,
   self-time, or other backend-owned sessions.
@@ -244,7 +250,9 @@ This document records user intention with regard to Kennedy.
   UI convenience must not imply that durable accepted history was erased.
 - Tool results should remain plain and direct. Avoid redundant JSON envelopes,
   pretty-printing, or duplicate generic result boxes when a tool already
-  updates a canonical stateful box.
+  updates a canonical stateful box. When a tool takes more than three seconds
+  to return, include its elapsed duration alongside the result in the model's
+  context; omit timing noise for faster calls.
 
 ## Intelligence and Provider Boundaries
 
@@ -345,9 +353,16 @@ This document records user intention with regard to Kennedy.
 - Take restart-safe custody of every accepted original before enrichment.
   Transcription, extraction, and annotation are supplementary fallible text;
   they never replace or modify the authoritative original bytes.
-- Once staged, filename, media type, transport kind, and object identity have
-  one authoritative value. Downstream adapters must not independently
-  reconstruct them.
+- Once staged, stored filename, media type, transport kind, and object identity
+  have one authoritative value. Downstream adapters must not independently
+  reconstruct them. A deliberate recipient-visible delivery filename is
+  separate presentation metadata: Kennedy may choose one when displaying or
+  sending an object without mutating, copying, or changing the identity of the
+  stored object. When omitted, delivery uses the stored filename.
+- Apply one selected delivery filename consistently to the session transcript,
+  browser download, and transport request for that outbound item. Delivery
+  filenames are bounded, path-free basenames; they do not override MIME type,
+  transport kind, bytes, provenance, or object identity.
 - Whenever Kennedy receives a user-supplied file, every model-facing session
   type shows a bounded metadata block sourced from that authoritative custody
   record: original filename, filename extension, MIME type, and exact byte
@@ -423,13 +438,15 @@ This document records user intention with regard to Kennedy.
   text, one or more staged or canonical Kweb object attachments, or both, to
   any explicitly targeted authorized user from any session, but only after
   that user has opened a private chat with the bot. The tool accepts the stable
-  numeric user identity and object references; Telegram transport resolves the
-  private chat without exposing chat IDs to Kennedy or KennedyServer. Apply the
-  ordinary outbound-media size, filename, MIME, and native-media rules rather
-  than creating a separate attachment store or embedding raw bytes in tool
-  arguments. Do not impose a tool-specific attachment-count ceiling or reject
-  repeated object references; existing request, session, object-size, and
-  provider constraints are the relevant bounds.
+  numeric user identity and object references, with an optional
+  recipient-visible delivery filename for each attachment; Telegram transport
+  resolves the private chat without exposing chat IDs to Kennedy or
+  KennedyServer. Apply the ordinary outbound-media size, filename, MIME, and
+  native-media rules rather than creating a separate attachment store or
+  embedding raw bytes in tool arguments. Do not impose a tool-specific
+  attachment-count ceiling or reject repeated object references; existing
+  request, session, object-size, and provider constraints are the relevant
+  bounds.
 - An initiated private message belongs to the targeted user's already-active
   direct Kennedy session when one exists, preferring the transport's current
   session and then another private Telegram session; create a new private

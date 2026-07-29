@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::{
     AgentMode, Api, Config, Manuals, RuntimeModel, Session,
     http::{data_url, encode_path},
-    session::{SessionOptions, is_agent_loop_round_limit},
+    session::{SessionOptions, is_agent_loop_round_limit, validate_delivery_file_name},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -1645,16 +1645,20 @@ impl Orchestrator {
         forced_context_warning: Option<&str>,
     ) -> anyhow::Result<()> {
         enum Delivery {
-            Object(String),
+            Object {
+                object_id: String,
+                file_name: Option<String>,
+            },
             Text(String, Value),
         }
 
         let mut deliveries = Vec::new();
         for response in session.responses_for_external_event(event_id) {
-            if let Some(objects) = response.get("objects").and_then(Value::as_array) {
-                for object_id in objects.iter().filter_map(Value::as_str) {
-                    deliveries.push(Delivery::Object(object_id.to_owned()));
-                }
+            for (object_id, file_name) in telegram_response_object_deliveries(response) {
+                deliveries.push(Delivery::Object {
+                    object_id,
+                    file_name,
+                });
             }
             if let Some(text) = response
                 .get("content")
@@ -1690,8 +1694,15 @@ impl Orchestrator {
         for (index, delivery) in deliveries.into_iter().enumerate() {
             let complete = index + 1 == delivery_count;
             match delivery {
-                Delivery::Object(object_id) => {
-                    let file = session.resolve_object(&object_id)?;
+                Delivery::Object {
+                    object_id,
+                    file_name,
+                } => {
+                    let mut file = session.resolve_object(&object_id)?;
+                    if let Some(file_name) = file_name {
+                        validate_delivery_file_name(&file_name)?;
+                        file.file_name = file_name;
+                    }
                     anyhow::ensure!(
                         file.bytes.len() <= self.config.telegram_max_media_bytes,
                         "object {object_id} is {} bytes, over the configured {}-byte Telegram media limit",
@@ -2597,6 +2608,40 @@ fn telegram_group_context_file_metadata(message: &Value) -> String {
         file_name_extension(file_name),
     )
 }
+
+fn telegram_response_object_deliveries(response: &Value) -> Vec<(String, Option<String>)> {
+    let objects = response
+        .get("objects")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let attachments = response
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    objects
+        .iter()
+        .filter_map(Value::as_str)
+        .enumerate()
+        .map(|(index, object_id)| {
+            let descriptor = attachments
+                .iter()
+                .find(|candidate| {
+                    ["objectId", "pendingId", "id"]
+                        .iter()
+                        .any(|key| candidate.get(key).and_then(Value::as_str) == Some(object_id))
+                })
+                .or_else(|| attachments.get(index));
+            let file_name = descriptor
+                .and_then(|descriptor| descriptor.get("fileName"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            (object_id.to_owned(), file_name)
+        })
+        .collect()
+}
+
 fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
     value
         .get(key)
@@ -2813,6 +2858,31 @@ mod tests {
         assert!(rendered.contains("Extension: .ogg"));
         assert!(rendered.contains("MIME type: audio/ogg"));
         assert!(rendered.contains("Size: 42 bytes"));
+    }
+
+    #[test]
+    fn telegram_object_delivery_carries_each_emitted_filename_override() {
+        let deliveries = telegram_response_object_deliveries(&json!({
+            "objects":["pending:2","AAECAwQF"],
+            "attachments":[
+                {"objectId":"AAECAwQF","fileName":"canonical-report.pdf"},
+                {"objectId":"pending:2","fileName":"draft-report.pdf"}
+            ]
+        }));
+        assert_eq!(
+            deliveries,
+            vec![
+                ("pending:2".into(), Some("draft-report.pdf".into())),
+                ("AAECAwQF".into(), Some("canonical-report.pdf".into())),
+            ]
+        );
+        assert_eq!(
+            telegram_response_object_deliveries(&json!({
+                "objects":["AAECAwQG"],
+                "attachments":[{"fileName":"index-fallback.txt"}]
+            })),
+            vec![("AAECAwQG".into(), Some("index-fallback.txt".into()))]
+        );
     }
 
     #[test]

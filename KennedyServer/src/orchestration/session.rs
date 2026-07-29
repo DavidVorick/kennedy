@@ -61,6 +61,7 @@ const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
 const SUBAGENT_CONTEXT_NODE_LIMIT: usize = 64;
 const BOX_TEXT_OBJECT_SOURCE: &str = "kennedy-box-text";
 const BOX_TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
+const SLOW_TOOL_THRESHOLD: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -212,6 +213,18 @@ pub(crate) struct ResolvedObject {
     pub transport_kind: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObjectDeliveryRequest {
+    object_id: String,
+    file_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedObjectDelivery {
+    object: ResolvedObject,
+    file_name: String,
+}
+
 struct DesiredKwebBox {
     logical_slot: String,
     name: String,
@@ -317,6 +330,16 @@ fn provider_tool_result_with_context_footer(journal: &HistorySession, result: &s
     } else {
         format!("{result}\n\n{footer}")
     }
+}
+
+fn append_slow_tool_duration(text: &mut String, elapsed: Duration) {
+    if elapsed <= SLOW_TOOL_THRESHOLD {
+        return;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("[tool duration: {:.3}s]", elapsed.as_secs_f64()));
 }
 
 fn render_web_search_result(result: &Value) -> anyhow::Result<String> {
@@ -1604,11 +1627,12 @@ impl Session {
                 .iter()
                 .map(|(name, content)| (name.clone(), BoxOwner::User, content.clone())),
         );
+        let recorded_at = now();
         if !matches!(self.mode, AgentMode::Ingress { .. }) {
             let projection = self
                 .journal
                 .state()
-                .projection_with_new_boxes(&prospective_boxes)?;
+                .projection_with_new_boxes_at(&recorded_at, &prospective_boxes)?;
             let limit = self.journal.state().live_context_limit();
             if projection.estimated_tokens > limit {
                 self.record_live_capacity_error(
@@ -1635,7 +1659,8 @@ impl Session {
             transcript_attachments.push(media.clone());
         }
         for (name, owner, content) in prospective_boxes {
-            self.journal.create_box(now(), name, owner, content)?;
+            self.journal
+                .create_box(recorded_at.clone(), name, owner, content)?;
         }
         let mut transcript = json!({"role":"user","content":visible});
         if !transcript_objects.is_empty() {
@@ -1669,7 +1694,7 @@ impl Session {
         kennedy: bool,
         text: &str,
         mut metadata: Value,
-        attachments: &[ResolvedObject],
+        attachments: &[ResolvedObjectDelivery],
         reuse_pending_objects: bool,
     ) -> anyhow::Result<()> {
         let owner = if kennedy {
@@ -1686,28 +1711,28 @@ impl Session {
         let mut descriptors = Vec::with_capacity(attachments.len());
         for attachment in attachments {
             let object_id =
-                if attachment.object_id.starts_with("pending:") && !reuse_pending_objects {
+                if attachment.object.object_id.starts_with("pending:") && !reuse_pending_objects {
                     self.journal
                         .stage_object(
                             now(),
-                            attachment.media_type.clone(),
-                            Some(attachment.file_name.clone()),
+                            attachment.object.media_type.clone(),
+                            Some(attachment.object.file_name.clone()),
                             json!({
                                 "source":"kennedy-direct-message",
-                                "kind":attachment.transport_kind,
+                                "kind":attachment.object.transport_kind,
                             }),
-                            &attachment.bytes,
+                            &attachment.object.bytes,
                         )?
                         .to_string()
                 } else {
-                    attachment.object_id.clone()
+                    attachment.object.object_id.clone()
                 };
             let mut descriptor = json!({
                 "fileName":attachment.file_name,
-                "mimeType":attachment.media_type,
-                "sizeBytes":attachment.bytes.len(),
+                "mimeType":attachment.object.media_type,
+                "sizeBytes":attachment.object.bytes.len(),
             });
-            if let Some(kind) = attachment.transport_kind.as_deref() {
+            if let Some(kind) = attachment.object.transport_kind.as_deref() {
                 descriptor["kind"] = json!(kind);
             }
             if object_id.starts_with("pending:") {
@@ -2152,8 +2177,8 @@ impl Session {
             self.rounds_used = round + 1;
             self.refresh_runtime_prompt()?;
             let deadline_after_response = self.prepare_free_time_round()?;
-            let input = self.journal.state().render();
             let projection = self.journal.state().projection();
+            let input = projection.render();
             if matches!(self.mode, AgentMode::Ingress { .. }) {
                 if projection.estimated_tokens > self.journal.state().ingress_context_limit()
                     || self.ingress_force_commit_requested()
@@ -2228,6 +2253,7 @@ impl Session {
                         checkpoint(self.snapshot()?).await?;
                     }
                     kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
+                        let tool_started_at = std::time::Instant::now();
                         used_tool = true;
                         if let Some(pending) = &pending_freeform_write {
                             let text = format!(
@@ -2408,6 +2434,7 @@ impl Session {
                                 outcome.store_result = false;
                             }
                         }
+                        append_slow_tool_duration(&mut outcome.text, tool_started_at.elapsed());
                         if !matches!(self.mode, AgentMode::Ingress { .. }) {
                             let projection = if outcome.store_result {
                                 self.journal.state().projection_with_new_boxes(&[(
@@ -2541,12 +2568,12 @@ impl Session {
                 if let Some(id) = &self.pending_external_event_id {
                     content.metadata["externalEventId"] = json!(id);
                 }
+                let recorded_at = now();
                 let rejected = if !matches!(self.mode, AgentMode::Ingress { .. }) {
-                    let projection = self.journal.state().projection_with_new_boxes(&[(
-                        "Kennedy message".into(),
-                        BoxOwner::Kennedy,
-                        content.clone(),
-                    )])?;
+                    let projection = self.journal.state().projection_with_new_boxes_at(
+                        &recorded_at,
+                        &[("Kennedy message".into(), BoxOwner::Kennedy, content.clone())],
+                    )?;
                     let limit = self.journal.state().live_context_limit();
                     if projection.estimated_tokens > limit {
                         let external_event_id = self.pending_external_event_id.clone();
@@ -2567,7 +2594,7 @@ impl Session {
                     answer.clear();
                 } else {
                     self.journal.create_box(
-                        now(),
+                        recorded_at,
                         "Kennedy message",
                         BoxOwner::Kennedy,
                         content,
@@ -2930,19 +2957,23 @@ impl Session {
             .map(|_| nonempty_string(arguments, "message", MAX_TELEGRAM_DM_CHARACTERS))
             .transpose()?
             .unwrap_or_default();
-        let attachment_ids = telegram_dm_attachment_ids(arguments)?;
+        let attachment_requests = telegram_dm_attachments(arguments)?;
         anyhow::ensure!(
-            !message.is_empty() || !attachment_ids.is_empty(),
+            !message.is_empty() || !attachment_requests.is_empty(),
             "SendTelegramDM requires a nonempty message, at least one attachment, or both"
         );
-        let mut attachments = Vec::with_capacity(attachment_ids.len());
-        for object_id in &attachment_ids {
-            let attachment = self.resolve_object(object_id)?;
+        let mut attachments = Vec::with_capacity(attachment_requests.len());
+        for request in &attachment_requests {
+            let attachment = self.resolve_object(&request.object_id)?;
             anyhow::ensure!(
                 !attachment.bytes.is_empty(),
-                "attachment object {object_id} is empty"
+                "attachment object {} is empty",
+                request.object_id
             );
-            attachments.push(attachment);
+            attachments.push(resolved_object_delivery(
+                attachment,
+                request.file_name.clone(),
+            ));
         }
 
         let already_holds_user_lock = self.session_type == "telegram"
@@ -2985,10 +3016,10 @@ impl Session {
                 .context("Telegram health omitted its attachment byte limit")?;
             for attachment in &attachments {
                 anyhow::ensure!(
-                    attachment.bytes.len() as u64 <= maximum,
+                    attachment.object.bytes.len() as u64 <= maximum,
                     "attachment object {} is {} bytes, over Telegram's {maximum}-byte limit",
-                    attachment.object_id,
-                    attachment.bytes.len()
+                    attachment.object.object_id,
+                    attachment.object.bytes.len()
                 );
             }
         }
@@ -3150,18 +3181,20 @@ impl Session {
             delivery_expected_conversation_id = Some(&conversation_id);
         }
         for attachment in &attachments {
+            let mut delivery_object = attachment.object.clone();
+            delivery_object.file_name = attachment.file_name.clone();
             self.api
                 .telegram_send_private_object(
                     telegram_user_id,
                     &conversation_id,
                     delivery_expected_conversation_id,
-                    attachment,
+                    &delivery_object,
                 )
                 .await
                 .with_context(|| {
                     format!(
                         "sending Telegram direct-message attachment {}",
-                        attachment.object_id
+                        attachment.object.object_id
                     )
                 })?;
             delivery_expected_conversation_id = Some(&conversation_id);
@@ -3271,13 +3304,15 @@ impl Session {
                 render_load_nodes_result(&self.journal, &changed)?
             }
             "EmitObject" => {
-                validate_arguments(&call.arguments, &["objectId"], &[])?;
+                validate_arguments(&call.arguments, &["objectId"], &["fileName"])?;
                 anyhow::ensure!(
                     matches!(self.mode, AgentMode::Conversation),
                     "EmitObject is only available in a conversation"
                 );
                 let object_id = nonempty_string(&call.arguments, "objectId", 64)?;
                 let object = self.resolve_object(&object_id)?;
+                let file_name = optional_delivery_file_name(&call.arguments, "fileName")?
+                    .unwrap_or_else(|| object.file_name.clone());
                 if let Some(maximum) = self.channel.get("maxObjectBytes").and_then(Value::as_u64) {
                     anyhow::ensure!(
                         !object.bytes.is_empty(),
@@ -3291,7 +3326,7 @@ impl Session {
                 }
                 let descriptor = json!({
                     "objectId":object_id,
-                    "fileName":object.file_name,
+                    "fileName":file_name,
                     "mediaType":object.media_type,
                     "byteLength":object.bytes.len(),
                 });
@@ -3307,21 +3342,25 @@ impl Session {
                     objects: vec![object_id.clone()],
                     metadata,
                 };
+                let recorded_at = now();
                 let projected = self
                     .journal
                     .state()
-                    .projection_with_new_boxes(&[(
-                        "Kennedy message".into(),
-                        BoxOwner::Kennedy,
-                        content.clone(),
-                    )])?
+                    .projection_with_new_boxes_at(
+                        &recorded_at,
+                        &[("Kennedy message".into(), BoxOwner::Kennedy, content.clone())],
+                    )?
                     .estimated_tokens;
                 anyhow::ensure!(
                     projected <= self.journal.state().live_context_limit(),
                     "emitting object {object_id} would exceed the live context limit"
                 );
-                self.journal
-                    .create_box(now(), "Kennedy message", BoxOwner::Kennedy, content)?;
+                self.journal.create_box(
+                    recorded_at,
+                    "Kennedy message",
+                    BoxOwner::Kennedy,
+                    content,
+                )?;
                 let mut transcript = json!({
                     "role":"kennedy",
                     "content":"",
@@ -4291,6 +4330,7 @@ impl Session {
 
     pub(crate) fn snapshot(&self) -> anyhow::Result<Value> {
         let projection = self.journal.state().projection();
+        let chatend_text = projection.render();
         let session_status = projection.status.clone();
         Ok(json!({
             "format":"kennedy-chatend",
@@ -4323,7 +4363,7 @@ impl Session {
             "events":self.journal.state().events,
             "context":projection,
             "sessionStatus":session_status,
-            "chatendText":self.journal.state().render(),
+            "chatendText":chatend_text,
         }))
     }
 
@@ -4375,8 +4415,17 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
                 ));
             }
 
+            let tool_started_at = std::time::Instant::now();
             let previous = canonical_box_versions(&self.session.journal);
-            let mut outcome = self.session.execute_tool(&call, operation_id).await?;
+            let mut outcome = match self.session.execute_tool(&call, operation_id).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let mut text = format!("{} failed: {error}", call.name);
+                    append_slow_tool_duration(&mut text, tool_started_at.elapsed());
+                    return Ok(kcode_agent_runtime::ToolOutcome::failure(text));
+                }
+            };
+            append_slow_tool_duration(&mut outcome.text, tool_started_at.elapsed());
             if let Some(managed) = outcome.managed_source_snapshot.take() {
                 apply_managed_source_snapshot(
                     &mut self.session.journal,
@@ -5059,7 +5108,7 @@ fn optional_object_id_array(
     Ok(ids)
 }
 
-fn telegram_dm_attachment_ids(value: &Value) -> anyhow::Result<Vec<String>> {
+fn telegram_dm_attachments(value: &Value) -> anyhow::Result<Vec<ObjectDeliveryRequest>> {
     let Some(attachments) = value.get("attachments") else {
         return Ok(Vec::new());
     };
@@ -5068,13 +5117,52 @@ fn telegram_dm_attachment_ids(value: &Value) -> anyhow::Result<Vec<String>> {
         .context("attachments must be an array")?
         .iter()
         .map(|attachment| {
-            attachment
+            if let Some(object_id) = attachment
                 .as_str()
                 .filter(|object_id| !object_id.trim().is_empty())
-                .map(str::to_owned)
-                .context("attachments entries must be nonempty object ID strings")
+            {
+                return Ok(ObjectDeliveryRequest {
+                    object_id: object_id.to_owned(),
+                    file_name: None,
+                });
+            }
+            attachment
+                .as_object()
+                .context("attachments entries must be object ID strings or objects")?;
+            validate_arguments(attachment, &["objectId"], &["fileName"])?;
+            Ok(ObjectDeliveryRequest {
+                object_id: nonempty_string(attachment, "objectId", 64)?,
+                file_name: optional_delivery_file_name(attachment, "fileName")?,
+            })
         })
         .collect()
+}
+
+fn optional_delivery_file_name(value: &Value, key: &str) -> anyhow::Result<Option<String>> {
+    let Some(file_name) = value.get(key) else {
+        return Ok(None);
+    };
+    let file_name = file_name
+        .as_str()
+        .with_context(|| format!("{key} must be a string"))?;
+    validate_delivery_file_name(file_name)?;
+    Ok(Some(file_name.to_owned()))
+}
+
+fn resolved_object_delivery(
+    object: ResolvedObject,
+    file_name: Option<String>,
+) -> ResolvedObjectDelivery {
+    let file_name = file_name.unwrap_or_else(|| object.file_name.clone());
+    ResolvedObjectDelivery { object, file_name }
+}
+
+pub(crate) fn validate_delivery_file_name(file_name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        sanitize_file_name(file_name, "object.bin") == file_name,
+        "fileName must be a nonempty path-free filename of at most 255 UTF-8 bytes without control characters or double quotes"
+    );
+    Ok(())
 }
 
 fn validate_transcription_model(model: &str) -> anyhow::Result<()> {
@@ -5319,7 +5407,7 @@ fn render_box_text_objects(objects: &[BoxTextObject]) -> String {
 fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
     kcode_codex_runtime_v2::DynamicTool::new(
         "call_ktool",
-        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may send an authorized user a private Telegram message, optionally with Kweb object attachments, from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\",\"AAECAwQF\"]}}.",
+        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may display an object with an optional recipient-visible filename using {\"name\":\"EmitObject\",\"arguments\":{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}}. She may send an authorized user a private Telegram message, optionally with Kweb object attachments and per-attachment delivery filenames, from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\",{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}]}}.",
         json!({
             "type":"object",
             "additionalProperties":false,
@@ -6142,11 +6230,93 @@ mod tests {
             .chain(["pending:1".into()])
             .collect::<Vec<_>>();
         assert_eq!(
-            telegram_dm_attachment_ids(&json!({"attachments":attachments})).unwrap(),
-            attachments
+            telegram_dm_attachments(&json!({"attachments":attachments}))
+                .unwrap()
+                .into_iter()
+                .map(|attachment| attachment.object_id)
+                .collect::<Vec<_>>(),
+            attachments,
         );
-        assert!(telegram_dm_attachment_ids(&json!({"attachments":"pending:1"})).is_err());
-        assert!(telegram_dm_attachment_ids(&json!({"attachments":[""]})).is_err());
+        assert!(telegram_dm_attachments(&json!({"attachments":"pending:1"})).is_err());
+        assert!(telegram_dm_attachments(&json!({"attachments":[""]})).is_err());
+    }
+
+    #[test]
+    fn object_delivery_filenames_are_optional_safe_and_attachment_specific() {
+        assert_eq!(
+            telegram_dm_attachments(&json!({
+                "attachments":[
+                    "pending:1",
+                    {"objectId":"AAECAwQF","fileName":"quarterly report.pdf"},
+                    {"objectId":"pending:1"}
+                ]
+            }))
+            .unwrap(),
+            vec![
+                ObjectDeliveryRequest {
+                    object_id: "pending:1".into(),
+                    file_name: None,
+                },
+                ObjectDeliveryRequest {
+                    object_id: "AAECAwQF".into(),
+                    file_name: Some("quarterly report.pdf".into()),
+                },
+                ObjectDeliveryRequest {
+                    object_id: "pending:1".into(),
+                    file_name: None,
+                },
+            ]
+        );
+        assert_eq!(
+            optional_delivery_file_name(&json!({}), "fileName").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_delivery_file_name(&json!({"fileName":"Kennedy’s résumé.pdf"}), "fileName")
+                .unwrap(),
+            Some("Kennedy’s résumé.pdf".into())
+        );
+        for invalid in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../report.pdf",
+            r"folder\report.pdf",
+            "bad\u{0000}name.pdf",
+            "\"report.pdf\"",
+            &"é".repeat(128),
+        ] {
+            assert!(
+                validate_delivery_file_name(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+        assert!(
+            telegram_dm_attachments(
+                &json!({"attachments":[{"objectId":"AAECAwQF","fileName":"../report.pdf"}]})
+            )
+            .is_err()
+        );
+        assert!(
+            telegram_dm_attachments(
+                &json!({"attachments":[{"objectId":"AAECAwQF","fileName":"report.pdf","extra":true}]})
+            )
+            .is_err()
+        );
+
+        let delivery = resolved_object_delivery(
+            ResolvedObject {
+                object_id: "AAECAwQF".into(),
+                bytes: b"report".to_vec(),
+                file_name: "AAECAwQF.pdf".into(),
+                media_type: "application/pdf".into(),
+                transport_kind: None,
+            },
+            Some("quarterly-report.pdf".into()),
+        );
+        assert_eq!(delivery.file_name, "quarterly-report.pdf");
+        assert_eq!(delivery.object.file_name, "AAECAwQF.pdf");
     }
 
     #[test]
@@ -6653,8 +6823,10 @@ mod tests {
             .unwrap();
         let provider_result = provider_tool_result_with_context_footer(&journal, "Tool completed.");
         let stale = provider_result.rfind("[stale boxes:").unwrap();
+        let current_time = provider_result.rfind("[current time:").unwrap();
         let budget = provider_result.rfind("[context budget |").unwrap();
-        assert!(stale < budget);
+        assert!(stale < current_time);
+        assert!(current_time < budget);
         assert!(
             provider_result
                 .lines()
@@ -6663,6 +6835,17 @@ mod tests {
                 .starts_with("[context budget |")
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn only_slow_tool_results_receive_elapsed_duration() {
+        let mut fast = "fast result".to_owned();
+        append_slow_tool_duration(&mut fast, Duration::from_secs(3));
+        assert_eq!(fast, "fast result");
+
+        let mut slow = "slow result".to_owned();
+        append_slow_tool_duration(&mut slow, Duration::from_millis(3_250));
+        assert_eq!(slow, "slow result\n[tool duration: 3.250s]");
     }
 
     #[test]
