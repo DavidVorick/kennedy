@@ -248,6 +248,9 @@ This document records user intention with regard to Kennedy.
   self-time, or other backend-owned sessions.
 - Accepted session history and committed objects are permanent. A cleanup or
   UI convenience must not imply that durable accepted history was erased.
+- Recovery derives external-turn completion from the authoritative session
+  journal. Once that journal contains Kennedy's response, a stale lifecycle
+  checkpoint must not keep the turn pending or block later transport events.
 - Tool results should remain plain and direct. Avoid redundant JSON envelopes,
   pretty-printing, or duplicate generic result boxes when a tool already
   updates a canonical stateful box. When a tool takes more than three seconds

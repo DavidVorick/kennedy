@@ -1296,28 +1296,7 @@ impl Session {
         restore_kweb_context(&journal, &mut context)?;
         let plan = KwebPlan::restore(restored, &journal)?;
         let transcript = transcript_from_journal(&journal);
-        let journal_pending_external = transcript.iter().rev().find_map(|entry| {
-            if entry.get("role").and_then(Value::as_str) != Some("user") {
-                return None;
-            }
-            let id = entry.get("externalEventId").and_then(Value::as_str)?;
-            let answered = transcript.iter().any(|candidate| {
-                matches!(
-                    candidate.get("role").and_then(Value::as_str),
-                    Some("kennedy" | "system")
-                ) && candidate.get("externalEventId").and_then(Value::as_str) == Some(id)
-            });
-            (!answered).then(|| id.to_owned())
-        });
-        let restored_pending = restored
-            .and_then(|state| state.get("pendingTurn"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let pending_external_event_id = restored
-            .and_then(|state| state.get("pendingExternalEventId"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(journal_pending_external);
+        let (pending_turn, pending_external_event_id) = restore_pending_turn(restored, &transcript);
 
         let needs_initialization = !journal
             .state()
@@ -1351,7 +1330,7 @@ impl Session {
             reference_root_node_ids: options.reference_root_node_ids,
             started_at,
             transcript,
-            pending_turn: restored_pending || pending_external_event_id.is_some(),
+            pending_turn,
             pending_external_event_id,
             completed,
             rounds_used: restored
@@ -4628,6 +4607,42 @@ fn transcript_from_journal(journal: &HistorySession) -> Vec<Value> {
         .collect()
 }
 
+fn restore_pending_turn(restored: Option<&Value>, transcript: &[Value]) -> (bool, Option<String>) {
+    let answered = |id: &str| {
+        transcript.iter().any(|candidate| {
+            matches!(
+                candidate.get("role").and_then(Value::as_str),
+                Some("kennedy" | "system")
+            ) && candidate.get("externalEventId").and_then(Value::as_str) == Some(id)
+        })
+    };
+    let journal_pending_external = transcript.iter().rev().find_map(|entry| {
+        if entry.get("role").and_then(Value::as_str) != Some("user") {
+            return None;
+        }
+        let id = entry.get("externalEventId").and_then(Value::as_str)?;
+        (!answered(id)).then(|| id.to_owned())
+    });
+    let restored_pending = restored
+        .and_then(|state| state.get("pendingTurn"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let restored_external = restored
+        .and_then(|state| state.get("pendingExternalEventId"))
+        .and_then(Value::as_str);
+    // The response box is journaled before the lifecycle checkpoint that clears
+    // the turn, so recovery must tolerate a crash between those two writes.
+    let restored_external_answered = restored_external.is_some_and(&answered);
+    let pending_external_event_id = journal_pending_external.or_else(|| {
+        restored_external
+            .filter(|id| !answered(id))
+            .map(str::to_owned)
+    });
+    let pending_turn =
+        pending_external_event_id.is_some() || (restored_pending && !restored_external_answered);
+    (pending_turn, pending_external_event_id)
+}
+
 fn staged_object_transport_kind(
     journal: &HistorySession,
     pending_id: &PendingId,
@@ -5912,6 +5927,41 @@ mod tests {
                 .and_then(|record| record.get("id"))
                 .and_then(Value::as_str),
             Some("telegram")
+        );
+    }
+
+    #[test]
+    fn journaled_answer_clears_stale_restored_external_turn() {
+        let restored = json!({
+            "pendingTurn":true,
+            "pendingExternalEventId":"answered-event",
+        });
+        let transcript = vec![
+            json!({"role":"user","content":"question","externalEventId":"answered-event"}),
+            json!({"role":"kennedy","content":"answer","externalEventId":"answered-event"}),
+        ];
+
+        assert_eq!(
+            restore_pending_turn(Some(&restored), &transcript),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn journal_unanswered_external_turn_overrides_stale_restored_event() {
+        let restored = json!({
+            "pendingTurn":true,
+            "pendingExternalEventId":"answered-event",
+        });
+        let transcript = vec![
+            json!({"role":"user","content":"old","externalEventId":"answered-event"}),
+            json!({"role":"kennedy","content":"answer","externalEventId":"answered-event"}),
+            json!({"role":"user","content":"new","externalEventId":"unanswered-event"}),
+        ];
+
+        assert_eq!(
+            restore_pending_turn(Some(&restored), &transcript),
+            (true, Some("unanswered-event".into()))
         );
     }
 
