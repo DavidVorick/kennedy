@@ -1236,6 +1236,24 @@ impl Api {
         .await
     }
 
+    pub async fn telegram_send_private_object(
+        &self,
+        telegram_user_id: i64,
+        conversation_id: &str,
+        expected_conversation_id: Option<&str>,
+        file: &ResolvedObject,
+    ) -> Result<Value, ApiError> {
+        let kind = telegram_native_kind(&file.media_type, file.transport_kind.as_deref());
+        let form =
+            telegram_private_file_form(conversation_id, expected_conversation_id, file, kind)?;
+        self.multipart(
+            &self.telegram,
+            &format!("/api/v1/private-sessions/{telegram_user_id}/attachments"),
+            form,
+        )
+        .await
+    }
+
     pub fn bootstrap_node(&self, short_name: Option<&str>) -> Result<Node, ApiError> {
         let (short_name, short_description, long_description) = bootstrap_root_metadata(short_name);
         let source_created_at = chrono::Utc::now();
@@ -1804,6 +1822,36 @@ fn telegram_file_form(
         .text("fileName", file.file_name.clone())
         .text("complete", complete.to_string())
         .part("file", part);
+    if let Some(kind) = kind {
+        form = form.text("kind", kind.to_owned());
+    }
+    Ok(form)
+}
+
+fn telegram_private_file_form(
+    conversation_id: &str,
+    expected_conversation_id: Option<&str>,
+    file: &ResolvedObject,
+    kind: Option<&str>,
+) -> Result<multipart::Form, ApiError> {
+    let part = multipart::Part::bytes(file.bytes.clone())
+        .file_name(file.file_name.clone())
+        .mime_str(&file.media_type)
+        .map_err(|error| ApiError {
+            status: None,
+            code: "invalid_object_metadata".into(),
+            message: format!("Could not encode the object's media type: {error}"),
+        })?;
+    let mut form = multipart::Form::new()
+        .text("conversationId", conversation_id.to_owned())
+        .text("fileName", file.file_name.clone())
+        .part("file", part);
+    if let Some(expected_conversation_id) = expected_conversation_id {
+        form = form.text(
+            "expectedConversationId",
+            expected_conversation_id.to_owned(),
+        );
+    }
     if let Some(kind) = kind {
         form = form.text("kind", kind.to_owned());
     }

@@ -1661,6 +1661,17 @@ impl Session {
         text: &str,
         metadata: Value,
     ) -> anyhow::Result<()> {
+        self.stage_source_message_with_attachments(kennedy, text, metadata, &[], false)
+    }
+
+    fn stage_source_message_with_attachments(
+        &mut self,
+        kennedy: bool,
+        text: &str,
+        mut metadata: Value,
+        attachments: &[ResolvedObject],
+        reuse_pending_objects: bool,
+    ) -> anyhow::Result<()> {
         let owner = if kennedy {
             BoxOwner::Kennedy
         } else {
@@ -1671,21 +1682,68 @@ impl Session {
         } else {
             "User message"
         };
+        let mut object_ids = Vec::with_capacity(attachments.len());
+        let mut descriptors = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let object_id =
+                if attachment.object_id.starts_with("pending:") && !reuse_pending_objects {
+                    self.journal
+                        .stage_object(
+                            now(),
+                            attachment.media_type.clone(),
+                            Some(attachment.file_name.clone()),
+                            json!({
+                                "source":"kennedy-direct-message",
+                                "kind":attachment.transport_kind,
+                            }),
+                            &attachment.bytes,
+                        )?
+                        .to_string()
+                } else {
+                    attachment.object_id.clone()
+                };
+            let mut descriptor = json!({
+                "fileName":attachment.file_name,
+                "mimeType":attachment.media_type,
+                "sizeBytes":attachment.bytes.len(),
+            });
+            if let Some(kind) = attachment.transport_kind.as_deref() {
+                descriptor["kind"] = json!(kind);
+            }
+            if object_id.starts_with("pending:") {
+                descriptor["pendingId"] = json!(object_id);
+            } else {
+                descriptor["objectId"] = json!(object_id);
+            }
+            object_ids.push(object_id);
+            descriptors.push(descriptor);
+        }
+        if !descriptors.is_empty() {
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+            metadata["attachments"] = json!(descriptors);
+        }
         self.journal.create_box(
             now(),
             name,
             owner,
             BoxContent {
                 text: text.into(),
-                objects: Vec::new(),
+                objects: object_ids.clone(),
                 metadata: metadata.clone(),
             },
         )?;
-        self.transcript.push(json!({
+        let mut transcript = json!({
             "role":if kennedy {"kennedy"} else {"user"},
             "content":text,
             "metadata":metadata,
-        }));
+        });
+        if !object_ids.is_empty() {
+            transcript["objects"] = json!(object_ids);
+            transcript["attachments"] = json!(descriptors);
+        }
+        self.transcript.push(transcript);
         Ok(())
     }
 
@@ -2858,7 +2916,7 @@ impl Session {
     }
 
     async fn send_telegram_dm(&mut self, arguments: &Value) -> anyhow::Result<String> {
-        validate_arguments(arguments, &["user", "message"], &[])?;
+        validate_arguments(arguments, &["user"], &["message", "attachments"])?;
         let user_argument = arguments
             .get("user")
             .filter(|value| value.is_object())
@@ -2867,7 +2925,25 @@ impl Session {
         let telegram_user_id = positive_integer(user_argument, "telegramUserId")?;
         let telegram_user_id = i64::try_from(telegram_user_id)
             .context("telegramUserId exceeds Telegram's supported integer range")?;
-        let message = nonempty_string(arguments, "message", MAX_TELEGRAM_DM_CHARACTERS)?;
+        let message = arguments
+            .get("message")
+            .map(|_| nonempty_string(arguments, "message", MAX_TELEGRAM_DM_CHARACTERS))
+            .transpose()?
+            .unwrap_or_default();
+        let attachment_ids = telegram_dm_attachment_ids(arguments)?;
+        anyhow::ensure!(
+            !message.is_empty() || !attachment_ids.is_empty(),
+            "SendTelegramDM requires a nonempty message, at least one attachment, or both"
+        );
+        let mut attachments = Vec::with_capacity(attachment_ids.len());
+        for object_id in &attachment_ids {
+            let attachment = self.resolve_object(object_id)?;
+            anyhow::ensure!(
+                !attachment.bytes.is_empty(),
+                "attachment object {object_id} is empty"
+            );
+            attachments.push(attachment);
+        }
 
         let already_holds_user_lock = self.session_type == "telegram"
             && self.channel.get("telegramUserId").and_then(Value::as_i64) == Some(telegram_user_id);
@@ -2897,6 +2973,25 @@ impl Session {
                 session.get("telegramUserId").and_then(Value::as_i64) == Some(telegram_user_id)
             })
             .context("This Telegram user has not opened a private chat with Kennedy.")?;
+        if !attachments.is_empty() {
+            let health = self
+                .api
+                .telegram_get("/health")
+                .await
+                .context("discovering the Telegram attachment limit")?;
+            let maximum = health
+                .pointer("/capabilities/maxMediaBytes")
+                .and_then(Value::as_u64)
+                .context("Telegram health omitted its attachment byte limit")?;
+            for attachment in &attachments {
+                anyhow::ensure!(
+                    attachment.bytes.len() as u64 <= maximum,
+                    "attachment object {} is {} bytes, over Telegram's {maximum}-byte limit",
+                    attachment.object_id,
+                    attachment.bytes.len()
+                );
+            }
+        }
         let expected_conversation_id = private_session
             .get("currentConversationId")
             .and_then(Value::as_str)
@@ -2939,7 +3034,13 @@ impl Session {
             .and_then(Value::as_str)
             == Some(current_session_id.as_str())
         {
-            self.stage_source_message(true, &message, metadata)?;
+            self.stage_source_message_with_attachments(
+                true,
+                &message,
+                metadata,
+                &attachments,
+                true,
+            )?;
             current_session_id
         } else if let Some(summary) = selected {
             let id = summary
@@ -2975,7 +3076,13 @@ impl Session {
                 Some(&state),
             )
             .await?;
-            target.stage_source_message(true, &message, metadata)?;
+            target.stage_source_message_with_attachments(
+                true,
+                &message,
+                metadata,
+                &attachments,
+                false,
+            )?;
             self.api
                 .history_checkpoint(
                     &id,
@@ -3007,7 +3114,13 @@ impl Session {
                 None,
             )
             .await?;
-            target.stage_source_message(true, &message, metadata)?;
+            target.stage_source_message_with_attachments(
+                true,
+                &message,
+                metadata,
+                &attachments,
+                false,
+            )?;
             let state = target.snapshot()?;
             let id = target.journal.state().metadata.session_id.clone();
             self.api
@@ -3021,19 +3134,45 @@ impl Session {
             id
         };
 
-        self.api
-            .telegram_post(
-                &format!("/api/v1/private-sessions/{telegram_user_id}/messages"),
-                json!({
-                    "conversationId":conversation_id,
-                    "expectedConversationId":expected_conversation_id,
-                    "text":message,
-                }),
-            )
-            .await
-            .context("sending the Telegram direct message")?;
+        let mut delivery_expected_conversation_id = expected_conversation_id.as_deref();
+        if !message.is_empty() {
+            self.api
+                .telegram_post(
+                    &format!("/api/v1/private-sessions/{telegram_user_id}/messages"),
+                    json!({
+                        "conversationId":conversation_id,
+                        "expectedConversationId":expected_conversation_id,
+                        "text":message,
+                    }),
+                )
+                .await
+                .context("sending the Telegram direct message")?;
+            delivery_expected_conversation_id = Some(&conversation_id);
+        }
+        for attachment in &attachments {
+            self.api
+                .telegram_send_private_object(
+                    telegram_user_id,
+                    &conversation_id,
+                    delivery_expected_conversation_id,
+                    attachment,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "sending Telegram direct-message attachment {}",
+                        attachment.object_id
+                    )
+                })?;
+            delivery_expected_conversation_id = Some(&conversation_id);
+        }
+        let attachment_summary = match attachments.len() {
+            0 => String::new(),
+            1 => " with 1 attachment".into(),
+            count => format!(" with {count} attachments"),
+        };
         Ok(format!(
-            "Sent a Telegram direct message to user {telegram_user_id} and attached it to session {conversation_id}."
+            "Sent a Telegram direct message{attachment_summary} to user {telegram_user_id} and attached it to session {conversation_id}."
         ))
     }
 
@@ -4920,6 +5059,24 @@ fn optional_object_id_array(
     Ok(ids)
 }
 
+fn telegram_dm_attachment_ids(value: &Value) -> anyhow::Result<Vec<String>> {
+    let Some(attachments) = value.get("attachments") else {
+        return Ok(Vec::new());
+    };
+    attachments
+        .as_array()
+        .context("attachments must be an array")?
+        .iter()
+        .map(|attachment| {
+            attachment
+                .as_str()
+                .filter(|object_id| !object_id.trim().is_empty())
+                .map(str::to_owned)
+                .context("attachments entries must be nonempty object ID strings")
+        })
+        .collect()
+}
+
 fn validate_transcription_model(model: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(
@@ -5162,7 +5319,7 @@ fn render_box_text_objects(objects: &[BoxTextObject]) -> String {
 fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
     kcode_codex_runtime_v2::DynamicTool::new(
         "call_ktool",
-        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may send an authorized user a private Telegram message from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\"}}.",
+        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may send an authorized user a private Telegram message, optionally with Kweb object attachments, from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\",\"AAECAwQF\"]}}.",
         json!({
             "type":"object",
             "additionalProperties":false,
@@ -5976,6 +6133,20 @@ mod tests {
         )))
         .unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn telegram_dm_attachments_have_no_tool_specific_count_or_duplicate_restriction() {
+        let attachments = (1..=11)
+            .map(|index| format!("pending:{index}"))
+            .chain(["pending:1".into()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            telegram_dm_attachment_ids(&json!({"attachments":attachments})).unwrap(),
+            attachments
+        );
+        assert!(telegram_dm_attachment_ids(&json!({"attachments":"pending:1"})).is_err());
+        assert!(telegram_dm_attachment_ids(&json!({"attachments":[""]})).is_err());
     }
 
     #[test]

@@ -419,16 +419,23 @@ This document records user intention with regard to Kennedy.
 - Keep a separate durable session for each participant and group, distinct from
   direct messages and from the participant's sessions in other groups. Preserve
   strict order within a stream while allowing unrelated streams to progress.
-- Kennedy's main agent may initiate a private Telegram message to any explicitly
-  targeted authorized user from any session, but only after that user has
-  opened a private chat with the bot. The tool accepts the stable numeric user
-  identity; Telegram transport resolves the private chat without exposing chat
-  IDs to Kennedy or KennedyServer.
+- Kennedy's main agent may initiate a private Telegram delivery containing
+  text, one or more staged or canonical Kweb object attachments, or both, to
+  any explicitly targeted authorized user from any session, but only after
+  that user has opened a private chat with the bot. The tool accepts the stable
+  numeric user identity and object references; Telegram transport resolves the
+  private chat without exposing chat IDs to Kennedy or KennedyServer. Apply the
+  ordinary outbound-media size, filename, MIME, and native-media rules rather
+  than creating a separate attachment store or embedding raw bytes in tool
+  arguments. Do not impose a tool-specific attachment-count ceiling or reject
+  repeated object references; existing request, session, object-size, and
+  provider constraints are the relevant bounds.
 - An initiated private message belongs to the targeted user's already-active
   direct Kennedy session when one exists, preferring the transport's current
   session and then another private Telegram session; create a new private
-  Telegram session when none is active. Record the Kennedy-authored message in
-  that session and atomically bind successful delivery to it.
+  Telegram session when none is active. Record the Kennedy-authored text and
+  attachment references in that session and atomically bind each successful
+  delivery to it.
 - Invocation controls when Kennedy responds, not which accepted bounded group
   context she may inspect. Passive group discussion and retained media should
   be available to an open participant session without pretending that messages
