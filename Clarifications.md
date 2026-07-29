@@ -76,10 +76,15 @@ This document records user intention with regard to Kennedy.
 - The context projection gives each explicitly loaded node one full box and
   each of its fixed connections one full box, without an arbitrary
   fixed-connection count cap. There is no active-connection category. All
-  recent connections included in the projection are fanout-only and appear
-  together in one globally deduplicated summary box containing each node's name
-  and short description; they are never automatically promoted to full nodes.
-  An explicitly loaded node uses the concise header
+  recent connections included in the projection are fanout-only and accumulate
+  in globally deduplicated summary boxes containing each node's name and short
+  description, with at most eight unique connections per box. Only the newest
+  box may contain fewer than eight; newly discovered connections fill that box
+  before another is created. A recent-connections box is never retired once
+  created, and a full box's membership and canonical snapshot are frozen,
+  though any such box may still be dehydrated or summarized. Recent connections
+  are never automatically promoted to full nodes. An explicitly loaded node
+  uses the concise header
   `[box {box_id} | Kweb loaded node | hydrated]`: its identifier and short name
   belong in the node body rather than being duplicated in the header, and its
   Kweb resource owner belongs in that node data rather than exposing Chatend's
