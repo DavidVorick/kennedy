@@ -60,7 +60,7 @@ kcode-codex-runtime-v2 = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtim
 kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-23f3-18c6a0bd003493ae-4" }
 kcode-rust-bins = { path = "data/kcode/kcode-rust-libs/kcode-rust-bins/generations/g-e5c-18c688799653cb78-0" }
 kcode-rust-libs-v2 = { path = "data/kcode/kcode-rust-libs/kcode-rust-libs-v2/generations/g-33ef-18c68a1dca33927f-0" }
-kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-9f3-18c6ac5de8cafab9-0" }
+kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-995-18c6ce1a2bf59b33-0" }
 kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-128e-18c662e17afaea2e-0" }
 
 [profile.dev]

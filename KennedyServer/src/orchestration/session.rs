@@ -957,6 +957,8 @@ fn subagent_state_updates(
 struct KennedySubagentHost<'a> {
     session: &'a mut Session,
     captures: HashMap<String, FreeformWriteRequest>,
+    parent_operation_id: Uuid,
+    pending_manifest_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1922,6 +1924,28 @@ impl Session {
         Ok(())
     }
 
+    fn record_descendant_usage(
+        &mut self,
+        source: &str,
+        parent_operation_id: Uuid,
+        usage: Option<&Value>,
+    ) -> anyhow::Result<()> {
+        let event = descendant_provider_receipt(source, parent_operation_id, usage)?;
+        self.journal.record(now(), event)?;
+        Ok(())
+    }
+
+    fn record_descendant_metering(
+        &mut self,
+        source: &str,
+        parent_operation_id: Uuid,
+        metering: Option<&Value>,
+    ) -> anyhow::Result<()> {
+        let event = descendant_metering_receipt(source, parent_operation_id, metering)?;
+        self.journal.record(now(), event)?;
+        Ok(())
+    }
+
     async fn run_agent_loop<C, F>(
         &mut self,
         operation_id: Uuid,
@@ -2451,6 +2475,8 @@ impl Session {
             let mut host = KennedySubagentHost {
                 session: self,
                 captures: HashMap::new(),
+                parent_operation_id,
+                pending_manifest_hash: None,
             };
             runtime
                 .run(
@@ -3151,6 +3177,7 @@ impl Session {
                         },
                     )
                     .await?;
+                self.record_descendant_usage("web_search", operation_id, result.get("usage"))?;
                 render_web_search_result(&result)?
             }
             "WebFetch" => {
@@ -3259,6 +3286,11 @@ impl Session {
                         operation_id,
                     )
                     .await?;
+                self.record_descendant_metering(
+                    "audio_transcription",
+                    operation_id,
+                    result.get("metering"),
+                )?;
                 render_audio_transcription_result(
                     &object.object_id,
                     &object.file_name,
@@ -3289,6 +3321,11 @@ impl Session {
                         operation_id,
                     )
                     .await?;
+                self.record_descendant_usage(
+                    "media_annotation",
+                    operation_id,
+                    result.get("usage"),
+                )?;
                 render_media_annotation_result(
                     &media.object_id,
                     &media.file_name,
@@ -3320,6 +3357,13 @@ impl Session {
                     .api
                     .generate_image(&user_id, &model, &prompt, references, operation_id)
                     .await?;
+                let usage = result
+                    .usage
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .context("serializing image-generation provider usage")?;
+                self.record_descendant_usage("image_generation", operation_id, usage.as_ref())?;
                 let size = result.bytes.len();
                 let file_name =
                     format!("generated-image.{}", image_extension(&result.content_type));
@@ -4146,6 +4190,28 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
     }
 
     fn record(&mut self, label: &str, value: Value) -> anyhow::Result<()> {
+        if label == "subagent_inference_submitted" {
+            anyhow::ensure!(
+                self.pending_manifest_hash.is_none(),
+                "subagent submitted another inference before recording the prior receipt"
+            );
+            self.pending_manifest_hash = Some(
+                value
+                    .get("manifestHash")
+                    .and_then(Value::as_str)
+                    .context("subagent inference submission has no manifest hash")?
+                    .to_owned(),
+            );
+        }
+        if label == "subagent_provider_receipt" {
+            let manifest_hash = self
+                .pending_manifest_hash
+                .take()
+                .context("subagent provider receipt has no matching inference submission")?;
+            let event = subagent_provider_receipt(manifest_hash, self.parent_operation_id, &value)?;
+            self.session.journal.record(now(), event)?;
+            return Ok(());
+        }
         self.session.journal.record(
             now(),
             EventKind::Note {
@@ -4155,6 +4221,131 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
         )?;
         Ok(())
     }
+}
+
+fn subagent_provider_receipt(
+    manifest_hash: String,
+    parent_operation_id: Uuid,
+    receipt: &Value,
+) -> anyhow::Result<EventKind> {
+    let round = receipt
+        .get("round")
+        .and_then(Value::as_u64)
+        .context("subagent provider receipt has no round")?;
+    let provider_data = match receipt.get("usage") {
+        None | Some(Value::Null) => json!({
+            "source":"subagent",
+            "parentOperationId":parent_operation_id,
+            "round":round,
+            "usageIsDelta":true,
+            "metering":"unavailable",
+            "reportedUsage":Value::Null,
+        }),
+        Some(usage) => {
+            let input = provider_usage_u64(usage, "inputTokens")?;
+            let cached = provider_usage_u64(usage, "cachedInputTokens")?;
+            let output = provider_usage_u64(usage, "outputTokens")?;
+            let thinking = provider_usage_u64(usage, "reasoningOutputTokens")?;
+            json!({
+                "source":"subagent",
+                "parentOperationId":parent_operation_id,
+                "round":round,
+                "usageIsDelta":true,
+                "metering":"tokens",
+                "nonCachedInputTokens":input.saturating_sub(cached),
+                "cachedInputTokens":cached,
+                "thinkingTokens":thinking,
+                "outputTokens":output.saturating_sub(thinking),
+                "providerInputTokens":input,
+                "providerOutputTokens":output,
+                "reportedUsage":usage,
+            })
+        }
+    };
+    Ok(EventKind::ProviderReceipt {
+        manifest_hash,
+        // A subagent's provider input is not Kennedy's Chatend input. Keep it
+        // out of the current-context calibration while still accumulating its
+        // exact token categories in the session status.
+        input_tokens: None,
+        output_tokens: None,
+        context_bytes: None,
+        raw_context_tokens: None,
+        provider_data,
+    })
+}
+
+fn provider_usage_u64(usage: &Value, key: &str) -> anyhow::Result<u64> {
+    usage
+        .get(key)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("subagent provider usage has no {key}"))
+}
+
+fn descendant_provider_receipt(
+    source: &str,
+    parent_operation_id: Uuid,
+    usage: Option<&Value>,
+) -> anyhow::Result<EventKind> {
+    let provider_data = match usage {
+        None | Some(Value::Null) => json!({
+            "source":source,
+            "parentOperationId":parent_operation_id,
+            "usageIsDelta":true,
+            "metering":"unavailable",
+        }),
+        Some(usage) => json!({
+            "source":source,
+            "parentOperationId":parent_operation_id,
+            "usageIsDelta":true,
+            "metering":"tokens",
+            // Router TokenUsage categories are already mutually exclusive.
+            "nonCachedInputTokens":descendant_usage_u64(usage, "inputTokens")?,
+            "cachedInputTokens":descendant_usage_u64(usage, "cachedInputTokens")?,
+            "thinkingTokens":descendant_usage_u64(usage, "thinkingTokens")?,
+            "outputTokens":descendant_usage_u64(usage, "outputTokens")?,
+            "reportedUsage":usage,
+        }),
+    };
+    Ok(descendant_receipt_event(provider_data))
+}
+
+fn descendant_metering_receipt(
+    source: &str,
+    parent_operation_id: Uuid,
+    metering: Option<&Value>,
+) -> anyhow::Result<EventKind> {
+    if metering
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("tokens")
+    {
+        return descendant_provider_receipt(source, parent_operation_id, metering);
+    }
+    Ok(descendant_receipt_event(json!({
+        "source":source,
+        "parentOperationId":parent_operation_id,
+        "usageIsDelta":true,
+        "metering":metering.cloned().unwrap_or_else(|| json!({"kind":"unavailable"})),
+    })))
+}
+
+fn descendant_receipt_event(provider_data: Value) -> EventKind {
+    EventKind::ProviderReceipt {
+        manifest_hash: format!("descendant:{}", Uuid::new_v4()),
+        input_tokens: None,
+        output_tokens: None,
+        context_bytes: None,
+        raw_context_tokens: None,
+        provider_data,
+    }
+}
+
+fn descendant_usage_u64(usage: &Value, key: &str) -> anyhow::Result<u64> {
+    usage
+        .get(key)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("descendant provider usage has no {key}"))
 }
 
 fn restore_kweb_context(journal: &HistorySession, context: &mut KwebContext) -> anyhow::Result<()> {
@@ -4893,14 +5084,44 @@ fn validate_extractable_document(media_type: &str, file_name: &str) -> anyhow::R
         .rsplit_once('.')
         .map(|(_, extension)| extension)
         .map(str::to_ascii_lowercase);
-    anyhow::ensure!(
-        matches!(
+    let supported_media_type = media_type.starts_with("text/")
+        || matches!(
             media_type.as_str(),
             "application/pdf"
                 | "application/msword"
                 | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ) || matches!(extension.as_deref(), Some("pdf" | "doc" | "docx")),
-        "ExtractDocumentText accepts PDF, DOC, or DOCX objects only"
+                | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                | "application/vnd.ms-excel"
+                | "application/vnd.ms-excel.sheet.binary.macroenabled.12"
+                | "application/vnd.oasis.opendocument.spreadsheet"
+                | "application/json"
+                | "application/xml"
+                | "application/yaml"
+                | "application/x-yaml"
+        );
+    anyhow::ensure!(
+        supported_media_type
+            || matches!(
+                extension.as_deref(),
+                Some(
+                    "pdf"
+                        | "doc"
+                        | "docx"
+                        | "xlsx"
+                        | "xls"
+                        | "xlsb"
+                        | "ods"
+                        | "csv"
+                        | "tsv"
+                        | "txt"
+                        | "md"
+                        | "json"
+                        | "yaml"
+                        | "yml"
+                        | "xml"
+                )
+            ),
+        "ExtractDocumentText accepts supported PDF, Word, spreadsheet, and text-family objects only"
     );
     Ok(())
 }
@@ -5711,6 +5932,112 @@ mod tests {
     }
 
     #[test]
+    fn subagent_provider_usage_advances_session_totals_without_reanchoring_context() {
+        let (path, mut journal) = test_journal("subagent-provider-usage", 10_000);
+        journal
+            .create_box(
+                "t1",
+                "system",
+                BoxOwner::System,
+                BoxContent::text("parent context"),
+            )
+            .unwrap();
+        let parent_context = journal.state().projection();
+        journal
+            .record(
+                "t2",
+                EventKind::ProviderReceipt {
+                    manifest_hash: "parent-manifest".into(),
+                    input_tokens: Some(400),
+                    output_tokens: Some(30),
+                    context_bytes: Some(parent_context.context_bytes),
+                    raw_context_tokens: Some(parent_context.raw_estimated_tokens),
+                    provider_data: json!({
+                        "usageIsDelta":true,
+                        "nonCachedInputTokens":300,
+                        "cachedInputTokens":100,
+                        "thinkingTokens":10,
+                        "outputTokens":20,
+                    }),
+                },
+            )
+            .unwrap();
+        journal
+            .record(
+                "t3",
+                subagent_provider_receipt(
+                    "subagent-manifest".into(),
+                    Uuid::nil(),
+                    &json!({
+                        "round":1,
+                        "usage":{
+                            "inputTokens":250,
+                            "cachedInputTokens":50,
+                            "outputTokens":60,
+                            "reasoningOutputTokens":20,
+                            "lastInputTokens":250,
+                            "lastOutputTokens":60,
+                        }
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let status = &journal.state().projection().status;
+        assert_eq!(status.current_context_tokens, 400);
+        assert_eq!(status.cached_input_tokens, 150);
+        assert_eq!(status.non_cached_input_tokens, 500);
+        assert_eq!(status.thinking_tokens, 30);
+        assert_eq!(status.output_tokens, 60);
+        let EventKind::ProviderReceipt {
+            input_tokens,
+            provider_data,
+            ..
+        } = &journal.state().events.last().unwrap().kind
+        else {
+            panic!("subagent usage was not stored as a provider receipt");
+        };
+        assert_eq!(*input_tokens, None);
+        assert_eq!(provider_data["source"], "subagent");
+        assert_eq!(provider_data["parentOperationId"], Uuid::nil().to_string());
+        assert_eq!(provider_data["usageIsDelta"], true);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn descendant_tool_usage_keeps_router_categories_exact_and_exclusive() {
+        let operation_id = Uuid::new_v4();
+        let receipt = descendant_provider_receipt(
+            "web_search",
+            operation_id,
+            Some(&json!({
+                "inputTokens":200,
+                "cachedInputTokens":50,
+                "thinkingTokens":30,
+                "outputTokens":40,
+            })),
+        )
+        .unwrap();
+        let EventKind::ProviderReceipt {
+            input_tokens,
+            provider_data,
+            ..
+        } = receipt
+        else {
+            panic!("descendant usage was not stored as a provider receipt");
+        };
+
+        assert_eq!(input_tokens, None);
+        assert_eq!(provider_data["source"], "web_search");
+        assert_eq!(provider_data["parentOperationId"], operation_id.to_string());
+        assert_eq!(provider_data["nonCachedInputTokens"], 200);
+        assert_eq!(provider_data["cachedInputTokens"], 50);
+        assert_eq!(provider_data["thinkingTokens"], 30);
+        assert_eq!(provider_data["outputTokens"], 40);
+    }
+
+    #[test]
     fn subagent_node_selection_preserves_order_and_rejects_duplicates() {
         let selected = canonical_node_id_array(
             &json!({"contextNodeIds":["AAECAwQG","AAECAwQF"]}),
@@ -6194,7 +6521,7 @@ mod tests {
     }
 
     #[test]
-    fn document_enrichment_accepts_only_pdf_doc_and_docx() {
+    fn document_enrichment_accepts_library_document_formats() {
         assert!(validate_extractable_document("application/pdf", "file.bin").is_ok());
         assert!(validate_extractable_document("application/octet-stream", "legacy.doc").is_ok());
         assert!(
@@ -6204,7 +6531,38 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(validate_extractable_document("text/plain", "notes.txt").is_err());
+        for extension in [
+            "xlsx", "xls", "xlsb", "ods", "csv", "tsv", "txt", "md", "json", "yaml", "yml", "xml",
+        ] {
+            assert!(
+                validate_extractable_document(
+                    "application/octet-stream",
+                    &format!("document.{extension}")
+                )
+                .is_ok(),
+                "{extension} should be extractable"
+            );
+        }
+        for media_type in [
+            "text/plain; charset=utf-8",
+            "text/markdown",
+            "application/json",
+            "application/xml",
+            "application/yaml",
+            "application/x-yaml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+            "application/vnd.ms-excel.sheet.binary.macroenabled.12",
+            "application/vnd.oasis.opendocument.spreadsheet",
+        ] {
+            assert!(
+                validate_extractable_document(media_type, "document").is_ok(),
+                "{media_type} should be extractable"
+            );
+        }
+        assert!(validate_extractable_document("application/octet-stream", "NOTES.TXT").is_ok());
+        assert!(validate_extractable_document("image/png", "photo.png").is_err());
+        assert!(validate_extractable_document("application/octet-stream", "archive.zip").is_err());
     }
 
     #[test]
@@ -6518,7 +6876,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_tool_results_end_with_the_current_context_budget() {
+    fn provider_tool_results_end_with_the_current_and_max_context_sizes() {
         let (path, mut journal) = test_journal("tool-context-footer", 10_000);
         let box_id = journal
             .create_box(
@@ -6535,16 +6893,16 @@ mod tests {
         let provider_result = provider_tool_result_with_context_footer(&journal, "Tool completed.");
         let stale = provider_result.rfind("[stale boxes:").unwrap();
         let current_time = provider_result.rfind("[current time:").unwrap();
-        let budget = provider_result.rfind("[context budget |").unwrap();
+        let context_size = provider_result.rfind("[current context size:").unwrap();
         assert!(stale < current_time);
-        assert!(current_time < budget);
-        assert!(
-            provider_result
-                .lines()
-                .last()
-                .unwrap()
-                .starts_with("[context budget |")
+        assert!(current_time < context_size);
+        assert_eq!(
+            provider_result.lines().last().unwrap(),
+            journal.state().projection().footer.lines().last().unwrap()
         );
+        assert!(provider_result.ends_with("| max context size: 7000]"));
+        assert!(!provider_result.contains("effective="));
+        assert!(!provider_result.contains("turn_limit="));
         std::fs::remove_file(path).unwrap();
     }
 

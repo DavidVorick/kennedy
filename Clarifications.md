@@ -250,23 +250,38 @@ This document records user intention with regard to Kennedy.
   conversation, history ingress, and completed archive). It visibly reports
   current estimated context occupancy, the active failure-avoidance limit and
   progress toward it, and exact cumulative cached input, non-cached input,
-  thinking, and output tokens.
+  thinking, and output tokens. Those cumulative totals cover every
+  model-backed provider call causally owned by the session, not only Kennedy's
+  top-level turns: delegated-agent rounds and their tool-triggered inference,
+  hosted search, media annotation, transcription, generation, and any other
+  descendant or background inference all contribute. Local operations that do
+  not call a model, such as ordinary fetch or document extraction, do not.
+  Token-metered calls advance the token categories; calls for which a provider
+  reports only non-token metering or no metering remain visibly accounted for
+  as such rather than disappearing or receiving invented token counts.
 - Anchor current context occupancy to the newest input-token measurement
-  returned by intelligence after each inference. Record the exact UTF-8 byte
-  length of the rendered context at that moment, then adjust the measurement
-  by the signed change in current rendered bytes at four bytes per token as
-  boxes are added, revised, summarized, hydrated, dehydrated, or retired.
-  Before the first provider measurement, use the same four-bytes-per-token
-  approximation. Cumulative usage categories are never estimated: advance
-  them only from new provider usage results, including multiple inference
-  steps within one Kennedy turn.
-- The model-visible context footer lists stale boxes first and the context
-  budget last, so the budget is always the final line. Immediately above the
-  budget, show the current time including the year, refreshed whenever Chatend
-  is projected. Recalculate and attach that footer after every Ktool result
-  before allowing the provider's next inference; sequential tool use must
-  expose the current time and remaining budget between calls rather than
-  showing only the values from the beginning of the turn.
+  returned by intelligence for Kennedy's own Chatend input. Descendant
+  inference contributes to cumulative usage but must not replace that context
+  anchor. Record the exact UTF-8 byte length of the rendered context at the
+  anchor moment, then adjust the measurement by the signed change in current
+  rendered bytes at four bytes per token as boxes are added, revised,
+  summarized, hydrated, dehydrated, or retired. Before the first provider
+  measurement, use the same four-bytes-per-token approximation. Cumulative
+  usage categories are never estimated: advance them only from new provider
+  usage results, including multiple inference steps within one Kennedy turn,
+  and reconcile live updates with the final call receipt without double
+  counting.
+- The model-visible context footer lists stale boxes first and context size
+  last. Its final line shows only the current estimated context size and the
+  active failure-avoidance limit, labeled `current context size` and
+  `max context size`; do not expose the larger provider window as an
+  `effective` value that Kennedy could mistake for usable capacity.
+  Immediately above that line, show the current time including the year,
+  refreshed whenever Chatend is projected. Recalculate and attach the footer
+  after every Ktool result before allowing the provider's next inference;
+  sequential tool use must expose the current time and remaining capacity
+  between calls rather than showing only the values from the beginning of the
+  turn.
 - Conversation sessions read the Kmap but do not mutate it. Durable graph
   changes happen in explicitly writable history-ingress, audio-ingress,
   self-time, or other backend-owned sessions.
@@ -353,8 +368,13 @@ This document records user intention with regard to Kennedy.
   subagent work.
 - Attribute every provider call to a stable Kennedy user and persist one usage
   receipt per call, including failed calls for which complete metering is
-  unavailable. Cached input, uncached input, reasoning, and visible output must
-  remain distinguishable where the provider reports them.
+  unavailable. Each receipt retains a stable call identity and operation
+  lineage sufficient to attribute all direct and descendant inference to its
+  originating session and to project that session's live and replayed totals
+  idempotently. The router's receipts remain the canonical usage ledger;
+  session history stores their accounting projection rather than creating a
+  competing ledger. Cached input, uncached input, reasoning, and visible output
+  must remain distinguishable where the provider reports them.
 - Discover effective model limits from the provider boundary and fail closed
   when they cannot be verified. Do not invent local context limits or allow
   provider-side automatic compaction to silently remove Kennedy's Kmap context.
@@ -401,6 +421,10 @@ This document records user intention with regard to Kennedy.
   when the contents matter.
 - Browser uploads may accept arbitrary files. Document extraction is optional
   enrichment and failure to extract must not discard an otherwise valid file.
+  Kennedy's document tool exposes the extraction library's supported
+  searchable PDF, Word, spreadsheet, and text-family formats, including plain
+  text, CSV, TSV, Markdown, JSON, YAML, and XML; do not retain a narrower
+  advanced-document-only gate in KennedyServer.
 - User-supplied voice and media reach Kennedy as originals without eager
   transport-generated interpretation. Kennedy chooses whether and how to
   transcribe or annotate them, including the exact model and bounded prompt.
