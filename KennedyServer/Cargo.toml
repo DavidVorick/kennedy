@@ -20,6 +20,7 @@ kcode-codex-runtime-v2.workspace = true
 kcode-commit-session.workspace = true
 kcode-credential-vault.workspace = true
 kcode-dev-tools.workspace = true
+kcode-history-ingress-context.workspace = true
 kcode-intelligence-router.workspace = true
 kcode-kweb-context.workspace = true
 kcode-kweb-db.workspace = true

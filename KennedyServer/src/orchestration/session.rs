@@ -18,16 +18,16 @@ use kcode_dev_tools::{
     WRITE_FILE_FREEFORM_WEB_LIB_TOOL, WRITE_RUST_BIN_TOOL, WRITE_RUST_LIB_TOOL, WRITE_WEB_LIB_TOOL,
     proposed_write_snapshot,
 };
+use kcode_history_ingress_context::Outcome as HistoryIngressContextOutcome;
 use kcode_kweb_context::{
-    BoxKind as KwebBoxKind, Context as KwebContext, Node as KwebNode, NodeDraft,
-    StagedCreate as KwebStagedCreate,
+    Context as KwebContext, Node as KwebNode, NodeDraft, StagedCreate as KwebStagedCreate,
 };
 use kcode_kweb_db::{NodeId, ObjectId};
 use kcode_server_object_envelopes::{StoredFile, encode_file, sanitize_file_name};
 use kcode_session_history::{
     NewSession, Session as HistorySession,
     chatend::{
-        BoxContent, BoxId, BoxOwner, BoxRepresentation, BoxState, Chatend, EventId, EventKind,
+        BoxContent, BoxId, BoxOwner, BoxRepresentation, BoxState, EventId, EventKind,
         ObjectMetadata, PendingId, Representation, SessionKind, SessionMetadata, ToolSlotInput,
     },
 };
@@ -47,7 +47,6 @@ const BROWSER_CONVERSATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 
 const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WAKEUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_TELEGRAM_DM_CHARACTERS: usize = 40_000;
-const INLINE_TOOL_INVOCATION_CHARACTERS: usize = 1_000;
 const MIN_NODE_SHORT_NAME_CHARACTERS: usize = 4;
 const MAX_NODE_SHORT_NAME_CHARACTERS: usize = 50;
 const MAX_NODE_SHORT_DESCRIPTION_CHARACTERS: usize = 200;
@@ -63,9 +62,6 @@ const SUBAGENT_CONTEXT_NODE_LIMIT: usize = 64;
 const BOX_TEXT_OBJECT_SOURCE: &str = "kennedy-box-text";
 const BOX_TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
 const SLOW_TOOL_THRESHOLD: Duration = Duration::from_secs(3);
-const RECENT_CONNECTIONS_PER_BOX: usize = 8;
-const RECENT_CONNECTIONS_LOGICAL_SLOT: &str = "recent-connections";
-const RECENT_CONNECTION_IDS_METADATA: &str = "kwebRecentConnectionIds";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMode {
@@ -229,254 +225,10 @@ struct ResolvedObjectDelivery {
     file_name: String,
 }
 
-struct DesiredKwebBox {
-    logical_slot: String,
-    name: String,
-    content: BoxContent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RecentConnectionEntry {
-    id: String,
-    text: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputStage {
     Accepted,
     RejectedForCapacity,
-}
-
-fn mark_kweb_content(content: &mut BoxContent, logical_slot: &str, role: &str) {
-    if !content.metadata.is_object() {
-        content.metadata = json!({});
-    }
-    content.metadata["kwebLogicalSlot"] = json!(logical_slot);
-    content.metadata["kwebRole"] = json!(role);
-}
-
-fn kweb_logical_slot(state: &BoxState, actual_slot: &str) -> String {
-    state
-        .canonical
-        .content
-        .metadata
-        .get("kwebLogicalSlot")
-        .and_then(Value::as_str)
-        .unwrap_or(actual_slot)
-        .to_owned()
-}
-
-fn recent_connection_entries(content: &BoxContent) -> anyhow::Result<Vec<RecentConnectionEntry>> {
-    let body = content
-        .text
-        .strip_prefix("Recent connections")
-        .context("Kweb recent-connections box has an invalid heading")?;
-    let body = body
-        .strip_prefix('\n')
-        .context("Kweb recent-connections box has no body")?;
-    if body == "None." {
-        return Ok(Vec::new());
-    }
-
-    let mut entries: Vec<RecentConnectionEntry> = Vec::new();
-    for line in body.split('\n') {
-        let identifier = line.split_once(" · ").and_then(|(identifier, _)| {
-            let canonical = identifier.parse::<NodeId>().is_ok();
-            let pending = PendingId::parse(identifier.to_owned()).is_ok();
-            (canonical || pending).then_some(identifier)
-        });
-        if let Some(identifier) = identifier {
-            entries.push(RecentConnectionEntry {
-                id: identifier.to_owned(),
-                text: line.to_owned(),
-            });
-        } else {
-            let entry = entries
-                .last_mut()
-                .context("Kweb recent-connections box starts with invalid entry text")?;
-            entry.text.push('\n');
-            entry.text.push_str(line);
-        }
-    }
-
-    if let Some(expected) = content
-        .metadata
-        .get(RECENT_CONNECTION_IDS_METADATA)
-        .and_then(Value::as_array)
-    {
-        let expected = expected
-            .iter()
-            .map(Value::as_str)
-            .collect::<Option<Vec<_>>>()
-            .context("Kweb recent-connection IDs metadata contains a non-string value")?;
-        anyhow::ensure!(
-            expected
-                == entries
-                    .iter()
-                    .map(|entry| entry.id.as_str())
-                    .collect::<Vec<_>>(),
-            "Kweb recent-connection IDs metadata does not match its canonical text"
-        );
-    }
-    Ok(entries)
-}
-
-fn format_recent_connection_entries(entries: &[RecentConnectionEntry]) -> String {
-    if entries.is_empty() {
-        return "Recent connections\nNone.".into();
-    }
-    format!(
-        "Recent connections\n{}",
-        entries
-            .iter()
-            .map(|entry| entry.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
-}
-
-fn update_recent_connection_content(
-    content: &mut BoxContent,
-    logical_slot: &str,
-    entries: &[RecentConnectionEntry],
-) {
-    content.text = format_recent_connection_entries(entries);
-    mark_kweb_content(content, logical_slot, "recent");
-    content.metadata["revisionHash"] = json!(hex::encode(Sha256::digest(content.text.as_bytes())));
-    content.metadata[RECENT_CONNECTION_IDS_METADATA] = json!(
-        entries
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect::<Vec<_>>()
-    );
-}
-
-fn desired_recent_connection_boxes(
-    journal: &HistorySession,
-    fresh: DesiredKwebBox,
-) -> anyhow::Result<Vec<DesiredKwebBox>> {
-    let mut boxes = Vec::new();
-    let mut seen = HashSet::new();
-    let mut used_logical_slots = HashSet::new();
-
-    if let Some(tool) = journal.state().tools.get(KWEB_TOOL_INSTANCE) {
-        for slot in &tool.slots {
-            let state = journal
-                .state()
-                .box_state(slot.box_id)
-                .context("Kweb tool slot box is missing")?;
-            let logical_slot = kweb_logical_slot(state, &slot.slot);
-            used_logical_slots.insert(logical_slot.clone());
-            if slot.retired
-                || state
-                    .canonical
-                    .content
-                    .metadata
-                    .get("kwebRole")
-                    .and_then(Value::as_str)
-                    != Some("recent")
-            {
-                continue;
-            }
-            let entries = recent_connection_entries(&state.canonical.content)?;
-            for entry in &entries {
-                seen.insert(entry.id.clone());
-            }
-            boxes.push((
-                DesiredKwebBox {
-                    logical_slot,
-                    name: state.name.clone(),
-                    content: state.canonical.content.clone(),
-                },
-                entries,
-            ));
-        }
-    }
-
-    let additions = recent_connection_entries(&fresh.content)?
-        .into_iter()
-        .filter(|entry| seen.insert(entry.id.clone()))
-        .collect::<Vec<_>>();
-    let mut next_addition = 0;
-
-    if let Some((last, entries)) = boxes.last_mut()
-        && entries.len() < RECENT_CONNECTIONS_PER_BOX
-    {
-        let available = RECENT_CONNECTIONS_PER_BOX - entries.len();
-        let end = additions.len().min(available);
-        entries.extend_from_slice(&additions[..end]);
-        next_addition = end;
-        if end > 0 {
-            update_recent_connection_content(&mut last.content, &last.logical_slot, entries);
-        }
-    }
-
-    while next_addition < additions.len() || boxes.is_empty() {
-        let end = (next_addition + RECENT_CONNECTIONS_PER_BOX).min(additions.len());
-        let entries = additions[next_addition..end].to_vec();
-        let mut sequence = boxes.len() + 1;
-        let logical_slot = loop {
-            let candidate = if sequence == 1 {
-                RECENT_CONNECTIONS_LOGICAL_SLOT.to_owned()
-            } else {
-                format!("{RECENT_CONNECTIONS_LOGICAL_SLOT}:{sequence}")
-            };
-            if used_logical_slots.insert(candidate.clone()) {
-                break candidate;
-            }
-            sequence += 1;
-        };
-        let mut content = fresh.content.clone();
-        update_recent_connection_content(&mut content, &logical_slot, &entries);
-        boxes.push((
-            DesiredKwebBox {
-                logical_slot,
-                name: fresh.name.clone(),
-                content,
-            },
-            entries,
-        ));
-        next_addition = end;
-    }
-
-    Ok(boxes.into_iter().map(|(box_spec, _)| box_spec).collect())
-}
-
-type KwebBoxVersions = BTreeMap<BoxId, (String, EventId)>;
-
-fn kweb_box_versions(journal: &HistorySession) -> KwebBoxVersions {
-    journal
-        .state()
-        .tool_layouts
-        .get(KWEB_TOOL_INSTANCE)
-        .into_iter()
-        .flatten()
-        .filter_map(|box_id| {
-            let state = journal.state().box_state(*box_id)?;
-            state
-                .active
-                .then(|| (*box_id, (state.name.clone(), state.canonical.event_id)))
-        })
-        .collect()
-}
-
-fn changed_kweb_box_ids(journal: &HistorySession, previous: &KwebBoxVersions) -> Vec<BoxId> {
-    journal
-        .state()
-        .tool_layouts
-        .get(KWEB_TOOL_INSTANCE)
-        .into_iter()
-        .flatten()
-        .filter_map(|box_id| {
-            let state = journal.state().box_state(*box_id)?;
-            let current = (state.name.as_str(), state.canonical.event_id);
-            let changed = previous
-                .get(box_id)
-                .map(|(name, revision)| (name.as_str(), *revision) != current)
-                .unwrap_or(true);
-            (state.active && changed).then_some(*box_id)
-        })
-        .collect()
 }
 
 fn render_load_nodes_result(
@@ -679,168 +431,6 @@ fn render_document_extraction_result(
     Ok(format!(
         "Extracted text for {object_id}\nFile: {file_name}\nFormat: {format}\nCharacters: {characters}\nTruncated: {truncated}\n\n{text}"
     ))
-}
-
-struct HistoryIngressRepresentationPlan {
-    desired: BTreeMap<BoxId, BoxRepresentation>,
-    fits: bool,
-}
-
-fn history_ingress_representation_plan(
-    state: &Chatend,
-) -> anyhow::Result<HistoryIngressRepresentationPlan> {
-    let mut desired = state
-        .active_boxes()
-        .map(|box_state| {
-            let representation = if matches!(box_state.owner, BoxOwner::System) {
-                BoxRepresentation::Hydrated
-            } else if let Representation::Summarized { text, .. } = &box_state.representation {
-                BoxRepresentation::Summarized(text.clone())
-            } else {
-                BoxRepresentation::Hydrated
-            };
-            (box_state.id, representation)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let projection = state.projection_with_box_representations(&desired)?;
-    let limit = state.ingress_initial_context_limit();
-    if projection.estimated_tokens <= limit {
-        return Ok(HistoryIngressRepresentationPlan {
-            desired,
-            fits: true,
-        });
-    }
-
-    let mut unprotected = state
-        .active_boxes()
-        .filter(|box_state| !history_ingress_box_is_protected(box_state))
-        .map(|box_state| {
-            let target = if matches!(
-                desired.get(&box_state.id),
-                Some(BoxRepresentation::Summarized(_))
-            ) {
-                BoxRepresentation::Dehydrated
-            } else if let Some((tool_name, characters)) = tool_invocation(box_state)
-                && characters > INLINE_TOOL_INVOCATION_CHARACTERS
-            {
-                BoxRepresentation::Summarized(format!(
-                    "Tool invocation: {tool_name} {{arguments dehydrated: {} characters}}.",
-                    decimal_with_commas(characters)
-                ))
-            } else {
-                BoxRepresentation::Dehydrated
-            };
-            (box_state.id, target)
-        })
-        .collect::<Vec<_>>();
-    if reduce_history_ingress_boxes(state, &mut desired, &mut unprotected, limit)? {
-        return Ok(HistoryIngressRepresentationPlan {
-            desired,
-            fits: true,
-        });
-    }
-
-    let mut protected = state
-        .active_boxes()
-        .filter(|box_state| history_ingress_box_is_protected(box_state))
-        .map(|box_state| (box_state.id, BoxRepresentation::Dehydrated))
-        .collect::<Vec<_>>();
-    if reduce_history_ingress_boxes(state, &mut desired, &mut protected, limit)? {
-        return Ok(HistoryIngressRepresentationPlan {
-            desired,
-            fits: true,
-        });
-    }
-
-    let mut remaining = state
-        .active_boxes()
-        .map(|box_state| (box_state.id, BoxRepresentation::Dehydrated))
-        .collect::<Vec<_>>();
-    let fits = reduce_history_ingress_boxes(state, &mut desired, &mut remaining, limit)?;
-    Ok(HistoryIngressRepresentationPlan { desired, fits })
-}
-
-fn reduce_history_ingress_boxes(
-    state: &Chatend,
-    desired: &mut BTreeMap<BoxId, BoxRepresentation>,
-    candidates: &mut Vec<(BoxId, BoxRepresentation)>,
-    limit: u64,
-) -> anyhow::Result<bool> {
-    let projection = state.projection_with_box_representations(desired)?;
-    let rendered_tokens = projection
-        .items
-        .iter()
-        .filter(|item| !item.marker)
-        .map(|item| (item.box_id, item.approximate_tokens))
-        .collect::<BTreeMap<_, _>>();
-    candidates.retain(|(box_id, target)| desired.get(box_id) != Some(target));
-    candidates.sort_by(|left, right| {
-        rendered_tokens
-            .get(&right.0)
-            .copied()
-            .unwrap_or_default()
-            .cmp(&rendered_tokens.get(&left.0).copied().unwrap_or_default())
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    for (box_id, target) in candidates.drain(..) {
-        desired.insert(box_id, target);
-        if state
-            .projection_with_box_representations(desired)?
-            .estimated_tokens
-            <= limit
-        {
-            return Ok(true);
-        }
-    }
-    Ok(state
-        .projection_with_box_representations(desired)?
-        .estimated_tokens
-        <= limit)
-}
-
-fn history_ingress_box_is_protected(state: &BoxState) -> bool {
-    if matches!(state.owner, BoxOwner::System)
-        || matches!(state.owner, BoxOwner::User) && state.name == "User message"
-        || matches!(state.owner, BoxOwner::Kennedy) && state.name == "Kennedy message"
-    {
-        return true;
-    }
-    if state
-        .canonical
-        .content
-        .metadata
-        .get("kwebRole")
-        .and_then(Value::as_str)
-        .is_some_and(|role| matches!(role, "direct" | "fixed" | "active"))
-    {
-        return true;
-    }
-    tool_invocation(state)
-        .is_some_and(|(_, characters)| characters <= INLINE_TOOL_INVOCATION_CHARACTERS)
-}
-
-fn tool_invocation(state: &BoxState) -> Option<(&str, usize)> {
-    let BoxOwner::Kennedy = &state.owner else {
-        return None;
-    };
-    let tool_name = state.name.strip_prefix("Kennedy tool call: ")?;
-    Some((tool_name, state.canonical.content.text.chars().count()))
-}
-
-fn decimal_with_commas(value: usize) -> String {
-    let digits = value.to_string();
-    let first = digits.len() % 3;
-    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
-    if first > 0 {
-        output.push_str(&digits[..first]);
-    }
-    for chunk in digits.as_bytes()[first..].chunks(3) {
-        if !output.is_empty() {
-            output.push(',');
-        }
-        output.push_str(std::str::from_utf8(chunk).expect("decimal digits are UTF-8"));
-    }
-    output
 }
 
 fn unique_kweb_slot(logical: &str, used: &mut HashSet<String>) -> String {
@@ -1612,25 +1202,28 @@ impl Session {
                 .configure_context(ingress_kind, self.runtime.context_window_tokens);
         }
         self.revalidate_loaded_nodes().await?;
-        let plan = history_ingress_representation_plan(self.journal.state())?;
-        self.journal
-            .apply_box_representations(now(), &plan.desired)?;
-        if !plan.fits {
-            self.journal.record(
-                now(),
-                EventKind::Note {
-                    label: INGRESS_FORCE_COMMIT_NOTE.into(),
-                    value: json!({
-                        "reason":"fully_dehydrated_context_above_initial_target",
-                        "estimatedTokens":self.journal.state().projection().estimated_tokens,
-                        "initialTargetTokens":self.journal.state().ingress_initial_context_limit(),
-                    }),
-                },
-            )?;
-            self.pending_turn = false;
-            self.finalize_kweb_session()?;
-            self.completed = true;
-            return Ok(());
+        match kcode_history_ingress_context::prepare(&mut self.journal, now())? {
+            HistoryIngressContextOutcome::Ready => {}
+            HistoryIngressContextOutcome::OverCapacity {
+                estimated_tokens,
+                target_tokens,
+            } => {
+                self.journal.record(
+                    now(),
+                    EventKind::Note {
+                        label: INGRESS_FORCE_COMMIT_NOTE.into(),
+                        value: json!({
+                            "reason":"fully_dehydrated_context_above_initial_target",
+                            "estimatedTokens":estimated_tokens,
+                            "initialTargetTokens":target_tokens,
+                        }),
+                    },
+                )?;
+                self.pending_turn = false;
+                self.finalize_kweb_session()?;
+                self.completed = true;
+                return Ok(());
+            }
         }
         self.journal
             .record(now(), EventKind::HistoryIngressStarted)?;
@@ -3896,7 +3489,6 @@ impl Session {
     }
 
     fn sync_kweb_boxes(&mut self) -> anyhow::Result<Vec<BoxId>> {
-        let previous = kweb_box_versions(&self.journal);
         let updates = self
             .plan
             .updates
@@ -3912,128 +3504,9 @@ impl Session {
                 data: kweb_node_draft(&create.data),
             })
             .collect::<Vec<_>>();
-        let specs = self
-            .context
-            .box_specs(&updates, &creates)
-            .map_err(anyhow::Error::new)?;
-        let mut desired = Vec::with_capacity(specs.len());
-        let mut recent = None;
-        for spec in specs {
-            let mut metadata = json!({
-                "revisionHash":hex::encode(Sha256::digest(spec.text.as_bytes())),
-            });
-            if let Some(node) = spec.stored_node {
-                metadata["canonicalNodeId"] = json!(node.id);
-                metadata["storedNode"] = serde_json::to_value(node)?;
-            }
-            if let Some(node) = spec.staged_node {
-                metadata["staged"] = json!(true);
-                metadata["nodeData"] = serde_json::to_value(node)?;
-            }
-            let mut content = BoxContent {
-                text: spec.text,
-                objects: Vec::new(),
-                metadata,
-            };
-            content.use_concise_header();
-            mark_kweb_content(&mut content, &spec.logical_slot, spec.kind.metadata_name());
-            let entry = DesiredKwebBox {
-                logical_slot: spec.logical_slot,
-                name: spec.kind.name().into(),
-                content,
-            };
-            if spec.kind == KwebBoxKind::Recent {
-                anyhow::ensure!(
-                    recent.replace(entry).is_none(),
-                    "Kweb context produced more than one recent-connections candidate"
-                );
-            } else {
-                desired.push(entry);
-            }
-        }
-        let recent = recent.context("Kweb context produced no recent-connections candidate")?;
-        desired.extend(desired_recent_connection_boxes(&self.journal, recent)?);
-        self.reconcile_kweb_slots(desired)?;
-        Ok(changed_kweb_box_ids(&self.journal, &previous))
-    }
-
-    fn reconcile_kweb_slots(&mut self, desired: Vec<DesiredKwebBox>) -> anyhow::Result<()> {
-        let current = self
-            .journal
-            .state()
-            .tools
-            .get(KWEB_TOOL_INSTANCE)
-            .cloned()
-            .unwrap_or_default();
-        let desired_by_logical = desired
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.logical_slot.as_str(), index))
-            .collect::<BTreeMap<_, _>>();
-        anyhow::ensure!(
-            desired_by_logical.len() == desired.len(),
-            "Kweb box layout contains duplicate logical slots"
-        );
-        let mut claimed = HashSet::new();
-        let mut actual_by_desired = BTreeMap::new();
-        let mut slots = Vec::with_capacity(current.slots.len() + desired.len());
-        let mut used_actual = current
-            .slots
-            .iter()
-            .map(|slot| slot.slot.clone())
-            .collect::<HashSet<_>>();
-        for slot in &current.slots {
-            let state = self
-                .journal
-                .state()
-                .box_state(slot.box_id)
-                .context("Kweb tool slot box is missing")?;
-            let logical = kweb_logical_slot(state, &slot.slot);
-            let selected = !slot.retired
-                && desired_by_logical.contains_key(logical.as_str())
-                && claimed.insert(logical.clone());
-            if selected {
-                let entry = &desired[desired_by_logical[logical.as_str()]];
-                slots.push(ToolSlotInput {
-                    slot: slot.slot.clone(),
-                    name: entry.name.clone(),
-                    content: entry.content.clone(),
-                    retired: false,
-                });
-                actual_by_desired.insert(entry.logical_slot.clone(), slot.slot.clone());
-            } else {
-                slots.push(ToolSlotInput {
-                    slot: slot.slot.clone(),
-                    name: state.name.clone(),
-                    content: state.canonical.content.clone(),
-                    retired: slot.retired || !selected,
-                });
-            }
-        }
-        for entry in &desired {
-            if actual_by_desired.contains_key(&entry.logical_slot) {
-                continue;
-            }
-            let actual = unique_kweb_slot(&entry.logical_slot, &mut used_actual);
-            slots.push(ToolSlotInput {
-                slot: actual.clone(),
-                name: entry.name.clone(),
-                content: entry.content.clone(),
-                retired: false,
-            });
-            actual_by_desired.insert(entry.logical_slot.clone(), actual);
-        }
-        let layout_slots = desired
-            .iter()
-            .map(|entry| actual_by_desired[&entry.logical_slot].clone())
-            .collect::<Vec<_>>();
-        self.journal.apply_tool_slots_with_layout(
-            now(),
-            KWEB_TOOL_INSTANCE,
-            slots,
-            &layout_slots,
-        )?;
-        Ok(())
+        self.context
+            .sync_chatend(&mut self.journal, now(), &updates, &creates)
+            .map_err(anyhow::Error::new)
     }
 
     fn record_tool_invocation(
@@ -6958,189 +6431,11 @@ mod tests {
         assert!(short_description_error.contains("received 201"));
     }
 
-    fn recent_candidate(indices: &[u8], description: &str) -> DesiredKwebBox {
-        let entries = indices
-            .iter()
-            .map(|index| {
-                let id = NodeId::from_bytes([0, 0, 0, 0, 0, *index])
-                    .unwrap()
-                    .to_string();
-                RecentConnectionEntry {
-                    text: format!("{id} · Node {index}: {description} {index}"),
-                    id,
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut content = BoxContent::text(format_recent_connection_entries(&entries));
-        content.use_concise_header();
-        mark_kweb_content(&mut content, RECENT_CONNECTIONS_LOGICAL_SLOT, "recent");
-        DesiredKwebBox {
-            logical_slot: RECENT_CONNECTIONS_LOGICAL_SLOT.into(),
-            name: "Kweb recent connections".into(),
-            content,
-        }
-    }
-
-    fn apply_recent_boxes(
-        journal: &mut HistorySession,
-        recorded_at: &str,
-        boxes: &[DesiredKwebBox],
-    ) {
-        let layout = boxes
-            .iter()
-            .map(|box_spec| box_spec.logical_slot.clone())
-            .collect::<Vec<_>>();
-        journal
-            .apply_tool_slots_with_layout(
-                recorded_at,
-                KWEB_TOOL_INSTANCE,
-                boxes
-                    .iter()
-                    .map(|box_spec| ToolSlotInput {
-                        slot: box_spec.logical_slot.clone(),
-                        name: box_spec.name.clone(),
-                        content: box_spec.content.clone(),
-                        retired: false,
-                    })
-                    .collect(),
-                &layout,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn recent_connections_fill_permanent_boxes_eight_at_a_time() {
-        let (path, mut journal) = test_journal("recent-connection-boxes", 10_000);
-        let initial_indices = (1..=18).collect::<Vec<_>>();
-        let initial =
-            desired_recent_connection_boxes(&journal, recent_candidate(&initial_indices, "old"))
-                .unwrap();
-        assert_eq!(
-            initial
-                .iter()
-                .map(|box_spec| recent_connection_entries(&box_spec.content).unwrap().len())
-                .collect::<Vec<_>>(),
-            vec![8, 8, 2]
-        );
-        assert_eq!(
-            initial
-                .iter()
-                .map(|box_spec| box_spec.logical_slot.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "recent-connections",
-                "recent-connections:2",
-                "recent-connections:3"
-            ]
-        );
-        apply_recent_boxes(&mut journal, "t1", &initial);
-
-        let original_ids = journal.state().tool_layouts[KWEB_TOOL_INSTANCE].clone();
-        let original_revisions = original_ids
-            .iter()
-            .map(|box_id| {
-                journal
-                    .state()
-                    .box_state(*box_id)
-                    .unwrap()
-                    .canonical
-                    .event_id
-            })
-            .collect::<Vec<_>>();
-        journal
-            .summarize_box("t2", original_ids[0], "retained first box")
-            .unwrap();
-        journal
-            .dehydrate_boxes("t3", &[original_ids[1], original_ids[2]])
-            .unwrap();
-
-        let expanded_indices = (1..=27).collect::<Vec<_>>();
-        let expanded =
-            desired_recent_connection_boxes(&journal, recent_candidate(&expanded_indices, "new"))
-                .unwrap();
-        assert_eq!(
-            expanded
-                .iter()
-                .map(|box_spec| recent_connection_entries(&box_spec.content).unwrap().len())
-                .collect::<Vec<_>>(),
-            vec![8, 8, 8, 3]
-        );
-        assert_eq!(
-            expanded[0].content,
-            journal
-                .state()
-                .box_state(original_ids[0])
-                .unwrap()
-                .canonical
-                .content
-        );
-        assert_eq!(
-            expanded[1].content,
-            journal
-                .state()
-                .box_state(original_ids[1])
-                .unwrap()
-                .canonical
-                .content
-        );
-        assert!(expanded[2].content.text.contains("old 18"));
-        assert!(expanded[2].content.text.contains("new 24"));
-        assert!(!expanded[2].content.text.contains("new 18"));
-        apply_recent_boxes(&mut journal, "t4", &expanded);
-
-        let current = &journal.state().tools[KWEB_TOOL_INSTANCE];
-        assert_eq!(current.slots.len(), 4);
-        assert!(current.slots.iter().all(|slot| !slot.retired));
-        assert_eq!(current.slots[0].box_id, original_ids[0]);
-        assert_eq!(current.slots[1].box_id, original_ids[1]);
-        assert_eq!(current.slots[2].box_id, original_ids[2]);
-
-        let first = journal.state().box_state(original_ids[0]).unwrap();
-        assert_eq!(first.canonical.event_id, original_revisions[0]);
-        assert!(matches!(
-            first.representation,
-            Representation::Summarized { based_on, .. } if based_on == first.canonical.event_id
-        ));
-        let second = journal.state().box_state(original_ids[1]).unwrap();
-        assert_eq!(second.canonical.event_id, original_revisions[1]);
-        assert!(matches!(
-            second.representation,
-            Representation::Dehydrated { based_on } if based_on == second.canonical.event_id
-        ));
-        let third = journal.state().box_state(original_ids[2]).unwrap();
-        assert_ne!(third.canonical.event_id, original_revisions[2]);
-        assert!(matches!(
-            third.representation,
-            Representation::Dehydrated { based_on } if based_on == original_revisions[2]
-        ));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn an_empty_recent_projection_starts_one_fillable_box() {
-        let (path, journal) = test_journal("empty-recent-connection-box", 10_000);
-        let boxes =
-            desired_recent_connection_boxes(&journal, recent_candidate(&[], "unused")).unwrap();
-        assert_eq!(boxes.len(), 1);
-        assert!(
-            recent_connection_entries(&boxes[0].content)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            boxes[0].content.metadata[RECENT_CONNECTION_IDS_METADATA],
-            json!([])
-        );
-        std::fs::remove_file(path).unwrap();
-    }
-
     #[test]
     fn load_nodes_result_is_exact_changed_kweb_projection_in_layout_order() {
         let (path, mut journal) = test_journal("load-node-result", 10_000);
-        let mut loaded = BoxContent::text("Node ID: loaded\nNode name: Loaded");
-        mark_kweb_content(&mut loaded, "loaded", "loaded");
-        let mut recent = BoxContent::text("old recent connections");
-        mark_kweb_content(&mut recent, "recent-connections", "recent");
+        let loaded = BoxContent::text("Node ID: loaded\nNode name: Loaded");
+        let recent = BoxContent::text("old recent connections");
         journal
             .apply_tool_slots_with_layout(
                 "t1",
@@ -7166,12 +6461,9 @@ mod tests {
         journal
             .summarize_box("t2", recent_id, "Kennedy's retained recent-node summary")
             .unwrap();
-        let previous = kweb_box_versions(&journal);
 
-        let mut refreshed_recent = BoxContent::text("new canonical recent connections");
-        mark_kweb_content(&mut refreshed_recent, "recent-connections", "recent");
-        let mut fixed = BoxContent::text("Node ID: fixed\nNode name: Fixed");
-        mark_kweb_content(&mut fixed, "fixed", "fixed");
+        let refreshed_recent = BoxContent::text("new canonical recent connections");
+        let fixed = BoxContent::text("Node ID: fixed\nNode name: Fixed");
         journal
             .apply_tool_slots_with_layout(
                 "t3",
@@ -7200,9 +6492,8 @@ mod tests {
             )
             .unwrap();
 
-        let changed = changed_kweb_box_ids(&journal, &previous);
         let fixed_id = journal.state().tool_layouts[KWEB_TOOL_INSTANCE][1];
-        assert_eq!(changed, vec![fixed_id, recent_id]);
+        let changed = vec![fixed_id, recent_id];
 
         let projected = journal
             .state()
@@ -7219,11 +6510,8 @@ mod tests {
         assert!(!result.contains("new canonical recent connections"));
         assert!(!result.contains("\"updatedBoxIds\""));
 
-        let current = kweb_box_versions(&journal);
-        let unchanged = changed_kweb_box_ids(&journal, &current);
-        assert!(unchanged.is_empty());
         assert_eq!(
-            render_load_nodes_result(&journal, &unchanged).unwrap(),
+            render_load_nodes_result(&journal, &[]).unwrap(),
             "LoadNodes completed. The shared Kweb boxes were already current."
         );
         std::fs::remove_file(path).unwrap();
@@ -7720,203 +7008,6 @@ mod tests {
         );
         assert!(!fetched.contains("\\n"));
         assert!(!fetched.contains("\\\"raw\\\""));
-    }
-
-    #[test]
-    fn ingress_always_keeps_kennedy_summaries_and_otherwise_hydrates_a_small_context() {
-        let (path, mut journal) = test_journal("small", 1_000);
-        journal
-            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
-            .unwrap();
-        let summarized = journal
-            .create_box(
-                "t2",
-                "web result",
-                BoxOwner::Controller,
-                BoxContent::text("x".repeat(600)),
-            )
-            .unwrap();
-        journal
-            .summarize_box("t3", summarized, "Kennedy's important points")
-            .unwrap();
-        let dehydrated = journal
-            .create_box(
-                "t4",
-                "code",
-                BoxOwner::Tool {
-                    tool_instance: "rust".into(),
-                    slot: "lib.rs".into(),
-                },
-                BoxContent::text("y".repeat(300)),
-            )
-            .unwrap();
-        journal.dehydrate_boxes("t5", &[dehydrated]).unwrap();
-
-        let plan = history_ingress_representation_plan(journal.state()).unwrap();
-        assert!(plan.fits);
-        assert_eq!(
-            plan.desired[&summarized],
-            BoxRepresentation::Summarized("Kennedy's important points".into())
-        );
-        assert_eq!(plan.desired[&dehydrated], BoxRepresentation::Hydrated);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn ingress_reduces_largest_unprotected_box_before_protected_messages() {
-        let (path, mut journal) = test_journal("largest-first", 500);
-        journal
-            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
-            .unwrap();
-        let message = journal
-            .create_box(
-                "t2",
-                "User message",
-                BoxOwner::User,
-                BoxContent::text("m".repeat(300)),
-            )
-            .unwrap();
-        let large = journal
-            .create_box(
-                "t3",
-                "Kennedy tool result",
-                BoxOwner::Controller,
-                BoxContent::text("r".repeat(1_200)),
-            )
-            .unwrap();
-        let small = journal
-            .create_box(
-                "t4",
-                "small notice",
-                BoxOwner::Controller,
-                BoxContent::text("n".repeat(60)),
-            )
-            .unwrap();
-
-        let plan = history_ingress_representation_plan(journal.state()).unwrap();
-        assert!(plan.fits);
-        assert_eq!(plan.desired[&message], BoxRepresentation::Hydrated);
-        assert_eq!(plan.desired[&large], BoxRepresentation::Dehydrated);
-        assert_eq!(plan.desired[&small], BoxRepresentation::Hydrated);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn ingress_dehydrates_largest_protected_box_when_protected_context_exceeds_target() {
-        let (path, mut journal) = test_journal("protected-largest-first", 500);
-        let system = journal
-            .create_box(
-                "t1",
-                "system",
-                BoxOwner::System,
-                BoxContent::text("s".repeat(500)),
-            )
-            .unwrap();
-        let message = journal
-            .create_box(
-                "t2",
-                "User message",
-                BoxOwner::User,
-                BoxContent::text("m".repeat(1_200)),
-            )
-            .unwrap();
-
-        let plan = history_ingress_representation_plan(journal.state()).unwrap();
-        assert!(plan.fits);
-        assert_eq!(plan.desired[&message], BoxRepresentation::Dehydrated);
-        assert_eq!(plan.desired[&system], BoxRepresentation::Hydrated);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn ingress_reports_no_fit_only_after_every_box_is_dehydrated() {
-        let (path, mut journal) = test_journal("fully-dehydrated", 100);
-        let mut box_ids = Vec::new();
-        for index in 0..40 {
-            box_ids.push(
-                journal
-                    .create_box(
-                        format!("t{index}"),
-                        format!("protected message {index}"),
-                        BoxOwner::User,
-                        BoxContent::text("x"),
-                    )
-                    .unwrap(),
-            );
-        }
-
-        let plan = history_ingress_representation_plan(journal.state()).unwrap();
-        assert!(!plan.fits);
-        assert!(
-            box_ids
-                .iter()
-                .all(|box_id| plan.desired[box_id] == BoxRepresentation::Dehydrated)
-        );
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn long_tool_invocations_are_programmatically_summarized_only_when_needed() {
-        let invocation = "i".repeat(1_284);
-        let (large_path, mut large_window) = test_journal("tool-large-window", 1_000);
-        large_window
-            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
-            .unwrap();
-        let large_id = large_window
-            .create_box(
-                "t2",
-                "Kennedy tool call: LoadNodes",
-                BoxOwner::Kennedy,
-                BoxContent::text(&invocation),
-            )
-            .unwrap();
-        let large_plan = history_ingress_representation_plan(large_window.state()).unwrap();
-        assert_eq!(large_plan.desired[&large_id], BoxRepresentation::Hydrated);
-
-        let (small_path, mut small_window) = test_journal("tool-small-window", 300);
-        small_window
-            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
-            .unwrap();
-        let small_id = small_window
-            .create_box(
-                "t2",
-                "Kennedy tool call: LoadNodes",
-                BoxOwner::Kennedy,
-                BoxContent::text(invocation),
-            )
-            .unwrap();
-        let small_plan = history_ingress_representation_plan(small_window.state()).unwrap();
-        assert_eq!(
-            small_plan.desired[&small_id],
-            BoxRepresentation::Summarized(
-                "Tool invocation: LoadNodes {arguments dehydrated: 1,284 characters}.".into()
-            )
-        );
-        std::fs::remove_file(large_path).unwrap();
-        std::fs::remove_file(small_path).unwrap();
-    }
-
-    #[test]
-    fn a_large_unprotected_kennedy_summary_can_later_be_dehydrated() {
-        let (path, mut journal) = test_journal("large-summary", 300);
-        journal
-            .create_box("t1", "system", BoxOwner::System, BoxContent::text("system"))
-            .unwrap();
-        let summarized = journal
-            .create_box(
-                "t2",
-                "large fetched page",
-                BoxOwner::Controller,
-                BoxContent::text("canonical".repeat(300)),
-            )
-            .unwrap();
-        journal
-            .summarize_box("t3", summarized, "s".repeat(1_200))
-            .unwrap();
-
-        let plan = history_ingress_representation_plan(journal.state()).unwrap();
-        assert_eq!(plan.desired[&summarized], BoxRepresentation::Dehydrated);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -17,15 +17,19 @@ This document records user intention with regard to Kennedy.
 - Reduce KennedyServer by extracting cohesive Rust capabilities into managed
   Kcode libraries, starting with the least-coupled boundaries. An extracted
   library should normally contain 300-3,000 lines of code, expose a lightweight
-  well-defined API, and materially simplify what KennedyServer owns; do not
-  create pass-through crates that merely relocate server-specific glue. Prefer
-  focused new libraries over casually making an existing managed library
-  larger, but optimize for the simplest total architecture: extend the clear
-  owner of a capability when doing so removes duplicate implementation or
-  parallel ownership and leaves a lighter boundary between components. Judge an
-  extraction by total first-party implementation as well as server size: move
-  code and tests rather than copying them, reuse existing transports, and do not
-  add abstraction or supporting code that consumes the deduplication benefit.
+  well-defined API, and materially simplify what KennedyServer owns; its public
+  operations should complete the capability's internal workflow rather than
+  require callers to sequence planning, application, or other intermediate
+  steps. Return only outcomes needed for decisions that genuinely remain
+  outside the boundary. Do not create pass-through crates that merely relocate
+  server-specific glue. Prefer focused new libraries over casually making an
+  existing managed library larger, but optimize for the simplest total
+  architecture: extend the clear owner of a capability when doing so removes
+  duplicate implementation or parallel ownership and leaves a lighter boundary
+  between components. Judge an extraction by total first-party implementation
+  as well as server size: move code and tests rather than copying them, reuse
+  existing transports, and do not add abstraction or supporting code that
+  consumes the deduplication benefit.
 - Managed libraries maintained only by LLMs are source-first: their code and
   tests are the specification. Do not add a separate `Specification.md` that
   duplicates an ingestible codebase; retain only documentation required by the
@@ -64,6 +68,13 @@ This document records user intention with regard to Kennedy.
   layout, application validation, and model attribution.
   Kweb owns durable resource ownership, privacy evaluation, and owner-only
   mutation enforcement.
+- One small typed Kweb-context library owns the in-session loaded/fixed node
+  model and mechanically reconciles Kennedy's chosen projection into Chatend,
+  including stable box identity, typed metadata, permanent bounded
+  recent-connection boxes, and preservation of representation choices.
+  KennedyServer owns node fetching, root selection, the staged mutation plan,
+  synchronization timing, model-facing tool-result presentation, and commit
+  decisions; it must not retain a parallel Kweb-box parser or slot reconciler.
 - After KennedyServer bootstraps and validates its application-owned roots, one
   small typed Kmap library exclusively owns the live `KwebDb` handle. That
   library owns typed node reads, idempotent provenance and ordinary node
@@ -154,6 +165,14 @@ This document records user intention with regard to Kennedy.
 - Session History exclusively owns active session logs, lifecycle/control
   journals, pending session objects, and completion receipts. KennedyServer uses
   its typed API and must not manipulate the same files independently.
+- One small history-ingress context library owns the complete mechanical
+  preparation of Chatend representations for ingress: initial hydration,
+  summary preservation, protected-content ordering, largest-first reduction,
+  durable application, and final capacity measurement. Its public workflow is
+  one outcome-level preparation call rather than separately exposed planning or
+  application steps. KennedyServer owns prompt and runtime selection, Kweb
+  revalidation, ingress lifecycle events, and the decision to continue ingress
+  or finalize and commit an over-capacity session.
 - Session completion synchronizes its immutable receipt before removing active
   files. Concurrent readers must treat a journal that disappears after
   enumeration as a completed lifecycle transition, not as storage corruption

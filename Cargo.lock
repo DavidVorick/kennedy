@@ -2095,6 +2095,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-history-ingress-context"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0fd3e7ebf25c5cb6b49c73178b5742d761e45736e3f72f903ac723a25500258"
+dependencies = [
+ "anyhow",
+ "kcode-session-history",
+]
+
+[[package]]
 name = "kcode-intelligence-router"
 version = "0.2.1"
 dependencies = [
@@ -2137,13 +2147,16 @@ dependencies = [
 
 [[package]]
 name = "kcode-kweb-context"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d12d5cec8d389104d84054a5371cec4e8375c2a75b1128ec673404079be92b09"
+checksum = "dd481abe8245ca215e60bd0a50cd491ae7511e8af2d77ebb63ed0580bbdf322b"
 dependencies = [
+ "hex",
  "kcode-kweb-db",
+ "kcode-session-history",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2330,6 +2343,7 @@ dependencies = [
  "kcode-commit-session",
  "kcode-credential-vault",
  "kcode-dev-tools",
+ "kcode-history-ingress-context",
  "kcode-intelligence-router",
  "kcode-kmap",
  "kcode-kmap-size",
