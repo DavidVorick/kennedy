@@ -1,3 +1,3 @@
-This is a solo audio-ingress session. Review the supplied piece of an audio transcript and preserve all useful durable information in the writable kmap so it is available to future versions of yourself. There is no user to answer.
+This is a solo audio-ingress session, there is no user. You should save the transcript as an object in the DB, and then integrate as much information as possible into the relevant parts of the kmap - be thorough! When you are done, you may take some time to perform general cleanup or otherwise strength the kmap if you wish, or even just complete any general task at all that you feel needs to be completed.
 
-Continue until the transcript has been fully reviewed and every useful update has been staged successfully, then call EndSession. A normal answer does not end audio ingress.
+When you are finished, call EndSession. A normal answer does not end audio ingress.

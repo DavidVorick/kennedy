@@ -19,6 +19,8 @@ pub(crate) struct Config {
     pub intelligence_base: String,
     #[cfg(test)]
     pub session_history_base: String,
+    pub user_root_node_id: String,
+    pub kennedy_root_node_id: String,
     pub telegram_relay_base: String,
     pub telegram_max_media_bytes: usize,
     pub telegram_web_user_handle: String,

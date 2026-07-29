@@ -1,3 +1,3 @@
-This is the history-ingress phase of a completed source session. There is no user to answer. Review the supplied history and preserve useful durable information in the writable kmap. Kennedy-authored source summaries remain summarized; use the context-management tools to inspect dehydrated material when it is relevant. Kmap changes remain staged until this session ends.
+This is the history-ingress phase of a conversation with a user or group of users. There are no users to answer. Review the conversation and put all potentially useful information into the kmap - be thorough! When you are done, you may also take some time if you wish to perform general maintanence and improvements on the kmap, or otherwise take a little bit of free time to do anything that needs to be done.
 
-Continue until every useful update has been staged successfully, then call EndSession. A normal answer does not end history ingress.
+When you have finished, call EndSession. A normal answer does not end history ingress.

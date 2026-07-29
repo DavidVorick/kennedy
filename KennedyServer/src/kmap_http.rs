@@ -1,11 +1,4 @@
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::{
-    collections::HashSet,
-    path::Path as FilePath,
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, path::Path as FilePath, str::FromStr};
 
 use anyhow::Context;
 use axum::{
@@ -17,25 +10,19 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chrono::{DateTime, Utc};
-#[cfg(test)]
-use kcode_commit_session::PlannedNode;
-use kcode_commit_session::{CommitReceipt, CommitRequest, ErrorKind as CommitErrorKind};
+use chrono::Utc;
+use kcode_kmap::{ErrorKind as KmapErrorKind, Kmap};
 use kcode_kweb_db::{
     Config, Error as KwebError, KwebDb, Node, NodeData, NodeId, ObjectId, Owner, Provenance,
 };
 use kcode_server_object_envelopes::{
-    StoredFile, StoredProvenance, decode_file, decode_provenance, encode_file, encode_provenance,
-    sanitize_file_name,
+    StoredFile, StoredProvenance, decode_file, decode_provenance, sanitize_file_name,
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tower_http::trace::TraceLayer;
 
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
-const MAX_EMBEDDED_PROVENANCE_BYTES: usize = 1024 * 1024;
 const KUI_LOADER_MODULE: &str = "/lib/kcode-kui-loader/v0.1";
 const KUI_LOADER_PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -62,245 +49,19 @@ pub(crate) struct SystemRoots {
 
 #[derive(Clone)]
 pub(crate) struct Service {
-    database: Arc<KwebDb>,
+    kmap: Kmap,
     roots: SystemRoots,
-    receipts: Arc<Mutex<Connection>>,
-    receipt_database: std::path::PathBuf,
 }
 
 impl Service {
-    pub(crate) fn new(
-        database: KwebDb,
-        roots: SystemRoots,
-        identity_database: &FilePath,
-    ) -> anyhow::Result<Self> {
-        let receipts = Connection::open(identity_database).with_context(|| {
-            format!(
-                "opening identity database {} for Kmap idempotency receipts",
-                identity_database.display()
-            )
-        })?;
-        receipts.execute_batch("PRAGMA busy_timeout=5000;")?;
-        Ok(Self {
-            database: Arc::new(database),
-            roots,
-            receipts: Arc::new(Mutex::new(receipts)),
-            receipt_database: identity_database.to_path_buf(),
-        })
-    }
-
-    pub(crate) async fn get_json(&self, path: &str) -> Result<Value, ApiError> {
-        let state = State(self.clone());
-        match path {
-            "/api/v1/kmap/health" => {
-                let Json(value) = health(state).await?;
-                Ok(value)
-            }
-            "/api/v1/kmap/roots" => {
-                let Json(value) = get_roots(state).await;
-                Ok(value)
-            }
-            _ if path.starts_with("/api/v1/kmap/nodes/") && path.ends_with("/history") => {
-                let id = path
-                    .trim_start_matches("/api/v1/kmap/nodes/")
-                    .trim_end_matches("/history");
-                let Json(value) = get_history(state, Path(id.into())).await?;
-                Ok(value)
-            }
-            _ if path.starts_with("/api/v1/kmap/nodes/") => {
-                let id = path.trim_start_matches("/api/v1/kmap/nodes/");
-                let Json(value) = get_node(state, Path(id.into())).await?;
-                Ok(value)
-            }
-            _ if path.starts_with("/api/v1/kmap/provenance/") => {
-                let id = path.trim_start_matches("/api/v1/kmap/provenance/");
-                let Json(value) = get_provenance(state, Path(id.into())).await?;
-                Ok(value)
-            }
-            _ if path.starts_with("/api/v1/session-history/") => {
-                let id = path.trim_start_matches("/api/v1/session-history/");
-                let id = parse_object_id(id)?;
-                let bytes = self.database.get_object(id)?;
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    ApiError::internal(format!(
-                        "session archive object {id} is not valid JSON: {error}"
-                    ))
-                })
-            }
-            _ => Err(ApiError::not_found("Kmap resource not found.")),
-        }
-    }
-
-    pub(crate) async fn post_json(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        let state = State(self.clone());
-        match path {
-            "/api/v1/kmap/provenance" => {
-                let (_, Json(value)) = create_provenance(
-                    state,
-                    Json(
-                        serde_json::from_value(body)
-                            .map_err(|error| ApiError::invalid(error.to_string()))?,
-                    ),
-                )
-                .await?;
-                Ok(value)
-            }
-            "/api/v1/kmap/nodes" => {
-                let (_, Json(value)) = create_node(
-                    state,
-                    Json(
-                        serde_json::from_value(body)
-                            .map_err(|error| ApiError::invalid(error.to_string()))?,
-                    ),
-                )
-                .await?;
-                Ok(value)
-            }
-            _ => Err(ApiError::not_found("Kmap resource not found.")),
-        }
-    }
-
-    pub(crate) async fn put_json(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        let id = path
-            .strip_prefix("/api/v1/kmap/nodes/")
-            .filter(|id| !id.contains('/'))
-            .ok_or_else(|| ApiError::not_found("Kmap node not found."))?;
-        let Json(value) = update_node(
-            State(self.clone()),
-            Path(id.into()),
-            Json(
-                serde_json::from_value(body)
-                    .map_err(|error| ApiError::invalid(error.to_string()))?,
-            ),
-        )
-        .await?;
-        Ok(value)
+    pub(crate) fn new(kmap: Kmap, roots: SystemRoots) -> Self {
+        Self { kmap, roots }
     }
 
     pub(crate) fn get_file(&self, id: &str) -> Result<StoredFile, ApiError> {
         let id = parse_object_id(id)?;
-        let bytes = self.database.get_object(id)?;
+        let bytes = self.kmap.get_object(id)?;
         decode_file(id, bytes).map_err(ApiError::internal)
-    }
-
-    pub(crate) fn save_rust_binary_object(&self, bytes: Vec<u8>) -> Result<String, ApiError> {
-        let mut transaction = self.database.start_transaction(Provenance {
-            author: "Kennedy".into(),
-            source: "kennedy-rust-binary".into(),
-            source_created_at: Utc::now(),
-            data: "Output payload from a managed Rust-binary call.".into(),
-        })?;
-        let id = transaction.create_object(bytes)?;
-        transaction.finalize()?;
-        Ok(id.to_string())
-    }
-
-    pub(crate) fn save_generated_image(
-        &self,
-        bytes: Vec<u8>,
-        file_name: &str,
-        media_type: &str,
-        model: &str,
-    ) -> Result<String, ApiError> {
-        let bytes = encode_file(
-            "generated-image",
-            Some(file_name),
-            media_type,
-            Some("image"),
-            bytes,
-        )
-        .map_err(ApiError::internal)?;
-        let mut transaction = self.database.start_transaction(Provenance {
-            author: model.into(),
-            source: "kennedy-generated-image".into(),
-            source_created_at: Utc::now(),
-            data: "Image generated or modified through Kennedy intelligence.".into(),
-        })?;
-        let id = transaction.create_object(bytes)?;
-        transaction.finalize()?;
-        Ok(id.to_string())
-    }
-
-    pub(crate) fn commit_session(&self, request: CommitRequest) -> Result<CommitReceipt, ApiError> {
-        // All Kmap mutations share this lane. The library owns the session
-        // receipt connection, while this guard preserves Kennedy's scheduling
-        // relationship with its other idempotent Kweb mutations.
-        let _receipt_lane = self
-            .receipts
-            .lock()
-            .map_err(|_| ApiError::internal("Kmap idempotency mutex is poisoned"))?;
-        kcode_commit_session::commit_session(&self.database, &self.receipt_database, request)
-            .map_err(ApiError::from)
-    }
-
-    fn with_idempotency(
-        &self,
-        idempotency_id: &str,
-        operation: &'static str,
-        request_sha256: [u8; 32],
-        mutation: impl FnOnce() -> Result<String, ApiError>,
-    ) -> Result<String, ApiError> {
-        validate_idempotency_id(idempotency_id)?;
-        let receipts = self
-            .receipts
-            .lock()
-            .map_err(|_| ApiError::internal("Kmap idempotency mutex is poisoned"))?;
-        let existing = receipts
-            .query_row(
-                "SELECT operation,request_sha256,result_id
-                 FROM kmap_idempotency_receipts WHERE idempotency_id=?1",
-                [idempotency_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(ApiError::internal)?;
-        if let Some((stored_operation, stored_hash, result_id)) = existing {
-            if stored_operation != operation || stored_hash.as_slice() != request_sha256 {
-                return Err(ApiError::conflict(
-                    "idempotency_id was already used for a different Kmap mutation",
-                ));
-            }
-            return result_id.ok_or_else(|| {
-                ApiError::conflict(
-                    "a prior Kmap mutation with this idempotency_id has an unknown outcome; offline recovery is required",
-                )
-            });
-        }
-
-        receipts
-            .execute(
-                "INSERT INTO kmap_idempotency_receipts(
-                     idempotency_id,operation,request_sha256,result_id,started_at,committed_at
-                 ) VALUES(?1,?2,?3,NULL,?4,NULL)",
-                params![
-                    idempotency_id,
-                    operation,
-                    request_sha256.as_slice(),
-                    Utc::now().to_rfc3339(),
-                ],
-            )
-            .map_err(ApiError::internal)?;
-        let result_id = mutation()?;
-        let updated = receipts
-            .execute(
-                "UPDATE kmap_idempotency_receipts
-                 SET result_id=?2,committed_at=?3
-                 WHERE idempotency_id=?1 AND result_id IS NULL",
-                params![idempotency_id, &result_id, Utc::now().to_rfc3339()],
-            )
-            .map_err(ApiError::internal)?;
-        if updated != 1 {
-            return Err(ApiError::internal(
-                "Kmap idempotency receipt disappeared during mutation",
-            ));
-        }
-        Ok(result_id)
     }
 }
 
@@ -366,12 +127,12 @@ impl From<KwebError> for ApiError {
     }
 }
 
-impl From<kcode_commit_session::Error> for ApiError {
-    fn from(error: kcode_commit_session::Error) -> Self {
+impl From<kcode_kmap::Error> for ApiError {
+    fn from(error: kcode_kmap::Error) -> Self {
         match error.kind() {
-            CommitErrorKind::InvalidInput => Self::invalid(error.to_string()),
-            CommitErrorKind::NotFound => Self::not_found(error.to_string()),
-            CommitErrorKind::Conflict => Self::conflict(error.to_string()),
+            KmapErrorKind::InvalidInput => Self::invalid(error.to_string()),
+            KmapErrorKind::NotFound => Self::not_found(error.to_string()),
+            KmapErrorKind::Conflict => Self::conflict(error.to_string()),
             _ => Self::internal(error),
         }
     }
@@ -387,53 +148,11 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub(crate) struct ArtifactInput {
-    pub original_filename: String,
-    pub media_type: String,
-    pub data: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct CreateNodeRequest {
-    idempotency_id: String,
-    provenance_id: String,
-    owner_node_id: String,
-    model_attribution: String,
-    short_name: String,
-    short_description: String,
-    long_description: String,
-    #[serde(default)]
-    fixed_connections: Vec<String>,
-    #[serde(default)]
-    recent_connections: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct UpdateNodeRequest {
-    idempotency_id: String,
-    provenance_id: String,
-    owner_node_id: String,
-    model_attribution: String,
-    short_name: String,
-    short_description: String,
-    long_description: String,
-    fixed_connections: Vec<String>,
-    recent_connections: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct CreateProvenanceRequest {
-    idempotency_id: String,
-    data: String,
-    source: String,
-    source_created_at: String,
-}
-
 pub(crate) fn initialize(
     kweb_root: &FilePath,
     config: Config,
     identity_database: &FilePath,
-) -> anyhow::Result<(KwebDb, SystemRoots)> {
+) -> anyhow::Result<(Kmap, SystemRoots)> {
     let mut identity = Connection::open(identity_database).with_context(|| {
         format!(
             "opening identity database {} for system roots",
@@ -446,15 +165,6 @@ pub(crate) fn initialize(
              role TEXT PRIMARY KEY CHECK(role IN ('user','kennedy')),
              root_node_id TEXT NOT NULL UNIQUE CHECK(length(root_node_id)=8),
              created_at TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS kmap_idempotency_receipts (
-             idempotency_id TEXT PRIMARY KEY CHECK(length(idempotency_id)=32),
-             operation TEXT NOT NULL,
-             request_sha256 BLOB NOT NULL CHECK(length(request_sha256)=32),
-             result_id TEXT CHECK(result_id IS NULL OR length(result_id)=8),
-             started_at TEXT NOT NULL,
-             committed_at TEXT,
-             CHECK((result_id IS NULL) = (committed_at IS NULL))
          );",
     )?;
     let database = KwebDb::open(kweb_root, config).map_err(anyhow::Error::new)?;
@@ -512,7 +222,10 @@ pub(crate) fn initialize(
     database
         .get_node(roots.kennedy)
         .map_err(anyhow::Error::new)?;
-    Ok((database, roots))
+    let kmap = Kmap::open(database, identity_database)
+        .map_err(anyhow::Error::new)
+        .context("opening Kmap application service")?;
+    Ok((kmap, roots))
 }
 
 fn system_root(identity: &Connection, role: &str) -> anyhow::Result<Option<String>> {
@@ -611,8 +324,8 @@ async fn set_default_cache_control(mut response: Response) -> Response {
 }
 
 async fn health(State(state): State<Service>) -> Result<Json<Value>, ApiError> {
-    state.database.get_node(state.roots.user)?;
-    state.database.get_node(state.roots.kennedy)?;
+    state.kmap.get_node(state.roots.user)?;
+    state.kmap.get_node(state.roots.kennedy)?;
     Ok(Json(json!({"service":"kmap","status":"ok"})))
 }
 
@@ -623,43 +336,12 @@ async fn get_roots(State(state): State<Service>) -> Json<Value> {
     }))
 }
 
-async fn create_provenance(
-    State(state): State<Service>,
-    Json(input): Json<CreateProvenanceRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let source_created_at = parse_time(&input.source_created_at)?;
-    let digest = provenance_request_digest(
-        "create_provenance",
-        &input.data,
-        &input.source,
-        source_created_at,
-        None,
-        &[],
-    );
-    let id = state.with_idempotency(&input.idempotency_id, "create_provenance", digest, || {
-        let mut transaction = state
-            .database
-            .start_transaction(storage_provenance(&input.source, source_created_at))?;
-        let envelope = StoredProvenance {
-            data: input.data,
-            source: input.source,
-            source_created_at,
-            artifacts: Vec::new(),
-        };
-        let id =
-            transaction.create_object(encode_provenance(&envelope).map_err(ApiError::internal)?)?;
-        transaction.finalize()?;
-        Ok(id.to_string())
-    })?;
-    Ok((StatusCode::CREATED, Json(json!({"id":id.to_string()}))))
-}
-
 async fn get_provenance(
     State(state): State<Service>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = parse_object_id(&id)?;
-    let provenance = load_provenance(&state.database, id)?;
+    let provenance = load_provenance(&state.kmap, id)?;
     Ok(Json(provenance_response(&provenance)))
 }
 
@@ -668,7 +350,7 @@ async fn get_session_archive(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = parse_object_id(&id)?;
-    let bytes = state.database.get_object(id)?;
+    let bytes = state.kmap.get_object(id)?;
     let archive = serde_json::from_slice(&bytes).map_err(|error| {
         ApiError::internal(format!(
             "session archive object {id} is not valid JSON: {error}"
@@ -733,93 +415,13 @@ fn ascii_response_file_name(value: &str) -> String {
     }
 }
 
-async fn create_node(
-    State(state): State<Service>,
-    Json(input): Json<CreateNodeRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let provenance_id = parse_object_id(&input.provenance_id)?;
-    let data = NodeData {
-        short_name: input.short_name,
-        short_description: input.short_description,
-        long_description: input.long_description,
-        owner: parse_owner(&input.owner_node_id)?,
-        fixed_connections: parse_node_ids(&input.fixed_connections)?,
-        recent_connections: parse_node_ids(&input.recent_connections)?,
-        objects: Vec::new(),
-    };
-    let digest = node_request_digest(
-        "create_node",
-        None,
-        provenance_id,
-        &input.model_attribution,
-        &data,
-    );
-    let id = state.with_idempotency(&input.idempotency_id, "create_node", digest, || {
-        let provenance = load_provenance(&state.database, provenance_id)?;
-        let mut transaction = state.database.start_transaction(transaction_provenance(
-            &provenance,
-            provenance_id,
-            input.model_attribution,
-        ))?;
-        let id = transaction.create_node(data)?;
-        transaction.finalize()?;
-        Ok(id.to_string())
-    })?;
-    let id = parse_node_id(&id)?;
-    let node = state.database.get_node(id)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({"node":node_response(&state.database, &node)?})),
-    ))
-}
-
 async fn get_node(
     State(state): State<Service>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = parse_node_id(&id)?;
-    let node = state.database.get_node(id)?;
-    Ok(Json(node_response(&state.database, &node)?))
-}
-
-async fn update_node(
-    State(state): State<Service>,
-    Path(id): Path<String>,
-    Json(input): Json<UpdateNodeRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let id = parse_node_id(&id)?;
-    let provenance_id = parse_object_id(&input.provenance_id)?;
-    let data = NodeData {
-        short_name: input.short_name,
-        short_description: input.short_description,
-        long_description: input.long_description,
-        owner: parse_owner(&input.owner_node_id)?,
-        fixed_connections: parse_node_ids(&input.fixed_connections)?,
-        recent_connections: parse_node_ids(&input.recent_connections)?,
-        objects: Vec::new(),
-    };
-    let digest = node_request_digest(
-        "update_node",
-        Some(id),
-        provenance_id,
-        &input.model_attribution,
-        &data,
-    );
-    state.with_idempotency(&input.idempotency_id, "update_node", digest, || {
-        let provenance = load_provenance(&state.database, provenance_id)?;
-        let mut data = data;
-        data.objects = state.database.get_node(id)?.data.objects;
-        let mut transaction = state.database.start_transaction(transaction_provenance(
-            &provenance,
-            provenance_id,
-            input.model_attribution,
-        ))?;
-        transaction.update_node(id, data)?;
-        transaction.finalize()?;
-        Ok(id.to_string())
-    })?;
-    let node = state.database.get_node(id)?;
-    Ok(Json(json!({"node":node_response(&state.database, &node)?})))
+    let node = state.kmap.get_node(id)?;
+    Ok(Json(node_response(&state.kmap, &node)?))
 }
 
 async fn get_history(
@@ -827,7 +429,7 @@ async fn get_history(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = parse_node_id(&id)?;
-    let history = state.database.get_node_history(id)?;
+    let history = state.kmap.get_node_history(id)?;
     let entries = history
         .entries
         .into_iter()
@@ -853,7 +455,7 @@ async fn get_history(
     })))
 }
 
-fn node_response(database: &KwebDb, node: &Node) -> Result<Value, ApiError> {
+fn node_response(kmap: &Kmap, node: &Node) -> Result<Value, ApiError> {
     let mut seen = HashSet::new();
     let mut connection_summaries = Vec::new();
     for connection_id in node
@@ -866,7 +468,7 @@ fn node_response(database: &KwebDb, node: &Node) -> Result<Value, ApiError> {
         if !seen.insert(connection_id) {
             continue;
         }
-        let connection = database.get_node(connection_id)?;
+        let connection = kmap.get_node(connection_id)?;
         connection_summaries.push(json!({
             "id":connection.id.to_string(),
             "short_name":connection.data.short_name,
@@ -909,59 +511,10 @@ fn provenance_response(provenance: &StoredProvenance) -> Value {
     })
 }
 
-fn storage_provenance(source: &str, source_created_at: DateTime<Utc>) -> Provenance {
-    Provenance {
-        author: "kennedy-provenance".into(),
-        source: if source.trim().is_empty() {
-            "kennedy".into()
-        } else {
-            source.into()
-        },
-        source_created_at,
-        data: "Stored Kennedy provenance object.".into(),
-    }
-}
-
-fn transaction_provenance(
-    stored: &StoredProvenance,
-    object_id: ObjectId,
-    author: String,
-) -> Provenance {
-    let data = if stored.data.len() <= MAX_EMBEDDED_PROVENANCE_BYTES {
-        stored.data.clone()
-    } else {
-        format!("Kennedy provenance is stored in object {object_id}.")
-    };
-    Provenance {
-        author,
-        source: stored.source.clone(),
-        source_created_at: stored.source_created_at,
-        data,
-    }
-}
-
-fn load_provenance(database: &KwebDb, id: ObjectId) -> Result<StoredProvenance, ApiError> {
-    let bytes = database.get_object(id)?;
+fn load_provenance(kmap: &Kmap, id: ObjectId) -> Result<StoredProvenance, ApiError> {
+    let bytes = kmap.get_object(id)?;
     decode_provenance(&bytes)
         .map_err(|error| ApiError::internal(format!("invalid provenance object {id}: {error}")))
-}
-
-fn parse_time(value: &str) -> Result<DateTime<Utc>, ApiError> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|_| ApiError::invalid("source_created_at must be RFC 3339"))
-}
-
-fn parse_owner(value: &str) -> Result<Owner, ApiError> {
-    match value {
-        "self" => Ok(Owner::SelfNode),
-        "unowned" => Ok(Owner::Unowned),
-        _ => Ok(Owner::Node(parse_node_id(value)?)),
-    }
-}
-
-fn parse_node_ids(values: &[String]) -> Result<Vec<NodeId>, ApiError> {
-    values.iter().map(|value| parse_node_id(value)).collect()
 }
 
 fn parse_node_id(value: &str) -> Result<NodeId, ApiError> {
@@ -972,100 +525,13 @@ fn parse_object_id(value: &str) -> Result<ObjectId, ApiError> {
     ObjectId::from_str(value).map_err(ApiError::from)
 }
 
-fn validate_idempotency_id(value: &str) -> Result<(), ApiError> {
-    if value.len() != 32
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(ApiError::invalid(
-            "idempotency_id must encode 16 bytes as lowercase hexadecimal",
-        ));
-    }
-    Ok(())
-}
-
-struct RequestDigest(Sha256);
-
-impl RequestDigest {
-    fn new(operation: &str) -> Self {
-        let mut hash = Sha256::new();
-        hash.update(b"kennedy kmap idempotency v1\0");
-        let mut value = Self(hash);
-        value.field(operation.as_bytes());
-        value
-    }
-
-    fn field(&mut self, bytes: &[u8]) {
-        self.0.update((bytes.len() as u64).to_be_bytes());
-        self.0.update(bytes);
-    }
-
-    fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
-    }
-}
-
-fn provenance_request_digest(
-    operation: &str,
-    data: &str,
-    source: &str,
-    source_created_at: DateTime<Utc>,
-    data_filename: Option<&str>,
-    artifacts: &[ArtifactInput],
-) -> [u8; 32] {
-    let mut hash = RequestDigest::new(operation);
-    hash.field(data.as_bytes());
-    hash.field(source.as_bytes());
-    hash.field(&source_created_at.timestamp().to_be_bytes());
-    hash.field(&source_created_at.timestamp_subsec_nanos().to_be_bytes());
-    hash.field(data_filename.unwrap_or("").as_bytes());
-    hash.field(&(artifacts.len() as u64).to_be_bytes());
-    for artifact in artifacts {
-        hash.field(artifact.original_filename.as_bytes());
-        hash.field(artifact.media_type.as_bytes());
-        hash.field(&artifact.data);
-    }
-    hash.finish()
-}
-
-fn node_request_digest(
-    operation: &str,
-    id: Option<NodeId>,
-    provenance_id: ObjectId,
-    model_attribution: &str,
-    data: &NodeData,
-) -> [u8; 32] {
-    let mut hash = RequestDigest::new(operation);
-    hash.field(&id.map(NodeId::to_bytes).unwrap_or([0; 6]));
-    hash.field(&provenance_id.to_bytes());
-    hash.field(model_attribution.as_bytes());
-    hash.field(data.short_name.as_bytes());
-    hash.field(data.short_description.as_bytes());
-    hash.field(data.long_description.as_bytes());
-    match data.owner {
-        Owner::Unowned => hash.field(&[0]),
-        Owner::SelfNode => hash.field(&[1]),
-        Owner::Node(owner) => {
-            hash.field(&[2]);
-            hash.field(&owner.to_bytes());
-        }
-    }
-    hash.field(&(data.fixed_connections.len() as u64).to_be_bytes());
-    for connection in &data.fixed_connections {
-        hash.field(&connection.to_bytes());
-    }
-    hash.field(&(data.recent_connections.len() as u64).to_be_bytes());
-    for connection in &data.recent_connections {
-        hash.field(&connection.to_bytes());
-    }
-    hash.finish()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use kcode_kweb_db::{NoopGossip, WriterId};
+    use kcode_server_object_envelopes::encode_file;
 
     #[tokio::test]
     async fn root_page_loads_the_floating_kui_patch_line_without_caching() {
@@ -1098,11 +564,11 @@ mod tests {
     }
 
     #[test]
-    fn initializes_canonical_system_roots() {
+    fn initializes_canonical_system_roots_and_hands_database_to_kmap() {
         let directory =
             std::env::temp_dir().join(format!("kennedy-kweb-http-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let (database, roots) = initialize(
+        let (kmap, roots) = initialize(
             &directory.join("kweb"),
             config(),
             &directory.join("users.sqlite3"),
@@ -1110,62 +576,9 @@ mod tests {
         .unwrap();
         assert_eq!(roots.user.to_string().len(), 8);
         assert_eq!(roots.kennedy.to_string().len(), 8);
-        database.get_node(roots.user).unwrap();
-        database.get_node(roots.kennedy).unwrap();
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn rust_binary_payloads_are_stored_raw_and_file_envelopes_decode_to_exact_bytes() {
-        let directory = std::env::temp_dir().join(format!(
-            "kennedy-rust-binary-objects-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let identity = directory.join("users.sqlite3");
-        let (database, roots) = initialize(&directory.join("kweb"), config(), &identity).unwrap();
-        let service = Service::new(database, roots, &identity).unwrap();
-
-        let object_id = service
-            .save_rust_binary_object(b"%PDF-1.7\nexact binary output\n".to_vec())
-            .unwrap();
-        assert_eq!(object_id.len(), 8);
-        let output = service.get_file(&object_id).unwrap();
-        assert_eq!(output.bytes, b"%PDF-1.7\nexact binary output\n");
-        assert_eq!(output.media_type, "application/pdf");
-        assert_eq!(output.file_name, format!("{object_id}.pdf"));
-        assert!(!output.enveloped);
-
-        let envelope = encode_file(
-            "pending:1",
-            Some("original.jpg"),
-            "image/jpeg",
-            Some("photo"),
-            b"\xff\xd8\xffexact original".to_vec(),
-        )
-        .unwrap();
-        let object_id = service.save_rust_binary_object(envelope).unwrap();
-        let input = service.get_file(&object_id).unwrap();
-        assert_eq!(input.bytes, b"\xff\xd8\xffexact original");
-        assert!(input.enveloped);
-
-        let generated_id = service
-            .save_generated_image(
-                b"\x89PNG\r\ngenerated".to_vec(),
-                "generated-image.png",
-                "image/png",
-                "gpt-image-2",
-            )
-            .unwrap();
-        let generated = service.get_file(&generated_id).unwrap();
-        assert_eq!(generated.bytes, b"\x89PNG\r\ngenerated");
-        assert_eq!(generated.file_name, "generated-image.png");
-        assert_eq!(generated.media_type, "image/png");
-        assert_eq!(generated.transport_kind.as_deref(), Some("image"));
-        assert!(generated.enveloped);
-
-        drop(service);
+        kmap.get_node(roots.user).unwrap();
+        kmap.get_node(roots.kennedy).unwrap();
+        drop(kmap);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1191,301 +604,5 @@ mod tests {
             response.headers()[header::CONTENT_DISPOSITION],
             "inline; filename=\"r_sum_.pdf\""
         );
-    }
-
-    #[tokio::test]
-    async fn application_idempotency_replays_without_duplicate_kweb_transactions() {
-        let directory =
-            std::env::temp_dir().join(format!("kennedy-kweb-receipts-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let identity = directory.join("users.sqlite3");
-        let (database, roots) = initialize(&directory.join("kweb"), config(), &identity).unwrap();
-        let service = Service::new(database, roots, &identity).unwrap();
-
-        let provenance_request = json!({
-            "idempotency_id":"00000000000000000000000000000001",
-            "data":"source material",
-            "source":"test",
-            "source_created_at":"2026-07-23T00:00:00Z",
-        });
-        let first = service
-            .post_json("/api/v1/kmap/provenance", provenance_request.clone())
-            .await
-            .unwrap();
-        let replay = service
-            .post_json("/api/v1/kmap/provenance", provenance_request)
-            .await
-            .unwrap();
-        assert_eq!(first, replay);
-
-        let conflicting = service
-            .post_json(
-                "/api/v1/kmap/provenance",
-                json!({
-                    "idempotency_id":"00000000000000000000000000000001",
-                    "data":"different source material",
-                    "source":"test",
-                    "source_created_at":"2026-07-23T00:00:00Z",
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(conflicting.status, StatusCode::CONFLICT);
-
-        let node_request = json!({
-            "idempotency_id":"00000000000000000000000000000002",
-            "provenance_id":first["id"],
-            "owner_node_id":"self",
-            "model_attribution":"test",
-            "short_name":"Test Node",
-            "short_description":"",
-            "long_description":"",
-            "fixed_connections":[],
-            "recent_connections":[],
-        });
-        let first_node = service
-            .post_json("/api/v1/kmap/nodes", node_request.clone())
-            .await
-            .unwrap();
-        let replayed_node = service
-            .post_json("/api/v1/kmap/nodes", node_request)
-            .await
-            .unwrap();
-        assert_eq!(first_node, replayed_node);
-        let node_id = first_node["node"]["id"].as_str().unwrap();
-        let history = service
-            .get_json(&format!("/api/v1/kmap/nodes/{node_id}/history"))
-            .await
-            .unwrap();
-        assert_eq!(history["entries"].as_array().unwrap().len(), 1);
-
-        drop(service);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn one_session_commit_supports_circular_creates_with_archive_objects_and_updates() {
-        let directory =
-            std::env::temp_dir().join(format!("kennedy-session-commit-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let identity = directory.join("users.sqlite3");
-        let (database, roots) = initialize(&directory.join("kweb"), config(), &identity).unwrap();
-        let service = Service::new(database, roots, &identity).unwrap();
-        let root = service.database.get_node(roots.user).unwrap();
-        let pending_node = "pending:7".to_owned();
-        let circular_node = "pending:9".to_owned();
-        let pending_object = "pending:8".to_owned();
-        let result = service
-            .commit_session(CommitRequest {
-                idempotency_key: "session-test".into(),
-                author: "test-model".into(),
-                source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                archive: format!("{{\"session\":\"archive\",\"object\":\"{pending_object}\"}}")
-                    .into_bytes(),
-                objects: BTreeMap::from([(
-                    pending_object.clone(),
-                    encode_file(
-                        &pending_object,
-                        Some("attachment.txt"),
-                        "text/plain",
-                        Some("document"),
-                        b"attachment".to_vec(),
-                    )
-                    .unwrap(),
-                )]),
-                creates: BTreeMap::from([
-                    (
-                        pending_node.clone(),
-                        PlannedNode {
-                            short_name: "Created Memory".into(),
-                            short_description: String::new(),
-                            long_description: format!(
-                                "Created in one session transaction with object {pending_object}."
-                            ),
-                            owner: roots.user.to_string(),
-                            fixed_connections: Vec::new(),
-                            recent_connections: vec![roots.user.to_string(), circular_node.clone()],
-                            objects: vec![pending_object.clone()],
-                            attach_session_archive: true,
-                        },
-                    ),
-                    (
-                        circular_node.clone(),
-                        PlannedNode {
-                            short_name: "Circular Memory".into(),
-                            short_description: String::new(),
-                            long_description: "References the other created node.".into(),
-                            owner: roots.user.to_string(),
-                            fixed_connections: Vec::new(),
-                            recent_connections: vec![pending_node.clone()],
-                            objects: Vec::new(),
-                            attach_session_archive: false,
-                        },
-                    ),
-                ]),
-                updates: BTreeMap::from([(
-                    roots.user,
-                    PlannedNode {
-                        short_name: root.data.short_name,
-                        short_description: root.data.short_description,
-                        long_description: root.data.long_description,
-                        owner: "self".into(),
-                        fixed_connections: root
-                            .data
-                            .fixed_connections
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                        recent_connections: vec![pending_node.clone()],
-                        objects: root.data.objects.iter().map(ToString::to_string).collect(),
-                        attach_session_archive: true,
-                    },
-                )]),
-            })
-            .unwrap();
-        let created_id = result.node_ids[&pending_node];
-        let circular_id = result.node_ids[&circular_node];
-        let created = service.database.get_node(created_id).unwrap();
-        let circular = service.database.get_node(circular_id).unwrap();
-        let updated_root = service.database.get_node(roots.user).unwrap();
-        assert_eq!(
-            created.data.recent_connections,
-            vec![roots.user, circular_id]
-        );
-        assert_eq!(circular.data.recent_connections, vec![created_id]);
-        assert_eq!(updated_root.data.recent_connections, vec![created_id]);
-        assert!(created.data.objects.contains(&result.session_object_id));
-        assert_eq!(
-            created.data.long_description,
-            format!(
-                "Created in one session transaction with object {}.",
-                result.object_ids[&pending_object]
-            )
-        );
-        assert_eq!(
-            service
-                .get_file(&result.object_ids[&pending_object].to_string())
-                .unwrap()
-                .bytes,
-            b"attachment"
-        );
-        let archive = service
-            .database
-            .get_object(result.session_object_id)
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&archive).unwrap()["object"],
-            result.object_ids[&pending_object].to_string()
-        );
-        drop(service);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn session_commit_preserves_legacy_node_text_outside_live_kennedy_policy() {
-        let directory = std::env::temp_dir().join(format!(
-            "kennedy-session-legacy-node-text-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let identity = directory.join("users.sqlite3");
-        let (database, roots) = initialize(&directory.join("kweb"), config(), &identity).unwrap();
-        let service = Service::new(database, roots, &identity).unwrap();
-        let pending_node = "pending:7".to_owned();
-        let long_description = std::iter::repeat_n("a", 3_001)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(long_description.chars().count() > 5_000);
-        assert!(long_description.split_whitespace().count() > 1_000);
-
-        let result = service
-            .commit_session(CommitRequest {
-                idempotency_key: "legacy-node-text".into(),
-                author: "test-model".into(),
-                source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                archive: b"{\"session\":\"sealed-before-policy-change\"}".to_vec(),
-                objects: BTreeMap::new(),
-                creates: BTreeMap::from([(
-                    pending_node.clone(),
-                    PlannedNode {
-                        short_name: String::new(),
-                        short_description: "x".repeat(201),
-                        long_description: long_description.clone(),
-                        owner: "self".into(),
-                        fixed_connections: Vec::new(),
-                        recent_connections: Vec::new(),
-                        objects: Vec::new(),
-                        attach_session_archive: true,
-                    },
-                )]),
-                updates: BTreeMap::new(),
-            })
-            .unwrap();
-        let created = service
-            .database
-            .get_node(result.node_ids[&pending_node])
-            .unwrap();
-        assert_eq!(created.data.short_name, "");
-        assert_eq!(created.data.short_description.chars().count(), 201);
-        assert_eq!(created.data.long_description, long_description);
-
-        drop(service);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn session_commit_replay_returns_the_original_receipt_without_a_second_transaction() {
-        let directory = std::env::temp_dir().join(format!(
-            "kennedy-session-commit-replay-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let identity = directory.join("users.sqlite3");
-        let kweb = directory.join("kweb");
-        let (database, roots) = initialize(&kweb, config(), &identity).unwrap();
-        let service = Service::new(database, roots, &identity).unwrap();
-        let input = CommitRequest {
-            idempotency_key: "session-replay-test".into(),
-            author: "test-model".into(),
-            source_created_at: DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            archive: b"{\"header\":{},\"events\":[]}".to_vec(),
-            objects: BTreeMap::new(),
-            creates: BTreeMap::new(),
-            updates: BTreeMap::new(),
-        };
-        let first = service.commit_session(input.clone()).unwrap();
-        let committed_length = std::fs::metadata(kweb.join("transactions.kwl"))
-            .unwrap()
-            .len();
-        service
-            .receipts
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE kmap_session_commit_receipts
-                 SET result_json=NULL,committed_at=NULL
-                 WHERE session_id='session-replay-test'",
-                [],
-            )
-            .unwrap();
-        let replay = service.commit_session(input.clone()).unwrap();
-        assert_eq!(replay.transaction_id, None);
-        assert_eq!(replay.session_object_id, first.session_object_id);
-        assert_eq!(replay.node_ids, first.node_ids);
-        assert_eq!(replay.object_ids, first.object_ids);
-        assert_eq!(
-            std::fs::metadata(kweb.join("transactions.kwl"))
-                .unwrap()
-                .len(),
-            committed_length
-        );
-        assert_eq!(service.commit_session(input).unwrap(), replay);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }

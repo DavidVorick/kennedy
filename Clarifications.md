@@ -64,6 +64,12 @@ This document records user intention with regard to Kennedy.
   layout, application validation, and model attribution.
   Kweb owns durable resource ownership, privacy evaluation, and owner-only
   mutation enforcement.
+- After KennedyServer bootstraps and validates its application-owned roots, one
+  small typed Kmap library exclusively owns the live `KwebDb` handle. That
+  library owns typed node reads, idempotent provenance and ordinary node
+  mutations, opaque object storage, and session commits; KennedyServer retains
+  root policy and genuine HTTP presentation. Do not retain a parallel database
+  handle or route same-process Kmap calls through HTTP paths or JSON values.
 - Fixed connections are deliberately placed references, not task slots or a
   priority system. Graph hygiene belongs to Kennedy; the harness should not
   silently promote or rearrange connections.
@@ -173,6 +179,19 @@ This document records user intention with regard to Kennedy.
 - Hydration, dehydration, and Kennedy-authored summaries must never destroy
   canonical content. If canonical state changes behind a compact
   representation, preserve Kennedy's representation choice and mark it stale.
+- Routine context reduction is a batch operation. `DehydrateBoxes` accepts any
+  nonempty set of distinct active box IDs, including a one-item set, validates
+  the complete selection before changing it, and dehydrates all selected boxes
+  in one call. Do not expose or retain a singular `DehydrateBox` command.
+- Kmap navigation is likewise a batch operation. `LoadNodes` accepts any
+  nonempty set of distinct canonical node IDs, including a one-item set, loads
+  the complete selection before synchronizing the shared Kweb boxes, and has no
+  fixed count limit. Do not expose or retain a singular `LoadNode` command.
+- Model-facing context control operates on boxes, not individual journal
+  events. Persisted events remain available for audit and replay, but do not
+  expose `HydrateEvent` or `DehydrateEvent` commands or create temporary
+  event-inspection boxes. Ingress-only guidance must not appear in other session
+  prompts.
 - Stateful tool results, especially complete managed-library source, should
   revise one stable box rather than repeatedly adding complete copies. Failed
   writes must not revise that box. Exact invocation arguments remain durable
@@ -183,12 +202,41 @@ This document records user intention with regard to Kennedy.
 - Do not rely on hidden provider conversation state or silent compaction.
   KennedyServer constructs the provider-visible projection, enforces capacity,
   and retains enough exact boundary data to explain what the provider received.
+- The UI's Context View is a transparent rendering of the exact UTF-8 Chatend
+  string supplied as the model input for the current state. It may render
+  newlines, tabs, and other whitespace normally for readability and may show
+  labels or a byte count outside the payload, but it must not trim, reflow,
+  annotate, unescape, or semantically reconstruct the payload itself. Provider
+  transport envelopes and JSONL request records are distinct diagnostics and
+  must never be substituted for model context. Active, history-ingress, audio,
+  Telegram, self-time, and immutable completed views derive this string through
+  the same authoritative backend projection.
 - Capacity limits should reject or end work predictably rather than silently
   dropping accepted content. History ingress may reduce initial context while
   preserving canonical material for selective inspection.
 - Treat current context occupancy and cumulative provider usage as different
   measurements. Do not present lifetime token consumption as though it were the
   amount currently occupying the model window.
+- Every Chatend exposes one continuously refreshed session status, regardless
+  of transport, session kind, or lifecycle phase (including source
+  conversation, history ingress, and completed archive). It visibly reports
+  current estimated context occupancy, the active failure-avoidance limit and
+  progress toward it, and exact cumulative cached input, non-cached input,
+  thinking, and output tokens.
+- Anchor current context occupancy to the newest input-token measurement
+  returned by intelligence after each inference. Record the exact UTF-8 byte
+  length of the rendered context at that moment, then adjust the measurement
+  by the signed change in current rendered bytes at four bytes per token as
+  boxes are added, revised, summarized, hydrated, dehydrated, or retired.
+  Before the first provider measurement, use the same four-bytes-per-token
+  approximation. Cumulative usage categories are never estimated: advance
+  them only from new provider usage results, including multiple inference
+  steps within one Kennedy turn.
+- The model-visible context footer lists stale boxes first and the context
+  budget last, so the budget is always the final line. Recalculate and attach
+  that footer after every Ktool result before allowing the provider's next
+  inference; sequential tool use must expose the remaining budget between
+  calls rather than showing only the value from the beginning of the turn.
 - Conversation sessions read the Kmap but do not mutate it. Durable graph
   changes happen in explicitly writable history-ingress, audio-ingress,
   self-time, or other backend-owned sessions.

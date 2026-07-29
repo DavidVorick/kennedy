@@ -24,6 +24,7 @@ kcode-commit-session = "=0.1.0"
 kcode-credential-vault = "=0.1.0"
 kcode-kweb-context = "=0.1.0"
 kcode-kweb-db = "1.0"
+kcode-kmap = { path = "data/kcode/kcode-rust-libs/kcode-kmap/generations/g-1d5f-18c698573a30c90f-0" }
 kcode-kmap-size = "=0.1.0"
 kcode-server-object-envelopes = "=0.1.0"
 kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-128e-18c662e17afaea2e-0" }
@@ -53,9 +54,12 @@ futures = "0.3"
 hound = "3.5"
 
 [patch.crates-io]
+kcode-agent-runtime = { path = "data/kcode/kcode-rust-libs/kcode-agent-runtime/generations/g-23f3-18c6a0bd004a0de5-6" }
+kcode-codex-runtime-v2 = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtime-v2/generations/g-23f3-18c6a0bd001b63b3-2" }
+kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-23f3-18c6a0bd003493ae-4" }
 kcode-rust-bins = { path = "data/kcode/kcode-rust-libs/kcode-rust-bins/generations/g-e5c-18c688799653cb78-0" }
 kcode-rust-libs-v2 = { path = "data/kcode/kcode-rust-libs/kcode-rust-libs-v2/generations/g-33ef-18c68a1dca33927f-0" }
-kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-22976a-18c662c16b353524-2a" }
+kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-840c-18c6a75f98f46e73-0" }
 kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-128e-18c662e17afaea2e-0" }
 
 [profile.dev]

@@ -4,7 +4,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use kcode_server_object_envelopes::StoredFile;
+use kcode_kmap::{CreateProvenance, Kmap, NodeContents, NodeWrite};
+use kcode_kweb_db::{Node, NodeId, ObjectId, Owner, Provenance};
+use kcode_server_object_envelopes::{StoredFile, StoredProvenance, decode_file, encode_file};
 use reqwest::multipart;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
@@ -12,7 +14,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-#[cfg(test)]
 use super::Config;
 use super::session::ResolvedObject;
 
@@ -20,7 +21,7 @@ const TELEGRAM_STARTUP_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(crate) struct LocalServices {
-    pub kmap: crate::kmap_http::Service,
+    pub kmap: Kmap,
     pub intelligence: kcode_intelligence_router::Intelligence,
     pub history: kcode_session_history::SessionHistory,
     pub audio: crate::audio_ingress::Service,
@@ -51,6 +52,8 @@ pub(crate) struct Api {
     services: ServiceBackend,
     history_sessions: kcode_session_history::SessionHistory,
     telegram: String,
+    user_root_node_id: String,
+    kennedy_root_node_id: String,
     telegram_user_locks: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
@@ -110,11 +113,13 @@ impl Api {
             }),
             history_sessions,
             telegram: trim_base(&config.telegram_relay_base),
+            user_root_node_id: config.user_root_node_id.clone(),
+            kennedy_root_node_id: config.kennedy_root_node_id.clone(),
             telegram_user_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
-    pub fn local(telegram_base: &str, services: LocalServices) -> anyhow::Result<Self> {
+    pub fn local(config: &Config, services: LocalServices) -> anyhow::Result<Self> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()
@@ -124,7 +129,9 @@ impl Api {
             client,
             services: ServiceBackend::Local(std::sync::Arc::new(services)),
             history_sessions,
-            telegram: trim_base(telegram_base),
+            telegram: trim_base(&config.telegram_relay_base),
+            user_root_node_id: config.user_root_node_id.clone(),
+            kennedy_root_node_id: config.kennedy_root_node_id.clone(),
             telegram_user_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -155,47 +162,33 @@ impl Api {
         self.history_sessions.open_session(metadata)
     }
 
-    pub async fn kmap_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.service_request(Method::POST, path, Some(body))
-            .await
-            .map(normalize_kmap_mutation_response)
+    pub fn kmap_node(&self, node_id: &str) -> Result<Node, ApiError> {
+        let node_id = node_id.parse::<NodeId>().map_err(local_api_error)?;
+        self.local_kmap()?.get_node(node_id).map_err(kmap_error)
     }
 
-    pub async fn kmap_get(&self, path: &str) -> Result<Value, ApiError> {
-        self.service_request(Method::GET, path, None).await
+    pub(crate) fn user_root_node_id(&self) -> &str {
+        &self.user_root_node_id
     }
 
-    pub async fn kmap_node(&self, node_id: &str) -> Result<Value, ApiError> {
-        self.kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
-            .await
-            .map(normalize_node)
+    pub(crate) fn kennedy_root_node_id(&self) -> &str {
+        &self.kennedy_root_node_id
     }
 
     pub(crate) fn commit_kweb_session(
         &self,
         input: kcode_commit_session::CommitRequest,
     ) -> Result<kcode_commit_session::CommitReceipt, ApiError> {
-        match &self.services {
-            ServiceBackend::Local(local) => local.kmap.commit_session(input).map_err(kmap_error),
-            #[cfg(test)]
-            ServiceBackend::Http(_) => Err(ApiError {
-                status: None,
-                code: "local_service_unavailable".into(),
-                message: "Session commits require the in-process Kweb service.".into(),
-            }),
-        }
+        self.local_kmap()?.commit_session(input).map_err(kmap_error)
     }
 
     pub(crate) fn kmap_file(&self, object_id: &str) -> Result<StoredFile, ApiError> {
-        match &self.services {
-            ServiceBackend::Local(local) => local.kmap.get_file(object_id).map_err(kmap_error),
-            #[cfg(test)]
-            ServiceBackend::Http(_) => Err(ApiError {
-                status: None,
-                code: "local_service_unavailable".into(),
-                message: "Object reads require the in-process Kweb service.".into(),
-            }),
-        }
+        let object_id = object_id.parse::<ObjectId>().map_err(local_api_error)?;
+        let bytes = self
+            .local_kmap()?
+            .get_object(object_id)
+            .map_err(kmap_error)?;
+        decode_file(object_id, bytes).map_err(local_api_error)
     }
 
     pub(crate) fn save_generated_image(
@@ -205,18 +198,26 @@ impl Api {
         media_type: &str,
         model: &str,
     ) -> Result<String, ApiError> {
-        match &self.services {
-            ServiceBackend::Local(local) => local
-                .kmap
-                .save_generated_image(bytes, file_name, media_type, model)
-                .map_err(kmap_error),
-            #[cfg(test)]
-            ServiceBackend::Http(_) => Err(ApiError {
-                status: None,
-                code: "local_service_unavailable".into(),
-                message: "Generated-image storage requires the in-process Kweb service.".into(),
-            }),
-        }
+        let bytes = encode_file(
+            "generated-image",
+            Some(file_name),
+            media_type,
+            Some("image"),
+            bytes,
+        )
+        .map_err(local_api_error)?;
+        self.local_kmap()?
+            .store_object(
+                Provenance {
+                    author: model.into(),
+                    source: "kennedy-generated-image".into(),
+                    source_created_at: chrono::Utc::now(),
+                    data: "Image generated or modified through Kennedy intelligence.".into(),
+                },
+                bytes,
+            )
+            .map(|id| id.to_string())
+            .map_err(kmap_error)
     }
 
     pub async fn start_agent_turn(
@@ -306,6 +307,9 @@ impl Api {
                         last_input_tokens: usage.get("last_input_tokens").and_then(Value::as_u64),
                         last_output_tokens: usage.get("last_output_tokens").and_then(Value::as_u64),
                     });
+                if let Some(usage) = usage.clone() {
+                    events.push_back(Ok(kcode_codex_runtime_v2::AgentEvent::UsageUpdated(usage)));
+                }
                 events.push_back(Ok(kcode_codex_runtime_v2::AgentEvent::Completed(
                     kcode_codex_runtime_v2::CompletedTurn {
                         thread_id: response
@@ -948,8 +952,17 @@ impl Api {
                     object_ids.push(
                         local
                             .kmap
-                            .save_rust_binary_object(bytes)
-                            .map_err(kmap_error)?,
+                            .store_object(
+                                Provenance {
+                                    author: "Kennedy".into(),
+                                    source: "kennedy-rust-binary".into(),
+                                    source_created_at: chrono::Utc::now(),
+                                    data: "Output payload from a managed Rust-binary call.".into(),
+                                },
+                                bytes,
+                            )
+                            .map_err(kmap_error)?
+                            .to_string(),
                     );
                 }
                 append_object_ids(&mut execution.text, &object_ids);
@@ -1223,52 +1236,41 @@ impl Api {
         .await
     }
 
-    pub async fn kmap_context(&self, node_id: &str) -> Result<Value, ApiError> {
-        let requested = self
-            .kmap_get(&format!("/api/v1/kmap/nodes/{node_id}"))
-            .await?;
-        let fixed_ids = fixed_connection_ids(&requested);
-        let mut seen = std::collections::HashSet::from([node_id.to_owned()]);
-        let mut fixed = Vec::with_capacity(fixed_ids.len());
-        for id in fixed_ids {
-            if seen.insert(id.clone()) {
-                fixed.push(self.kmap_get(&format!("/api/v1/kmap/nodes/{id}")).await?);
-            }
-        }
-        Ok(json!({
-            "requested_node": normalize_node(requested),
-            "fixed_connection_nodes": fixed.into_iter().map(normalize_node).collect::<Vec<_>>(),
-        }))
-    }
-
-    pub async fn bootstrap_node(&self, short_name: Option<&str>) -> Result<Value, ApiError> {
+    pub fn bootstrap_node(&self, short_name: Option<&str>) -> Result<Node, ApiError> {
         let (short_name, short_description, long_description) = bootstrap_root_metadata(short_name);
-        let provenance = self
-            .kmap_post(
-                "/api/v1/kmap/provenance",
-                json!({
-                    "idempotency_id": idempotency_id(),
-                    "data": "Automatically provisioned Kmap root node.",
-                    "source": "system-bootstrap",
-                    "source_created_at": chrono::Utc::now().to_rfc3339(),
-                }),
-            )
-            .await?;
-        self.kmap_post(
-            "/api/v1/kmap/nodes",
-            json!({
-                "idempotency_id": idempotency_id(),
-                "provenance_id": string_at(&provenance, "id")?,
-                "owner_node_id": "self",
-                "model_attribution": "system-bootstrap",
-                "short_name": short_name,
-                "short_description": short_description,
-                "long_description": long_description,
-                "fixed_connections": [],
-                "recent_connections": [],
-            }),
-        )
-        .await
+        let source_created_at = chrono::Utc::now();
+        let kmap = self.local_kmap()?;
+        let provenance_id = kmap
+            .create_provenance(CreateProvenance {
+                idempotency_id: idempotency_id(),
+                value: StoredProvenance {
+                    data: "Automatically provisioned Kmap root node.".into(),
+                    source: "system-bootstrap".into(),
+                    source_created_at,
+                    artifacts: Vec::new(),
+                },
+                storage_provenance: Provenance {
+                    author: "kennedy-provenance".into(),
+                    source: "system-bootstrap".into(),
+                    source_created_at,
+                    data: "Stored provenance for a Kennedy Kmap mutation.".into(),
+                },
+            })
+            .map_err(kmap_error)?;
+        kmap.create_node(NodeWrite {
+            idempotency_id: idempotency_id(),
+            provenance_id,
+            author: "system-bootstrap".into(),
+            contents: NodeContents {
+                short_name: short_name.into(),
+                short_description: short_description.into(),
+                long_description: long_description.into(),
+                owner: Owner::SelfNode,
+                fixed_connections: Vec::new(),
+                recent_connections: Vec::new(),
+            },
+        })
+        .map_err(kmap_error)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1449,29 +1451,15 @@ impl Api {
         }
     }
 
-    async fn service_request(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, ApiError> {
+    fn local_kmap(&self) -> Result<&Kmap, ApiError> {
         match &self.services {
-            ServiceBackend::Local(services) => {
-                let body = body.unwrap_or(Value::Null);
-                match method {
-                    Method::GET => services.kmap.get_json(path).await,
-                    Method::POST => services.kmap.post_json(path, body).await,
-                    Method::PUT => services.kmap.put_json(path, body).await,
-                    _ => Err(crate::kmap_http::ApiError {
-                        status: StatusCode::METHOD_NOT_ALLOWED,
-                        code: "method_not_allowed",
-                        message: "Unsupported direct Kmap operation.".into(),
-                    }),
-                }
-                .map_err(kmap_error)
-            }
+            ServiceBackend::Local(services) => Ok(&services.kmap),
             #[cfg(test)]
-            ServiceBackend::Http(bases) => self.request(method, &bases.kweb, path, body).await,
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "Kmap access requires the in-process typed service.".into(),
+            }),
         }
     }
 }
@@ -1526,11 +1514,25 @@ impl AgentTurn {
     }
 }
 
-fn kmap_error(error: crate::kmap_http::ApiError) -> ApiError {
+fn kmap_error(error: kcode_kmap::Error) -> ApiError {
+    let (status, code, message) = match error.kind() {
+        kcode_kmap::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            error.to_string(),
+        ),
+        kcode_kmap::ErrorKind::NotFound => (StatusCode::NOT_FOUND, "not_found", error.to_string()),
+        kcode_kmap::ErrorKind::Conflict => (StatusCode::CONFLICT, "conflict", error.to_string()),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "An unexpected Kmap database error occurred.".into(),
+        ),
+    };
     ApiError {
-        status: Some(error.status),
-        code: error.code.into(),
-        message: error.message,
+        status: Some(status),
+        code: code.into(),
+        message,
     }
 }
 
@@ -1699,17 +1701,6 @@ pub(crate) fn encode_path(value: impl std::fmt::Display) -> String {
     urlencoding::encode(&value.to_string()).into_owned()
 }
 
-pub(crate) fn string_at<'a>(value: &'a Value, key: &str) -> Result<&'a str, ApiError> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError {
-            status: None,
-            code: "invalid_response".into(),
-            message: format!("Backend response is missing {key}."),
-        })
-}
-
 pub(crate) fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", BASE64.encode(bytes))
 }
@@ -1769,79 +1760,6 @@ fn media_for_image(
         filename,
         normalized,
     )
-}
-
-fn fixed_connection_ids(node: &Value) -> Vec<String> {
-    node.get("fixed_connections")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            entry
-                .as_str()
-                .or_else(|| entry.get("id").and_then(Value::as_str))
-                .map(str::to_owned)
-        })
-        .collect()
-}
-
-pub(super) fn normalize_node(mut node: Value) -> Value {
-    let summaries = node
-        .get("connection_summaries")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|summary| Some((summary.get("id")?.as_str()?.to_owned(), summary.clone())))
-        .collect::<std::collections::HashMap<_, _>>();
-    let hydrate = |entry: &Value| {
-        let id = entry
-            .as_str()
-            .or_else(|| entry.get("id").and_then(Value::as_str))
-            .unwrap_or_default();
-        let mut value = summaries
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| json!({"id": id}));
-        if let (Some(target), Some(source)) = (value.as_object_mut(), entry.as_object()) {
-            target.extend(source.clone());
-        }
-        value
-    };
-    let fixed = node
-        .get("fixed_connections")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-        .map(|(index, entry)| {
-            let mut value = hydrate(entry);
-            if let Some(object) = value.as_object_mut() {
-                object.entry("slot").or_insert_with(|| json!(index + 1));
-            }
-            value
-        })
-        .collect::<Vec<_>>();
-    let recent = node
-        .get("recent_connections")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(hydrate)
-        .collect::<Vec<_>>();
-    let owner = node.get("owner_node_id").cloned().unwrap_or(Value::Null);
-    if let Some(object) = node.as_object_mut() {
-        object.insert("owner_root_node_id".into(), owner);
-        object.insert("fixed_connections".into(), json!(fixed));
-        object.insert("recent_connections".into(), json!(recent));
-    }
-    node
-}
-
-fn normalize_kmap_mutation_response(mut response: Value) -> Value {
-    if let Some(node) = response.get_mut("node") {
-        *node = normalize_node(std::mem::take(node));
-    }
-    response
 }
 
 fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Option<&'static str> {
@@ -1959,55 +1877,6 @@ mod tests {
     }
 
     #[test]
-    fn mutation_nodes_are_normalized_for_immediate_agent_rendering() {
-        let recent = (0..9).map(|index| format!("recent-{index}"));
-        let summaries = std::iter::once(json!({
-            "id":"fixed",
-            "short_name":"Fixed node",
-            "short_description":"Fixed summary",
-        }))
-        .chain((0..9).map(|index| {
-            json!({
-                "id":format!("recent-{index}"),
-                "short_name":format!("Recent {index}"),
-                "short_description":format!("Recent summary {index}"),
-            })
-        }))
-        .collect::<Vec<_>>();
-        let response = normalize_kmap_mutation_response(json!({
-            "node": {
-                "id":"updated",
-                "owner_node_id":"root",
-                "short_name":"Updated node",
-                "short_description":"Updated summary",
-                "long_description":"Updated details",
-                "fixed_connections":["fixed"],
-                "recent_connections":recent.collect::<Vec<_>>(),
-                "connection_summaries":summaries,
-            }
-        }));
-        let node = &response["node"];
-        assert_eq!(node["owner_root_node_id"], "root");
-        assert_eq!(node["fixed_connections"][0]["id"], "fixed");
-        assert_eq!(node["fixed_connections"][0]["slot"], 1);
-        assert_eq!(node["recent_connections"].as_array().unwrap().len(), 9);
-        assert_eq!(node["recent_connections"][0]["short_name"], "Recent 0");
-        assert!(node.get("active_connections").is_none());
-        assert!(node.get("fanout_connections").is_none());
-    }
-
-    #[test]
-    fn fixed_connection_selection_has_no_policy_count_cap() {
-        let expected = (0..64)
-            .map(|index| format!("fixed-{index}"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            fixed_connection_ids(&json!({"fixed_connections":expected.clone()})),
-            expected
-        );
-    }
-
-    #[test]
     fn telegram_native_delivery_prefers_preserved_transport_kind() {
         assert_eq!(
             telegram_native_kind("image/webp", Some("sticker")),
@@ -2035,6 +1904,8 @@ mod tests {
             kweb_base: base.clone(),
             intelligence_base: base.clone(),
             session_history_base: base.clone(),
+            user_root_node_id: "00000001".into(),
+            kennedy_root_node_id: "00000002".into(),
             telegram_relay_base: base,
             telegram_max_media_bytes: 1024,
             telegram_web_user_handle: "@test".into(),
@@ -2085,6 +1956,8 @@ mod tests {
             kweb_base: base.clone(),
             intelligence_base: base.clone(),
             session_history_base: base.clone(),
+            user_root_node_id: "00000001".into(),
+            kennedy_root_node_id: "00000002".into(),
             telegram_relay_base: base.clone(),
             telegram_max_media_bytes: 1024,
             telegram_web_user_handle: "@test".into(),

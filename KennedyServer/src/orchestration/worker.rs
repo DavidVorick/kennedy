@@ -130,21 +130,18 @@ impl Orchestrator {
     }
 
     async fn initialize(&self) -> anyhow::Result<Runtime> {
-        let (kweb, history, telegram) = tokio::join!(
-            self.api.kmap_get("/api/v1/kmap/health"),
-            self.api.history_health(),
-            self.api.telegram_health(),
-        );
-        kweb?;
+        self.api.kmap_node(self.api.user_root_node_id())?;
+        self.api.kmap_node(self.api.kennedy_root_node_id())?;
+        let (history, telegram) =
+            tokio::join!(self.api.history_health(), self.api.telegram_health());
         history?;
         telegram?;
         let manuals = Manuals::load(&self.config.system_prompts_directory)?;
-        let roots = self.api.kmap_get("/api/v1/kmap/roots").await?;
         let runtime = Runtime {
             manuals,
             model: self.config.runtime_model.clone(),
-            user_root_node_id: required_string(&roots, "user_root_node_id")?,
-            kennedy_root_node_id: required_string(&roots, "kennedy_root_node_id")?,
+            user_root_node_id: self.api.user_root_node_id().to_owned(),
+            kennedy_root_node_id: self.api.kennedy_root_node_id().to_owned(),
         };
         self.api.history_release_interrupted_ingress().await?;
         Ok(runtime)
@@ -1146,12 +1143,7 @@ impl Orchestrator {
                 runtime.user_root_node_id.clone()
             } else {
                 let _guard = self.writer.lock().await;
-                let created = self.api.bootstrap_node(None).await?;
-                created
-                    .pointer("/node/id")
-                    .and_then(Value::as_str)
-                    .context("created user root omitted its node ID")?
-                    .to_owned()
+                self.api.bootstrap_node(None)?.id.to_string()
             };
             self.api
                 .directory_complete_handle_root(
@@ -1164,12 +1156,7 @@ impl Orchestrator {
         for group in groups {
             let group_id = group.group_id;
             let _guard = self.writer.lock().await;
-            let created = self.api.bootstrap_node(Some("Group Root")).await?;
-            let root = created
-                .pointer("/node/id")
-                .and_then(Value::as_str)
-                .context("created group root omitted its node ID")?
-                .to_owned();
+            let root = self.api.bootstrap_node(Some("Group Root"))?.id.to_string();
             self.api
                 .directory_complete_group_root(
                     &group_id,
@@ -1191,11 +1178,7 @@ impl Orchestrator {
         let mut user = self.api.directory_user(id).await?;
         if !user.root_ready {
             let _guard = self.writer.lock().await;
-            let created = self.api.bootstrap_node(None).await?;
-            let root = created
-                .pointer("/node/id")
-                .and_then(Value::as_str)
-                .context("created user root omitted its node ID")?;
+            let root = self.api.bootstrap_node(None)?.id.to_string();
             user = self
                 .api
                 .directory_complete_user_root(
@@ -1215,11 +1198,7 @@ impl Orchestrator {
         let mut group = self.api.directory_group(group_id).await?;
         if !group.root_ready {
             let _guard = self.writer.lock().await;
-            let created = self.api.bootstrap_node(Some("Group Root")).await?;
-            let root = created
-                .pointer("/node/id")
-                .and_then(Value::as_str)
-                .context("created group root omitted its node ID")?;
+            let root = self.api.bootstrap_node(Some("Group Root"))?.id.to_string();
             group = self
                 .api
                 .directory_complete_group_root(

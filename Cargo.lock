@@ -1968,8 +1968,6 @@ dependencies = [
 [[package]]
 name = "kcode-agent-runtime"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70832a25d8ca759bf7235f78679844beedf8502c649d40eea986dfae09a4c0a8"
 dependencies = [
  "anyhow",
  "hex",
@@ -2019,8 +2017,6 @@ dependencies = [
 [[package]]
 name = "kcode-codex-runtime-v2"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eeff1db5fe465d2fd368a927033219c1a6244e163498813db4eb2f99aad742f"
 dependencies = [
  "base64",
  "serde_json",
@@ -2101,8 +2097,6 @@ dependencies = [
 [[package]]
 name = "kcode-intelligence-router"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7125dd061a388224ec60317f437673b21eb8c3ceb60a1c5d8a1298db8bb60172"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2117,6 +2111,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kcode-kmap"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "kcode-commit-session",
+ "kcode-kweb-db",
+ "kcode-server-object-envelopes",
+ "rusqlite",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2325,6 +2331,7 @@ dependencies = [
  "kcode-credential-vault",
  "kcode-dev-tools",
  "kcode-intelligence-router",
+ "kcode-kmap",
  "kcode-kmap-size",
  "kcode-kweb-context",
  "kcode-kweb-db",

@@ -270,9 +270,31 @@ mod tests {
     }
 
     #[test]
-    fn load_node_manual_shows_the_exact_bridge_payload() {
+    fn load_nodes_manual_requires_the_plural_batch_contract() {
         let manual = include_str!("../../runtime/system-prompts/ReadTools.txt");
-        assert!(manual.contains(r#"{"name":"LoadNode","arguments":{"identifier":"Nl_hWdsl"}}"#));
+        assert!(manual.contains(
+            r#"{"name":"LoadNodes","arguments":{"identifiers":["Nl_hWdsl","Km_7Qp2x"]}}"#
+        ));
+        assert!(!manual.contains(r#""name":"LoadNode""#));
+        assert!(manual.contains("single node still uses the identifiers array"));
+        assert!(manual.contains("complete batch is loaded before"));
+    }
+
+    #[test]
+    fn dehydration_manual_requires_the_plural_batch_contract() {
+        let manual = include_str!("../../runtime/system-prompts/ReadTools.txt");
+        assert!(manual.contains(r#"{"name":"DehydrateBoxes","arguments":{"boxIds":[12,15]}}"#));
+        assert!(!manual.contains(r#""name":"DehydrateBox""#));
+        assert!(manual.contains("single box still uses the boxIds array"));
+        assert!(manual.contains("validated before any selected box is changed"));
+    }
+
+    #[test]
+    fn shared_read_tools_have_no_ingress_only_event_controls() {
+        let manual = include_str!("../../runtime/system-prompts/ReadTools.txt");
+        assert!(!manual.contains("HydrateEvent"));
+        assert!(!manual.contains("DehydrateEvent"));
+        assert!(!manual.contains("only during history ingress"));
     }
 
     #[test]

@@ -192,7 +192,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kcode_codex_runtime::CatalogCache::new(kcode_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) =
         kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
-    let kmap_service = kmap_http::Service::new(kmap, system_roots, &args.user_database)?;
+    let kmap_service = kmap_http::Service::new(kmap.clone(), system_roots);
     let dev_tools = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
         rust_libraries_root: args.rust_libs_root.clone(),
         web_libraries_root: args.web_libs_root.clone(),
@@ -314,6 +314,8 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let audio_ingress_router = audio_ingress::router(audio_service.clone());
     let orchestration = orchestration::Config {
         system_prompts_directory: args.system_prompts_dir.clone(),
+        user_root_node_id: system_roots.user.to_string(),
+        kennedy_root_node_id: system_roots.kennedy.to_string(),
         telegram_relay_base: orchestration_telegram_base,
         telegram_max_media_bytes: args.telegram_max_voice_bytes,
         #[cfg(test)]
@@ -326,9 +328,9 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         runtime_model: orchestration::RuntimeModel::from_intelligence(intelligence_runtime),
     };
     let orchestration_api = orchestration::Api::local(
-        &orchestration.telegram_relay_base,
+        &orchestration,
         orchestration::LocalServices {
-            kmap: kmap_service.clone(),
+            kmap,
             intelligence: intelligence_service,
             agents: agent_runtime,
             history: history_service,

@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use super::{
     Api, Manuals, RuntimeModel,
-    context::{load_durable, load_durable_batch, node_from_value},
+    context::{load_durable_batch, node_from_value},
     human_utc_datetime, runtime_description,
 };
 
@@ -53,7 +53,6 @@ const MAX_NODE_SHORT_DESCRIPTION_CHARACTERS: usize = 200;
 const MAX_NODE_LONG_DESCRIPTION_CHARACTERS: usize = 5_000;
 const MAX_MEDIA_ENRICHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const KWEB_TOOL_INSTANCE: &str = "kweb";
-const HISTORY_TOOL_INSTANCE: &str = "history";
 const RUST_LIB_TOOL_INSTANCE: &str = "managed-rust-libraries";
 const WEB_LIB_TOOL_INSTANCE: &str = "managed-web-libraries";
 const RUST_BIN_TOOL_INSTANCE: &str = "managed-rust-binaries";
@@ -281,12 +280,12 @@ fn changed_kweb_box_ids(journal: &HistorySession, previous: &KwebBoxVersions) ->
         .collect()
 }
 
-fn render_load_node_result(
+fn render_load_nodes_result(
     journal: &HistorySession,
     changed_box_ids: &[BoxId],
 ) -> anyhow::Result<String> {
     if changed_box_ids.is_empty() {
-        return Ok("LoadNode completed. The shared Kweb boxes were already current.".into());
+        return Ok("LoadNodes completed. The shared Kweb boxes were already current.".into());
     }
     let rendered = journal
         .state()
@@ -306,6 +305,18 @@ fn render_load_node_result(
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .map(|boxes| boxes.join("\n\n"))
+}
+
+fn provider_tool_result_with_context_footer(journal: &HistorySession, result: &str) -> String {
+    // A provider turn may perform several inference/tool steps without being
+    // restarted, so put the newly projected status at the end of every tool
+    // continuation rather than leaving the model with the turn-opening value.
+    let footer = journal.state().projection().footer;
+    if result.is_empty() {
+        footer
+    } else {
+        format!("{result}\n\n{footer}")
+    }
 }
 
 fn render_web_search_result(result: &Value) -> anyhow::Result<String> {
@@ -1365,19 +1376,14 @@ impl Session {
                 )?;
             }
             let roots = session.root_node_ids.clone();
-            let mut invocations = Vec::with_capacity(roots.len());
-            for root in &roots {
-                invocations
-                    .push(session.record_tool_invocation("LoadNode", json!({"identifier":root}))?);
-            }
-            let result = load_durable_batch(&session.api, &mut session.context, &roots).await?;
+            let invocation =
+                session.record_tool_invocation("LoadNodes", json!({"identifiers":&roots}))?;
+            let result = load_durable_batch(&session.api, &mut session.context, &roots)?;
             session.sync_kweb_boxes()?;
-            for invocation in &invocations {
-                session.record_tool_completion(
-                    Some(invocation),
-                    json!({"ok":true,"automatic":true,"identifiers":roots,"result":result}),
-                )?;
-            }
+            session.record_tool_completion(
+                Some(&invocation),
+                json!({"ok":true,"automatic":true,"identifiers":roots,"result":result}),
+            )?;
         } else {
             session.sync_kweb_boxes()?;
         }
@@ -1446,9 +1452,7 @@ impl Session {
 
     async fn revalidate_loaded_nodes(&mut self) -> anyhow::Result<()> {
         let direct = self.context.loaded_node_ids().to_vec();
-        for id in &direct {
-            load_durable(&self.api, &mut self.context, id).await?;
-        }
+        load_durable_batch(&self.api, &mut self.context, &direct)?;
         self.sync_kweb_boxes()?;
         Ok(())
     }
@@ -2022,6 +2026,61 @@ impl Session {
         }
     }
 
+    fn record_provider_usage(
+        &mut self,
+        manifest_hash: &str,
+        usage: Option<&kcode_codex_runtime_v2::TokenUsage>,
+        previous: Option<&kcode_codex_runtime_v2::TokenUsage>,
+    ) -> anyhow::Result<()> {
+        let context_bytes = self.journal.state().render().len() as u64;
+        let raw_context_tokens = self.journal.state().projection().raw_estimated_tokens;
+        let provider_data = usage
+            .map(|usage| {
+                let previous_input = previous.map(|value| value.input_tokens).unwrap_or_default();
+                let previous_cached = previous
+                    .map(|value| value.cached_input_tokens)
+                    .unwrap_or_default();
+                let previous_output = previous
+                    .map(|value| value.output_tokens)
+                    .unwrap_or_default();
+                let previous_thinking = previous
+                    .map(|value| value.reasoning_output_tokens)
+                    .unwrap_or_default();
+                let input_delta = usage.input_tokens.saturating_sub(previous_input);
+                let cached_delta = usage.cached_input_tokens.saturating_sub(previous_cached);
+                let output_delta = usage.output_tokens.saturating_sub(previous_output);
+                let thinking_delta = usage
+                    .reasoning_output_tokens
+                    .saturating_sub(previous_thinking);
+                json!({
+                    "usageIsDelta":true,
+                    "nonCachedInputTokens":input_delta.saturating_sub(cached_delta),
+                    "cachedInputTokens":cached_delta,
+                    "thinkingTokens":thinking_delta,
+                    "outputTokens":output_delta.saturating_sub(thinking_delta),
+                    "providerCumulativeInputTokens":usage.input_tokens,
+                    "providerCumulativeOutputTokens":usage.output_tokens,
+                    "providerCumulativeCachedInputTokens":usage.cached_input_tokens,
+                    "providerCumulativeReasoningOutputTokens":usage.reasoning_output_tokens,
+                })
+            })
+            .unwrap_or(Value::Null);
+        self.journal.record(
+            now(),
+            EventKind::ProviderReceipt {
+                manifest_hash: manifest_hash.into(),
+                input_tokens: usage
+                    .map(|usage| usage.last_input_tokens.unwrap_or(usage.input_tokens)),
+                output_tokens: usage
+                    .map(|usage| usage.last_output_tokens.unwrap_or(usage.output_tokens)),
+                context_bytes: Some(context_bytes),
+                raw_context_tokens: Some(raw_context_tokens),
+                provider_data,
+            },
+        )?;
+        Ok(())
+    }
+
     async fn run_agent_loop<C, F>(
         &mut self,
         operation_id: Uuid,
@@ -2084,6 +2143,7 @@ impl Session {
             let mut used_tool = false;
             let mut emitted_response = false;
             let mut pending_freeform_write: Option<PendingFreeformWrite> = None;
+            let mut last_provider_usage: Option<kcode_codex_runtime_v2::TokenUsage> = None;
             let completed = loop {
                 let event = turn
                     .next_event()
@@ -2100,6 +2160,15 @@ impl Session {
                         )?;
                         checkpoint(self.snapshot()?).await?;
                     }
+                    kcode_codex_runtime_v2::AgentEvent::UsageUpdated(usage) => {
+                        self.record_provider_usage(
+                            &manifest_hash,
+                            Some(&usage),
+                            last_provider_usage.as_ref(),
+                        )?;
+                        last_provider_usage = Some(usage);
+                        checkpoint(self.snapshot()?).await?;
+                    }
                     kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
                         used_tool = true;
                         if let Some(pending) = &pending_freeform_write {
@@ -2108,10 +2177,12 @@ impl Session {
                                 pending.request.kind.freeform_write_tool()
                             );
                             self.record_tool_completion(None, json!({"ok":false,"result":text}))?;
+                            let provider_result =
+                                provider_tool_result_with_context_footer(&self.journal, &text);
                             checkpoint(self.snapshot()?).await?;
                             turn.respond(
                                 &native.call_id,
-                                kcode_codex_runtime_v2::ToolResult::failure(text),
+                                kcode_codex_runtime_v2::ToolResult::failure(provider_result),
                             )
                             .await?;
                             continue;
@@ -2210,7 +2281,7 @@ impl Session {
                                             }
                                             Err(error) => ToolOutcome {
                                                 text: format!("{} failed: {error}", call.name),
-                                                store_result: call.name != "LoadNode",
+                                                store_result: call.name != "LoadNodes",
                                                 ok: false,
                                                 end_session: false,
                                                 freeform_write: None,
@@ -2322,7 +2393,8 @@ impl Session {
                                 BoxContent::text(&outcome.text),
                             )?;
                         }
-                        let provider_result = outcome.text.clone();
+                        let provider_result =
+                            provider_tool_result_with_context_footer(&self.journal, &outcome.text);
                         self.record_tool_completion(
                             recorded_invocation.as_ref(),
                             json!({"ok":outcome.ok,"result":outcome.text}),
@@ -2362,29 +2434,15 @@ impl Session {
                     kcode_codex_runtime_v2::AgentEvent::Completed(completed) => break completed,
                 }
             };
-            let usage = completed.usage.as_ref();
-            let raw_context_tokens = self.journal.state().projection().raw_estimated_tokens;
-            self.journal.record(
-                now(),
-                EventKind::ProviderReceipt {
-                    manifest_hash,
-                    input_tokens: usage
-                        .map(|usage| usage.last_input_tokens.unwrap_or(usage.input_tokens)),
-                    output_tokens: usage
-                        .map(|usage| usage.last_output_tokens.unwrap_or(usage.output_tokens)),
-                    raw_context_tokens: Some(raw_context_tokens),
-                    provider_data: usage
-                        .map(|usage| {
-                            json!({
-                                "inputTokens":usage.input_tokens,
-                                "outputTokens":usage.output_tokens,
-                                "cachedInputTokens":usage.cached_input_tokens,
-                                "reasoningOutputTokens":usage.reasoning_output_tokens,
-                            })
-                        })
-                        .unwrap_or(Value::Null),
-                },
-            )?;
+            if completed.usage.as_ref() != last_provider_usage.as_ref() {
+                self.record_provider_usage(
+                    &manifest_hash,
+                    completed.usage.as_ref(),
+                    last_provider_usage.as_ref(),
+                )?;
+            } else if completed.usage.is_none() && last_provider_usage.is_none() {
+                self.record_provider_usage(&manifest_hash, None, None)?;
+            }
             let mut answer = if let Some(pending) = pending_freeform_write {
                 let result_metadata = pending.request.clone();
                 let outcome = self
@@ -2536,14 +2594,7 @@ impl Session {
             canonical_node_id_array(arguments, "contextNodeIds", SUBAGENT_CONTEXT_NODE_LIMIT)?;
         let mut context = Vec::with_capacity(context_node_ids.len());
         for node_id in &context_node_ids {
-            let node = self.api.kmap_node(node_id).await?;
-            context.push(
-                node.get("long_description")
-                    .or_else(|| node.get("longDescription"))
-                    .and_then(Value::as_str)
-                    .with_context(|| format!("Kmap node {node_id} has no long description"))?
-                    .to_owned(),
-            );
+            context.push(self.api.kmap_node(node_id)?.data.long_description);
         }
         let user_id = self
             .root_node_ids
@@ -2939,16 +2990,7 @@ impl Session {
                 .context("attaching the direct message to the active Kennedy session")?;
             id
         } else {
-            let roots = self
-                .api
-                .kmap_get("/api/v1/kmap/roots")
-                .await
-                .context("loading Kennedy's root for a new Telegram session")?;
-            let kennedy_root = roots
-                .get("kennedy_root_node_id")
-                .and_then(Value::as_str)
-                .context("Kmap roots omitted Kennedy's root")?
-                .to_owned();
+            let kennedy_root = self.api.kennedy_root_node_id().to_owned();
             let mut options =
                 SessionOptions::conversation("telegram", vec![user_root, kennedy_root]);
             options.channel = json!({
@@ -3049,11 +3091,17 @@ impl Session {
                 }
                 "Session ending.".into()
             }
-            "DehydrateBox" => {
-                validate_arguments(&call.arguments, &["boxId"], &[])?;
-                let id = box_id(&call.arguments, "boxId")?;
-                self.journal.dehydrate_box(now(), id)?;
-                format!("Dehydrated box {id}.")
+            "DehydrateBoxes" => {
+                validate_arguments(&call.arguments, &["boxIds"], &[])?;
+                let ids = box_id_array(&call.arguments, "boxIds")?;
+                self.journal.dehydrate_boxes(now(), &ids)?;
+                format!(
+                    "Dehydrated boxes {}.",
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
             "SummarizeBox" => {
                 validate_arguments(&call.arguments, &["boxId", "summary"], &[])?;
@@ -3075,59 +3123,13 @@ impl Session {
                 let objects = stage_box_text_objects(&mut self.journal, &ids, &now())?;
                 render_box_text_objects(&objects)
             }
-            "HydrateEvent" => {
-                anyhow::ensure!(
-                    matches!(self.mode, AgentMode::Ingress { .. }),
-                    "HydrateEvent is only available during history ingress"
-                );
-                validate_arguments(&call.arguments, &["eventId"], &[])?;
-                let event_id = event_id(&call.arguments, "eventId")?;
-                let event = self
-                    .journal
-                    .state()
-                    .event(event_id)
-                    .cloned()
-                    .with_context(|| format!("event {event_id} does not exist"))?;
-                let content = BoxContent::text(serde_json::to_string_pretty(&event)?);
-                self.apply_history_inspection(event_id, content)?;
-                self.journal.record(
-                    now(),
-                    EventKind::HistoryEventInspected {
-                        source_event: event_id,
-                    },
-                )?;
-                format!("Hydrated history event {event_id}.")
-            }
-            "DehydrateEvent" => {
-                anyhow::ensure!(
-                    matches!(self.mode, AgentMode::Ingress { .. }),
-                    "DehydrateEvent is only available during history ingress"
-                );
-                validate_arguments(&call.arguments, &["eventId"], &[])?;
-                let event_id = event_id(&call.arguments, "eventId")?;
-                if let Some(tool) = self.journal.state().tools.get(HISTORY_TOOL_INSTANCE)
-                    && let Some(slot) = tool
-                        .slots
-                        .iter()
-                        .find(|slot| slot.slot == event_id.to_string() && !slot.retired)
-                {
-                    self.journal.retire_box(now(), slot.box_id)?;
-                }
-                self.journal.record(
-                    now(),
-                    EventKind::HistoryEventReleased {
-                        source_event: event_id,
-                    },
-                )?;
-                format!("Released history event {event_id} from the active context.")
-            }
-            "LoadNode" => {
-                validate_arguments(&call.arguments, &["identifier"], &[])?;
-                let id = canonical_node_id(&call.arguments, "identifier")?;
-                load_durable(&self.api, &mut self.context, &id).await?;
+            "LoadNodes" => {
+                validate_arguments(&call.arguments, &["identifiers"], &[])?;
+                let identifiers = canonical_node_id_list(&call.arguments, "identifiers")?;
+                load_durable_batch(&self.api, &mut self.context, &identifiers)?;
                 let changed = self.sync_kweb_boxes()?;
                 store_result = false;
-                render_load_node_result(&self.journal, &changed)?
+                render_load_nodes_result(&self.journal, &changed)?
             }
             "EmitObject" => {
                 validate_arguments(&call.arguments, &["objectId"], &[])?;
@@ -3550,57 +3552,6 @@ impl Session {
         Ok(())
     }
 
-    fn apply_history_inspection(
-        &mut self,
-        event_id: EventId,
-        content: BoxContent,
-    ) -> anyhow::Result<()> {
-        let current = self
-            .journal
-            .state()
-            .tools
-            .get(HISTORY_TOOL_INSTANCE)
-            .cloned()
-            .unwrap_or_default();
-        let mut slots = current
-            .slots
-            .iter()
-            .map(|slot| {
-                let state = self
-                    .journal
-                    .state()
-                    .box_state(slot.box_id)
-                    .context("history slot box is missing")?;
-                Ok(ToolSlotInput {
-                    slot: slot.slot.clone(),
-                    name: state.name.clone(),
-                    content: state.canonical.content.clone(),
-                    retired: slot.retired,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        if let Some(existing) = slots
-            .iter_mut()
-            .find(|slot| slot.slot == event_id.to_string())
-        {
-            anyhow::ensure!(
-                !existing.retired,
-                "that history event inspection was retired"
-            );
-            existing.content = content;
-        } else {
-            slots.push(ToolSlotInput {
-                slot: event_id.to_string(),
-                name: format!("History event {event_id}"),
-                content,
-                retired: false,
-            });
-        }
-        self.journal
-            .apply_tool_slots(now(), HISTORY_TOOL_INSTANCE, slots)?;
-        Ok(())
-    }
-
     fn sync_kweb_boxes(&mut self) -> anyhow::Result<Vec<BoxId>> {
         let previous = kweb_box_versions(&self.journal);
         let updates = self
@@ -4005,7 +3956,7 @@ impl Session {
             canonical_id(id)?;
             anyhow::ensure!(
                 self.context.contains_full_node(id) || self.plan.updates.contains_key(id),
-                "node {id} is not loaded; call LoadNode first"
+                "node {id} is not loaded; call LoadNodes first"
             );
         }
         Ok(())
@@ -4200,11 +4151,14 @@ impl Session {
     }
 
     pub(crate) fn snapshot(&self) -> anyhow::Result<Value> {
+        let projection = self.journal.state().projection();
+        let session_status = projection.status.clone();
         Ok(json!({
             "format":"kennedy-chatend",
             "version":1,
             "stateVersion":3,
             "sessionId":self.journal.state().metadata.session_id,
+            "chatendMetadata":self.journal.state().metadata,
             "sessionType":self.session_type,
             "sourceSessionType":self.source_session_type,
             "channel":self.channel,
@@ -4228,7 +4182,8 @@ impl Session {
             "eventCount":self.journal.state().events.len(),
             "boxes":self.journal.state().boxes,
             "events":self.journal.state().events,
-            "context":self.journal.state().projection(),
+            "context":projection,
+            "sessionStatus":session_status,
             "chatendText":self.journal.state().render(),
         }))
     }
@@ -4296,10 +4251,13 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
             } else {
                 Vec::new()
             };
-            for state in &states {
-                if state.hide_from_parent && state.text.is_some() {
-                    self.session.journal.dehydrate_box(now(), state.box_id)?;
-                }
+            let hidden = states
+                .iter()
+                .filter(|state| state.hide_from_parent && state.text.is_some())
+                .map(|state| state.box_id)
+                .collect::<Vec<_>>();
+            if !hidden.is_empty() {
+                self.session.journal.dehydrate_boxes(now(), &hidden)?;
             }
             let capture = outcome.freeform_write.take().map(|request| {
                 let id = Uuid::new_v4().to_string();
@@ -4333,10 +4291,13 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
                 .session
                 .complete_subagent_freeform_write(request, contents, &budget)
                 .await?;
-            for state in &states {
-                if state.hide_from_parent && state.text.is_some() {
-                    self.session.journal.dehydrate_box(now(), state.box_id)?;
-                }
+            let hidden = states
+                .iter()
+                .filter(|state| state.hide_from_parent && state.text.is_some())
+                .map(|state| state.box_id)
+                .collect::<Vec<_>>();
+            if !hidden.is_empty() {
+                self.session.journal.dehydrate_boxes(now(), &hidden)?;
             }
             Ok(kcode_agent_runtime::ToolOutcome {
                 text: outcome.text,
@@ -4381,18 +4342,33 @@ fn restore_kweb_context(journal: &HistorySession, context: &mut KwebContext) -> 
         .state()
         .events
         .iter()
-        .filter_map(|event| {
+        .flat_map(|event| {
             let EventKind::ToolInvoked {
                 tool_name,
                 arguments,
                 ..
             } = &event.kind
             else {
-                return None;
+                return Vec::new();
             };
-            (tool_name == "LoadNode")
-                .then(|| arguments.get("identifier")?.as_str().map(str::to_owned))
-                .flatten()
+            match tool_name.as_str() {
+                "LoadNodes" => arguments
+                    .get("identifiers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                // This is replay-only compatibility for persisted pre-batch sessions.
+                "LoadNode" => arguments
+                    .get("identifier")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            }
         })
         .collect::<Vec<_>>();
     if direct.is_empty() {
@@ -4559,7 +4535,7 @@ fn session_kind(session_type: &str, mode: &AgentMode) -> SessionKind {
 }
 
 fn tool_instance(name: &str) -> String {
-    if name == "LoadNode" {
+    if name == "LoadNodes" {
         return KWEB_TOOL_INSTANCE.into();
     }
     format!("{name}:{}", Uuid::new_v4())
@@ -5271,10 +5247,6 @@ fn box_id_array(value: &Value, key: &str) -> anyhow::Result<Vec<BoxId>> {
     Ok(ids)
 }
 
-fn event_id(value: &Value, key: &str) -> anyhow::Result<EventId> {
-    positive_integer(value, key).map(EventId)
-}
-
 fn canonical_id(value: &str) -> anyhow::Result<String> {
     value
         .parse::<NodeId>()
@@ -5282,16 +5254,29 @@ fn canonical_id(value: &str) -> anyhow::Result<String> {
     Ok(value.into())
 }
 
-fn canonical_node_id(value: &Value, key: &str) -> anyhow::Result<String> {
-    let value = string_value(value, key)?;
-    canonical_id(&value)
-}
-
 fn canonical_node_id_array(
     value: &Value,
     key: &str,
     maximum: usize,
 ) -> anyhow::Result<Vec<String>> {
+    let ids = canonical_node_ids(value, key)?;
+    anyhow::ensure!(
+        ids.len() <= maximum,
+        "{key} must contain at most {maximum} identifiers"
+    );
+    Ok(ids)
+}
+
+fn canonical_node_id_list(value: &Value, key: &str) -> anyhow::Result<Vec<String>> {
+    let ids = canonical_node_ids(value, key)?;
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "{key} must contain at least one identifier"
+    );
+    Ok(ids)
+}
+
+fn canonical_node_ids(value: &Value, key: &str) -> anyhow::Result<Vec<String>> {
     let ids = value
         .get(key)
         .and_then(Value::as_array)
@@ -5305,10 +5290,6 @@ fn canonical_node_id_array(
             )
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    anyhow::ensure!(
-        ids.len() <= maximum,
-        "{key} must contain at most {maximum} identifiers"
-    );
     anyhow::ensure!(
         ids.iter().collect::<HashSet<_>>().len() == ids.len(),
         "{key} must not contain duplicate identifiers"
@@ -5738,7 +5719,7 @@ mod tests {
             },
         )
         .unwrap();
-        journal.dehydrate_box("t2", box_id).unwrap();
+        journal.dehydrate_boxes("t2", &[box_id]).unwrap();
         let previous = canonical_box_versions(&journal);
         apply_rust_lib_snapshot(
             &mut journal,
@@ -5755,7 +5736,7 @@ mod tests {
         assert_eq!(states[0].text.as_deref(), Some("new source"));
         assert!(states[0].hide_from_parent);
         if states[0].hide_from_parent {
-            journal.dehydrate_box("t3", box_id).unwrap();
+            journal.dehydrate_boxes("t3", &[box_id]).unwrap();
         }
         assert!(matches!(
             journal.state().boxes[&box_id].representation,
@@ -5778,6 +5759,24 @@ mod tests {
                 &json!({"contextNodeIds":["AAECAwQF","AAECAwQF"]}),
                 "contextNodeIds",
                 SUBAGENT_CONTEXT_NODE_LIMIT,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn load_nodes_selection_is_nonempty_ordered_and_duplicate_free() {
+        let selected = canonical_node_id_list(
+            &json!({"identifiers":["AAECAwQG","AAECAwQF"]}),
+            "identifiers",
+        )
+        .unwrap();
+        assert_eq!(selected, vec!["AAECAwQG", "AAECAwQF"]);
+        assert!(canonical_node_id_list(&json!({"identifiers":[]}), "identifiers").is_err());
+        assert!(
+            canonical_node_id_list(
+                &json!({"identifiers":["AAECAwQF","AAECAwQF"]}),
+                "identifiers",
             )
             .is_err()
         );
@@ -6372,7 +6371,7 @@ mod tests {
     }
 
     #[test]
-    fn load_node_result_is_exact_changed_kweb_projection_in_layout_order() {
+    fn load_nodes_result_is_exact_changed_kweb_projection_in_layout_order() {
         let (path, mut journal) = test_journal("load-node-result", 10_000);
         let mut loaded = BoxContent::text("Node ID: loaded\nNode name: Loaded");
         mark_kweb_content(&mut loaded, "loaded", "loaded");
@@ -6449,7 +6448,7 @@ mod tests {
             .filter(|item| !item.marker && changed.contains(&item.box_id))
             .map(|item| item.text)
             .collect::<Vec<_>>();
-        let result = render_load_node_result(&journal, &changed).unwrap();
+        let result = render_load_nodes_result(&journal, &changed).unwrap();
         assert_eq!(result, projected.join("\n\n"));
         assert!(result.find("Node ID: fixed").unwrap() < result.find("retained recent").unwrap());
         assert!(result.contains("| summarized | stale]"));
@@ -6460,8 +6459,37 @@ mod tests {
         let unchanged = changed_kweb_box_ids(&journal, &current);
         assert!(unchanged.is_empty());
         assert_eq!(
-            render_load_node_result(&journal, &unchanged).unwrap(),
-            "LoadNode completed. The shared Kweb boxes were already current."
+            render_load_nodes_result(&journal, &unchanged).unwrap(),
+            "LoadNodes completed. The shared Kweb boxes were already current."
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn provider_tool_results_end_with_the_current_context_budget() {
+        let (path, mut journal) = test_journal("tool-context-footer", 10_000);
+        let box_id = journal
+            .create_box(
+                "t1",
+                "state",
+                BoxOwner::Controller,
+                BoxContent::text("original"),
+            )
+            .unwrap();
+        journal.summarize_box("t2", box_id, "summary").unwrap();
+        journal
+            .update_box("t3", box_id, BoxContent::text("changed"))
+            .unwrap();
+        let provider_result = provider_tool_result_with_context_footer(&journal, "Tool completed.");
+        let stale = provider_result.rfind("[stale boxes:").unwrap();
+        let budget = provider_result.rfind("[context budget |").unwrap();
+        assert!(stale < budget);
+        assert!(
+            provider_result
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("[context budget |")
         );
         std::fs::remove_file(path).unwrap();
     }
@@ -6945,7 +6973,7 @@ mod tests {
                 BoxContent::text("y".repeat(300)),
             )
             .unwrap();
-        journal.dehydrate_box("t5", dehydrated).unwrap();
+        journal.dehydrate_boxes("t5", &[dehydrated]).unwrap();
 
         let plan = history_ingress_representation_plan(journal.state()).unwrap();
         assert!(plan.fits);
@@ -7060,7 +7088,7 @@ mod tests {
         let large_id = large_window
             .create_box(
                 "t2",
-                "Kennedy tool call: LoadNode",
+                "Kennedy tool call: LoadNodes",
                 BoxOwner::Kennedy,
                 BoxContent::text(&invocation),
             )
@@ -7075,7 +7103,7 @@ mod tests {
         let small_id = small_window
             .create_box(
                 "t2",
-                "Kennedy tool call: LoadNode",
+                "Kennedy tool call: LoadNodes",
                 BoxOwner::Kennedy,
                 BoxContent::text(invocation),
             )
@@ -7084,7 +7112,7 @@ mod tests {
         assert_eq!(
             small_plan.desired[&small_id],
             BoxRepresentation::Summarized(
-                "Tool invocation: LoadNode {arguments dehydrated: 1,284 characters}.".into()
+                "Tool invocation: LoadNodes {arguments dehydrated: 1,284 characters}.".into()
             )
         );
         std::fs::remove_file(large_path).unwrap();

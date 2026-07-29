@@ -1,8 +1,8 @@
-LoadNode
-  Call through call_ktool with exactly this shape: {"name":"LoadNode","arguments":{"identifier":"Nl_hWdsl"}}. Replace the example identifier with the exact canonical eight-character identifier of the node. It loads or refreshes that node and the nearby fixed and fanout context that helps navigate from it. Repeated loads refresh existing boxes instead of duplicating them. A summarized or dehydrated box keeps that representation and becomes stale if the canonical node changed. There is no fixed LoadNode count; the active context budget is the limit.
+LoadNodes
+  Call through call_ktool with one or more distinct canonical node IDs: {"name":"LoadNodes","arguments":{"identifiers":["Nl_hWdsl","Km_7Qp2x"]}}. A single node still uses the identifiers array. The complete batch is loaded before the shared Kweb boxes are synchronized. Each load also refreshes the nearby fixed and fanout context; existing boxes are refreshed instead of duplicated. Summarized or dehydrated boxes retain that representation and become stale when canonical content changes. There is no fixed node count; the active context budget is the limit.
 
-DehydrateBox
-  Give it the numeric boxId. It removes that box's substantive contents from active context while retaining its identity, lineage, revision, restoration metadata, and chronological continuation markers. This does not unload tool state or change canonical contents.
+DehydrateBoxes
+  Call through call_ktool with one or more distinct numeric box IDs: {"name":"DehydrateBoxes","arguments":{"boxIds":[12,15]}}. It dehydrates every selected box in one call, removing their substantive contents from active context while retaining each box's identity, lineage, revision, restoration metadata, and chronological continuation markers. A single box still uses the boxIds array. The complete request is validated before any selected box is changed. This does not unload tool state or change canonical contents.
 
 SummarizeBox
   Give it the numeric boxId and the exact summary text Kennedy wants to retain. It replaces the box's active representation with that summary. Canonical contents and lineage remain intact. If the owning tool later changes the canonical value, the summary remains visible and becomes stale.
@@ -12,9 +12,3 @@ HydrateBox
 
 BoxesIntoObjects
   Call through call_ktool with one or more distinct numeric box IDs: {"name":"BoxesIntoObjects","arguments":{"boxIds":[12,15]}}. It stages one UTF-8 plain-text object per selected active box using that box's complete latest canonical text, even when its current representation is summarized, dehydrated, or stale. It does not save the visible box header, summary, metadata, or attached objects. The returned pending object references resolve to canonical object IDs when the logical session commits; those pending references may be used by other staged operations in the same session. This is helpful for preserving complete codebases, transcripts, Granola notes, and any other large, meaningful text the user copy-pastes.
-
-HydrateEvent
-  This is available only during history ingress. Give it the numeric eventId. It hydrates that exact persisted source event into an ingress inspection box. The dehydrated history skeleton reports approximate hydration costs.
-
-DehydrateEvent
-  This is available only during history ingress. Give it the numeric eventId. It retires the active inspection box for that previously hydrated source event. It does not mutate source history.
