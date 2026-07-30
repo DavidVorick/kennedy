@@ -165,14 +165,16 @@ This document records user intention with regard to Kennedy.
 - Session History exclusively owns active session logs, lifecycle/control
   journals, pending session objects, and completion receipts. KennedyServer uses
   its typed API and must not manipulate the same files independently.
-- One small history-ingress context library owns the complete mechanical
-  preparation of Chatend representations for ingress: initial hydration,
-  summary preservation, protected-content ordering, largest-first reduction,
-  durable application, and final capacity measurement. Its public workflow is
-  one outcome-level preparation call rather than separately exposed planning or
-  application steps. KennedyServer owns prompt and runtime selection, Kweb
-  revalidation, ingress lifecycle events, and the decision to continue ingress
-  or finalize and commit an over-capacity session.
+- One small context-capacity policy library owns the complete mechanical
+  preparation of Chatend representations: initial history-ingress hydration,
+  summary preservation, live overflow recovery, protected-content ordering,
+  largest-first reduction, durable application, and final capacity
+  measurement. Its public workflows are outcome-level preparation and recovery
+  calls rather than separately exposed planning or application steps.
+  KennedyServer owns prompt and runtime selection, the visible overflow
+  warning and transport delivery, Kweb revalidation, ingress lifecycle events,
+  and the decision to continue ingress or finalize and commit a session that
+  cannot fit even after permitted reduction.
 - Session completion synchronizes its immutable receipt before removing active
   files. Concurrent readers must treat a journal that disappears after
   enumeration as a completed lifecycle transition, not as storage corruption
@@ -239,9 +241,27 @@ This document records user intention with regard to Kennedy.
   must never be substituted for model context. Active, history-ingress, audio,
   Telegram, self-time, and immutable completed views derive this string through
   the same authoritative backend projection.
-- Capacity limits should reject or end work predictably rather than silently
-  dropping accepted content. History ingress may reduce initial context while
-  preserving canonical material for selective inspection.
+- Crossing the active context limit is a recoverable condition in every
+  top-level session kind, not a reason to reject newly accepted user input,
+  Kennedy output, tool calls or results, or managed-state changes. Preserve the
+  new canonical material, automatically dehydrate active boxes until the
+  complete projected Chatend fits, and expose this exact hydrated system
+  message both in Chatend and through the user-facing transcript or transport:
+  `Context size was exceeded, some context has been dehydrated. The session is
+  now at risk of destabilizing, please perform any cleanup tasks and end the
+  session`. The warning and its projection cost are part of the recovered
+  context; do not silently compact or immediately force the otherwise
+  recoverable session into history ingress.
+- Automatic overflow recovery dehydrates the largest rendered candidates
+  first while preserving canonical contents. Protect the three most recent
+  user-message boxes and the ten most recent Kennedy-result boxes until
+  unprotected candidates have been exhausted. A Kennedy result is a semantic
+  box class covering anything Kennedy produced or caused to be produced,
+  including Kennedy messages, tool invocations, tool results, and managed tool
+  state; do not infer it only from the current low-level box-owner variant. If
+  protected content must also be reduced, exhaust other protected classes
+  before touching those ten recent Kennedy results, retaining largest-first
+  ordering within each protection tier.
 - Treat current context occupancy and cumulative provider usage as different
   measurements. Do not present lifetime token consumption as though it were the
   amount currently occupying the model window.
@@ -285,6 +305,14 @@ This document records user intention with regard to Kennedy.
 - Conversation sessions read the Kmap but do not mutate it. Durable graph
   changes happen in explicitly writable history-ingress, audio-ingress,
   self-time, or other backend-owned sessions.
+- Stopping work is an orchestration control, not a request for history ingress.
+  In an interactive user session, stop only the current Kennedy turn: cancel
+  its descendant work, preserve accepted input and completed effects, close any
+  interrupted invocation visibly, and leave the session active and ready for
+  new user input. In a non-user session, stop terminates that session through
+  its ordinary durable completion path without queuing another history-ingress
+  phase. The control must not mutate Session History files behind their typed
+  owner or report success before the running work has begun to unwind.
 - Accepted session history and committed objects are permanent. A cleanup or
   UI convenience must not imply that durable accepted history was erased.
 - Recovery derives external-turn completion from the authoritative session
@@ -469,6 +497,14 @@ This document records user intention with regard to Kennedy.
 - The Telegram library is transport plus a durable ordered queue. It does not
   compose Kennedy prompts, run tools, mutate Kmap, own Kennedy users, or unlock
   credentials.
+- Telegram is an in-process KennedyServer capability, not a loopback
+  microservice. Its library exposes a typed service handle plus the supervised
+  Telegram polling runtime; KennedyServer must call that handle directly
+  rather than encode routes, JSON bodies, multipart requests, or HTTP status
+  errors for same-process work. The main server listener (normally port 4321)
+  exclusively owns browser-visible health at `/health`; do not restore a
+  second Telegram listener or port 4324. Telegram's external Bot API remains a
+  genuine HTTP transport boundary.
 - Kennedy owns the user directory, whitelist, root assignments, and
   authorization policy. Bootstrap a handle through trust-on-first-use, then
   treat the stable numeric Telegram identity as authoritative.
@@ -485,6 +521,11 @@ This document records user intention with regard to Kennedy.
 - Keep a separate durable session for each participant and group, distinct from
   direct messages and from the participant's sessions in other groups. Preserve
   strict order within a stream while allowing unrelated streams to progress.
+- Telegram transport does not own permanent message history; Kennedy's ordinary
+  session and Kmap lifecycle does. Retain only the transport working state
+  needed for bounded live group context, media access, and pending Kmap ingress,
+  and reclaim it once no live transport workflow needs it. Do not add an
+  outbound transcript archive or durable outbox.
 - Kennedy's main agent may initiate a private Telegram delivery containing
   text, one or more staged or canonical Kweb object attachments, or both, to
   any explicitly targeted authorized user from any session, but only after
@@ -504,6 +545,22 @@ This document records user intention with regard to Kennedy.
   Telegram session when none is active. Record the Kennedy-authored text and
   attachment references in that session and atomically bind each successful
   delivery to it.
+- Kennedy's main agent may likewise initiate a Telegram delivery to any
+  explicitly targeted known group from any session, including browser,
+  private or group Telegram, history-ingress, audio-ingress, wakeup, and
+  self-time sessions. The group tool has the same text, attachment, delivery
+  filename, size, MIME, and native-media capabilities as initiated private
+  delivery, targets the group's canonical Kmap root rather than exposing a raw
+  Telegram chat ID, and remains unavailable to subagents. KennedyServer resolves
+  that root through the group directory, while Telegram transport resolves the
+  current chat and must freshly enforce the ordinary administrator,
+  complete-roster, and historical-whitelist requirements before sending. The
+  tool invocation and ordinary source-session/Kmap lifecycle are the durable
+  record; do not create or select a participant session merely to own a
+  group-wide delivery. Successful items may be followed by a later failed item
+  without rollback. Use only ordinary bounded in-memory transport retries:
+  failure ends the attempt, and no durable replay or exactly-once mechanism is
+  required.
 - Invocation controls when Kennedy responds, not which accepted bounded group
   context she may inspect. Passive group discussion and retained media should
   be available to an open participant session without pretending that messages
@@ -511,10 +568,20 @@ This document records user intention with regard to Kennedy.
 - Raw retained group media stays behind an authorized staging tool. It should
   not be copied eagerly into every participant's model context.
 - Reset and timeout handling must release stuck streams so later events can
-  proceed. Preserve accepted work for ingress where possible and surface a
-  useful failure to the Telegram chat.
-- Telegram sessions end through their explicit transport boundary; browser
-  inactivity rules must not silently close them.
+  proceed without sacrificing accepted work. Never acknowledge or abort a
+  bound Telegram event in a way that detaches its active Kennedy session before
+  that session has durably entered history ingress; retry the ingress handoff
+  first, then reset the transport stream and surface a useful failure to the
+  Telegram chat.
+- Bound every direct and group Telegram session to six hours from its creation.
+  At that boundary, durably queue the complete session for history ingress and
+  let the next event begin a fresh session. A turn already running at the
+  boundary may finish through its separately bounded operation timeout, but an
+  idle or recovered session must not remain open past the boundary. Repair
+  detached active sessions into the same ingress path instead of abandoning
+  their archives or staged Kmap transaction.
+- Telegram sessions otherwise end through their explicit transport boundary;
+  browser inactivity rules must not silently close them.
 
 ## Browser and Presentation
 
@@ -541,6 +608,11 @@ This document records user intention with regard to Kennedy.
   active model or tool work without losing the already accepted user command.
 - Keep a closed conversation selected while its history ingress continues.
   Do not automatically create or select a replacement conversation.
+- Order conversation history by actionable lifecycle state before recency:
+  active work first, then queued or currently updating memory, then terminal
+  ingress failures that require a manual retry, and only then fully ingressed
+  read-only history. A failed ingress must remain conspicuous without
+  displacing work that is still live or making forward progress.
 - Show source and ingress activity as one continuous session history. Internal
   prompts, boxes, tools, and diagnostics may be collapsed in the ordinary view
   but must remain inspectable.
@@ -571,11 +643,20 @@ This document records user intention with regard to Kennedy.
   deadline.
 - `EndSession` may carry a bounded handoff message into a fresh slice when
   enough time remains. Ordinary prose does not silently roll the session over.
+- A user stop during self time ends the entire selected self-time run. It must
+  cancel the active slice and suppress every later clean-slate slice, regardless
+  of how much time remains on the original deadline.
 - Persist and restore active self-time work, serialize starts across tabs, and
   prevent overlapping runs.
 - Give Kennedy a visible warning near the run deadline and enough bounded time
   to wrap up. Do not impose an unrelated short timeout on otherwise valid
   long-running research.
+- Use a threefold safety factor when setting finite production timeout
+  allowances across agent turns, descendant intelligence, managed tools,
+  provider transport, and persistence lock waits, so valid long-running work
+  is not cut off prematurely. Keep explicit user-selected durations exact, and
+  do not mistake retry backoff, polling cadence, leases, or diagnostic
+  thresholds for work timeouts.
 - Completed self-time work does not need a second ordinary history-ingress pass
   because the session already performs its own Kmap work.
 - Background queues must release retrying or failed claims so one bad item does

@@ -17,10 +17,25 @@ use axum::{
 };
 use kcode_session_history::{NewCommand, NewObject, RetryIngress, SessionHistory, StartSession};
 use serde_json::{Value, json};
+use std::sync::Arc;
+
+use crate::orchestration::Orchestrator;
 
 const MAX_OBJECT_BYTES: usize = 32 * 1024 * 1024 * 1024;
 
-pub(crate) fn router(history: SessionHistory) -> Router {
+#[derive(Clone)]
+struct HttpState {
+    history: SessionHistory,
+    orchestrator: Arc<Orchestrator>,
+}
+
+impl axum::extract::FromRef<HttpState> for SessionHistory {
+    fn from_ref(state: &HttpState) -> Self {
+        state.history.clone()
+    }
+}
+
+pub(crate) fn router(history: SessionHistory, orchestrator: Arc<Orchestrator>) -> Router {
     Router::new()
         .route("/api/v1/conversations/health", get(health))
         .route("/api/v1/conversations/summaries", get(list))
@@ -42,7 +57,10 @@ pub(crate) fn router(history: SessionHistory) -> Router {
             post(retry_ingress),
         )
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
-        .with_state(history)
+        .with_state(HttpState {
+            history,
+            orchestrator,
+        })
 }
 
 async fn health(State(history): State<SessionHistory>) -> Result<Json<Value>, ApiError> {
@@ -174,13 +192,10 @@ async fn object(
 }
 
 async fn stop(
-    State(history): State<SessionHistory>,
+    State(state): State<HttpState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let record = history.stop(&id).await?;
-    Ok(Json(
-        json!({"id":id,"phase":record.phase,"stopRequested":true}),
-    ))
+    Ok(Json(state.orchestrator.request_stop(&id).await?))
 }
 
 async fn retry_ingress(
@@ -227,6 +242,26 @@ impl From<kcode_session_history::Error> for ApiError {
             code: error.kind.code(),
             message: error.message,
         }
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(error: anyhow::Error) -> Self {
+        tracing::warn!(%error, "Kennedy orchestration stop request failed");
+        if let Some(error) = error.downcast_ref::<crate::orchestration::ApiError>() {
+            return Self {
+                status: error.status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                code: if error.code == "state_conflict" {
+                    "state_conflict"
+                } else if error.code == "not_found" {
+                    "not_found"
+                } else {
+                    "internal_error"
+                },
+                message: error.message.clone(),
+            };
+        }
+        Self::internal(error)
     }
 }
 

@@ -18,7 +18,9 @@ use kcode_dev_tools::{
     WRITE_FILE_FREEFORM_WEB_LIB_TOOL, WRITE_RUST_BIN_TOOL, WRITE_RUST_LIB_TOOL, WRITE_WEB_LIB_TOOL,
     proposed_write_snapshot,
 };
-use kcode_history_ingress_context::Outcome as HistoryIngressContextOutcome;
+use kcode_history_ingress_context::{
+    Outcome as HistoryIngressContextOutcome, RecoveryOutcome as ContextRecoveryOutcome,
+};
 use kcode_kweb_context::{
     Context as KwebContext, Node as KwebNode, NodeDraft, StagedCreate as KwebStagedCreate,
 };
@@ -27,8 +29,8 @@ use kcode_server_object_envelopes::{StoredFile, encode_file, sanitize_file_name}
 use kcode_session_history::{
     NewSession, Session as HistorySession,
     chatend::{
-        BoxContent, BoxId, BoxOwner, BoxRepresentation, BoxState, EventId, EventKind,
-        ObjectMetadata, PendingId, Representation, SessionKind, SessionMetadata, ToolSlotInput,
+        BoxContent, BoxId, BoxOwner, BoxState, EventId, EventKind, ObjectMetadata, PendingId,
+        Representation, SessionKind, SessionMetadata, ToolSlotInput,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -43,9 +45,9 @@ use super::{
 };
 
 const AGENT_LOOP_ROUND_LIMIT: u64 = 100;
-const BROWSER_CONVERSATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const WAKEUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const BROWSER_CONVERSATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+const HISTORY_INGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+const WAKEUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 const MAX_TELEGRAM_DM_CHARACTERS: usize = 40_000;
 const MIN_NODE_SHORT_NAME_CHARACTERS: usize = 4;
 const MAX_NODE_SHORT_NAME_CHARACTERS: usize = 50;
@@ -56,7 +58,8 @@ const KWEB_TOOL_INSTANCE: &str = "kweb";
 const RUST_LIB_TOOL_INSTANCE: &str = "managed-rust-libraries";
 const WEB_LIB_TOOL_INSTANCE: &str = "managed-web-libraries";
 const RUST_BIN_TOOL_INSTANCE: &str = "managed-rust-binaries";
-const CAPACITY_ERROR_BOX_NAME: &str = "Context capacity error";
+const CONTEXT_OVERFLOW_WARNING_BOX_NAME: &str = "Context overflow warning";
+const CONTEXT_OVERFLOW_WARNING: &str = "Context size was exceeded, some context has been dehydrated. The session is now at risk of destabilizing, please perform any cleanup tasks and end the session";
 const INGRESS_FORCE_COMMIT_NOTE: &str = "ingress_force_commit";
 const SUBAGENT_CONTEXT_NODE_LIMIT: usize = 64;
 const BOX_TEXT_OBJECT_SOURCE: &str = "kennedy-box-text";
@@ -228,7 +231,13 @@ struct ResolvedObjectDelivery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputStage {
     Accepted,
-    RejectedForCapacity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextRecovery {
+    NotNeeded,
+    Recovered,
+    Irreducible,
 }
 
 fn render_load_nodes_result(
@@ -529,14 +538,6 @@ impl ManagedSourceKind {
             BackendManagedSourceKind::RustBinary => Self::RustBinary,
         }
     }
-
-    fn capacity_reason(self) -> &'static str {
-        match self {
-            Self::RustLibrary => "managed_rust_snapshot_exceeded_full_window",
-            Self::WebLibrary => "managed_web_snapshot_exceeded_full_window",
-            Self::RustBinary => "managed_rust_binary_snapshot_exceeded_full_window",
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -686,6 +687,7 @@ fn managed_lib_box_id(
         })
 }
 
+#[cfg(test)]
 fn prospective_managed_lib_box_updates(
     journal: &HistorySession,
     call: &ToolCall,
@@ -698,41 +700,6 @@ fn prospective_managed_lib_box_updates(
         return BTreeMap::new();
     };
     BTreeMap::from([(box_id, managed_lib_box_content(kind, &snapshot))])
-}
-
-fn prospective_managed_source_snapshot_tokens(
-    journal: &HistorySession,
-    kind: ManagedSourceKind,
-    snapshot: &SourceSnapshot,
-) -> anyhow::Result<u64> {
-    let projection = if let Some(box_id) = managed_lib_box_id(journal, kind, &snapshot.name) {
-        journal.state().projection_with_new_boxes_and_updates(
-            &[],
-            &BTreeMap::from([(box_id, managed_lib_box_content(kind, snapshot))]),
-        )?
-    } else {
-        let current = journal
-            .state()
-            .tools
-            .get(kind.tool_instance())
-            .cloned()
-            .unwrap_or_default();
-        let mut used_slots = current
-            .slots
-            .iter()
-            .map(|slot| slot.slot.clone())
-            .collect::<HashSet<_>>();
-        let slot = unique_kweb_slot(&snapshot.name, &mut used_slots);
-        journal.state().projection_with_new_boxes(&[(
-            format!("Managed {} {}", kind.label(), snapshot.name),
-            BoxOwner::Tool {
-                tool_instance: kind.tool_instance().into(),
-                slot,
-            },
-            managed_lib_box_content(kind, snapshot),
-        )])?
-    };
-    Ok(projection.estimated_tokens)
 }
 
 fn apply_managed_source_snapshot(
@@ -804,27 +771,6 @@ fn apply_managed_source_snapshot(
         })
         .map(|slot| slot.box_id)
         .with_context(|| format!("managed {} box was not installed", kind.label()))
-}
-
-#[cfg(test)]
-fn rust_lib_box_id(journal: &HistorySession, name: &str) -> Option<BoxId> {
-    managed_lib_box_id(journal, ManagedSourceKind::RustLibrary, name)
-}
-
-#[cfg(test)]
-fn prospective_rust_lib_box_updates(
-    journal: &HistorySession,
-    call: &ToolCall,
-) -> BTreeMap<BoxId, BoxContent> {
-    prospective_managed_lib_box_updates(journal, call)
-}
-
-#[cfg(test)]
-fn prospective_rust_lib_snapshot_tokens(
-    journal: &HistorySession,
-    snapshot: &SourceSnapshot,
-) -> anyhow::Result<u64> {
-    prospective_managed_source_snapshot_tokens(journal, ManagedSourceKind::RustLibrary, snapshot)
 }
 
 #[cfg(test)]
@@ -1388,22 +1334,6 @@ impl Session {
                 .map(|(name, content)| (name.clone(), BoxOwner::User, content.clone())),
         );
         let recorded_at = now();
-        if !matches!(self.mode, AgentMode::Ingress { .. }) {
-            let projection = self
-                .journal
-                .state()
-                .projection_with_new_boxes_at(&recorded_at, &prospective_boxes)?;
-            let limit = self.journal.state().live_context_limit();
-            if projection.estimated_tokens > limit {
-                self.record_live_capacity_error(
-                    "Your message",
-                    projection.estimated_tokens,
-                    limit,
-                    metadata.get("externalEventId").and_then(Value::as_str),
-                )?;
-                return Ok(InputStage::RejectedForCapacity);
-            }
-        }
         let transcript_objects = content.objects.clone();
         let mut transcript_attachments = content
             .metadata
@@ -1433,6 +1363,10 @@ impl Session {
             transcript["externalEventId"] = json!(id);
         }
         self.transcript.push(transcript);
+        self.recover_context_overflow(
+            metadata.get("externalEventId").and_then(Value::as_str),
+            &[],
+        )?;
         Ok(InputStage::Accepted)
     }
 
@@ -1457,6 +1391,10 @@ impl Session {
         attachments: &[ResolvedObjectDelivery],
         reuse_pending_objects: bool,
     ) -> anyhow::Result<()> {
+        let external_event_id = metadata
+            .get("externalEventId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let owner = if kennedy {
             BoxOwner::Kennedy
         } else {
@@ -1528,16 +1466,18 @@ impl Session {
             transcript["objects"] = json!(object_ids);
             transcript["attachments"] = json!(descriptors);
         }
+        if let Some(id) = &external_event_id {
+            transcript["externalEventId"] = json!(id);
+        }
         self.transcript.push(transcript);
+        self.recover_context_overflow(external_event_id.as_deref(), &[])?;
         Ok(())
     }
 
     pub(crate) fn answer_for_external_event(&self, id: &str) -> Option<&Value> {
         self.transcript.iter().rev().find(|entry| {
-            matches!(
-                entry.get("role").and_then(Value::as_str),
-                Some("kennedy" | "system")
-            ) && entry.get("externalEventId").and_then(Value::as_str) == Some(id)
+            is_terminal_external_response(entry)
+                && entry.get("externalEventId").and_then(Value::as_str) == Some(id)
         })
     }
 
@@ -1590,81 +1530,121 @@ impl Session {
         Ok((resolved.bytes, resolved.file_name, resolved.media_type))
     }
 
-    fn record_live_capacity_error(
+    fn recover_context_overflow(
         &mut self,
-        attempted_operation: &str,
-        projected_tokens: u64,
-        limit_tokens: u64,
         external_event_id: Option<&str>,
-    ) -> anyhow::Result<String> {
-        if let Some(id) = external_event_id
-            && let Some(existing) = self.answer_for_external_event(id)
-            && existing.get("role").and_then(Value::as_str) == Some("system")
-            && let Some(text) = existing.get("content").and_then(Value::as_str)
-        {
-            let text = text.to_owned();
-            if self.journal.state().projection().estimated_tokens
-                > self.journal.state().forced_ingress_context_limit()
-                && !self.journal.state().source_terminated
-            {
-                self.journal.record(
-                    now(),
-                    EventKind::SourceTerminated {
-                        reason: "context_capacity_limit".into(),
-                    },
-                )?;
-            }
-            return Ok(text);
+        pinned_box_ids: &[BoxId],
+    ) -> anyhow::Result<ContextRecovery> {
+        let projection = self.journal.state().projection();
+        let target_tokens = self.journal.state().active_context_limit();
+        if projection.estimated_tokens <= target_tokens {
+            return Ok(ContextRecovery::NotNeeded);
         }
-        self.journal.record(
-            now(),
-            EventKind::CapacityError {
-                attempted_operation: attempted_operation.into(),
-                projected_tokens,
-                limit_tokens,
-            },
-        )?;
-        let text = format!(
-            "{attempted_operation} was not added because it would use approximately \
-             {projected_tokens} context tokens, above the 70% limit of {limit_tokens}. \
-             Reduce the size of the request or dehydrate existing context and try again."
-        );
+        let projection_hash = hex::encode(Sha256::digest(projection.render().as_bytes()));
+        let already_irreducible = self
+            .journal
+            .state()
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                EventKind::Note { label, value } if label == "context_overflow_recovery" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .is_some_and(|value| {
+                value.get("irreducible").and_then(Value::as_bool) == Some(true)
+                    && value.get("limitTokens").and_then(Value::as_u64) == Some(target_tokens)
+                    && value.get("projectionHash").and_then(Value::as_str)
+                        == Some(projection_hash.as_str())
+            });
+        if already_irreducible {
+            return Ok(ContextRecovery::Irreducible);
+        }
+
+        let before_tokens = projection.estimated_tokens;
         let mut metadata = json!({
             "transcriptRole":"system",
-            "capacityError":true,
-            "projectedTokens":projected_tokens,
-            "limitTokens":limit_tokens,
+            "contextOverflowWarning":true,
+            "projectedTokens":before_tokens,
+            "limitTokens":target_tokens,
         });
         if let Some(id) = external_event_id {
             metadata["externalEventId"] = json!(id);
         }
-        self.journal.create_box(
+        let warning_box_id = self.journal.create_box(
             now(),
-            CAPACITY_ERROR_BOX_NAME,
+            CONTEXT_OVERFLOW_WARNING_BOX_NAME,
             BoxOwner::Controller,
             BoxContent {
-                text: text.clone(),
+                text: CONTEXT_OVERFLOW_WARNING.into(),
                 objects: Vec::new(),
                 metadata,
             },
         )?;
-        let mut transcript = json!({"role":"system","content":text});
+        let mut transcript = json!({
+            "role":"system",
+            "content":CONTEXT_OVERFLOW_WARNING,
+            "contextOverflowWarning":true,
+        });
         if let Some(id) = external_event_id {
             transcript["externalEventId"] = json!(id);
         }
         self.transcript.push(transcript);
-        if self.journal.state().projection().estimated_tokens
-            > self.journal.state().forced_ingress_context_limit()
-            && !self.journal.state().source_terminated
-        {
-            self.journal.record(
-                now(),
-                EventKind::SourceTerminated {
-                    reason: "context_capacity_limit".into(),
-                },
-            )?;
+
+        let mut pins = pinned_box_ids.to_vec();
+        if !pins.contains(&warning_box_id) {
+            pins.push(warning_box_id);
         }
-        Ok(text)
+        let outcome = kcode_history_ingress_context::recover(&mut self.journal, now(), &pins)?;
+        let (dehydrated_box_ids, estimated_tokens, target_tokens, irreducible) = match outcome {
+            ContextRecoveryOutcome::Recovered {
+                dehydrated_box_ids,
+                estimated_tokens,
+                target_tokens,
+            } => (dehydrated_box_ids, estimated_tokens, target_tokens, false),
+            ContextRecoveryOutcome::OverCapacity {
+                dehydrated_box_ids,
+                estimated_tokens,
+                target_tokens,
+            } => (dehydrated_box_ids, estimated_tokens, target_tokens, true),
+        };
+        let final_projection_hash = hex::encode(Sha256::digest(
+            self.journal.state().projection().render().as_bytes(),
+        ));
+        self.journal.record(
+            now(),
+            EventKind::Note {
+                label: "context_overflow_recovery".into(),
+                value: json!({
+                    "beforeTokens":before_tokens,
+                    "estimatedTokens":estimated_tokens,
+                    "limitTokens":target_tokens,
+                    "dehydratedBoxIds":dehydrated_box_ids,
+                    "irreducible":irreducible,
+                    "projectionHash":final_projection_hash,
+                }),
+            },
+        )?;
+        if irreducible {
+            if matches!(self.mode, AgentMode::Ingress { .. }) {
+                self.request_ingress_force_commit(
+                    "irreducible_context_overflow",
+                    estimated_tokens,
+                )?;
+            } else if !self.journal.state().source_terminated {
+                self.journal.record(
+                    now(),
+                    EventKind::SourceTerminated {
+                        reason: "irreducible_context_overflow".into(),
+                    },
+                )?;
+            }
+            Ok(ContextRecovery::Irreducible)
+        } else {
+            Ok(ContextRecovery::Recovered)
+        }
     }
 
     fn request_ingress_force_commit(
@@ -1696,33 +1676,6 @@ impl Session {
                 EventKind::Note { label, .. } if label == INGRESS_FORCE_COMMIT_NOTE
             )
         })
-    }
-
-    fn pending_capacity_error(&self) -> bool {
-        self.pending_external_event_id
-            .as_deref()
-            .and_then(|id| self.answer_for_external_event(id))
-            .is_some_and(|entry| entry.get("role").and_then(Value::as_str) == Some("system"))
-    }
-
-    fn has_live_capacity_error(&self) -> bool {
-        self.journal.state().active_boxes().any(|box_state| {
-            box_state
-                .canonical
-                .content
-                .metadata
-                .get("capacityError")
-                .and_then(Value::as_bool)
-                == Some(true)
-        })
-    }
-
-    fn current_live_capacity_error(&self) -> bool {
-        match self.mode {
-            AgentMode::Conversation => self.pending_capacity_error(),
-            AgentMode::FreeTime | AgentMode::Wakeup => self.has_live_capacity_error(),
-            AgentMode::Ingress { .. } => false,
-        }
     }
 
     pub(crate) fn requires_history_ingress(&self) -> bool {
@@ -1782,10 +1735,7 @@ impl Session {
         let Some(stage) = self.stage_user_input(text, metadata) else {
             return false;
         };
-        if matches!(stage, InputStage::RejectedForCapacity) {
-            self.pending_external_event_id = None;
-            return true;
-        }
+        debug_assert_eq!(stage, InputStage::Accepted);
         self.rounds_used = 0;
         self.pending_turn = true;
         self.pending_external_event_id = metadata
@@ -1801,6 +1751,31 @@ impl Session {
         {
             self.rounds_used = 0;
         }
+    }
+
+    pub(crate) fn interrupt_current_turn(&mut self) -> anyhow::Result<()> {
+        self.journal.repair_unfinished_tools(now())?;
+        let notice = "The user stopped this agent turn.";
+        self.journal.create_box(
+            now(),
+            "Turn stopped",
+            BoxOwner::Controller,
+            BoxContent {
+                text: notice.into(),
+                objects: Vec::new(),
+                metadata: json!({"transcriptRole":"system","userStopped":true}),
+            },
+        )?;
+        self.transcript.push(json!({
+            "role":"system",
+            "content":notice,
+            "userStopped":true,
+        }));
+        self.pending_turn = false;
+        self.pending_external_event_id = None;
+        self.orchestration =
+            json!({"owner":"backend","status":"idle","lastOutcome":"user-stopped"});
+        Ok(())
     }
 
     pub(crate) async fn run_pending_turn<C, F>(
@@ -1843,11 +1818,6 @@ impl Session {
                         "Kennedy ended a conversational turn without an assistant response"
                     );
                 };
-                let mut response = json!({"role":"kennedy","content":answer});
-                if let Some(id) = &self.pending_external_event_id {
-                    response["externalEventId"] = json!(id);
-                }
-                self.transcript.push(response);
                 self.pending_turn = false;
                 self.pending_external_event_id = None;
                 checkpoint(self.snapshot()?).await?;
@@ -1959,24 +1929,19 @@ impl Session {
             self.rounds_used = round + 1;
             self.refresh_runtime_prompt()?;
             let deadline_after_response = self.prepare_free_time_round()?;
-            let projection = self.journal.state().projection();
-            let input = projection.render();
-            if matches!(self.mode, AgentMode::Ingress { .. }) {
-                if projection.estimated_tokens > self.journal.state().ingress_context_limit()
-                    || self.ingress_force_commit_requested()
-                {
-                    return Ok(None);
-                }
-            } else if projection.estimated_tokens > self.journal.state().live_context_limit() {
-                let external_event_id = self.pending_external_event_id.clone();
-                self.record_live_capacity_error(
-                    "The pending turn",
-                    projection.estimated_tokens,
-                    self.journal.state().live_context_limit(),
-                    external_event_id.as_deref(),
-                )?;
+            let external_event_id = self.pending_external_event_id.clone();
+            if self.recover_context_overflow(external_event_id.as_deref(), &[])?
+                == ContextRecovery::Irreducible
+            {
                 return Ok(None);
             }
+            if matches!(self.mode, AgentMode::Ingress { .. })
+                && self.ingress_force_commit_requested()
+            {
+                return Ok(None);
+            }
+            let projection = self.journal.state().projection();
+            let input = projection.render();
             let manifest_hash = hex::encode(Sha256::digest(input.as_bytes()));
             self.journal.record(
                 now(),
@@ -2055,6 +2020,7 @@ impl Session {
                         }
                         let mut created_call_box_id = None;
                         let mut recorded_invocation = None;
+                        let transcript_start = self.transcript.len();
                         let call = native_ktool_call(&native);
                         let mut outcome = match call {
                             Ok(call) => {
@@ -2065,49 +2031,19 @@ impl Session {
                                         &call.name,
                                         call.arguments.clone(),
                                     )?);
-                                let prospective_updates =
-                                    prospective_managed_lib_box_updates(&self.journal, &call);
-                                let prospective_projection =
-                                    self.journal.state().projection_with_new_boxes_and_updates(
-                                        &[(
-                                            call_name.clone(),
-                                            BoxOwner::Kennedy,
-                                            call_content.clone(),
-                                        )],
-                                        &prospective_updates,
-                                    )?;
-                                let prospective_tokens = prospective_projection.estimated_tokens;
-                                let rejected = if !matches!(self.mode, AgentMode::Ingress { .. }) {
-                                    if self.current_live_capacity_error() {
-                                        let external_event_id =
-                                            self.pending_external_event_id.clone();
-                                        Some(self.record_live_capacity_error(
-                                            &format!("Kennedy's {} tool call", call.name),
-                                            self.journal.state().projection().estimated_tokens,
-                                            self.journal.state().live_context_limit(),
-                                            external_event_id.as_deref(),
-                                        )?)
-                                    } else {
-                                        let limit = self.journal.state().live_context_limit();
-                                        if prospective_tokens > limit {
-                                            let external_event_id =
-                                                self.pending_external_event_id.clone();
-                                            Some(self.record_live_capacity_error(
-                                                &format!("Kennedy's {} tool call", call.name),
-                                                prospective_tokens,
-                                                limit,
-                                                external_event_id.as_deref(),
-                                            )?)
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-                                if let Some(text) = rejected {
+                                created_call_box_id = Some(self.journal.create_box(
+                                    now(),
+                                    call_name,
+                                    BoxOwner::Kennedy,
+                                    call_content,
+                                )?);
+                                let external_event_id = self.pending_external_event_id.clone();
+                                if self
+                                    .recover_context_overflow(external_event_id.as_deref(), &[])?
+                                    == ContextRecovery::Irreducible
+                                {
                                     ToolOutcome {
-                                        text,
+                                        text: CONTEXT_OVERFLOW_WARNING.into(),
                                         store_result: false,
                                         ok: false,
                                         end_session: false,
@@ -2115,45 +2051,21 @@ impl Session {
                                         managed_source_snapshot: None,
                                     }
                                 } else {
-                                    created_call_box_id = Some(self.journal.create_box(
-                                        now(),
-                                        call_name,
-                                        BoxOwner::Kennedy,
-                                        call_content,
-                                    )?);
-                                    if matches!(self.mode, AgentMode::Ingress { .. })
-                                        && prospective_tokens
-                                            > self.journal.state().ingress_context_limit()
-                                    {
-                                        self.request_ingress_force_commit(
-                                            "tool_call_exceeded_full_window",
-                                            prospective_tokens,
-                                        )?;
-                                        ToolOutcome {
-                                            text: "The tool was not run because history ingress exceeded the full context window; the staged transaction will now be committed.".into(),
-                                            store_result: false,
+                                    match self.execute_tool(&call, operation_id).await {
+                                        Ok(outcome) => {
+                                            if call.name == "EmitObject" && outcome.ok {
+                                                emitted_response = true;
+                                            }
+                                            outcome
+                                        }
+                                        Err(error) => ToolOutcome {
+                                            text: format!("{} failed: {error}", call.name),
+                                            store_result: call.name != "LoadNodes",
                                             ok: false,
                                             end_session: false,
                                             freeform_write: None,
                                             managed_source_snapshot: None,
-                                        }
-                                    } else {
-                                        match self.execute_tool(&call, operation_id).await {
-                                            Ok(outcome) => {
-                                                if call.name == "EmitObject" && outcome.ok {
-                                                    emitted_response = true;
-                                                }
-                                                outcome
-                                            }
-                                            Err(error) => ToolOutcome {
-                                                text: format!("{} failed: {error}", call.name),
-                                                store_result: call.name != "LoadNodes",
-                                                ok: false,
-                                                end_session: false,
-                                                freeform_write: None,
-                                                managed_source_snapshot: None,
-                                            },
-                                        }
+                                        },
                                     }
                                 }
                             }
@@ -2169,82 +2081,10 @@ impl Session {
                         if let Some(managed) = outcome.managed_source_snapshot.take() {
                             let kind = managed.kind;
                             let snapshot = managed.snapshot;
-                            let prospective_tokens = prospective_managed_source_snapshot_tokens(
-                                &self.journal,
-                                kind,
-                                &snapshot,
-                            )?;
-                            let ingress = matches!(self.mode, AgentMode::Ingress { .. });
-                            let limit = if ingress {
-                                self.journal.state().ingress_context_limit()
-                            } else {
-                                self.journal.state().live_context_limit()
-                            };
-                            if prospective_tokens > limit {
-                                let name = snapshot.name.clone();
-                                let text = if ingress {
-                                    self.request_ingress_force_commit(
-                                        kind.capacity_reason(),
-                                        prospective_tokens,
-                                    )?;
-                                    format!(
-                                        "The managed {} {name} was opened, but its source snapshot was not added because it exceeded the full context window; the staged transaction will now be committed.",
-                                        kind.label()
-                                    )
-                                } else {
-                                    let external_event_id = self.pending_external_event_id.clone();
-                                    self.record_live_capacity_error(
-                                        &format!(
-                                            "Kennedy's managed {} snapshot for {name}",
-                                            kind.label()
-                                        ),
-                                        prospective_tokens,
-                                        limit,
-                                        external_event_id.as_deref(),
-                                    )?
-                                };
-                                outcome = ToolOutcome {
-                                    text,
-                                    store_result: false,
-                                    ok: false,
-                                    end_session: false,
-                                    freeform_write: None,
-                                    managed_source_snapshot: None,
-                                };
-                            } else {
-                                apply_managed_source_snapshot(&mut self.journal, kind, snapshot)?;
-                                outcome.store_result = false;
-                            }
+                            apply_managed_source_snapshot(&mut self.journal, kind, snapshot)?;
+                            outcome.store_result = false;
                         }
                         append_slow_tool_duration(&mut outcome.text, tool_started_at.elapsed());
-                        if !matches!(self.mode, AgentMode::Ingress { .. }) {
-                            let projection = if outcome.store_result {
-                                self.journal.state().projection_with_new_boxes(&[(
-                                    "Kennedy tool result".into(),
-                                    BoxOwner::Controller,
-                                    BoxContent::text(&outcome.text),
-                                )])?
-                            } else {
-                                self.journal.state().projection()
-                            };
-                            let limit = self.journal.state().live_context_limit();
-                            if projection.estimated_tokens > limit {
-                                let external_event_id = self.pending_external_event_id.clone();
-                                outcome = ToolOutcome {
-                                    text: self.record_live_capacity_error(
-                                        "Kennedy's tool result",
-                                        projection.estimated_tokens,
-                                        limit,
-                                        external_event_id.as_deref(),
-                                    )?,
-                                    store_result: false,
-                                    ok: false,
-                                    end_session: false,
-                                    freeform_write: None,
-                                    managed_source_snapshot: None,
-                                };
-                            }
-                        }
                         if let Some(request) = outcome.freeform_write.take() {
                             pending_freeform_write = Some(PendingFreeformWrite {
                                 request,
@@ -2260,28 +2100,31 @@ impl Session {
                                 BoxContent::text(&outcome.text),
                             )?;
                         }
+                        let external_event_id = self.pending_external_event_id.clone();
+                        let recovery =
+                            self.recover_context_overflow(external_event_id.as_deref(), &[])?;
+                        let context_warning_added =
+                            self.transcript[transcript_start..].iter().any(|entry| {
+                                entry.get("contextOverflowWarning").and_then(Value::as_bool)
+                                    == Some(true)
+                            });
+                        let mut provider_text = outcome.text.clone();
+                        if context_warning_added
+                            && !provider_text.contains(CONTEXT_OVERFLOW_WARNING)
+                        {
+                            if !provider_text.is_empty() {
+                                provider_text.push_str("\n\n");
+                            }
+                            provider_text.push_str(CONTEXT_OVERFLOW_WARNING);
+                        }
                         let provider_result =
-                            provider_tool_result_with_context_footer(&self.journal, &outcome.text);
+                            provider_tool_result_with_context_footer(&self.journal, &provider_text);
                         self.record_tool_completion(
                             recorded_invocation.as_ref(),
                             json!({"ok":outcome.ok,"result":outcome.text}),
                         )?;
                         end_session |= outcome.ok && outcome.end_session;
-                        if matches!(self.mode, AgentMode::Ingress { .. })
-                            && self.journal.state().projection().estimated_tokens
-                                > self.journal.state().ingress_context_limit()
-                        {
-                            self.request_ingress_force_commit(
-                                "tool_context_exceeded_full_window",
-                                self.journal.state().projection().estimated_tokens,
-                            )?;
-                        }
                         checkpoint(self.snapshot()?).await?;
-                        if matches!(self.mode, AgentMode::Ingress { .. })
-                            && self.ingress_force_commit_requested()
-                        {
-                            return Ok(None);
-                        }
                         turn.respond(
                             &native.call_id,
                             if outcome.ok {
@@ -2291,9 +2134,11 @@ impl Session {
                             },
                         )
                         .await?;
-                        if !matches!(self.mode, AgentMode::Ingress { .. })
-                            && (self.current_live_capacity_error()
-                                || self.journal.state().source_terminated)
+                        if recovery == ContextRecovery::Irreducible
+                            || (matches!(self.mode, AgentMode::Ingress { .. })
+                                && self.ingress_force_commit_requested())
+                            || (!matches!(self.mode, AgentMode::Ingress { .. })
+                                && self.journal.state().source_terminated)
                         {
                             return Ok(None);
                         }
@@ -2310,7 +2155,8 @@ impl Session {
             } else if completed.usage.is_none() && last_provider_usage.is_none() {
                 self.record_provider_usage(&manifest_hash, None, None)?;
             }
-            let mut answer = if let Some(pending) = pending_freeform_write {
+            let mut completion_recovery = ContextRecovery::NotNeeded;
+            let answer = if let Some(pending) = pending_freeform_write {
                 let result_metadata = pending.request.clone();
                 let outcome = self
                     .complete_freeform_write(pending, completed.answer)
@@ -2337,73 +2183,42 @@ impl Session {
                         }),
                     },
                 )?;
+                let external_event_id = self.pending_external_event_id.clone();
+                completion_recovery =
+                    self.recover_context_overflow(external_event_id.as_deref(), &[])?;
                 String::new()
             } else {
                 completed.answer.trim().to_owned()
             };
-            if !matches!(self.mode, AgentMode::Ingress { .. }) && self.current_live_capacity_error()
-            {
-                answer.clear();
-            }
             if !answer.is_empty() {
                 let mut content = BoxContent::text(answer.clone());
                 if let Some(id) = &self.pending_external_event_id {
                     content.metadata["externalEventId"] = json!(id);
                 }
                 let recorded_at = now();
-                let rejected = if !matches!(self.mode, AgentMode::Ingress { .. }) {
-                    let projection = self.journal.state().projection_with_new_boxes_at(
-                        &recorded_at,
-                        &[("Kennedy message".into(), BoxOwner::Kennedy, content.clone())],
-                    )?;
-                    let limit = self.journal.state().live_context_limit();
-                    if projection.estimated_tokens > limit {
-                        let external_event_id = self.pending_external_event_id.clone();
-                        self.record_live_capacity_error(
-                            "Kennedy's response",
-                            projection.estimated_tokens,
-                            limit,
-                            external_event_id.as_deref(),
-                        )?;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if rejected {
-                    answer.clear();
-                } else {
-                    self.journal.create_box(
-                        recorded_at,
-                        "Kennedy message",
-                        BoxOwner::Kennedy,
-                        content,
-                    )?;
-                    if !matches!(self.mode, AgentMode::Conversation) {
-                        self.transcript
-                            .push(json!({"role":"kennedy","content":answer}));
-                    }
+                self.journal.create_box(
+                    recorded_at,
+                    "Kennedy message",
+                    BoxOwner::Kennedy,
+                    content,
+                )?;
+                let mut transcript = json!({"role":"kennedy","content":answer});
+                if let Some(id) = &self.pending_external_event_id {
+                    transcript["externalEventId"] = json!(id);
+                }
+                self.transcript.push(transcript);
+                let external_event_id = self.pending_external_event_id.clone();
+                let recovery = self.recover_context_overflow(external_event_id.as_deref(), &[])?;
+                if recovery != ContextRecovery::NotNeeded {
+                    completion_recovery = recovery;
                 }
             }
-            if matches!(self.mode, AgentMode::Ingress { .. })
-                && self.journal.state().projection().estimated_tokens
-                    > self.journal.state().ingress_context_limit()
-            {
-                self.request_ingress_force_commit(
-                    "kennedy_output_exceeded_full_window",
-                    self.journal.state().projection().estimated_tokens,
-                )?;
-            }
             checkpoint(self.snapshot()?).await?;
-            if matches!(self.mode, AgentMode::Ingress { .. })
-                && self.ingress_force_commit_requested()
-            {
-                return Ok(None);
-            }
-            if !matches!(self.mode, AgentMode::Ingress { .. })
-                && (self.current_live_capacity_error() || self.journal.state().source_terminated)
+            if completion_recovery == ContextRecovery::Irreducible
+                || (matches!(self.mode, AgentMode::Ingress { .. })
+                    && self.ingress_force_commit_requested())
+                || (!matches!(self.mode, AgentMode::Ingress { .. })
+                    && self.journal.state().source_terminated)
             {
                 return Ok(None);
             }
@@ -2638,57 +2453,15 @@ impl Session {
                 });
             }
         };
-        let preview = preview
+        let _preview = preview
             .snapshot
             .context("freeform write preview omitted the resulting source snapshot")?;
-        let source_box_id =
-            managed_lib_box_id(&self.journal, kind, &request.name).with_context(|| {
-                format!(
-                    "the managed {} box disappeared during freeform capture",
-                    kind.label()
-                )
-            })?;
-        let prospective = self.journal.state().projection_with_new_boxes_and_updates(
-            &[],
-            &BTreeMap::from([(source_box_id, managed_lib_box_content(kind, &preview))]),
-        )?;
-        let prospective_tokens = prospective.estimated_tokens;
-        let limit = if matches!(self.mode, AgentMode::Ingress { .. }) {
-            self.journal.state().ingress_context_limit()
-        } else {
-            self.journal.state().live_context_limit()
-        };
-        if prospective_tokens > limit {
-            if matches!(self.mode, AgentMode::Ingress { .. }) {
-                self.request_ingress_force_commit(
-                    "write_file_freeform_exceeded_full_window",
-                    prospective_tokens,
-                )?;
-                return Ok(ToolOutcome {
-                    text: "The file was not written because its resulting managed-source snapshot exceeded the full context window; the staged transaction will now be committed.".into(),
-                    store_result: false,
-                    ok: false,
-                    end_session: false,
-                    freeform_write: None,
-                    managed_source_snapshot: None,
-                });
-            }
-            let external_event_id = self.pending_external_event_id.clone();
-            let text = self.record_live_capacity_error(
-                &format!("Kennedy's {freeform_tool} output for {}", request.path),
-                prospective_tokens,
-                limit,
-                external_event_id.as_deref(),
-            )?;
-            return Ok(ToolOutcome {
-                text,
-                store_result: false,
-                ok: false,
-                end_session: false,
-                freeform_write: None,
-                managed_source_snapshot: None,
-            });
-        }
+        managed_lib_box_id(&self.journal, kind, &request.name).with_context(|| {
+            format!(
+                "the managed {} box disappeared during freeform capture",
+                kind.label()
+            )
+        })?;
 
         let execution_result = self
             .api
@@ -2741,7 +2514,7 @@ impl Session {
             .map(|_| nonempty_string(arguments, "message", MAX_TELEGRAM_DM_CHARACTERS))
             .transpose()?
             .unwrap_or_default();
-        let attachment_requests = telegram_dm_attachments(arguments)?;
+        let attachment_requests = telegram_attachments(arguments)?;
         anyhow::ensure!(
             !message.is_empty() || !attachment_requests.is_empty(),
             "SendTelegramDM requires a nonempty message, at least one attachment, or both"
@@ -2776,7 +2549,7 @@ impl Session {
 
         let private_sessions = self
             .api
-            .telegram_get("/api/v1/private-sessions")
+            .telegram_private_sessions()
             .await
             .context("discovering established Telegram private chats")?;
         let private_session = private_sessions
@@ -2789,15 +2562,11 @@ impl Session {
             })
             .context("This Telegram user has not opened a private chat with Kennedy.")?;
         if !attachments.is_empty() {
-            let health = self
+            let maximum = self
                 .api
-                .telegram_get("/health")
+                .telegram_max_media_bytes()
                 .await
                 .context("discovering the Telegram attachment limit")?;
-            let maximum = health
-                .pointer("/capabilities/maxMediaBytes")
-                .and_then(Value::as_u64)
-                .context("Telegram health omitted its attachment byte limit")?;
             for attachment in &attachments {
                 anyhow::ensure!(
                     attachment.object.bytes.len() as u64 <= maximum,
@@ -2952,13 +2721,11 @@ impl Session {
         let mut delivery_expected_conversation_id = expected_conversation_id.as_deref();
         if !message.is_empty() {
             self.api
-                .telegram_post(
-                    &format!("/api/v1/private-sessions/{telegram_user_id}/messages"),
-                    json!({
-                        "conversationId":conversation_id,
-                        "expectedConversationId":expected_conversation_id,
-                        "text":message,
-                    }),
+                .telegram_send_private_message(
+                    telegram_user_id,
+                    &conversation_id,
+                    expected_conversation_id.as_deref(),
+                    &message,
                 )
                 .await
                 .context("sending the Telegram direct message")?;
@@ -2993,6 +2760,100 @@ impl Session {
         ))
     }
 
+    async fn send_telegram_group_message(&mut self, arguments: &Value) -> anyhow::Result<String> {
+        validate_arguments(arguments, &["group"], &["message", "attachments"])?;
+        let root_node_id = telegram_group_root(arguments)?;
+        let canonical_root_node_id = root_node_id.to_string();
+        let message = arguments
+            .get("message")
+            .map(|_| nonempty_string(arguments, "message", MAX_TELEGRAM_DM_CHARACTERS))
+            .transpose()?
+            .unwrap_or_default();
+        let attachment_requests = telegram_attachments(arguments)?;
+        anyhow::ensure!(
+            !message.is_empty() || !attachment_requests.is_empty(),
+            "SendTelegramGroupMessage requires a nonempty message, at least one attachment, or both"
+        );
+
+        let mut attachments = Vec::with_capacity(attachment_requests.len());
+        for request in &attachment_requests {
+            let attachment = self.resolve_object(&request.object_id)?;
+            anyhow::ensure!(
+                !attachment.bytes.is_empty(),
+                "attachment object {} is empty",
+                request.object_id
+            );
+            attachments.push(resolved_object_delivery(
+                attachment,
+                request.file_name.clone(),
+            ));
+        }
+        if !attachments.is_empty() {
+            let maximum = self
+                .api
+                .telegram_max_media_bytes()
+                .await
+                .context("discovering the Telegram attachment limit")?;
+            for attachment in &attachments {
+                anyhow::ensure!(
+                    attachment.object.bytes.len() as u64 <= maximum,
+                    "attachment object {} is {} bytes, over Telegram's {maximum}-byte limit",
+                    attachment.object.object_id,
+                    attachment.object.bytes.len()
+                );
+            }
+        }
+
+        let directory_group = self
+            .api
+            .directory_group_for_root(root_node_id)
+            .await
+            .with_context(|| {
+                format!("resolving known Telegram group root {canonical_root_node_id}")
+            })?;
+        anyhow::ensure!(
+            directory_group.root_ready
+                && directory_group.root_node_id.as_deref() == Some(canonical_root_node_id.as_str()),
+            "The Telegram group's Kennedy root is not ready."
+        );
+        let group_id = directory_group.group_id;
+        let _group_guard = self
+            .api
+            .telegram_group_lock(&group_id)
+            .await
+            .lock_owned()
+            .await;
+
+        if !message.is_empty() {
+            self.api
+                .telegram_send_group_message(&group_id, &message)
+                .await
+                .context("sending the Telegram group message")?;
+        }
+        for attachment in &attachments {
+            let mut delivery_object = attachment.object.clone();
+            delivery_object.file_name = attachment.file_name.clone();
+            self.api
+                .telegram_send_group_object(&group_id, &delivery_object)
+                .await
+                .with_context(|| {
+                    format!(
+                        "sending Telegram group attachment {}",
+                        attachment.object.object_id
+                    )
+                })?;
+        }
+
+        let attachment_summary = match attachments.len() {
+            0 => String::new(),
+            1 => " with 1 attachment".into(),
+            count => format!(" with {count} attachments"),
+        };
+        Ok(format!(
+            "Sent a Telegram group message{attachment_summary} to group root {canonical_root_node_id}."
+        ))
+    }
+
     async fn execute_tool(
         &mut self,
         call: &ToolCall,
@@ -3005,6 +2866,7 @@ impl Session {
         let mut managed_source_snapshot = None;
         let text = match call.name.as_str() {
             "SendTelegramDM" => self.send_telegram_dm(&call.arguments).await?,
+            "SendTelegramGroupMessage" => self.send_telegram_group_message(&call.arguments).await?,
             "RunSubagent" => {
                 store_result = true;
                 let first_event = self.journal.state().events.len();
@@ -3069,9 +2931,15 @@ impl Session {
             "HydrateBox" => {
                 validate_arguments(&call.arguments, &["boxId"], &[])?;
                 let id = box_id(&call.arguments, "boxId")?;
-                self.preflight_hydration(id)?;
                 self.journal.rehydrate_box(now(), id)?;
-                format!("Hydrated box {id}.")
+                let external_event_id = self.pending_external_event_id.clone();
+                match self.recover_context_overflow(external_event_id.as_deref(), &[id])? {
+                    ContextRecovery::NotNeeded => format!("Hydrated box {id}."),
+                    ContextRecovery::Recovered => {
+                        format!("Hydrated box {id}.\n\n{CONTEXT_OVERFLOW_WARNING}")
+                    }
+                    ContextRecovery::Irreducible => anyhow::bail!(CONTEXT_OVERFLOW_WARNING),
+                }
             }
             "BoxesIntoObjects" => {
                 validate_arguments(&call.arguments, &["boxIds"], &[])?;
@@ -3126,25 +2994,8 @@ impl Session {
                     objects: vec![object_id.clone()],
                     metadata,
                 };
-                let recorded_at = now();
-                let projected = self
-                    .journal
-                    .state()
-                    .projection_with_new_boxes_at(
-                        &recorded_at,
-                        &[("Kennedy message".into(), BoxOwner::Kennedy, content.clone())],
-                    )?
-                    .estimated_tokens;
-                anyhow::ensure!(
-                    projected <= self.journal.state().live_context_limit(),
-                    "emitting object {object_id} would exceed the live context limit"
-                );
-                self.journal.create_box(
-                    recorded_at,
-                    "Kennedy message",
-                    BoxOwner::Kennedy,
-                    content,
-                )?;
+                self.journal
+                    .create_box(now(), "Kennedy message", BoxOwner::Kennedy, content)?;
                 let mut transcript = json!({
                     "role":"kennedy",
                     "content":"",
@@ -3222,9 +3073,7 @@ impl Session {
                 } else {
                     let (bytes, downloaded_media_type) = self
                         .api
-                        .telegram_bytes(&format!(
-                            "/api/v1/group-messages/{chat_id}/{message_id}/media"
-                        ))
+                        .telegram_group_message_media(chat_id, message_id)
                         .await?;
                     anyhow::ensure!(
                         !bytes.is_empty(),
@@ -3479,54 +3328,6 @@ impl Session {
             anyhow::ensure!(
                 !matches!(self.mode, AgentMode::Conversation),
                 "EndSession is unavailable in a conversation"
-            );
-        }
-        Ok(())
-    }
-
-    fn preflight_hydration(&mut self, id: BoxId) -> anyhow::Result<()> {
-        self.journal
-            .state()
-            .box_state(id)
-            .with_context(|| format!("box {id} does not exist"))?;
-        let projected = self
-            .journal
-            .state()
-            .projection_with_box_representations(&BTreeMap::from([(
-                id,
-                BoxRepresentation::Hydrated,
-            )]))?
-            .estimated_tokens;
-        let ingress = matches!(self.mode, AgentMode::Ingress { .. });
-        let limit = if ingress {
-            self.journal.state().ingress_context_limit()
-        } else {
-            self.journal.state().live_context_limit()
-        };
-        if projected > limit {
-            if !matches!(self.mode, AgentMode::Ingress { .. }) {
-                let external_event_id = self.pending_external_event_id.clone();
-                let message = self.record_live_capacity_error(
-                    &format!("Hydrating box {id}"),
-                    projected,
-                    limit,
-                    external_event_id.as_deref(),
-                )?;
-                anyhow::bail!(message);
-            }
-            self.journal.record(
-                now(),
-                EventKind::CapacityError {
-                    attempted_operation: format!("HydrateBox({id})"),
-                    projected_tokens: projected,
-                    limit_tokens: limit,
-                },
-            )?;
-            if ingress {
-                self.request_ingress_force_commit("hydration_exceeded_full_window", projected)?;
-            }
-            anyhow::bail!(
-                "hydrating box {id} would use approximately {projected} tokens, over the {limit} token limit"
             );
         }
         Ok(())
@@ -3971,7 +3772,7 @@ impl Session {
         if matches!(self.mode, AgentMode::FreeTime) {
             let deadline = deadline(&self.free_time)?;
             return Some(Duration::from_secs(
-                (deadline - Utc::now()).num_seconds().max(1) as u64 + 120,
+                (deadline - Utc::now()).num_seconds().max(1) as u64 + 360,
             ));
         }
         None
@@ -3980,7 +3781,7 @@ impl Session {
     pub(crate) fn refresh_telegram_group_context(
         &mut self,
         group_context: &Value,
-        _current_message_id: Option<&str>,
+        current_message_id: Option<&str>,
     ) -> anyhow::Result<()> {
         if self.session_type != "telegram-group" {
             return Ok(());
@@ -3993,12 +3794,13 @@ impl Session {
             BoxOwner::Controller,
             BoxContent::text(format_telegram_group_context(group_context)),
         )?;
+        self.recover_context_overflow(current_message_id, &[])?;
         Ok(())
     }
 
     pub(crate) fn finalize_free_time(&mut self, reason: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
-            matches!(reason, "tool" | "deadline" | "hard-stop"),
+            matches!(reason, "tool" | "deadline" | "hard-stop" | "user-stop"),
             "invalid self-time completion reason"
         );
         self.free_time["sliceEndedReason"] = json!(reason);
@@ -4092,9 +3894,12 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
                     "RunSubagent is unavailable inside a subagent. Only Kennedy may launch subagents.",
                 ));
             }
-            if call.name == "SendTelegramDM" {
+            if matches!(
+                call.name.as_str(),
+                "SendTelegramDM" | "SendTelegramGroupMessage"
+            ) {
                 return Ok(kcode_agent_runtime::ToolOutcome::failure(
-                    "SendTelegramDM is unavailable inside a subagent. Only Kennedy may send a direct message.",
+                    "Telegram cold delivery is unavailable inside a subagent. Only Kennedy may initiate a Telegram message.",
                 ));
             }
             if budget.estimated_tokens() > budget.max_input_tokens() {
@@ -4463,18 +4268,36 @@ fn transcript_from_journal(journal: &HistorySession) -> Vec<Value> {
             if let Some(id) = state.canonical.content.metadata.get("externalEventId") {
                 entry["externalEventId"] = id.clone();
             }
+            if state
+                .canonical
+                .content
+                .metadata
+                .get("contextOverflowWarning")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                entry["contextOverflowWarning"] = json!(true);
+            }
             Some(entry)
         })
         .collect()
 }
 
+fn is_terminal_external_response(entry: &Value) -> bool {
+    match entry.get("role").and_then(Value::as_str) {
+        Some("kennedy") => true,
+        Some("system") => {
+            entry.get("contextOverflowWarning").and_then(Value::as_bool) != Some(true)
+        }
+        _ => false,
+    }
+}
+
 fn restore_pending_turn(restored: Option<&Value>, transcript: &[Value]) -> (bool, Option<String>) {
     let answered = |id: &str| {
         transcript.iter().any(|candidate| {
-            matches!(
-                candidate.get("role").and_then(Value::as_str),
-                Some("kennedy" | "system")
-            ) && candidate.get("externalEventId").and_then(Value::as_str) == Some(id)
+            is_terminal_external_response(candidate)
+                && candidate.get("externalEventId").and_then(Value::as_str) == Some(id)
         })
     };
     let journal_pending_external = transcript.iter().rev().find_map(|entry| {
@@ -4984,7 +4807,7 @@ fn optional_object_id_array(
     Ok(ids)
 }
 
-fn telegram_dm_attachments(value: &Value) -> anyhow::Result<Vec<ObjectDeliveryRequest>> {
+fn telegram_attachments(value: &Value) -> anyhow::Result<Vec<ObjectDeliveryRequest>> {
     let Some(attachments) = value.get("attachments") else {
         return Ok(Vec::new());
     };
@@ -5012,6 +4835,23 @@ fn telegram_dm_attachments(value: &Value) -> anyhow::Result<Vec<ObjectDeliveryRe
             })
         })
         .collect()
+}
+
+fn telegram_group_root(value: &Value) -> anyhow::Result<NodeId> {
+    let group = value
+        .get("group")
+        .filter(|value| value.is_object())
+        .context("group must be an object")?;
+    validate_arguments(group, &["rootNodeId"], &[])?;
+    let root_node_id_text = nonempty_string(group, "rootNodeId", 128)?;
+    let root_node_id = root_node_id_text
+        .parse::<NodeId>()
+        .context("group.rootNodeId must be a canonical Kweb node ID")?;
+    anyhow::ensure!(
+        root_node_id.to_string() == root_node_id_text,
+        "group.rootNodeId must use the canonical Kweb node ID encoding"
+    );
+    Ok(root_node_id)
 }
 
 fn optional_delivery_file_name(value: &Value, key: &str) -> anyhow::Result<Option<String>> {
@@ -5313,7 +5153,7 @@ fn render_box_text_objects(objects: &[BoxTextObject]) -> String {
 fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
     kcode_codex_runtime_v2::DynamicTool::new(
         "call_ktool",
-        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may display an object with an optional recipient-visible filename using {\"name\":\"EmitObject\",\"arguments\":{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}}. She may send an authorized user a private Telegram message, optionally with Kweb object attachments and per-attachment delivery filenames, from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\",{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}]}}.",
+        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may display an object with an optional recipient-visible filename using {\"name\":\"EmitObject\",\"arguments\":{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}}. She may send an authorized user a private Telegram message, optionally with Kweb object attachments and per-attachment delivery filenames, from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\",{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}]}}. Kennedy may likewise send text and attachments to any known Telegram group, addressed by its canonical Kweb root, with {\"name\":\"SendTelegramGroupMessage\",\"arguments\":{\"group\":{\"rootNodeId\":\"AAAAAAAE\"},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\"]}}.",
         json!({
             "type":"object",
             "additionalProperties":false,
@@ -6271,27 +6111,47 @@ mod tests {
     }
 
     #[test]
-    fn telegram_dm_attachments_have_no_tool_specific_count_or_duplicate_restriction() {
+    fn telegram_attachments_have_no_tool_specific_count_or_duplicate_restriction() {
         let attachments = (1..=11)
             .map(|index| format!("pending:{index}"))
             .chain(["pending:1".into()])
             .collect::<Vec<_>>();
         assert_eq!(
-            telegram_dm_attachments(&json!({"attachments":attachments}))
+            telegram_attachments(&json!({"attachments":attachments}))
                 .unwrap()
                 .into_iter()
                 .map(|attachment| attachment.object_id)
                 .collect::<Vec<_>>(),
             attachments,
         );
-        assert!(telegram_dm_attachments(&json!({"attachments":"pending:1"})).is_err());
-        assert!(telegram_dm_attachments(&json!({"attachments":[""]})).is_err());
+        assert!(telegram_attachments(&json!({"attachments":"pending:1"})).is_err());
+        assert!(telegram_attachments(&json!({"attachments":[""]})).is_err());
+    }
+
+    #[test]
+    fn telegram_group_delivery_uses_an_exact_canonical_root_target() {
+        let arguments = json!({
+            "group":{"rootNodeId":"AAAAAAAE"},
+            "message":"hello"
+        });
+        validate_arguments(&arguments, &["group"], &["message", "attachments"]).unwrap();
+        let root = telegram_group_root(&arguments).unwrap();
+        assert_eq!(root.to_string(), "AAAAAAAE");
+        assert!(
+            telegram_group_root(&json!({"group":{"rootNodeId":"AAAAAAAE","telegramChatId":-100}}))
+                .is_err()
+        );
+        assert!(
+            call_ktool_definition()
+                .description
+                .contains("SendTelegramGroupMessage")
+        );
     }
 
     #[test]
     fn object_delivery_filenames_are_optional_safe_and_attachment_specific() {
         assert_eq!(
-            telegram_dm_attachments(&json!({
+            telegram_attachments(&json!({
                 "attachments":[
                     "pending:1",
                     {"objectId":"AAECAwQF","fileName":"quarterly report.pdf"},
@@ -6340,13 +6200,13 @@ mod tests {
             );
         }
         assert!(
-            telegram_dm_attachments(
+            telegram_attachments(
                 &json!({"attachments":[{"objectId":"AAECAwQF","fileName":"../report.pdf"}]})
             )
             .is_err()
         );
         assert!(
-            telegram_dm_attachments(
+            telegram_attachments(
                 &json!({"attachments":[{"objectId":"AAECAwQF","fileName":"report.pdf","extra":true}]})
             )
             .is_err()
@@ -7059,79 +6919,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_rust_write_capacity_previews_replacement_instead_of_duplication() {
-        let (path, mut journal) = test_journal("managed-rust-capacity", 1_200);
-        let initial = SourceSnapshot {
-            kind: BackendManagedSourceKind::RustLibrary,
-            name: "large-lib".into(),
-            text: format!(
-                "Rust library: large-lib\nFiles: 1\n\nFile: src/lib.rs\n{}",
-                "a".repeat(1_800)
-            ),
-        };
-        apply_rust_lib_snapshot(&mut journal, initial).unwrap();
-        let call = ToolCall {
-            name: WRITE_RUST_LIB_TOOL.into(),
-            arguments: json!({
-                "name":"large-lib",
-                "files":[{"path":"src/lib.rs","contents":"b".repeat(1_800)}]
-            }),
-        };
-        let call_name = format!("Kennedy tool call: {}", call.name);
-        let full_call = BoxContent::text(
-            serde_json::to_string_pretty(&json!({"name":call.name,"arguments":call.arguments}))
-                .unwrap(),
-        );
-        let duplicated = journal
-            .state()
-            .projection_with_new_boxes(&[(call_name.clone(), BoxOwner::Kennedy, full_call)])
-            .unwrap();
-        assert!(duplicated.estimated_tokens > journal.state().live_context_limit());
-
-        let compact = tool_call_box_content(&call).unwrap();
-        let updates = prospective_rust_lib_box_updates(&journal, &call);
-        let replacement = journal
-            .state()
-            .projection_with_new_boxes_and_updates(
-                &[(call_name, BoxOwner::Kennedy, compact)],
-                &updates,
-            )
-            .unwrap();
-        assert!(replacement.estimated_tokens <= journal.state().live_context_limit());
-        assert_eq!(
-            replacement
-                .items
-                .iter()
-                .filter(|item| item.text.contains(&"b".repeat(200)))
-                .count(),
-            1
-        );
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn oversized_managed_rust_open_is_preflighted_without_mutating_chatend() {
-        let (path, journal) = test_journal("managed-rust-open-capacity", 1_000);
-        let snapshot = SourceSnapshot {
-            kind: BackendManagedSourceKind::RustLibrary,
-            name: "oversized-lib".into(),
-            text: format!(
-                "Rust library: oversized-lib\nFiles: 1\n\nFile: src/lib.rs\n{}",
-                "x".repeat(10_000)
-            ),
-        };
-        let event_count = journal.state().events.len();
-        let box_count = journal.state().boxes.len();
-        let projected = prospective_rust_lib_snapshot_tokens(&journal, &snapshot).unwrap();
-
-        assert!(projected > journal.state().live_context_limit());
-        assert_eq!(journal.state().events.len(), event_count);
-        assert_eq!(journal.state().boxes.len(), box_count);
-        assert!(rust_lib_box_id(&journal, "oversized-lib").is_none());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn freeform_write_capture_preserves_the_exact_file_and_summarizes_its_active_box() {
         let request = freeform_write_request(&json!({
             "name":"example-lib",
@@ -7481,32 +7268,48 @@ mod tests {
     }
 
     #[test]
-    fn capacity_errors_are_recovered_as_system_transcript_messages() {
+    fn context_overflow_warnings_are_recovered_as_nonterminal_system_messages() {
         let (path, mut journal) = test_journal("capacity-system-message", 1_000);
         journal
             .create_box(
                 "t1",
-                CAPACITY_ERROR_BOX_NAME,
+                CONTEXT_OVERFLOW_WARNING_BOX_NAME,
                 BoxOwner::Controller,
                 BoxContent {
-                    text: "The message exceeded capacity.".into(),
+                    text: CONTEXT_OVERFLOW_WARNING.into(),
                     objects: Vec::new(),
                     metadata: json!({
                         "transcriptRole":"system",
                         "externalEventId":"event-1",
-                        "capacityError":true,
+                        "contextOverflowWarning":true,
                     }),
                 },
             )
             .unwrap();
 
+        let transcript = transcript_from_journal(&journal);
         assert_eq!(
-            transcript_from_journal(&journal),
+            transcript,
             vec![json!({
                 "role":"system",
-                "content":"The message exceeded capacity.",
+                "content":CONTEXT_OVERFLOW_WARNING,
                 "externalEventId":"event-1",
+                "contextOverflowWarning":true,
             })]
+        );
+        assert!(!is_terminal_external_response(&transcript[0]));
+        assert_eq!(
+            restore_pending_turn(
+                Some(&json!({
+                    "pendingTurn":true,
+                    "pendingExternalEventId":"event-1",
+                })),
+                &[
+                    json!({"role":"user","content":"question","externalEventId":"event-1"}),
+                    transcript[0].clone(),
+                ],
+            ),
+            (true, Some("event-1".into()))
         );
         std::fs::remove_file(path).unwrap();
     }

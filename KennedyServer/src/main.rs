@@ -4,7 +4,6 @@ mod orchestration;
 mod session_history_http;
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -31,10 +30,6 @@ struct Args {
     command: Option<Command>,
     #[arg(long, global = true, default_value = "127.0.0.1:4321")]
     kweb_bind: String,
-    #[arg(long, default_value = "127.0.0.1:4324")]
-    telegram_bind: String,
-    #[arg(long, default_value = "http://127.0.0.1:4321")]
-    frontend_origin: String,
     #[arg(long, global = true, default_value = "./data/kweb")]
     kweb_root: PathBuf,
     #[arg(
@@ -163,7 +158,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding Kweb listener {}", args.kweb_bind))?;
     ensure_runtime_parent_directories(&args, &vault_path)?;
-    let orchestration_telegram_base = telegram_relay_http_base(&args.telegram_bind);
     let vault = if vault_path.exists() {
         let passphrase = prompt_passphrase("Unlock Kennedy credential vault: ")?;
         CredentialVault::unlock(&vault_path, passphrase)?
@@ -192,7 +186,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kcode_codex_runtime::CatalogCache::new(kcode_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) =
         kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
-    let kmap_service = kmap_http::Service::new(kmap.clone(), system_roots);
     let dev_tools = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
         rust_libraries_root: args.rust_libs_root.clone(),
         web_libraries_root: args.web_libs_root.clone(),
@@ -221,7 +214,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             directory: args.session_directory,
             completed_list: args.session_history_file,
         })?;
-    let history_router = session_history_http::router(history_service.clone());
     let (intelligence_service, intelligence_runtime) =
         kcode_intelligence_router::open(kcode_intelligence_router::Config {
             openai_api_key,
@@ -231,14 +223,16 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         })
         .await?;
     let agent_runtime = kcode_agent_runtime::AgentRuntime::new(intelligence_service.clone());
-    let telegram = kcode_tg_kennedy_bot::Config {
-        bind: args.telegram_bind,
+    let telegram_runtime = kcode_tg_kennedy_bot::open(kcode_tg_kennedy_bot::Config {
         database: args.telegram_database,
-        allowed_origins: vec![args.frontend_origin.clone()],
         bot_token: telegram_bot_token,
         identity_sink: telegram_identity.clone(),
         max_voice_bytes: args.telegram_max_voice_bytes,
-    };
+    })
+    .await?;
+    let telegram_service = telegram_runtime.service();
+    let kmap_service =
+        kmap_http::Service::new(kmap.clone(), system_roots, telegram_service.clone());
     let chunk_intelligence = intelligence_service.clone();
     let transcribe_chunk: kcode_audio_ingress::AudioChunkCall = Arc::new(move |request| {
         let intelligence = chunk_intelligence.clone();
@@ -316,7 +310,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         system_prompts_directory: args.system_prompts_dir.clone(),
         user_root_node_id: system_roots.user.to_string(),
         kennedy_root_node_id: system_roots.kennedy.to_string(),
-        telegram_relay_base: orchestration_telegram_base,
         telegram_max_media_bytes: args.telegram_max_voice_bytes,
         #[cfg(test)]
         kweb_base: String::new(),
@@ -333,20 +326,24 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             kmap,
             intelligence: intelligence_service,
             agents: agent_runtime,
-            history: history_service,
+            history: history_service.clone(),
             audio: audio_service,
             directory: telegram_identity.clone(),
             dev_tools,
+            telegram: telegram_service,
         },
     )?;
+    let orchestration_worker = orchestration::build(orchestration, orchestration_api);
+    let history_router =
+        session_history_http::router(history_service, orchestration_worker.clone());
     tokio::try_join!(
         kmap_http::serve_with_listener(
             kmap_service,
             kmap_http::MergedRouters::new(history_router, audio_ingress_router, web_lib_router),
             kweb_listener,
         ),
-        kcode_tg_kennedy_bot::serve(telegram),
-        orchestration::run(orchestration, orchestration_api),
+        telegram_runtime.run(),
+        orchestration::run(orchestration_worker),
     )?;
     Ok(())
 }
@@ -423,22 +420,6 @@ fn migrate_audio_ingress_database(legacy: &Path, current: &Path) -> anyhow::Resu
         "Migrated AudioIngress database into its owned persistence root"
     );
     Ok(())
-}
-
-fn telegram_relay_http_base(bind: &str) -> String {
-    let bind = bind.trim();
-    let Ok(address) = bind.parse::<SocketAddr>() else {
-        return format!("http://{bind}");
-    };
-    let ip = if address.ip().is_unspecified() {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    } else {
-        address.ip()
-    };
-    match ip {
-        IpAddr::V4(ip) => format!("http://{ip}:{}", address.port()),
-        IpAddr::V6(ip) => format!("http://[{ip}]:{}", address.port()),
-    }
 }
 
 async fn maintenance_guard(bind: &str, purpose: &str) -> anyhow::Result<tokio::net::TcpListener> {
@@ -941,19 +922,6 @@ mod tests {
     }
 
     #[test]
-    fn telegram_relay_urls_are_valid_for_wildcard_and_ipv6_binds() {
-        assert_eq!(
-            telegram_relay_http_base("0.0.0.0:4321"),
-            "http://127.0.0.1:4321"
-        );
-        assert_eq!(
-            telegram_relay_http_base("[::]:4322"),
-            "http://127.0.0.1:4322"
-        );
-        assert_eq!(telegram_relay_http_base("[::1]:9876"), "http://[::1]:9876");
-    }
-
-    #[test]
     fn legacy_audio_database_is_copied_once_into_the_persistence_root() {
         let directory = std::env::temp_dir().join(format!(
             "kennedy-audio-migration-test-{}",
@@ -1009,8 +977,6 @@ mod tests {
             vault_path: vault.clone(),
             command: None,
             kweb_bind: bind,
-            telegram_bind: "127.0.0.1:0".to_owned(),
-            frontend_origin: "http://127.0.0.1:4321".to_owned(),
             kweb_root: kmap.clone(),
             conversation_history_database: conversations.clone(),
             session_directory: directory.join("sessions"),

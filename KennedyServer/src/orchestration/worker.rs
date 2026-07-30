@@ -11,19 +11,20 @@ use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use kcode_server_object_envelopes::sanitize_file_name;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 use uuid::Uuid;
 
 use super::{
     AgentMode, Api, Config, Manuals, RuntimeModel, Session,
-    http::{data_url, encode_path},
+    http::data_url,
     session::{SessionOptions, is_agent_loop_round_limit, validate_delivery_file_name},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_RETRY: Duration = Duration::from_secs(2);
-const TELEGRAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const TELEGRAM_TIMEOUT_NOTICE: &str = "Kennedy could not complete a response within 30 minutes, so this request was stopped. Please send it again if you want to retry it.";
+const TELEGRAM_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+const TELEGRAM_SESSION_MAX_AGE: ChronoDuration = ChronoDuration::hours(6);
+const TELEGRAM_TIMEOUT_NOTICE: &str = "Kennedy could not complete a response within 90 minutes, so this request was stopped. Please send it again if you want to retry it.";
 
 #[derive(Clone)]
 struct Runtime {
@@ -48,6 +49,40 @@ struct TelegramEventRetry {
     last_error: String,
 }
 
+#[derive(Clone)]
+struct ActiveOperation {
+    operation_id: Uuid,
+    stopped: Arc<AtomicBool>,
+    notification: Arc<Notify>,
+}
+
+impl ActiveOperation {
+    fn new(operation_id: Uuid) -> Self {
+        Self {
+            operation_id,
+            stopped: Arc::new(AtomicBool::new(false)),
+            notification: Arc::new(Notify::new()),
+        }
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.notification.notify_waiters();
+    }
+
+    async fn stopped(&self) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        self.notification.notified().await;
+    }
+}
+
+enum TurnCompletion {
+    Finished,
+    Stopped,
+}
+
 pub(crate) struct Orchestrator {
     config: Config,
     api: Api,
@@ -60,7 +95,7 @@ pub(crate) struct Orchestrator {
     group_updates_in_flight: Mutex<HashSet<String>>,
     group_ingress_in_flight: Mutex<HashSet<String>>,
     directory_in_flight: Mutex<HashSet<String>>,
-    active_operations: Mutex<HashMap<String, Uuid>>,
+    active_operations: Mutex<HashMap<String, ActiveOperation>>,
     conversation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     last_poll_error: RwLock<Option<String>>,
 }
@@ -83,6 +118,45 @@ impl Orchestrator {
             conversation_locks: Mutex::new(HashMap::new()),
             last_poll_error: RwLock::new(None),
         }
+    }
+
+    pub(crate) async fn request_stop(&self, id: &str) -> anyhow::Result<Value> {
+        let record = self.get_conversation(id).await?;
+        let scope = stop_scope(&record);
+        let request = self
+            .api
+            .history_request_stop(
+                id,
+                kcode_session_history::NewStopRequest {
+                    idempotency_id: Uuid::new_v4().to_string(),
+                    scope: scope.into(),
+                },
+            )
+            .await?;
+        let signaled = self.signal_stop(id).await;
+        if scope == "turn" && !signaled {
+            let has_command = self
+                .api
+                .history_command_heads()
+                .await?
+                .get("commands")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| {
+                    commands.iter().any(|command| {
+                        command.get("conversationId").and_then(Value::as_str) == Some(id)
+                    })
+                });
+            if !has_command {
+                self.finish_idle_turn_stop(id).await?;
+            }
+        }
+        Ok(json!({
+            "id":id,
+            "scope":scope,
+            "status":"stopping",
+            "stopRequested":true,
+            "stopRequestId":request.get("id").cloned().unwrap_or(Value::Null),
+        }))
     }
 
     pub(crate) async fn run(self: Arc<Self>) -> anyhow::Result<()> {
@@ -144,6 +218,7 @@ impl Orchestrator {
             kennedy_root_node_id: self.api.kennedy_root_node_id().to_owned(),
         };
         self.api.history_release_interrupted_ingress().await?;
+        self.queue_detached_private_telegram_sessions().await?;
         Ok(runtime)
     }
 
@@ -169,7 +244,7 @@ impl Orchestrator {
     }
 
     async fn create_wakeup_sessions(&self, marker: DateTime<Utc>) -> anyhow::Result<()> {
-        let private_sessions = self.api.telegram_get("/api/v1/private-sessions").await?;
+        let private_sessions = self.api.telegram_private_sessions().await?;
         for private_session in private_sessions
             .get("sessions")
             .and_then(Value::as_array)
@@ -239,6 +314,9 @@ impl Orchestrator {
     async fn poll_once(self: &Arc<Self>) -> anyhow::Result<()> {
         self.api.synchronize_audio_ingress().await?;
         let histories = self.list_history().await?;
+        self.signal_pending_stops().await?;
+        self.queue_expired_telegram_sessions(&histories, Utc::now())
+            .await?;
         self.sync_conversation_commands().await?;
         self.sync_directory_provisioning().await?;
         self.sync_group_updates().await?;
@@ -246,6 +324,161 @@ impl Orchestrator {
         self.sync_telegram_events().await?;
         self.schedule_writer_job(&histories).await?;
         Ok(())
+    }
+
+    async fn signal_pending_stops(&self) -> anyhow::Result<()> {
+        let command_conversations = self
+            .api
+            .history_command_heads()
+            .await?
+            .get("commands")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|command| {
+                command
+                    .get("conversationId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        for request in self.pending_stops().await? {
+            if let Some(id) = request.get("sessionId").and_then(Value::as_str) {
+                let signaled = self.signal_stop(id).await;
+                if !signaled
+                    && request.get("scope").and_then(Value::as_str) == Some("turn")
+                    && !command_conversations.contains(id)
+                {
+                    self.finish_idle_turn_stop(id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn pending_stops(&self) -> anyhow::Result<Vec<Value>> {
+        Ok(self
+            .api
+            .history_stop_heads()
+            .await?
+            .get("stopRequests")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn pending_stop(&self, session_id: &str) -> anyhow::Result<Option<Value>> {
+        Ok(self
+            .pending_stops()
+            .await?
+            .into_iter()
+            .find(|request| request.get("sessionId").and_then(Value::as_str) == Some(session_id)))
+    }
+
+    async fn complete_pending_stop(&self, session_id: &str, outcome: Value) -> anyhow::Result<()> {
+        if let Some(request) = self.pending_stop(session_id).await?
+            && let Some(id) = request.get("id").and_then(Value::as_str)
+        {
+            self.api.history_complete_stop(id, outcome).await?;
+        }
+        Ok(())
+    }
+
+    async fn signal_stop(&self, session_id: &str) -> bool {
+        let active = self.active_operations.lock().await.get(session_id).cloned();
+        if let Some(active) = active {
+            let _ = self.api.cancel_intelligence(active.operation_id);
+            active.stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn finish_idle_turn_stop(&self, session_id: &str) -> anyhow::Result<()> {
+        let lock = self.conversation_lock(session_id).await;
+        let _guard = lock.lock().await;
+        if self.signal_stop(session_id).await {
+            return Ok(());
+        }
+        if self.pending_stop(session_id).await?.is_none() {
+            return Ok(());
+        }
+        let record = self.get_conversation(session_id).await?;
+        if record.get("phase").and_then(Value::as_str) != Some("active") {
+            return Ok(());
+        }
+        let record = Arc::new(Mutex::new(record));
+        let mut session = {
+            let locked = record.lock().await;
+            self.session_for_record(&locked).await?
+        };
+        let telegram_event = matches!(session.session_type.as_str(), "telegram" | "telegram-group")
+            .then(|| session.pending_external_event_id.clone())
+            .flatten();
+        session.interrupt_current_turn()?;
+        persist_record(&self.api, &record, session.snapshot()?, false).await?;
+        if let Some(event_id) = telegram_event {
+            self.api
+                .telegram_interrupt_event(&event_id, session_id)
+                .await?;
+        }
+        self.complete_pending_stop(session_id, json!({"status":"stopped","scope":"turn"}))
+            .await
+    }
+
+    async fn register_operation(
+        &self,
+        session_id: &str,
+        active: ActiveOperation,
+    ) -> anyhow::Result<()> {
+        self.active_operations
+            .lock()
+            .await
+            .insert(session_id.to_owned(), active.clone());
+        if self.pending_stop(session_id).await?.is_some() {
+            let _ = self.api.cancel_intelligence(active.operation_id);
+            active.stop();
+        }
+        Ok(())
+    }
+
+    async fn remove_operation(&self, session_id: &str, operation_id: Uuid) {
+        let mut active = self.active_operations.lock().await;
+        if active
+            .get(session_id)
+            .is_some_and(|operation| operation.operation_id == operation_id)
+        {
+            active.remove(session_id);
+        }
+    }
+
+    async fn run_session_turn<C, F>(
+        &self,
+        session_id: &str,
+        session: &mut Session,
+        active: ActiveOperation,
+        checkpoint: C,
+    ) -> anyhow::Result<TurnCompletion>
+    where
+        C: FnMut(Value) -> F,
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        self.register_operation(session_id, active.clone()).await?;
+        let result: anyhow::Result<TurnCompletion> = {
+            let turn = session.run_pending_turn(active.operation_id, checkpoint);
+            tokio::pin!(turn);
+            tokio::select! {
+                biased;
+                _ = active.stopped() => Ok({
+                    let _ = self.api.cancel_intelligence(active.operation_id);
+                    TurnCompletion::Stopped
+                }),
+                result = &mut turn => result.map(|_| TurnCompletion::Finished),
+            }
+        };
+        self.remove_operation(session_id, active.operation_id).await;
+        result
     }
 
     async fn list_history(&self) -> anyhow::Result<Vec<Value>> {
@@ -286,15 +519,7 @@ impl Orchestrator {
                 .unwrap_or(false)
                 && self.commands_in_flight.lock().await.contains(&id)
             {
-                if let Some(operation) = self
-                    .active_operations
-                    .lock()
-                    .await
-                    .get(&conversation_id)
-                    .copied()
-                {
-                    let _ = self.api.cancel_intelligence(operation);
-                }
+                self.signal_stop(&conversation_id).await;
                 continue;
             }
             let mut in_flight = self.commands_in_flight.lock().await;
@@ -334,23 +559,6 @@ impl Orchestrator {
         let kind = required_string(&command, "kind")?;
         let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
         let record = Arc::new(Mutex::new(record));
-        if command
-            .get("cancelRequested")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            let mut state = record
-                .lock()
-                .await
-                .get("state")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            state["orchestration"] = json!({"owner":"backend","status":"stopped"});
-            persist_record(&self.api, &record, state, false).await?;
-            self.complete_command(&command_id, json!({"status":"stopped"}))
-                .await?;
-            return Ok(());
-        }
         if kind == "end" {
             let mut state = record
                 .lock()
@@ -380,6 +588,25 @@ impl Orchestrator {
             let locked = record.lock().await;
             self.session_for_record(&locked).await?
         };
+        if command
+            .get("cancelRequested")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            session.interrupt_current_turn()?;
+            persist_record(&self.api, &record, session.snapshot()?, false).await?;
+            self.complete_command(
+                &command_id,
+                json!({"status":"stopped","reason":"user_stopped"}),
+            )
+            .await?;
+            self.complete_pending_stop(
+                &conversation_id,
+                json!({"status":"stopped","scope":"turn"}),
+            )
+            .await?;
+            return Ok(());
+        }
         if session.orchestration.get("owner").and_then(Value::as_str) != Some("backend") {
             session.orchestration = json!({"owner":"backend","status":"idle"});
             persist_record(&self.api, &record, session.snapshot()?, false).await?;
@@ -410,15 +637,11 @@ impl Orchestrator {
                     }
                     session.orchestration = json!({"owner":"backend","status":"working"});
                     persist_record(&self.api, &record, session.snapshot()?, true).await?;
-                    let operation = Uuid::new_v4();
-                    self.active_operations
-                        .lock()
-                        .await
-                        .insert(conversation_id.clone(), operation);
+                    let active = ActiveOperation::new(Uuid::new_v4());
                     let api = self.api.clone();
                     let saved_record = record.clone();
-                    let result = session
-                        .run_pending_turn(operation, move |state| {
+                    let result = self
+                        .run_session_turn(&conversation_id, &mut session, active, move |state| {
                             let api = api.clone();
                             let record = saved_record.clone();
                             async move {
@@ -427,7 +650,21 @@ impl Orchestrator {
                             }
                         })
                         .await;
-                    self.active_operations.lock().await.remove(&conversation_id);
+                    if matches!(&result, Ok(TurnCompletion::Stopped)) {
+                        session.interrupt_current_turn()?;
+                        persist_record(&self.api, &record, session.snapshot()?, false).await?;
+                        self.complete_command(
+                            &command_id,
+                            json!({"status":"stopped","reason":"user_stopped"}),
+                        )
+                        .await?;
+                        self.complete_pending_stop(
+                            &conversation_id,
+                            json!({"status":"stopped","scope":"turn"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     if let Err(error) = result {
                         let round_limit = is_agent_loop_round_limit(&error);
                         session.orchestration = if is_cancelled(&error) {
@@ -485,15 +722,11 @@ impl Orchestrator {
                     session.reset_exhausted_turn_rounds_for_retry();
                     session.orchestration = json!({"owner":"backend","status":"working"});
                     persist_record(&self.api, &record, session.snapshot()?, false).await?;
-                    let operation = Uuid::new_v4();
-                    self.active_operations
-                        .lock()
-                        .await
-                        .insert(conversation_id.clone(), operation);
+                    let active = ActiveOperation::new(Uuid::new_v4());
                     let api = self.api.clone();
                     let saved_record = record.clone();
-                    let result = session
-                        .run_pending_turn(operation, move |state| {
+                    let result = self
+                        .run_session_turn(&conversation_id, &mut session, active, move |state| {
                             let api = api.clone();
                             let record = saved_record.clone();
                             async move {
@@ -502,7 +735,21 @@ impl Orchestrator {
                             }
                         })
                         .await;
-                    self.active_operations.lock().await.remove(&conversation_id);
+                    if matches!(&result, Ok(TurnCompletion::Stopped)) {
+                        session.interrupt_current_turn()?;
+                        persist_record(&self.api, &record, session.snapshot()?, false).await?;
+                        self.complete_command(
+                            &command_id,
+                            json!({"status":"stopped","reason":"user_stopped"}),
+                        )
+                        .await?;
+                        self.complete_pending_stop(
+                            &conversation_id,
+                            json!({"status":"stopped","scope":"turn"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     if let Err(error) = result {
                         let round_limit = is_agent_loop_round_limit(&error);
                         session.orchestration = if is_cancelled(&error) {
@@ -580,6 +827,11 @@ impl Orchestrator {
             _ => anyhow::bail!("Unsupported browser conversation command {kind}"),
         };
         self.complete_command(&command_id, outcome).await?;
+        self.complete_pending_stop(
+            &conversation_id,
+            json!({"status":"already-completed","scope":"turn"}),
+        )
+        .await?;
         Ok(())
     }
 
@@ -823,16 +1075,26 @@ impl Orchestrator {
                 session.pending_turn = true;
                 let api = self.api.clone();
                 let saved_record = record.clone();
-                session
-                    .run_pending_turn(Uuid::new_v4(), move |session_state| {
-                        let api = api.clone();
-                        let record = saved_record.clone();
-                        async move {
-                            persist_ingress_record(&api, &record, session_state).await?;
-                            Ok(())
-                        }
-                    })
+                let completion = self
+                    .run_session_turn(
+                        &id,
+                        &mut session,
+                        ActiveOperation::new(Uuid::new_v4()),
+                        move |session_state| {
+                            let api = api.clone();
+                            let record = saved_record.clone();
+                            async move {
+                                persist_ingress_record(&api, &record, session_state).await?;
+                                Ok(())
+                            }
+                        },
+                    )
                     .await?;
+                if matches!(completion, TurnCompletion::Stopped) {
+                    session.interrupt_current_turn()?;
+                    session.commit_current_write_session()?;
+                    stage = "stop-completion";
+                }
             }
             persist_ingress_record(&self.api, &record, session.snapshot()?).await?;
             stage = "completion";
@@ -848,12 +1110,7 @@ impl Orchestrator {
                 .and_then(|channel| channel.get("groupIngressBatchId"))
                 .and_then(Value::as_str)
             {
-                self.api
-                    .telegram_post(
-                        &format!("/api/v1/group-ingress/{}/complete", encode_path(batch)),
-                        json!({}),
-                    )
-                    .await?;
+                self.api.telegram_complete_group_ingress(batch).await?;
             }
             Ok(())
         }
@@ -951,15 +1208,15 @@ impl Orchestrator {
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc))
             .context("self-time deadline is invalid")?;
-        let timeout = (deadline - Utc::now() + ChronoDuration::minutes(2))
+        let timeout = (deadline - Utc::now() + ChronoDuration::minutes(6))
             .to_std()
             .unwrap_or(Duration::ZERO);
-        let operation = Uuid::new_v4();
+        let active = ActiveOperation::new(Uuid::new_v4());
         let api = self.api.clone();
         let saved = record_arc.clone();
         let result = tokio::time::timeout(
             timeout,
-            session.run_pending_turn(operation, move |state| {
+            self.run_session_turn(&id, &mut session, active.clone(), move |state| {
                 let api = api.clone();
                 let record = saved.clone();
                 async move {
@@ -969,8 +1226,9 @@ impl Orchestrator {
             }),
         )
         .await;
-        let reason = match result {
-            Ok(Ok(_)) => session
+        let mut reason = match result {
+            Ok(Ok(TurnCompletion::Stopped)) => "user-stop".into(),
+            Ok(Ok(TurnCompletion::Finished)) => session
                 .free_time
                 .get("sliceEndedReason")
                 .and_then(Value::as_str)
@@ -984,10 +1242,18 @@ impl Orchestrator {
                 .to_owned(),
             Ok(Err(error)) => return Err(error),
             Err(_) => {
-                let _ = self.api.cancel_intelligence(operation);
+                let _ = self.api.cancel_intelligence(active.operation_id);
+                active.stop();
+                self.remove_operation(&id, active.operation_id).await;
                 "hard-stop".into()
             }
         };
+        if reason != "user-stop" && self.pending_stop(&id).await?.is_some() {
+            reason = "user-stop".into();
+        }
+        if reason == "user-stop" {
+            session.interrupt_current_turn()?;
+        }
         session.finalize_free_time(&reason)?;
         session.commit_current_write_session()?;
         persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
@@ -1005,7 +1271,7 @@ impl Orchestrator {
             )
             .await?;
         *locked = completed;
-        if deadline - Utc::now() >= ChronoDuration::minutes(5) {
+        if reason != "user-stop" && deadline - Utc::now() >= ChronoDuration::minutes(5) {
             self.create_next_self_time_slice(
                 &runtime,
                 session.free_time.clone(),
@@ -1023,19 +1289,26 @@ impl Orchestrator {
         session.stage_wakeup_opening()?;
         let record = Arc::new(Mutex::new(record));
         persist_record(&self.api, &record, session.snapshot()?, false).await?;
-        let operation = Uuid::new_v4();
         let api = self.api.clone();
         let saved = record.clone();
-        session
-            .run_pending_turn(operation, move |state| {
-                let api = api.clone();
-                let record = saved.clone();
-                async move {
-                    persist_record(&api, &record, state, false).await?;
-                    Ok(())
-                }
-            })
+        let completion = self
+            .run_session_turn(
+                &id,
+                &mut session,
+                ActiveOperation::new(Uuid::new_v4()),
+                move |state| {
+                    let api = api.clone();
+                    let record = saved.clone();
+                    async move {
+                        persist_record(&api, &record, state, false).await?;
+                        Ok(())
+                    }
+                },
+            )
             .await?;
+        if matches!(completion, TurnCompletion::Stopped) {
+            session.interrupt_current_turn()?;
+        }
         session.commit_current_write_session()?;
         persist_record(&self.api, &record, session.snapshot()?, false).await?;
         session.release_managed_sources().await;
@@ -1243,7 +1516,10 @@ impl Orchestrator {
         excluded_message_id: Option<&str>,
         group_id: &str,
     ) -> anyhow::Result<Value> {
-        let chat_id = context.get("chatId").map(value_string).unwrap_or_default();
+        let chat_id = context
+            .get("chatId")
+            .and_then(Value::as_i64)
+            .context("Telegram group context omitted its numeric chat ID")?;
         let mut messages = Vec::new();
         for mut message in context
             .get("messages")
@@ -1255,6 +1531,10 @@ impl Orchestrator {
                 .get("messageId")
                 .map(value_string)
                 .unwrap_or_default();
+            let numeric_message_id = message
+                .get("messageId")
+                .and_then(Value::as_i64)
+                .context("Telegram group context message omitted its numeric message ID")?;
             let excluded = excluded_message_id == Some(message_id.as_str());
             let kind = message
                 .get("kind")
@@ -1273,11 +1553,7 @@ impl Orchestrator {
                 let prepared = async {
                     let (bytes, mime) = self
                         .api
-                        .telegram_bytes(&format!(
-                            "/api/v1/group-messages/{}/{}/media",
-                            encode_path(&chat_id),
-                            encode_path(&message_id)
-                        ))
+                        .telegram_group_message_media(chat_id, numeric_message_id)
                         .await?;
                     let result = self
                         .api
@@ -1320,13 +1596,13 @@ impl Orchestrator {
                 message["preparationTruncated"] = json!(truncated);
                 let _ = self
                     .api
-                    .telegram_post(
-                        &format!(
-                            "/api/v1/group-messages/{}/{}/preparation",
-                            encode_path(&chat_id),
-                            encode_path(&message_id)
-                        ),
-                        json!({"text":text,"model":model,"format":format,"truncated":truncated}),
+                    .telegram_save_group_message_preparation(
+                        chat_id,
+                        numeric_message_id,
+                        &text,
+                        model.as_deref(),
+                        format.as_deref(),
+                        truncated,
                     )
                     .await;
             }
@@ -1345,13 +1621,10 @@ impl Orchestrator {
             {
                 let has_media = message.get("hasMedia").and_then(Value::as_bool) == Some(true);
                 if has_media {
-                    let media_path = format!(
-                        "/api/v1/group-messages/{}/{}/media",
-                        encode_path(&chat_id),
-                        encode_path(&message_id)
-                    );
-                    let (size_bytes, downloaded_mime_type) =
-                        self.api.telegram_file_metadata(&media_path).await?;
+                    let (size_bytes, downloaded_mime_type) = self
+                        .api
+                        .telegram_group_message_media_metadata(chat_id, numeric_message_id)
+                        .await?;
                     let mime_type = normalized_file_mime_type(
                         message
                             .get("mimeType")
@@ -1408,7 +1681,7 @@ impl Orchestrator {
     async fn sync_telegram_events(self: &Arc<Self>) -> anyhow::Result<()> {
         let events = self
             .api
-            .telegram_get("/api/v1/events")
+            .telegram_events()
             .await?
             .get("events")
             .and_then(Value::as_array)
@@ -1454,26 +1727,36 @@ impl Orchestrator {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        let operation = Uuid::new_v4();
+        let active = ActiveOperation::new(Uuid::new_v4());
         self.active_operations
             .lock()
             .await
-            .insert(format!("telegram:{id}"), operation);
+            .insert(format!("telegram:{id}"), active.clone());
         let conversation_id = Arc::new(Mutex::new(
             event
                 .get("conversationId")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         ));
+        if let Some(conversation_id) = conversation_id.lock().await.clone() {
+            self.active_operations
+                .lock()
+                .await
+                .insert(conversation_id, active.clone());
+        }
         let result = tokio::time::timeout(
             telegram_timeout(&event),
-            self.process_telegram_event(&event, operation, conversation_id.clone()),
+            self.process_telegram_event(&event, active.clone(), conversation_id.clone()),
         )
         .await;
         self.active_operations
             .lock()
             .await
             .remove(&format!("telegram:{id}"));
+        if let Some(conversation_id) = conversation_id.lock().await.clone() {
+            self.remove_operation(&conversation_id, active.operation_id)
+                .await;
+        }
         match result {
             Ok(Ok(())) => {
                 self.event_retries.lock().await.remove(&id);
@@ -1501,24 +1784,41 @@ impl Orchestrator {
                 }
             }
             Err(_) => {
-                self.event_retries.lock().await.remove(&id);
-                let _ = self.api.cancel_intelligence(operation);
+                let _ = self.api.cancel_intelligence(active.operation_id);
                 let conversation = conversation_id.lock().await.clone();
                 if let Some(conversation_id) = &conversation
                     && let Err(error) = self
                         .transition_timed_out_telegram_to_ingress(conversation_id)
                         .await
                 {
-                    tracing::error!(event_id=%id,error=%error,"Timed-out Telegram conversation could not be queued for ingress");
+                    let message = bounded_error(&error);
+                    let (attempt, delay, should_warn) =
+                        self.record_telegram_event_retry(&id, &message).await;
+                    if should_warn {
+                        tracing::warn!(
+                            event_id=%id,
+                            attempt,
+                            retry_in_seconds=delay.as_secs(),
+                            error=%message,
+                            "Timed-out Telegram event retained until its conversation can be queued for ingress"
+                        );
+                    } else {
+                        tracing::debug!(
+                            event_id=%id,
+                            attempt,
+                            retry_in_seconds=delay.as_secs(),
+                            error=%message,
+                            "Timed-out Telegram ingress handoff remains unsuccessful"
+                        );
+                    }
+                    return;
                 }
+                self.event_retries.lock().await.remove(&id);
                 let _ = self
                     .api
-                    .telegram_post(
-                        &format!("/api/v1/events/{}/abort", encode_path(&id)),
-                        json!({"conversationId":conversation,"message":TELEGRAM_TIMEOUT_NOTICE}),
-                    )
+                    .telegram_abort_event(&id, conversation.as_deref(), TELEGRAM_TIMEOUT_NOTICE)
                     .await;
-                tracing::error!(event_id=%id,"Telegram event reached its 30-minute deadline and was aborted");
+                tracing::error!(event_id=%id,"Telegram event reached its 90-minute deadline and was aborted");
             }
         }
     }
@@ -1548,7 +1848,7 @@ impl Orchestrator {
     async fn process_telegram_event(
         &self,
         event: &Value,
-        operation: Uuid,
+        active: ActiveOperation,
         bound_conversation_id: Arc<Mutex<Option<String>>>,
     ) -> anyhow::Result<()> {
         let id = required_string(event, "id")?;
@@ -1578,6 +1878,8 @@ impl Orchestrator {
             required_string(&locked, "id")?
         };
         *bound_conversation_id.lock().await = Some(conversation_id.clone());
+        self.register_operation(&conversation_id, active.clone())
+            .await?;
         let lock = self.conversation_lock(&conversation_id).await;
         let _guard = lock.lock().await;
         let mut session = {
@@ -1597,7 +1899,16 @@ impl Orchestrator {
                             .get("fileName")
                             .and_then(Value::as_str)
                             .unwrap_or("that document");
-                        self.api.telegram_post(&format!("/api/v1/events/{}/reply",encode_path(&id)),json!({"conversationId":conversation_id,"text":format!("I couldn't read {filename}: {error} Please try sending it again."),"contextWarning":Value::Null})).await?;
+                        self.api
+                            .telegram_reply_event(
+                                &id,
+                                &conversation_id,
+                                &format!(
+                                    "I couldn't read {filename}: {error} Please try sending it again."
+                                ),
+                                None,
+                            )
+                            .await?;
                         return Ok(());
                     }
                     Err(error) => return Err(error),
@@ -1607,8 +1918,8 @@ impl Orchestrator {
             }
             let api = self.api.clone();
             let saved = record_arc.clone();
-            session
-                .run_pending_turn(operation, move |state| {
+            let completion = self
+                .run_session_turn(&conversation_id, &mut session, active, move |state| {
                     let api = api.clone();
                     let record = saved.clone();
                     async move {
@@ -1617,24 +1928,43 @@ impl Orchestrator {
                     }
                 })
                 .await?;
+            if matches!(completion, TurnCompletion::Stopped) {
+                session.interrupt_current_turn()?;
+                persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
+                self.api
+                    .telegram_interrupt_event(&id, &conversation_id)
+                    .await?;
+                self.complete_pending_stop(
+                    &conversation_id,
+                    json!({"status":"stopped","scope":"turn"}),
+                )
+                .await?;
+                return Ok(());
+            }
             persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
             if session.requires_history_ingress() {
                 session.orchestration =
                     json!({"owner":"backend","status":"ending","reason":"context-limit"});
                 persist_record(&self.api, &record_arc, session.snapshot()?, false).await?;
                 self.request_conversation_ingress(&record_arc, None).await?;
-                self.deliver_telegram_responses(
-                    &mut session,
-                    &id,
+                self.deliver_telegram_responses(&mut session, &id, &conversation_id)
+                    .await?;
+                self.complete_pending_stop(
                     &conversation_id,
-                    Some("session ended after crossing the 75% forced-ingress threshold"),
+                    json!({"status":"already-completed","scope":"turn"}),
                 )
                 .await?;
                 return Ok(());
             }
         }
-        self.deliver_telegram_responses(&mut session, &id, &conversation_id, None)
-            .await
+        self.deliver_telegram_responses(&mut session, &id, &conversation_id)
+            .await?;
+        self.complete_pending_stop(
+            &conversation_id,
+            json!({"status":"already-completed","scope":"turn"}),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn deliver_telegram_responses(
@@ -1642,7 +1972,6 @@ impl Orchestrator {
         session: &mut Session,
         event_id: &str,
         conversation_id: &str,
-        forced_context_warning: Option<&str>,
     ) -> anyhow::Result<()> {
         enum Delivery {
             Object {
@@ -1674,18 +2003,6 @@ impl Orchestrator {
                 ));
             }
         }
-        if let Some(warning) = forced_context_warning {
-            let has_text = deliveries
-                .iter()
-                .any(|delivery| matches!(delivery, Delivery::Text(_, _)));
-            if !has_text {
-                deliveries.push(Delivery::Text(
-                    "This session reached its context limit and has been sent to history ingress."
-                        .into(),
-                    json!(warning),
-                ));
-            }
-        }
         anyhow::ensure!(
             !deliveries.is_empty(),
             "Kennedy completed the turn without a recoverable Telegram response"
@@ -1710,26 +2027,16 @@ impl Orchestrator {
                         self.config.telegram_max_media_bytes
                     );
                     self.api
-                        .telegram_send_object(
-                            &encode_path(event_id),
-                            conversation_id,
-                            &file,
-                            complete,
-                        )
+                        .telegram_send_object(event_id, conversation_id, &file, complete)
                         .await?;
                 }
                 Delivery::Text(text, response_warning) => {
-                    let warning = forced_context_warning
-                        .map(|warning| json!(warning))
-                        .unwrap_or(response_warning);
                     self.api
-                        .telegram_post(
-                            &format!("/api/v1/events/{}/reply", encode_path(event_id)),
-                            json!({
-                                "conversationId":conversation_id,
-                                "text":text,
-                                "contextWarning":warning,
-                            }),
+                        .telegram_reply_event(
+                            event_id,
+                            conversation_id,
+                            &text,
+                            response_warning.as_str(),
                         )
                         .await?;
                 }
@@ -1773,6 +2080,92 @@ impl Orchestrator {
             self.api.release_managed_sources(session_id).await;
         }
         Ok(())
+    }
+
+    async fn queue_detached_private_telegram_sessions(&self) -> anyhow::Result<()> {
+        let bound = self
+            .api
+            .telegram_private_sessions()
+            .await?
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session.get("currentConversationId").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let histories = self.list_history().await?;
+        for record in histories.iter().filter(|record| {
+            record.get("phase").and_then(Value::as_str) == Some("active")
+                && session_type(record) == "telegram"
+                && record
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !bound.contains(id))
+        }) {
+            self.queue_telegram_session_for_ingress(record, "telegram-detached")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn queue_expired_telegram_sessions(
+        &self,
+        histories: &[Value],
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        for record in histories
+            .iter()
+            .filter(|record| telegram_session_is_expired(record, now))
+        {
+            self.queue_telegram_session_for_ingress(record, "telegram-session-timeout")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn queue_telegram_session_for_ingress(
+        &self,
+        summary: &Value,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let id = required_string(summary, "id")?;
+        let lock = self.conversation_lock(&id).await;
+        let _guard = lock.lock().await;
+        let record = self.get_conversation(&id).await?;
+        if record.get("phase").and_then(Value::as_str) != Some("active")
+            || !matches!(
+                session_type(&record).as_str(),
+                "telegram" | "telegram-group"
+            )
+        {
+            return Ok(false);
+        }
+        if reason == "telegram-session-timeout" && !telegram_session_is_expired(&record, Utc::now())
+        {
+            return Ok(false);
+        }
+        let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+        state["orchestration"] = json!({
+            "owner":"backend",
+            "status":"stopped",
+            "reason":reason,
+        });
+        self.api
+            .history_request_ingress(
+                &id,
+                kcode_session_history::Checkpoint {
+                    expected_version: version(&record)?,
+                    state: state.clone(),
+                    user_activity: false,
+                },
+            )
+            .await?;
+        if let Some(session_id) = state.get("rustLibSessionId").and_then(Value::as_str) {
+            self.api.release_managed_sources(session_id).await;
+        }
+        tracing::info!(session_id=%id, %reason, "Queued Telegram session for history ingress");
+        Ok(true)
     }
 
     async fn telegram_session(
@@ -1829,7 +2222,13 @@ impl Orchestrator {
         if event.get("conversationId").and_then(Value::as_str) != Some(&id)
             || event.get("processingStartedAt").is_none()
         {
-            self.api.telegram_post(&format!("/api/v1/events/{}/bind",encode_path(required_string(event,"id")?)),json!({"conversationId":id,"expectedConversationId":event.get("conversationId").cloned().unwrap_or(Value::Null)})).await?;
+            self.api
+                .telegram_bind_event(
+                    &required_string(event, "id")?,
+                    &id,
+                    event.get("conversationId").and_then(Value::as_str),
+                )
+                .await?;
         }
         if group && !created {
             let group_id = required_string(event, "groupId")?;
@@ -1911,10 +2310,7 @@ impl Orchestrator {
         let id = required_string(event, "id")?;
         match event.get("kind").and_then(Value::as_str).unwrap_or("text") {
             "voice" => {
-                let (bytes, mime) = self
-                    .api
-                    .telegram_bytes(&format!("/api/v1/events/{}/media", encode_path(&id)))
-                    .await?;
+                let (bytes, mime) = self.api.telegram_event_media(&id).await?;
                 let filename = event
                     .get("fileName")
                     .and_then(Value::as_str)
@@ -1930,10 +2326,7 @@ impl Orchestrator {
                 ))
             }
             "document" => {
-                let (bytes, mime) = self
-                    .api
-                    .telegram_bytes(&format!("/api/v1/events/{}/media", encode_path(&id)))
-                    .await?;
+                let (bytes, mime) = self.api.telegram_event_media(&id).await?;
                 let filename = event
                     .get("fileName")
                     .and_then(Value::as_str)
@@ -1975,10 +2368,7 @@ impl Orchestrator {
                 ))
             }
             kind @ ("photo" | "video" | "animation" | "audio" | "video_note" | "sticker") => {
-                let (bytes, downloaded_mime) = self
-                    .api
-                    .telegram_bytes(&format!("/api/v1/events/{}/media", encode_path(&id)))
-                    .await?;
+                let (bytes, downloaded_mime) = self.api.telegram_event_media(&id).await?;
                 let mime = event
                     .get("mimeType")
                     .and_then(Value::as_str)
@@ -2038,7 +2428,14 @@ impl Orchestrator {
     async fn process_telegram_reset(&self, event: &Value) -> anyhow::Result<()> {
         let id = required_string(event, "id")?;
         let Some(conversation_id) = event.get("conversationId").and_then(Value::as_str) else {
-            self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
+            self.api
+                .telegram_complete_reset(
+                    &id,
+                    Some(
+                        "There is no active Telegram session to reset. Your next message will begin one.",
+                    ),
+                )
+                .await?;
             return Ok(());
         };
         let record = match self.get_conversation(conversation_id).await {
@@ -2048,13 +2445,27 @@ impl Orchestrator {
                     .downcast_ref::<super::ApiError>()
                     .is_some_and(|error| error.code == "not_found") =>
             {
-                self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
+                self.api
+                    .telegram_complete_reset(
+                        &id,
+                        Some(
+                            "There is no active Telegram session to reset. Your next message will begin one.",
+                        ),
+                    )
+                    .await?;
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
         if record.get("phase").and_then(Value::as_str) != Some("active") {
-            self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"There is no active Telegram session to reset. Your next message will begin one."})).await?;
+            self.api
+                .telegram_complete_reset(
+                    &id,
+                    Some(
+                        "There is no active Telegram session to reset. Your next message will begin one.",
+                    ),
+                )
+                .await?;
             return Ok(());
         }
         let session = self.session_for_record(&record).await?;
@@ -2069,14 +2480,21 @@ impl Orchestrator {
                 },
             )
             .await?;
-        self.api.telegram_post(&format!("/api/v1/events/{}/reset-completed",encode_path(&id)),json!({"message":"Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session."})).await?;
+        self.api
+            .telegram_complete_reset(
+                &id,
+                Some(
+                    "Conversation reset. The Telegram session has been queued for memory ingress; your next message will begin a new session.",
+                ),
+            )
+            .await?;
         Ok(())
     }
 
     async fn sync_group_updates(self: &Arc<Self>) -> anyhow::Result<()> {
         let updates = self
             .api
-            .telegram_get("/api/v1/group-sessions/updates")
+            .telegram_group_session_updates()
             .await?
             .get("updates")
             .and_then(Value::as_array)
@@ -2118,15 +2536,7 @@ impl Orchestrator {
         };
         if record.get("phase").and_then(Value::as_str) != Some("active") {
             if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
-                self.api
-                    .telegram_post(
-                        &format!(
-                            "/api/v1/group-sessions/{}/silent-reset-completed",
-                            encode_path(&id)
-                        ),
-                        json!({}),
-                    )
-                    .await?;
+                self.api.telegram_complete_silent_group_reset(&id).await?;
             }
             return Ok(());
         }
@@ -2147,17 +2557,17 @@ impl Orchestrator {
         persist_record(&self.api, &record, session.snapshot()?, false).await?;
         if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
             self.close_conversation(&record, &session).await?;
+            self.api.telegram_complete_silent_group_reset(&id).await?;
+        } else {
             self.api
-                .telegram_post(
-                    &format!(
-                        "/api/v1/group-sessions/{}/silent-reset-completed",
-                        encode_path(&id)
-                    ),
-                    json!({}),
+                .telegram_acknowledge_group_context(
+                    &id,
+                    update
+                        .get("throughMessageId")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
                 )
                 .await?;
-        } else {
-            self.api.telegram_post(&format!("/api/v1/group-sessions/{}/context-ack",encode_path(&id)),json!({"throughMessageId":update.get("throughMessageId").cloned().unwrap_or(json!(0))})).await?;
         }
         Ok(())
     }
@@ -2170,13 +2580,7 @@ impl Orchestrator {
         match missing_group_session_recovery(update)? {
             MissingGroupSessionRecovery::CompleteSilentReset => {
                 self.api
-                    .telegram_post(
-                        &format!(
-                            "/api/v1/group-sessions/{}/silent-reset-completed",
-                            encode_path(conversation_id)
-                        ),
-                        json!({}),
-                    )
+                    .telegram_complete_silent_group_reset(conversation_id)
                     .await?;
                 tracing::info!(
                     %conversation_id,
@@ -2189,16 +2593,7 @@ impl Orchestrator {
             } => {
                 let result = self
                     .api
-                    .telegram_post(
-                        &format!(
-                            "/api/v1/group-sessions/{}/detach-if-current",
-                            encode_path(conversation_id)
-                        ),
-                        json!({
-                            "groupId":group_id,
-                            "telegramUserId":telegram_user_id,
-                        }),
-                    )
+                    .telegram_detach_group_session(conversation_id, &group_id, telegram_user_id)
                     .await;
                 match result {
                     Ok(_) => {
@@ -2227,7 +2622,7 @@ impl Orchestrator {
     async fn sync_group_ingress(self: &Arc<Self>) -> anyhow::Result<()> {
         let batches = self
             .api
-            .telegram_get("/api/v1/group-ingress")
+            .telegram_group_ingress()
             .await?
             .get("batches")
             .and_then(Value::as_array)
@@ -2264,12 +2659,7 @@ impl Orchestrator {
         }) {
             match existing.get("phase").and_then(Value::as_str) {
                 Some("complete") => {
-                    self.api
-                        .telegram_post(
-                            &format!("/api/v1/group-ingress/{}/complete", encode_path(&id)),
-                            json!({}),
-                        )
-                        .await?;
+                    self.api.telegram_complete_group_ingress(&id).await?;
                 }
                 Some("active") => {
                     let existing = self
@@ -2433,6 +2823,26 @@ fn session_type(record: &Value) -> String {
         .into()
 }
 
+fn stop_scope(record: &Value) -> &'static str {
+    let phase = record
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let session_type = session_type(record);
+    if phase == "active"
+        && matches!(
+            session_type.as_str(),
+            "conversation" | "telegram" | "telegram-group"
+        )
+    {
+        "turn"
+    } else if phase == "active" && session_type == "free-time" {
+        "self-time-run"
+    } else {
+        "session"
+    }
+}
+
 fn next_wakeup_marker(now: DateTime<Utc>) -> DateTime<Utc> {
     let day_start = now
         .date_naive()
@@ -2496,6 +2906,23 @@ fn ingress_record_time(record: &Value) -> DateTime<Utc> {
 
 fn is_browser_conversation(record: &Value) -> bool {
     session_type(record) == "conversation"
+}
+fn telegram_session_is_expired(record: &Value, now: DateTime<Utc>) -> bool {
+    if record.get("phase").and_then(Value::as_str) != Some("active")
+        || !matches!(session_type(record).as_str(), "telegram" | "telegram-group")
+        || record
+            .get("state")
+            .and_then(|state| state.get("pendingTurn"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        return false;
+    }
+    record
+        .get("started_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|started| now >= started.with_timezone(&Utc) + TELEGRAM_SESSION_MAX_AGE)
 }
 fn record_channel(record: &Value) -> Option<&Value> {
     record.get("state").and_then(|state| state.get("channel"))
@@ -2589,10 +3016,12 @@ fn telegram_group_context_file_metadata(message: &Value) -> String {
         .get("fileName")
         .and_then(Value::as_str)
         .unwrap_or("telegram-file");
-    let source_note = (message.get("fileNameSource").and_then(Value::as_str)
-        == Some("synthesized"))
-    .then_some(" (synthesized because Telegram supplied no filename)")
-    .unwrap_or_default();
+    let source_note =
+        if message.get("fileNameSource").and_then(Value::as_str) == Some("synthesized") {
+            " (synthesized because Telegram supplied no filename)"
+        } else {
+            ""
+        };
     let mime_type = normalized_file_mime_type(
         message
             .get("mimeType")
@@ -2755,6 +3184,76 @@ mod tests {
             "phase":"active",
             "state":{"sessionType":"telegram"}
         })));
+    }
+
+    #[test]
+    fn stop_scope_preserves_interactive_sessions_and_terminates_autonomous_work() {
+        for session_type in ["conversation", "telegram", "telegram-group"] {
+            assert_eq!(
+                stop_scope(&json!({
+                    "phase":"active",
+                    "state":{"sessionType":session_type}
+                })),
+                "turn"
+            );
+        }
+        assert_eq!(
+            stop_scope(&json!({
+                "phase":"active",
+                "state":{"sessionType":"free-time"}
+            })),
+            "self-time-run"
+        );
+        for (phase, session_type) in [
+            ("active", "wakeup"),
+            ("ingress_pending", "conversation"),
+            ("ingress_in_progress", "telegram"),
+        ] {
+            assert_eq!(
+                stop_scope(&json!({
+                    "phase":phase,
+                    "state":{"sessionType":session_type}
+                })),
+                "session"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_sessions_roll_over_six_hours_after_creation_once_idle() {
+        let now = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let record = json!({
+            "phase":"active",
+            "started_at":"2026-07-30T06:00:00Z",
+            "state":{"sessionType":"telegram","pendingTurn":false}
+        });
+        assert!(telegram_session_is_expired(&record, now));
+        assert!(!telegram_session_is_expired(
+            &json!({
+                "phase":"active",
+                "started_at":"2026-07-30T06:00:01Z",
+                "state":{"sessionType":"telegram-group","pendingTurn":false}
+            }),
+            now
+        ));
+        assert!(!telegram_session_is_expired(
+            &json!({
+                "phase":"active",
+                "started_at":"2026-07-30T05:00:00Z",
+                "state":{"sessionType":"telegram","pendingTurn":true}
+            }),
+            now
+        ));
+        assert!(!telegram_session_is_expired(
+            &json!({
+                "phase":"ingress_pending",
+                "started_at":"2026-07-30T05:00:00Z",
+                "state":{"sessionType":"telegram","pendingTurn":false}
+            }),
+            now
+        ));
     }
 
     #[test]

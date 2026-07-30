@@ -1,14 +1,18 @@
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+#[cfg(test)]
+use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 
+#[cfg(test)]
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use kcode_kmap::{CreateProvenance, Kmap, NodeContents, NodeWrite};
 use kcode_kweb_db::{Node, NodeId, ObjectId, Owner, Provenance};
 use kcode_server_object_envelopes::{StoredFile, StoredProvenance, decode_file, encode_file};
-use reqwest::multipart;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::StatusCode;
+#[cfg(test)]
+use reqwest::{Client, Method, multipart};
 use serde_json::{Value, json};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
@@ -16,8 +20,6 @@ use uuid::Uuid;
 
 use super::Config;
 use super::session::ResolvedObject;
-
-const TELEGRAM_STARTUP_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(crate) struct LocalServices {
@@ -28,6 +30,7 @@ pub(crate) struct LocalServices {
     pub directory: std::sync::Arc<kcode_telegram_identity::Directory>,
     pub dev_tools: kcode_dev_tools::Service,
     pub agents: kcode_agent_runtime::AgentRuntime,
+    pub telegram: kcode_tg_kennedy_bot::Service,
 }
 
 #[derive(Debug, Clone)]
@@ -48,13 +51,14 @@ impl std::error::Error for ApiError {}
 
 #[derive(Clone)]
 pub(crate) struct Api {
+    #[cfg(test)]
     client: Client,
     services: ServiceBackend,
     history_sessions: kcode_session_history::SessionHistory,
-    telegram: String,
     user_root_node_id: String,
     kennedy_root_node_id: String,
     telegram_user_locks: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
+    telegram_group_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -91,7 +95,7 @@ impl Api {
     #[cfg(test)]
     pub fn new(config: &Config) -> anyhow::Result<Self> {
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .context("building reqwest client")?;
         let history_root = std::env::temp_dir().join(format!(
@@ -112,27 +116,29 @@ impl Api {
                 history: trim_base(&config.session_history_base),
             }),
             history_sessions,
-            telegram: trim_base(&config.telegram_relay_base),
             user_root_node_id: config.user_root_node_id.clone(),
             kennedy_root_node_id: config.kennedy_root_node_id.clone(),
             telegram_user_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            telegram_group_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
     pub fn local(config: &Config, services: LocalServices) -> anyhow::Result<Self> {
+        #[cfg(test)]
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(30))
             .build()
-            .context("building Telegram relay HTTP client")?;
+            .context("building test HTTP client")?;
         let history_sessions = services.history.clone();
         Ok(Self {
+            #[cfg(test)]
             client,
             services: ServiceBackend::Local(std::sync::Arc::new(services)),
             history_sessions,
-            telegram: trim_base(&config.telegram_relay_base),
             user_root_node_id: config.user_root_node_id.clone(),
             kennedy_root_node_id: config.kennedy_root_node_id.clone(),
             telegram_user_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            telegram_group_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -146,6 +152,27 @@ impl Api {
             .entry(telegram_user_id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    pub(crate) async fn telegram_group_lock(&self, group_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.telegram_group_locks
+            .lock()
+            .await
+            .entry(group_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn telegram(&self) -> Result<&kcode_tg_kennedy_bot::Service, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => Ok(&local.telegram),
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Err(ApiError {
+                status: None,
+                code: "local_service_unavailable".into(),
+                message: "Telegram requires KennedyServer's in-process transport service.".into(),
+            }),
+        }
     }
 
     pub(crate) fn create_history_session(
@@ -567,6 +594,71 @@ impl Api {
         }
     }
 
+    pub async fn history_request_stop(
+        &self,
+        id: &str,
+        input: kcode_session_history::NewStopRequest,
+    ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        let path = format!("/api/v1/conversations/{}/stop-requests", encode_path(id));
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .request_stop(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(|created| json_value(created.value)),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn history_stop_heads(&self) -> Result<Value, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => {
+                let stop_requests = local.history.stop_heads().await.map_err(history_error)?;
+                Ok(json!({"stopRequests":stop_requests}))
+            }
+            #[cfg(test)]
+            ServiceBackend::Http(_) => Ok(json!({"stopRequests":[]})),
+        }
+    }
+
+    pub async fn history_complete_stop(&self, id: &str, outcome: Value) -> Result<Value, ApiError> {
+        let input = kcode_session_history::StopOutcome { outcome };
+        #[cfg(test)]
+        let path = format!(
+            "/api/v1/conversation-stop-requests/{}/complete",
+            encode_path(id)
+        );
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .history
+                .complete_stop(id, input)
+                .await
+                .map_err(history_error)
+                .and_then(json_value),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => {
+                self.request(
+                    Method::POST,
+                    &bases.history,
+                    &path,
+                    Some(json_value(input)?),
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn history_checkpoint(
         &self,
         id: &str,
@@ -855,6 +947,31 @@ impl Api {
         }
     }
 
+    pub async fn directory_group_for_root(
+        &self,
+        root_node_id: kcode_kweb_db::NodeId,
+    ) -> Result<kcode_telegram_identity::Group, ApiError> {
+        match &self.services {
+            ServiceBackend::Local(local) => local
+                .directory
+                .group_for_root(root_node_id)
+                .map_err(directory_error),
+            #[cfg(test)]
+            ServiceBackend::Http(bases) => self
+                .request(
+                    Method::GET,
+                    &bases.kweb,
+                    &format!(
+                        "/api/v1/telegram-directory/groups/by-root/{}",
+                        encode_path(root_node_id)
+                    ),
+                    None,
+                )
+                .await
+                .and_then(|value| serde_json::from_value(value).map_err(local_api_error)),
+        }
+    }
+
     pub async fn directory_complete_handle_root(
         &self,
         handle: &str,
@@ -1092,25 +1209,240 @@ impl Api {
         }
     }
 
-    pub async fn telegram_get(&self, path: &str) -> Result<Value, ApiError> {
-        self.request(Method::GET, &self.telegram, path, None).await
-    }
-
-    pub async fn telegram_post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
-        self.request(Method::POST, &self.telegram, path, Some(body))
-            .await
-    }
-
     pub async fn telegram_health(&self) -> Result<(), ApiError> {
-        self.telegram_get("/health").await.map(|_| ())
+        let _ = self.telegram()?.status();
+        Ok(())
     }
 
-    pub async fn wait_until_telegram_ready(&self) {
-        while self.telegram_health().await.is_err() {
-            tokio::time::sleep(TELEGRAM_STARTUP_RETRY).await;
-        }
+    pub async fn telegram_max_media_bytes(&self) -> Result<u64, ApiError> {
+        Ok(self.telegram()?.status().max_media_bytes as u64)
     }
 
+    pub async fn telegram_private_sessions(&self) -> Result<Value, ApiError> {
+        self.telegram()?
+            .list_private_sessions()
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_send_private_message(
+        &self,
+        telegram_user_id: i64,
+        conversation_id: &str,
+        expected_conversation_id: Option<&str>,
+        text: &str,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .send_private_message(
+                telegram_user_id,
+                conversation_id.to_owned(),
+                expected_conversation_id.map(ToOwned::to_owned),
+                text.to_owned(),
+            )
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_send_group_message(
+        &self,
+        group_id: &str,
+        text: &str,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .send_group_message(group_id.to_owned(), text.to_owned())
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_events(&self) -> Result<Value, ApiError> {
+        self.telegram()?.list_events().await.map_err(telegram_error)
+    }
+
+    pub async fn telegram_group_ingress(&self) -> Result<Value, ApiError> {
+        self.telegram()?
+            .list_group_ingress()
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_complete_group_ingress(&self, batch_id: &str) -> Result<Value, ApiError> {
+        self.telegram()?
+            .complete_group_ingress(batch_id.to_owned())
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_group_session_updates(&self) -> Result<Value, ApiError> {
+        self.telegram()?
+            .list_group_session_updates()
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_complete_silent_group_reset(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .complete_silent_group_reset(conversation_id.to_owned())
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_acknowledge_group_context(
+        &self,
+        conversation_id: &str,
+        through_message_id: i64,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .acknowledge_group_session_context(conversation_id.to_owned(), through_message_id)
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_detach_group_session(
+        &self,
+        conversation_id: &str,
+        group_id: &str,
+        telegram_user_id: i64,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .detach_group_session(
+                conversation_id.to_owned(),
+                group_id.to_owned(),
+                telegram_user_id,
+            )
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_save_group_message_preparation(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        model: Option<&str>,
+        format: Option<&str>,
+        truncated: bool,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .save_group_message_preparation(
+                chat_id,
+                message_id,
+                text.to_owned(),
+                model.map(ToOwned::to_owned),
+                format.map(ToOwned::to_owned),
+                truncated,
+            )
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_bind_event(
+        &self,
+        event_id: &str,
+        conversation_id: &str,
+        expected_conversation_id: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .bind_event(
+                event_id.to_owned(),
+                conversation_id.to_owned(),
+                expected_conversation_id.map(ToOwned::to_owned),
+            )
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_reply_event(
+        &self,
+        event_id: &str,
+        conversation_id: &str,
+        text: &str,
+        context_warning: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .reply_event(
+                event_id.to_owned(),
+                conversation_id.to_owned(),
+                text.to_owned(),
+                context_warning.map(ToOwned::to_owned),
+            )
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_abort_event(
+        &self,
+        event_id: &str,
+        conversation_id: Option<&str>,
+        message: &str,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .abort_event(
+                event_id.to_owned(),
+                conversation_id.map(ToOwned::to_owned),
+                message.to_owned(),
+            )
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_interrupt_event(
+        &self,
+        event_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .interrupt_event(event_id.to_owned(), conversation_id.to_owned())
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_complete_reset(
+        &self,
+        event_id: &str,
+        message: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .complete_reset(event_id.to_owned(), message.map(ToOwned::to_owned))
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_event_media(
+        &self,
+        event_id: &str,
+    ) -> Result<(Vec<u8>, String), ApiError> {
+        self.telegram()?
+            .event_media(event_id)
+            .map(|media| (media.bytes, media.media_type))
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_group_message_media(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<(Vec<u8>, String), ApiError> {
+        self.telegram()?
+            .group_message_media(chat_id, message_id)
+            .map(|media| (media.bytes, media.media_type))
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_group_message_media_metadata(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<(u64, String), ApiError> {
+        self.telegram()?
+            .group_message_media_metadata(chat_id, message_id)
+            .map(|media| (media.size_bytes, media.media_type))
+            .map_err(telegram_error)
+    }
+
+    #[cfg(test)]
     async fn request(
         &self,
         method: Method,
@@ -1130,66 +1462,7 @@ impl Api {
         decode_response(response).await
     }
 
-    pub async fn telegram_bytes(&self, path: &str) -> Result<(Vec<u8>, String), ApiError> {
-        let base = &self.telegram;
-        let response = self
-            .client
-            .get(format!("{base}{path}"))
-            .send()
-            .await
-            .map_err(|_| ApiError {
-                status: None,
-                code: "network_error".into(),
-                message: format!("Could not reach {base}."),
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(decode_error(response).await);
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_owned();
-        let bytes = response.bytes().await.map_err(|error| ApiError {
-            status: Some(status),
-            code: "invalid_response".into(),
-            message: format!("Could not read response bytes: {error}"),
-        })?;
-        Ok((bytes.to_vec(), content_type))
-    }
-
-    pub async fn telegram_file_metadata(&self, path: &str) -> Result<(u64, String), ApiError> {
-        let base = &self.telegram;
-        let response = self
-            .client
-            .head(format!("{base}{path}"))
-            .send()
-            .await
-            .map_err(|_| ApiError {
-                status: None,
-                code: "network_error".into(),
-                message: format!("Could not reach {base}."),
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(decode_error(response).await);
-        }
-        let size_bytes = response.content_length().ok_or_else(|| ApiError {
-            status: Some(status),
-            code: "invalid_response".into(),
-            message: "Telegram media metadata omitted its exact byte length.".into(),
-        })?;
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_owned();
-        Ok((size_bytes, content_type))
-    }
-
+    #[cfg(test)]
     async fn multipart(
         &self,
         base: &str,
@@ -1217,23 +1490,15 @@ impl Api {
         file: &ResolvedObject,
         complete: bool,
     ) -> Result<Value, ApiError> {
-        if let Some(kind) = telegram_native_kind(&file.media_type, file.transport_kind.as_deref()) {
-            let form = telegram_file_form(conversation_id, file, complete, Some(kind))?;
-            return self
-                .multipart(
-                    &self.telegram,
-                    &format!("/api/v1/events/{event_id}/media"),
-                    form,
-                )
-                .await;
-        }
-        let form = telegram_file_form(conversation_id, file, complete, None)?;
-        self.multipart(
-            &self.telegram,
-            &format!("/api/v1/events/{event_id}/file"),
-            form,
-        )
-        .await
+        self.telegram()?
+            .send_event_attachment(
+                event_id.to_owned(),
+                conversation_id.to_owned(),
+                telegram_attachment(file),
+                complete,
+            )
+            .await
+            .map_err(telegram_error)
     }
 
     pub async fn telegram_send_private_object(
@@ -1243,15 +1508,26 @@ impl Api {
         expected_conversation_id: Option<&str>,
         file: &ResolvedObject,
     ) -> Result<Value, ApiError> {
-        let kind = telegram_native_kind(&file.media_type, file.transport_kind.as_deref());
-        let form =
-            telegram_private_file_form(conversation_id, expected_conversation_id, file, kind)?;
-        self.multipart(
-            &self.telegram,
-            &format!("/api/v1/private-sessions/{telegram_user_id}/attachments"),
-            form,
-        )
-        .await
+        self.telegram()?
+            .send_private_attachment(
+                telegram_user_id,
+                conversation_id.to_owned(),
+                expected_conversation_id.map(ToOwned::to_owned),
+                telegram_attachment(file),
+            )
+            .await
+            .map_err(telegram_error)
+    }
+
+    pub async fn telegram_send_group_object(
+        &self,
+        group_id: &str,
+        file: &ResolvedObject,
+    ) -> Result<Value, ApiError> {
+        self.telegram()?
+            .send_group_attachment(group_id.to_owned(), telegram_attachment(file))
+            .await
+            .map_err(telegram_error)
     }
 
     pub fn bootstrap_node(&self, short_name: Option<&str>) -> Result<Node, ApiError> {
@@ -1654,6 +1930,7 @@ fn audio_error(error: crate::audio_ingress::ServiceError) -> ApiError {
     }
 }
 
+#[cfg(test)]
 fn trim_base(value: &str) -> String {
     value.trim_end_matches('/').to_owned()
 }
@@ -1666,6 +1943,26 @@ fn local_api_error(error: impl std::fmt::Display) -> ApiError {
     }
 }
 
+fn telegram_error(error: kcode_tg_kennedy_bot::Error) -> ApiError {
+    ApiError {
+        status: None,
+        code: error.code().to_owned(),
+        message: error.message().to_owned(),
+    }
+}
+
+fn telegram_attachment(file: &ResolvedObject) -> kcode_tg_kennedy_bot::Attachment {
+    kcode_tg_kennedy_bot::Attachment {
+        bytes: file.bytes.clone(),
+        file_name: Some(file.file_name.clone()),
+        media_type: Some(file.media_type.clone()),
+        kind: telegram_native_kind(&file.media_type, file.transport_kind.as_deref())
+            .map(ToOwned::to_owned),
+        caption: None,
+    }
+}
+
+#[cfg(test)]
 async fn decode_response(response: reqwest::Response) -> Result<Value, ApiError> {
     if !response.status().is_success() {
         return Err(decode_error(response).await);
@@ -1686,6 +1983,7 @@ async fn decode_response(response: reqwest::Response) -> Result<Value, ApiError>
     })
 }
 
+#[cfg(test)]
 async fn decode_error(response: reqwest::Response) -> ApiError {
     let status = response.status();
     let payload = response.json::<Value>().await.unwrap_or(Value::Null);
@@ -1715,7 +2013,8 @@ pub(crate) fn stable_idempotency_id(namespace: &str, value: &str) -> String {
     hex::encode(&digest[..16])
 }
 
-pub(crate) fn encode_path(value: impl std::fmt::Display) -> String {
+#[cfg(test)]
+fn encode_path(value: impl std::fmt::Display) -> String {
     urlencoding::encode(&value.to_string()).into_owned()
 }
 
@@ -1803,61 +2102,6 @@ fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Optio
     }
 }
 
-fn telegram_file_form(
-    conversation_id: &str,
-    file: &ResolvedObject,
-    complete: bool,
-    kind: Option<&str>,
-) -> Result<multipart::Form, ApiError> {
-    let part = multipart::Part::bytes(file.bytes.clone())
-        .file_name(file.file_name.clone())
-        .mime_str(&file.media_type)
-        .map_err(|error| ApiError {
-            status: None,
-            code: "invalid_object_metadata".into(),
-            message: format!("Could not encode the object's media type: {error}"),
-        })?;
-    let mut form = multipart::Form::new()
-        .text("conversationId", conversation_id.to_owned())
-        .text("fileName", file.file_name.clone())
-        .text("complete", complete.to_string())
-        .part("file", part);
-    if let Some(kind) = kind {
-        form = form.text("kind", kind.to_owned());
-    }
-    Ok(form)
-}
-
-fn telegram_private_file_form(
-    conversation_id: &str,
-    expected_conversation_id: Option<&str>,
-    file: &ResolvedObject,
-    kind: Option<&str>,
-) -> Result<multipart::Form, ApiError> {
-    let part = multipart::Part::bytes(file.bytes.clone())
-        .file_name(file.file_name.clone())
-        .mime_str(&file.media_type)
-        .map_err(|error| ApiError {
-            status: None,
-            code: "invalid_object_metadata".into(),
-            message: format!("Could not encode the object's media type: {error}"),
-        })?;
-    let mut form = multipart::Form::new()
-        .text("conversationId", conversation_id.to_owned())
-        .text("fileName", file.file_name.clone())
-        .part("file", part);
-    if let Some(expected_conversation_id) = expected_conversation_id {
-        form = form.text(
-            "expectedConversationId",
-            expected_conversation_id.to_owned(),
-        );
-    }
-    if let Some(kind) = kind {
-        form = form.text("kind", kind.to_owned());
-    }
-    Ok(form)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1942,42 +2186,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestration_waits_until_the_telegram_relay_serves_health() {
-        use axum::{Json, Router, routing::get};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let config = Config {
-            system_prompts_directory: std::path::PathBuf::new(),
-            kweb_base: base.clone(),
-            intelligence_base: base.clone(),
-            session_history_base: base.clone(),
-            user_root_node_id: "00000001".into(),
-            kennedy_root_node_id: "00000002".into(),
-            telegram_relay_base: base,
-            telegram_max_media_bytes: 1024,
-            telegram_web_user_handle: "@test".into(),
-            runtime_model: crate::orchestration::RuntimeModel::testing(),
-        };
-        let api = Api::new(&config).unwrap();
-        let waiting = tokio::spawn(async move {
-            api.wait_until_telegram_ready().await;
-        });
-
-        tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
-
-        let app = Router::new().route("/health", get(|| async { Json(json!({"status":"ok"})) }));
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("readiness wait should finish once health is served")
-            .unwrap();
-
-        server.abort();
-    }
-
-    #[tokio::test]
     async fn rust_binary_call_arguments_and_raw_text_cross_the_test_boundary_unchanged() {
         use axum::{Json, Router, extract::State, routing::post};
 
@@ -2006,7 +2214,6 @@ mod tests {
             session_history_base: base.clone(),
             user_root_node_id: "00000001".into(),
             kennedy_root_node_id: "00000002".into(),
-            telegram_relay_base: base.clone(),
             telegram_max_media_bytes: 1024,
             telegram_web_user_handle: "@test".into(),
             runtime_model: crate::orchestration::RuntimeModel::testing(),

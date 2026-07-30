@@ -51,11 +51,20 @@ pub(crate) struct SystemRoots {
 pub(crate) struct Service {
     kmap: Kmap,
     roots: SystemRoots,
+    telegram: kcode_tg_kennedy_bot::Service,
 }
 
 impl Service {
-    pub(crate) fn new(kmap: Kmap, roots: SystemRoots) -> Self {
-        Self { kmap, roots }
+    pub(crate) fn new(
+        kmap: Kmap,
+        roots: SystemRoots,
+        telegram: kcode_tg_kennedy_bot::Service,
+    ) -> Self {
+        Self {
+            kmap,
+            roots,
+            telegram,
+        }
     }
 
     pub(crate) fn get_file(&self, id: &str) -> Result<StoredFile, ApiError> {
@@ -160,7 +169,7 @@ pub(crate) fn initialize(
         )
     })?;
     identity.execute_batch(
-        "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+        "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=15000;
          CREATE TABLE IF NOT EXISTS kmap_system_roots (
              role TEXT PRIMARY KEY CHECK(role IN ('user','kennedy')),
              root_node_id TEXT NOT NULL UNIQUE CHECK(length(root_node_id)=8),
@@ -278,6 +287,7 @@ pub(crate) async fn serve_with_listener(
     let app = Router::new()
         .route("/", get(kui_loader_page))
         .route("/index.html", get(kui_loader_page))
+        .route("/health", get(health))
         .route("/api/v1/kmap/health", get(health))
         .route("/api/v1/kmap/roots", get(get_roots))
         .route("/api/v1/kmap/nodes/{node_id}", get(get_node))
@@ -326,7 +336,18 @@ async fn set_default_cache_control(mut response: Response) -> Response {
 async fn health(State(state): State<Service>) -> Result<Json<Value>, ApiError> {
     state.kmap.get_node(state.roots.user)?;
     state.kmap.get_node(state.roots.kennedy)?;
-    Ok(Json(json!({"service":"kmap","status":"ok"})))
+    let telegram = state.telegram.status();
+    Ok(Json(json!({
+        "service":"kennedy-server",
+        "status":"ok",
+        "kmap":"ready",
+        "telegram":telegram.telegram,
+        "capabilities":{
+            "inboundMediaKinds":telegram.inbound_media_kinds,
+            "outboundMediaKinds":telegram.outbound_media_kinds,
+            "maxMediaBytes":telegram.max_media_bytes,
+        },
+    })))
 }
 
 async fn get_roots(State(state): State<Service>) -> Json<Value> {
@@ -579,6 +600,65 @@ mod tests {
         kmap.get_node(roots.user).unwrap();
         kmap.get_node(roots.kennedy).unwrap();
         drop(kmap);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[derive(Default)]
+    struct TestIdentitySink;
+
+    impl kcode_tg_kennedy_bot::IdentitySink for TestIdentitySink {
+        fn observe_identity(
+            &self,
+            _observation: &kcode_tg_kennedy_bot::IdentityObservation,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn whitelist(&self) -> anyhow::Result<kcode_tg_kennedy_bot::WhitelistSnapshot> {
+            Ok(kcode_tg_kennedy_bot::WhitelistSnapshot::default())
+        }
+
+        fn request_add_user(
+            &self,
+            _requested_by_telegram_user_id: i64,
+            _handle: &str,
+        ) -> anyhow::Result<kcode_tg_kennedy_bot::AddUserOutcome> {
+            Ok(kcode_tg_kennedy_bot::AddUserOutcome::Forbidden)
+        }
+
+        fn observe_group(&self, _group_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn main_health_includes_the_in_process_telegram_transport() {
+        let directory =
+            std::env::temp_dir().join(format!("kennedy-health-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (kmap, roots) = initialize(
+            &directory.join("kweb"),
+            config(),
+            &directory.join("users.sqlite3"),
+        )
+        .unwrap();
+        let telegram = kcode_tg_kennedy_bot::open(kcode_tg_kennedy_bot::Config {
+            database: directory.join("telegram.sqlite3"),
+            bot_token: None,
+            identity_sink: Arc::new(TestIdentitySink),
+            max_voice_bytes: 1024,
+        })
+        .await
+        .unwrap();
+        let response = health(State(Service::new(kmap, roots, telegram.service())))
+            .await
+            .unwrap();
+        assert_eq!(response.0["service"], "kennedy-server");
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(response.0["kmap"], "ready");
+        assert_eq!(response.0["telegram"], "disabled");
+        assert_eq!(response.0["capabilities"]["maxMediaBytes"], 1024);
+        drop(telegram);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

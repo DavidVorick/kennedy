@@ -1981,8 +1981,6 @@ dependencies = [
 [[package]]
 name = "kcode-audio-ingress"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fdd343c52abef44f3db3c1e9c9f88341032b67581639e09d5d2d36c40dd3e17"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2001,8 +1999,6 @@ dependencies = [
 [[package]]
 name = "kcode-codex-runtime"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9d5b09e16d427c8c79977f9b3cd6ae9a9ac6522f74f0b076ff147bffe900512"
 dependencies = [
  "anyhow",
  "hex",
@@ -2026,8 +2022,6 @@ dependencies = [
 [[package]]
 name = "kcode-commit-session"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7143f190dbb966fe7de61ec06b803fcdd32aee9f7b9b7e651474333a74469078"
 dependencies = [
  "chrono",
  "kcode-kweb-db",
@@ -2053,8 +2047,6 @@ dependencies = [
 [[package]]
 name = "kcode-dev-tools"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73d21714fc695a6c74a8b2510c2d14d12f1e54fd7f31e47ec4c002ed13bbd6aa"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2083,8 +2075,6 @@ dependencies = [
 [[package]]
 name = "kcode-gemini-api"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d54bd133528f3f826df617c6f55c8d69e275692157086571eea22c640708dee"
 dependencies = [
  "base64",
  "chrono",
@@ -2097,8 +2087,6 @@ dependencies = [
 [[package]]
 name = "kcode-history-ingress-context"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd3e7ebf25c5cb6b49c73178b5742d761e45736e3f72f903ac723a25500258"
 dependencies = [
  "anyhow",
  "kcode-session-history",
@@ -2177,8 +2165,6 @@ dependencies = [
 [[package]]
 name = "kcode-openai-api"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490723cf2d3bb2e81f76d58970eb26e981039b1c1cb3315a5ab7a7ed1b5732bd"
 dependencies = [
  "base64",
  "reqwest 0.13.4",
@@ -2217,6 +2203,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -2235,9 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-telegram-identity"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2180d6614ab320d5b91e590b950abd098449f6cf76bb3adbb263c100ba09a6e0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2246,11 +2231,12 @@ dependencies = [
  "rusqlite",
  "serde",
  "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
 name = "kcode-tg-kennedy-bot"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2261,7 +2247,6 @@ dependencies = [
  "serde_json",
  "teloxide",
  "tokio",
- "tower-http 0.7.0",
  "tracing",
  "uuid",
  "zeroize",
@@ -2270,8 +2255,6 @@ dependencies = [
 [[package]]
 name = "kcode-web-fetch"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40319dcdf4fc91b0f755470ec22cd15bf424bb47861099e26667209a485a5c06"
 dependencies = [
  "html2text",
  "reqwest 0.13.4",
@@ -2281,8 +2264,6 @@ dependencies = [
 [[package]]
 name = "kcode-web-libs"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8ad273f6988cb8ce0fdfa6615667c9f4f5ef4867f71a55c98b11e9ed0f85d88"
 dependencies = [
  "fs2",
  "semver",
