@@ -27,7 +27,7 @@ use kcode_kweb_context::{
 use kcode_kweb_db::{NodeId, ObjectId};
 use kcode_server_object_envelopes::{StoredFile, encode_file, sanitize_file_name};
 use kcode_session_history::{
-    NewSession, Session as HistorySession,
+    NewSession, Session as HistorySession, SessionRecord,
     chatend::{
         BoxContent, BoxId, BoxOwner, BoxState, EventId, EventKind, ObjectMetadata, PendingId,
         Representation, SessionKind, SessionMetadata, ToolSlotInput,
@@ -289,110 +289,76 @@ fn append_slow_tool_duration(text: &mut String, elapsed: Duration) {
     text.push_str(&format!("[tool duration: {:.3}s]", elapsed.as_secs_f64()));
 }
 
-fn render_web_search_result(result: &Value) -> anyhow::Result<String> {
-    let answer = result
-        .get("answer")
-        .and_then(Value::as_str)
-        .context("web search response has no answer text")?;
-    let mut text = answer.to_owned();
-    let sources = result
-        .get("sources")
-        .and_then(Value::as_array)
-        .context("web search response has no sources")?;
-    if !sources.is_empty() {
+fn render_web_search_result(result: &kcode_intelligence_router::SearchResponse) -> String {
+    let mut text = result.answer.clone();
+    if !result.sources.is_empty() {
         text.push_str("\n\nSources:");
-        for source in sources {
-            let url = source
-                .get("url")
-                .and_then(Value::as_str)
-                .context("web search source has no URL")?;
-            let title = source
-                .get("title")
-                .and_then(Value::as_str)
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or(url);
+        for source in &result.sources {
+            let title = if source.title.trim().is_empty() {
+                &source.url
+            } else {
+                &source.title
+            };
             text.push_str("\n- ");
             text.push_str(title);
-            if title != url {
+            if title != &source.url {
                 text.push_str(": ");
-                text.push_str(url);
+                text.push_str(&source.url);
             }
         }
     }
-    Ok(text)
+    text
 }
 
-fn render_web_fetch_result(result: &Value) -> anyhow::Result<String> {
-    let url = result
-        .get("url")
-        .and_then(Value::as_str)
-        .context("web fetch response has no URL")?;
-    let content = result
-        .get("content")
-        .and_then(Value::as_str)
-        .context("web fetch response has no page text")?;
-    let mut text = format!("Source URL: {url}");
+fn render_web_fetch_result(result: &kcode_intelligence_router::FetchResponse) -> String {
+    let mut text = format!("Source URL: {}", result.url);
     if let Some(title) = result
-        .get("title")
-        .and_then(Value::as_str)
+        .title
+        .as_deref()
         .filter(|title| !title.trim().is_empty())
     {
         text.push_str("\nTitle: ");
         text.push_str(title);
     }
-    if let Some(content_type) = result.get("contentType").and_then(Value::as_str) {
-        text.push_str("\nContent type: ");
-        text.push_str(content_type);
-    }
-    if result
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    text.push_str("\nContent type: ");
+    text.push_str(&result.content_type);
+    if result.truncated {
         text.push_str("\nThe returned page text was truncated.");
     }
     text.push_str("\n\n");
-    text.push_str(content);
-    Ok(text)
+    text.push_str(&result.content);
+    text
 }
 
 fn render_media_annotation_result(
     object_id: &str,
     file_name: &str,
     content_type: &str,
-    result: &Value,
+    result: &kcode_intelligence_router::AnnotationResponse,
 ) -> anyhow::Result<String> {
-    let text = result
-        .get("text")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .context("media annotation response has no text")?;
-    let model = result
-        .get("model")
-        .and_then(Value::as_str)
-        .context("media annotation response has no model")?;
-    let status = if result
-        .get("complete")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
+    anyhow::ensure!(
+        !result.text.trim().is_empty(),
+        "media annotation response has no text"
+    );
+    let status = if result.complete {
         "complete"
     } else {
         "incomplete"
     };
     let mut rendered = format!(
-        "Annotation for {object_id}\nFile: {file_name}\nContent type: {content_type}\nModel: {model}\nStatus: {status}"
+        "Annotation for {object_id}\nFile: {file_name}\nContent type: {content_type}\nModel: {}\nStatus: {status}",
+        result.model
     );
     if let Some(reason) = result
-        .get("incompleteReason")
-        .and_then(Value::as_str)
+        .incomplete_reason
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
         rendered.push_str("\nIncomplete reason: ");
         rendered.push_str(reason);
     }
     rendered.push_str("\n\n");
-    rendered.push_str(text);
+    rendered.push_str(&result.text);
     Ok(rendered)
 }
 
@@ -400,46 +366,27 @@ fn render_audio_transcription_result(
     object_id: &str,
     file_name: &str,
     content_type: &str,
-    result: &Value,
+    result: &kcode_intelligence_router::TranscriptionResponse,
 ) -> anyhow::Result<String> {
-    let text = result
-        .get("text")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .context("audio transcription response has no text")?;
-    let model = result
-        .get("model")
-        .and_then(Value::as_str)
-        .context("audio transcription response has no model")?;
+    anyhow::ensure!(
+        !result.text.trim().is_empty(),
+        "audio transcription response has no text"
+    );
     Ok(format!(
-        "Transcription for {object_id}\nFile: {file_name}\nContent type: {content_type}\nModel: {model}\nStatus: complete\n\n{text}"
+        "Transcription for {object_id}\nFile: {file_name}\nContent type: {content_type}\nModel: {}\nStatus: complete\n\n{}",
+        result.model, result.text
     ))
 }
 
 fn render_document_extraction_result(
     object_id: &str,
     file_name: &str,
-    result: &Value,
-) -> anyhow::Result<String> {
-    let text = result
-        .get("text")
-        .and_then(Value::as_str)
-        .context("document extraction response has no text")?;
-    let format = result
-        .get("format")
-        .and_then(Value::as_str)
-        .context("document extraction response has no format")?;
-    let characters = result
-        .get("characters")
-        .and_then(Value::as_u64)
-        .context("document extraction response has no character count")?;
-    let truncated = result
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    Ok(format!(
-        "Extracted text for {object_id}\nFile: {file_name}\nFormat: {format}\nCharacters: {characters}\nTruncated: {truncated}\n\n{text}"
-    ))
+    result: &kcode_intelligence_router::DocumentExtraction,
+) -> String {
+    format!(
+        "Extracted text for {object_id}\nFile: {file_name}\nFormat: {}\nCharacters: {}\nTruncated: {}\n\n{}",
+        result.format, result.characters, result.truncated, result.text
+    )
 }
 
 fn unique_kweb_slot(logical: &str, used: &mut HashSet<String>) -> String {
@@ -905,6 +852,7 @@ struct KennedySubagentHost<'a> {
     captures: HashMap<String, FreeformWriteRequest>,
     parent_operation_id: Uuid,
     pending_manifest_hash: Option<String>,
+    provider_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1123,6 +1071,7 @@ impl Session {
     }
 
     async fn prepare_history_ingress(&mut self, prompt: &str) -> anyhow::Result<()> {
+        let cost_at_ingress = self.journal.state().projection().status;
         if !self.journal.state().source_terminated {
             self.journal.record(
                 now(),
@@ -1149,6 +1098,16 @@ impl Session {
             self.journal
                 .configure_context(ingress_kind, self.runtime.context_window_tokens);
         }
+        self.journal.create_box(
+            now(),
+            "Session cost at ingress",
+            BoxOwner::Controller,
+            BoxContent::text(cost_summary(
+                "session cost before history ingress",
+                cost_at_ingress.estimated_cost_usd_nanos,
+                cost_at_ingress.unpriced_provider_calls,
+            )),
+        )?;
         self.revalidate_loaded_nodes().await?;
         match kcode_history_ingress_context::prepare(&mut self.journal, now())? {
             HistoryIngressContextOutcome::Ready => {}
@@ -1865,17 +1824,30 @@ impl Session {
                 let thinking_delta = usage
                     .reasoning_output_tokens
                     .saturating_sub(previous_thinking);
-                json!({
+                let normalized = kcode_intelligence_router::TokenUsage {
+                    input_tokens: input_delta.saturating_sub(cached_delta),
+                    cached_input_tokens: cached_delta,
+                    thinking_tokens: thinking_delta,
+                    output_tokens: output_delta.saturating_sub(thinking_delta),
+                };
+                let mut provider_data = json!({
                     "usageIsDelta":true,
-                    "nonCachedInputTokens":input_delta.saturating_sub(cached_delta),
-                    "cachedInputTokens":cached_delta,
-                    "thinkingTokens":thinking_delta,
-                    "outputTokens":output_delta.saturating_sub(thinking_delta),
+                    "providerModel":self.runtime.model,
+                    "nonCachedInputTokens":normalized.input_tokens,
+                    "cachedInputTokens":normalized.cached_input_tokens,
+                    "thinkingTokens":normalized.thinking_tokens,
+                    "outputTokens":normalized.output_tokens,
                     "providerCumulativeInputTokens":usage.input_tokens,
                     "providerCumulativeOutputTokens":usage.output_tokens,
                     "providerCumulativeCachedInputTokens":usage.cached_input_tokens,
                     "providerCumulativeReasoningOutputTokens":usage.reasoning_output_tokens,
-                })
+                });
+                attach_cost_estimate(
+                    &mut provider_data,
+                    kcode_intelligence_router::estimate_token_cost(&self.runtime.model, normalized)
+                        .as_ref(),
+                );
+                provider_data
             })
             .unwrap_or(Value::Null);
         self.journal.record(
@@ -1898,9 +1870,11 @@ impl Session {
         &mut self,
         source: &str,
         parent_operation_id: Uuid,
-        usage: Option<&Value>,
+        model: &str,
+        usage: Option<&kcode_intelligence_router::TokenUsage>,
+        cost: Option<&kcode_intelligence_router::CostEstimate>,
     ) -> anyhow::Result<()> {
-        let event = descendant_provider_receipt(source, parent_operation_id, usage)?;
+        let event = descendant_provider_receipt(source, parent_operation_id, model, usage, cost);
         self.journal.record(now(), event)?;
         Ok(())
     }
@@ -1909,9 +1883,11 @@ impl Session {
         &mut self,
         source: &str,
         parent_operation_id: Uuid,
-        metering: Option<&Value>,
+        model: &str,
+        metering: &kcode_intelligence_router::Metering,
+        cost: Option<&kcode_intelligence_router::CostEstimate>,
     ) -> anyhow::Result<()> {
-        let event = descendant_metering_receipt(source, parent_operation_id, metering)?;
+        let event = descendant_metering_receipt(source, parent_operation_id, model, metering, cost);
         self.journal.record(now(), event)?;
         Ok(())
     }
@@ -2284,14 +2260,16 @@ impl Session {
             .context("session has no user root for subagent intelligence accounting")?
             .clone();
         let timeout = self.agent_request_timeout();
-        let runtime = self.api.agent_runtime()?;
+        let runtime = self.api.agent_runtime();
         let first_event = self.journal.state().events.len();
+        let cost_before = self.journal.state().projection().status;
         let result = {
             let mut host = KennedySubagentHost {
                 session: self,
                 captures: HashMap::new(),
                 parent_operation_id,
                 pending_manifest_hash: None,
+                provider_model: None,
             };
             runtime
                 .run(
@@ -2309,23 +2287,42 @@ impl Session {
                 )
                 .await
         };
-        result.map(|result| result.answer).map_err(|error| {
-            let may_have_effects = self.journal.state().events[first_event..]
-                .iter()
-                .any(|event| {
-                    matches!(
-                        &event.kind,
-                        EventKind::Note { label, .. } if label == "subagent_tool_call"
+        match result {
+            Ok(result) => {
+                let cost_after = self.journal.state().projection().status;
+                Ok(format!(
+                    "{}\n\n[{}]",
+                    result.answer,
+                    cost_summary(
+                        "subagent cost",
+                        cost_after
+                            .estimated_cost_usd_nanos
+                            .saturating_sub(cost_before.estimated_cost_usd_nanos),
+                        cost_after
+                            .unpriced_provider_calls
+                            .saturating_sub(cost_before.unpriced_provider_calls),
                     )
-                });
-            if may_have_effects {
-                error.context(
-                    "the subagent failed after making Ktool calls; some tool effects may already have occurred",
-                )
-            } else {
-                error
+                ))
             }
-        })
+            Err(error) => {
+                let may_have_effects =
+                    self.journal.state().events[first_event..]
+                        .iter()
+                        .any(|event| {
+                            matches!(
+                                &event.kind,
+                                EventKind::Note { label, .. } if label == "subagent_tool_call"
+                            )
+                        });
+                if may_have_effects {
+                    Err(error.context(
+                        "the subagent failed after making Ktool calls; some tool effects may already have occurred",
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     async fn complete_subagent_freeform_write(
@@ -2553,20 +2550,11 @@ impl Session {
             .await
             .context("discovering established Telegram private chats")?;
         let private_session = private_sessions
-            .get("sessions")
-            .and_then(Value::as_array)
             .into_iter()
-            .flatten()
-            .find(|session| {
-                session.get("telegramUserId").and_then(Value::as_i64) == Some(telegram_user_id)
-            })
+            .find(|session| session.telegram_user_id == telegram_user_id)
             .context("This Telegram user has not opened a private chat with Kennedy.")?;
         if !attachments.is_empty() {
-            let maximum = self
-                .api
-                .telegram_max_media_bytes()
-                .await
-                .context("discovering the Telegram attachment limit")?;
+            let maximum = self.api.telegram_max_media_bytes();
             for attachment in &attachments {
                 anyhow::ensure!(
                     attachment.object.bytes.len() as u64 <= maximum,
@@ -2576,15 +2564,11 @@ impl Session {
                 );
             }
         }
-        let expected_conversation_id = private_session
-            .get("currentConversationId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let expected_conversation_id = private_session.current_conversation_id;
 
         let directory_user = self
             .api
             .directory_user(telegram_user_id)
-            .await
             .context("resolving the authorized Telegram user")?;
         let user_root = directory_user
             .root_node_id
@@ -2595,13 +2579,8 @@ impl Session {
             .history_list()
             .await
             .context("listing Kennedy sessions for the Telegram user")?;
-        let summaries = histories
-            .get("conversations")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         let selected = active_direct_session_for_user(
-            summaries,
+            &histories,
             &user_root,
             expected_conversation_id.as_deref(),
         );
@@ -2613,9 +2592,7 @@ impl Session {
             "sourceSessionId":current_session_id,
         });
 
-        let conversation_id = if selected
-            .and_then(|record| record.get("id"))
-            .and_then(Value::as_str)
+        let conversation_id = if selected.map(|record| record.id.as_str())
             == Some(current_session_id.as_str())
         {
             self.stage_source_message_with_attachments(
@@ -2627,17 +2604,13 @@ impl Session {
             )?;
             current_session_id
         } else if let Some(summary) = selected {
-            let id = summary
-                .get("id")
-                .and_then(Value::as_str)
-                .context("active session summary is missing its ID")?
-                .to_owned();
+            let id = summary.id.clone();
             let record = self
                 .api
                 .history_get_session(&id)
                 .await
                 .context("opening the Telegram user's active Kennedy session")?;
-            let state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+            let state = record.state.clone();
             let session_type = state
                 .get("sessionType")
                 .and_then(Value::as_str)
@@ -2671,11 +2644,10 @@ impl Session {
                 .history_checkpoint(
                     &id,
                     kcode_session_history::Checkpoint {
-                        expected_version: history_record_version(&record)?,
+                        expected_version: record.version,
                         state: target.snapshot()?,
                         user_activity: false,
                     },
-                    false,
                 )
                 .await
                 .context("attaching the direct message to the active Kennedy session")?;
@@ -2789,11 +2761,7 @@ impl Session {
             ));
         }
         if !attachments.is_empty() {
-            let maximum = self
-                .api
-                .telegram_max_media_bytes()
-                .await
-                .context("discovering the Telegram attachment limit")?;
+            let maximum = self.api.telegram_max_media_bytes();
             for attachment in &attachments {
                 anyhow::ensure!(
                     attachment.object.bytes.len() as u64 <= maximum,
@@ -2807,7 +2775,6 @@ impl Session {
         let directory_group = self
             .api
             .directory_group_for_root(root_node_id)
-            .await
             .with_context(|| {
                 format!("resolving known Telegram group root {canonical_root_node_id}")
             })?;
@@ -3028,8 +2995,14 @@ impl Session {
                         },
                     )
                     .await?;
-                self.record_descendant_usage("web_search", operation_id, result.get("usage"))?;
-                render_web_search_result(&result)?
+                self.record_descendant_usage(
+                    "web_search",
+                    operation_id,
+                    &result.model,
+                    result.usage.as_ref(),
+                    result.cost.as_ref(),
+                )?;
+                render_web_search_result(&result)
             }
             "WebFetch" => {
                 validate_arguments(&call.arguments, &["url"], &[])?;
@@ -3048,7 +3021,7 @@ impl Session {
                         },
                     )
                     .await?;
-                render_web_fetch_result(&result)?
+                render_web_fetch_result(&result)
             }
             "StageTelegramGroupMedia" => {
                 validate_arguments(&call.arguments, &["messageId"], &[])?;
@@ -3071,10 +3044,8 @@ impl Session {
                         true,
                     )?
                 } else {
-                    let (bytes, downloaded_media_type) = self
-                        .api
-                        .telegram_group_message_media(chat_id, message_id)
-                        .await?;
+                    let (bytes, downloaded_media_type) =
+                        self.api.telegram_group_message_media(chat_id, message_id)?;
                     anyhow::ensure!(
                         !bytes.is_empty(),
                         "Telegram group media message {message_id} is empty"
@@ -3138,7 +3109,9 @@ impl Session {
                 self.record_descendant_metering(
                     "audio_transcription",
                     operation_id,
-                    result.get("metering"),
+                    &result.model,
+                    &result.metering,
+                    result.cost.as_ref(),
                 )?;
                 render_audio_transcription_result(
                     &object.object_id,
@@ -3173,7 +3146,9 @@ impl Session {
                 self.record_descendant_usage(
                     "media_annotation",
                     operation_id,
-                    result.get("usage"),
+                    &result.model,
+                    result.usage.as_ref(),
+                    result.cost.as_ref(),
                 )?;
                 render_media_annotation_result(
                     &media.object_id,
@@ -3206,13 +3181,13 @@ impl Session {
                     .api
                     .generate_image(&user_id, &model, &prompt, references, operation_id)
                     .await?;
-                let usage = result
-                    .usage
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .context("serializing image-generation provider usage")?;
-                self.record_descendant_usage("image_generation", operation_id, usage.as_ref())?;
+                self.record_descendant_usage(
+                    "image_generation",
+                    operation_id,
+                    &result.model,
+                    result.usage.as_ref(),
+                    result.cost.as_ref(),
+                )?;
                 let size = result.bytes.len();
                 let file_name =
                     format!("generated-image.{}", image_extension(&result.content_type));
@@ -3236,7 +3211,7 @@ impl Session {
                     .api
                     .extract_document(object.bytes, object.file_name.clone(), &object.media_type)
                     .await?;
-                render_document_extraction_result(&object.object_id, &object.file_name, &result)?
+                render_document_extraction_result(&object.object_id, &object.file_name, &result)
             }
             "ConnectNodes" => self.connect_nodes(&call.arguments)?,
             "ConsolidateFanout" => self.consolidate_fanout(&call.arguments)?,
@@ -3995,6 +3970,15 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
     }
 
     fn record(&mut self, label: &str, value: Value) -> anyhow::Result<()> {
+        if label == "subagent_started" {
+            self.provider_model = Some(
+                value
+                    .get("providerModel")
+                    .and_then(Value::as_str)
+                    .context("subagent start record has no provider model")?
+                    .to_owned(),
+            );
+        }
         if label == "subagent_inference_submitted" {
             anyhow::ensure!(
                 self.pending_manifest_hash.is_none(),
@@ -4013,7 +3997,12 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
                 .pending_manifest_hash
                 .take()
                 .context("subagent provider receipt has no matching inference submission")?;
-            let event = subagent_provider_receipt(manifest_hash, self.parent_operation_id, &value)?;
+            let event = subagent_provider_receipt(
+                manifest_hash,
+                self.parent_operation_id,
+                self.provider_model.as_deref(),
+                &value,
+            )?;
             self.session.journal.record(now(), event)?;
             return Ok(());
         }
@@ -4031,16 +4020,18 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
 fn subagent_provider_receipt(
     manifest_hash: String,
     parent_operation_id: Uuid,
+    model: Option<&str>,
     receipt: &Value,
 ) -> anyhow::Result<EventKind> {
     let round = receipt
         .get("round")
         .and_then(Value::as_u64)
         .context("subagent provider receipt has no round")?;
-    let provider_data = match receipt.get("usage") {
+    let mut provider_data = match receipt.get("usage") {
         None | Some(Value::Null) => json!({
             "source":"subagent",
             "parentOperationId":parent_operation_id,
+            "providerModel":model,
             "round":round,
             "usageIsDelta":true,
             "metering":"unavailable",
@@ -4051,22 +4042,48 @@ fn subagent_provider_receipt(
             let cached = provider_usage_u64(usage, "cachedInputTokens")?;
             let output = provider_usage_u64(usage, "outputTokens")?;
             let thinking = provider_usage_u64(usage, "reasoningOutputTokens")?;
+            let normalized = kcode_intelligence_router::TokenUsage {
+                input_tokens: input.saturating_sub(cached),
+                cached_input_tokens: cached,
+                thinking_tokens: thinking,
+                output_tokens: output.saturating_sub(thinking),
+            };
             json!({
                 "source":"subagent",
                 "parentOperationId":parent_operation_id,
+                "providerModel":model,
                 "round":round,
                 "usageIsDelta":true,
                 "metering":"tokens",
-                "nonCachedInputTokens":input.saturating_sub(cached),
-                "cachedInputTokens":cached,
-                "thinkingTokens":thinking,
-                "outputTokens":output.saturating_sub(thinking),
+                "nonCachedInputTokens":normalized.input_tokens,
+                "cachedInputTokens":normalized.cached_input_tokens,
+                "thinkingTokens":normalized.thinking_tokens,
+                "outputTokens":normalized.output_tokens,
                 "providerInputTokens":input,
                 "providerOutputTokens":output,
                 "reportedUsage":usage,
             })
         }
     };
+    let cost = receipt
+        .get("usage")
+        .filter(|usage| !usage.is_null())
+        .and_then(|usage| {
+            let input = provider_usage_u64(usage, "inputTokens").ok()?;
+            let cached = provider_usage_u64(usage, "cachedInputTokens").ok()?;
+            let output = provider_usage_u64(usage, "outputTokens").ok()?;
+            let thinking = provider_usage_u64(usage, "reasoningOutputTokens").ok()?;
+            kcode_intelligence_router::estimate_token_cost(
+                model?,
+                kcode_intelligence_router::TokenUsage {
+                    input_tokens: input.saturating_sub(cached),
+                    cached_input_tokens: cached,
+                    thinking_tokens: thinking,
+                    output_tokens: output.saturating_sub(thinking),
+                },
+            )
+        });
+    attach_cost_estimate(&mut provider_data, cost.as_ref());
     Ok(EventKind::ProviderReceipt {
         manifest_hash,
         // A subagent's provider input is not Kennedy's Chatend input. Keep it
@@ -4090,49 +4107,96 @@ fn provider_usage_u64(usage: &Value, key: &str) -> anyhow::Result<u64> {
 fn descendant_provider_receipt(
     source: &str,
     parent_operation_id: Uuid,
-    usage: Option<&Value>,
-) -> anyhow::Result<EventKind> {
-    let provider_data = match usage {
-        None | Some(Value::Null) => json!({
+    model: &str,
+    usage: Option<&kcode_intelligence_router::TokenUsage>,
+    cost: Option<&kcode_intelligence_router::CostEstimate>,
+) -> EventKind {
+    let mut provider_data = match usage {
+        None => json!({
             "source":source,
             "parentOperationId":parent_operation_id,
+            "providerModel":model,
             "usageIsDelta":true,
             "metering":"unavailable",
         }),
         Some(usage) => json!({
             "source":source,
             "parentOperationId":parent_operation_id,
+            "providerModel":model,
             "usageIsDelta":true,
             "metering":"tokens",
-            // Router TokenUsage categories are already mutually exclusive.
-            "nonCachedInputTokens":descendant_usage_u64(usage, "inputTokens")?,
-            "cachedInputTokens":descendant_usage_u64(usage, "cachedInputTokens")?,
-            "thinkingTokens":descendant_usage_u64(usage, "thinkingTokens")?,
-            "outputTokens":descendant_usage_u64(usage, "outputTokens")?,
+            "nonCachedInputTokens":usage.input_tokens,
+            "cachedInputTokens":usage.cached_input_tokens,
+            "thinkingTokens":usage.thinking_tokens,
+            "outputTokens":usage.output_tokens,
             "reportedUsage":usage,
         }),
     };
-    Ok(descendant_receipt_event(provider_data))
+    attach_cost_estimate(&mut provider_data, cost);
+    descendant_receipt_event(provider_data)
 }
 
 fn descendant_metering_receipt(
     source: &str,
     parent_operation_id: Uuid,
-    metering: Option<&Value>,
-) -> anyhow::Result<EventKind> {
-    if metering
-        .and_then(|value| value.get("kind"))
-        .and_then(Value::as_str)
-        == Some("tokens")
-    {
-        return descendant_provider_receipt(source, parent_operation_id, metering);
+    model: &str,
+    metering: &kcode_intelligence_router::Metering,
+    cost: Option<&kcode_intelligence_router::CostEstimate>,
+) -> EventKind {
+    if let kcode_intelligence_router::Metering::Tokens(usage) = metering {
+        let mut provider_data = json!({
+            "source":source,
+            "parentOperationId":parent_operation_id,
+            "providerModel":model,
+            "usageIsDelta":true,
+            "metering":"tokens",
+            "nonCachedInputTokens":usage.input_tokens,
+            "cachedInputTokens":usage.cached_input_tokens,
+            "thinkingTokens":usage.thinking_tokens,
+            "outputTokens":usage.output_tokens,
+            "reportedUsage":metering,
+        });
+        attach_cost_estimate(&mut provider_data, cost);
+        return descendant_receipt_event(provider_data);
     }
-    Ok(descendant_receipt_event(json!({
+    let mut provider_data = json!({
         "source":source,
         "parentOperationId":parent_operation_id,
+        "providerModel":model,
         "usageIsDelta":true,
-        "metering":metering.cloned().unwrap_or_else(|| json!({"kind":"unavailable"})),
-    })))
+        "metering":metering,
+    });
+    attach_cost_estimate(&mut provider_data, cost);
+    descendant_receipt_event(provider_data)
+}
+
+fn attach_cost_estimate(
+    provider_data: &mut Value,
+    cost: Option<&kcode_intelligence_router::CostEstimate>,
+) {
+    let Some(cost) = cost else {
+        return;
+    };
+    provider_data["estimatedCostUsdNanos"] = json!(cost.usd_nanos);
+    provider_data["costAccuracy"] = json!(cost.accuracy);
+    provider_data["pricingVersion"] = json!(cost.pricing_version);
+}
+
+fn cost_summary(label: &str, estimated_cost_usd_nanos: u64, unpriced_calls: u64) -> String {
+    let rounded_milli_pennies = estimated_cost_usd_nanos.saturating_add(5_000) / 10_000;
+    let pennies = format!(
+        "{}.{:03}",
+        rounded_milli_pennies / 1_000,
+        rounded_milli_pennies % 1_000
+    );
+    if unpriced_calls == 0 {
+        format!("Estimated {label}: {pennies} pennies at standard API rates.")
+    } else {
+        format!(
+            "Estimated {label}: {pennies} pennies at standard API rates; {unpriced_calls} provider {} could not be priced.",
+            if unpriced_calls == 1 { "call" } else { "calls" }
+        )
+    }
 }
 
 fn descendant_receipt_event(provider_data: Value) -> EventKind {
@@ -4144,13 +4208,6 @@ fn descendant_receipt_event(provider_data: Value) -> EventKind {
         raw_context_tokens: None,
         provider_data,
     }
-}
-
-fn descendant_usage_u64(usage: &Value, key: &str) -> anyhow::Result<u64> {
-    usage
-        .get(key)
-        .and_then(Value::as_u64)
-        .with_context(|| format!("descendant provider usage has no {key}"))
 }
 
 fn restore_kweb_context(journal: &HistorySession, context: &mut KwebContext) -> anyhow::Result<()> {
@@ -5012,25 +5069,18 @@ fn string_values(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-fn history_record_version(record: &Value) -> anyhow::Result<i64> {
-    record
-        .get("version")
-        .and_then(Value::as_i64)
-        .context("session record is missing its version")
-}
-
 fn active_direct_session_for_user<'a>(
-    records: &'a [Value],
+    records: &'a [SessionRecord],
     user_root: &str,
     expected_conversation_id: Option<&str>,
-) -> Option<&'a Value> {
+) -> Option<&'a SessionRecord> {
     records
         .iter()
         .filter(|record| {
-            if record.get("phase").and_then(Value::as_str) != Some("active") {
+            if record.phase != "active" {
                 return false;
             }
-            let state = record.get("state").unwrap_or(&Value::Null);
+            let state = &record.state;
             matches!(
                 state.get("sessionType").and_then(Value::as_str),
                 Some("conversation" | "telegram")
@@ -5039,12 +5089,8 @@ fn active_direct_session_for_user<'a>(
                 .any(|root| root == user_root)
         })
         .min_by_key(|record| {
-            let id = record.get("id").and_then(Value::as_str);
-            let session_type = record
-                .get("state")
-                .and_then(|state| state.get("sessionType"))
-                .and_then(Value::as_str);
-            if id == expected_conversation_id {
+            let session_type = record.state.get("sessionType").and_then(Value::as_str);
+            if expected_conversation_id == Some(record.id.as_str()) {
                 0
             } else if session_type == Some("telegram") {
                 1
@@ -5629,6 +5675,28 @@ mod tests {
 
     use super::*;
 
+    fn session_record(overrides: Value) -> SessionRecord {
+        let mut record = json!({
+            "id":"session",
+            "phase":"active",
+            "started_at":"2026-07-30T00:00:00Z",
+            "updated_at":"2026-07-30T00:00:00Z",
+            "state":{},
+            "provenance_id":null,
+            "version":1,
+            "last_user_message_at":null,
+            "ended_at":null,
+            "ingress_failure_count":0,
+            "ingress_failures":[],
+            "ingress_next_attempt_at":null
+        });
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(overrides.as_object().unwrap().clone());
+        serde_json::from_value(record).unwrap()
+    }
+
     #[test]
     fn wakeup_opening_uses_the_acquired_marker_verbatim() {
         let marker = DateTime::parse_from_rfc3339("2026-07-28T04:00:00Z")
@@ -5643,20 +5711,23 @@ mod tests {
     #[test]
     fn cold_dm_prefers_the_transport_binding_then_an_active_private_session() {
         let records = vec![
-            json!({"id":"browser","phase":"active","state":{"sessionType":"conversation","rootNodeIds":["user"]}}),
-            json!({"id":"telegram","phase":"active","state":{"sessionType":"telegram","rootNodeIds":["user"]}}),
-            json!({"id":"wakeup","phase":"active","state":{"sessionType":"wakeup","rootNodeIds":["user"]}}),
+            session_record(
+                json!({"id":"browser","phase":"active","state":{"sessionType":"conversation","rootNodeIds":["user"]}}),
+            ),
+            session_record(
+                json!({"id":"telegram","phase":"active","state":{"sessionType":"telegram","rootNodeIds":["user"]}}),
+            ),
+            session_record(
+                json!({"id":"wakeup","phase":"active","state":{"sessionType":"wakeup","rootNodeIds":["user"]}}),
+            ),
         ];
         assert_eq!(
             active_direct_session_for_user(&records, "user", Some("browser"))
-                .and_then(|record| record.get("id"))
-                .and_then(Value::as_str),
+                .map(|record| record.id.as_str()),
             Some("browser")
         );
         assert_eq!(
-            active_direct_session_for_user(&records, "user", None)
-                .and_then(|record| record.get("id"))
-                .and_then(Value::as_str),
+            active_direct_session_for_user(&records, "user", None).map(|record| record.id.as_str()),
             Some("telegram")
         );
     }
@@ -5808,6 +5879,7 @@ mod tests {
                 subagent_provider_receipt(
                     "subagent-manifest".into(),
                     Uuid::nil(),
+                    Some("gpt-5.6-sol"),
                     &json!({
                         "round":1,
                         "usage":{
@@ -5842,23 +5914,29 @@ mod tests {
         assert_eq!(provider_data["source"], "subagent");
         assert_eq!(provider_data["parentOperationId"], Uuid::nil().to_string());
         assert_eq!(provider_data["usageIsDelta"], true);
+        assert_eq!(provider_data["providerModel"], "gpt-5.6-sol");
+        assert_eq!(provider_data["estimatedCostUsdNanos"], 2_825_000);
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn descendant_tool_usage_keeps_router_categories_exact_and_exclusive() {
         let operation_id = Uuid::new_v4();
+        let usage = kcode_intelligence_router::TokenUsage {
+            input_tokens: 200,
+            cached_input_tokens: 50,
+            thinking_tokens: 30,
+            output_tokens: 40,
+        };
+        let cost =
+            kcode_intelligence_router::estimate_token_cost("gemini-3.1-flash-lite", usage).unwrap();
         let receipt = descendant_provider_receipt(
             "web_search",
             operation_id,
-            Some(&json!({
-                "inputTokens":200,
-                "cachedInputTokens":50,
-                "thinkingTokens":30,
-                "outputTokens":40,
-            })),
-        )
-        .unwrap();
+            "gemini-3.1-flash-lite",
+            Some(&usage),
+            Some(&cost),
+        );
         let EventKind::ProviderReceipt {
             input_tokens,
             provider_data,
@@ -5873,8 +5951,21 @@ mod tests {
         assert_eq!(provider_data["parentOperationId"], operation_id.to_string());
         assert_eq!(provider_data["nonCachedInputTokens"], 200);
         assert_eq!(provider_data["cachedInputTokens"], 50);
+        assert_eq!(provider_data["estimatedCostUsdNanos"], cost.usd_nanos);
         assert_eq!(provider_data["thinkingTokens"], 30);
         assert_eq!(provider_data["outputTokens"], 40);
+    }
+
+    #[test]
+    fn model_costs_are_rendered_as_pennies_to_three_decimal_places() {
+        assert_eq!(
+            cost_summary("subagent cost", 12_345_678, 0),
+            "Estimated subagent cost: 1.235 pennies at standard API rates."
+        );
+        assert_eq!(
+            cost_summary("session cost before history ingress", 10_000, 2),
+            "Estimated session cost before history ingress: 0.001 pennies at standard API rates; 2 provider calls could not be priced."
+        );
     }
 
     #[test]
@@ -6458,17 +6549,16 @@ mod tests {
     fn media_and_document_results_use_authoritative_staged_filenames() {
         let pending = PendingId::parse("pending:47").unwrap();
         let pending_text = pending.to_string();
-        let annotation_result =
-            serde_json::to_value(kcode_intelligence_router::AnnotationResponse {
-                complete: false,
-                model: "gpt-5.6".into(),
-                file_name: "adapter-reconstructed.png".into(),
-                content_type: "application/octet-stream".into(),
-                text: "A sign reads \"Kennedy\".".into(),
-                incomplete_reason: Some("output limit".into()),
-                usage: None,
-            })
-            .unwrap();
+        let annotation_result = kcode_intelligence_router::AnnotationResponse {
+            complete: false,
+            model: "gpt-5.6".into(),
+            file_name: "adapter-reconstructed.png".into(),
+            content_type: "application/octet-stream".into(),
+            text: "A sign reads \"Kennedy\".".into(),
+            incomplete_reason: Some("output limit".into()),
+            usage: None,
+            cost: None,
+        };
         let annotation = render_media_annotation_result(
             &pending_text,
             "scene.png",
@@ -6489,29 +6579,28 @@ mod tests {
             &pending_text,
             "voice-note.ogg",
             "audio/ogg",
-            &json!({
-                "model":"gpt-4o-transcribe",
-                "text":"The exact spoken words."
-            }),
+            &kcode_intelligence_router::TranscriptionResponse {
+                model: "gpt-4o-transcribe".into(),
+                text: "The exact spoken words.".into(),
+                metering: kcode_intelligence_router::Metering::Unavailable,
+                cost: None,
+            },
         )
         .unwrap();
         assert!(transcription.contains("Transcription for pending:47"));
         assert!(transcription.contains("Model: gpt-4o-transcribe"));
         assert!(transcription.ends_with("The exact spoken words."));
 
-        let extraction_result =
-            serde_json::to_value(kcode_intelligence_router::DocumentExtraction {
-                file_name: "adapter-reconstructed.doc".into(),
-                content_type: "application/octet-stream".into(),
-                format: "doc".into(),
-                text: "Original body".into(),
-                characters: 13,
-                truncated: false,
-            })
-            .unwrap();
+        let extraction_result = kcode_intelligence_router::DocumentExtraction {
+            file_name: "adapter-reconstructed.doc".into(),
+            content_type: "application/octet-stream".into(),
+            format: "doc".into(),
+            text: "Original body".into(),
+            characters: 13,
+            truncated: false,
+        };
         let extraction =
-            render_document_extraction_result(&pending_text, "brief.doc", &extraction_result)
-                .unwrap();
+            render_document_extraction_result(&pending_text, "brief.doc", &extraction_result);
         assert!(extraction.contains("File: brief.doc"));
         assert!(extraction.contains("Format: doc"));
         assert!(!extraction.contains("adapter-reconstructed.doc"));
@@ -7123,30 +7212,37 @@ mod tests {
 
     #[test]
     fn web_tool_results_are_plain_text() {
-        let search = render_web_search_result(&json!({
-            "answer":"The answer uses \"quotes\" and a backslash: \\",
-            "sources":[
-                {"title":"Primary source","url":"https://example.test/source"},
-                {"title":"","url":"https://example.test/untitled"}
-            ]
-        }))
-        .unwrap();
+        let search = render_web_search_result(&kcode_intelligence_router::SearchResponse {
+            answer: "The answer uses \"quotes\" and a backslash: \\".into(),
+            sources: vec![
+                kcode_intelligence_router::WebSource {
+                    title: "Primary source".into(),
+                    url: "https://example.test/source".into(),
+                },
+                kcode_intelligence_router::WebSource {
+                    title: String::new(),
+                    url: "https://example.test/untitled".into(),
+                },
+            ],
+            model: "test".into(),
+            usage: None,
+            cost: None,
+        });
         assert_eq!(
             search,
             "The answer uses \"quotes\" and a backslash: \\\n\nSources:\n- Primary source: https://example.test/source\n- https://example.test/untitled"
         );
         assert!(!search.contains("\\\"quotes\\\""));
 
-        let fetch_result = serde_json::to_value(kcode_intelligence_router::FetchResponse {
+        let fetch_result = kcode_intelligence_router::FetchResponse {
             url: "https://example.test/page".into(),
             title: Some("A page".into()),
             content_type: "text/plain".into(),
             content: "fn main() {\n    println!(\"raw\");\n}\n".into(),
             truncated: true,
             retrieved_at: Utc::now(),
-        })
-        .unwrap();
-        let fetched = render_web_fetch_result(&fetch_result).unwrap();
+        };
+        let fetched = render_web_fetch_result(&fetch_result);
         assert_eq!(
             fetched,
             "Source URL: https://example.test/page\nTitle: A page\nContent type: text/plain\nThe returned page text was truncated.\n\nfn main() {\n    println!(\"raw\");\n}\n"

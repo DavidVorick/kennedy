@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "KennedyServer",
-    "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-18c0-18c70f96337cfb02-0",
+    "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-15d3-18c72b05513f5a02-0",
     "data/kcode/kcode-rust-libs/kcode-telegram-identity/generations/g-4ed1-18c70c4992c16252-0",
-    "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-d08-18c70ec43206dd77-0",
+    "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-a8b-18c729c3c7842e89-0",
 ]
 resolver = "2"
 
@@ -63,15 +63,15 @@ kcode-codex-runtime = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtime/g
 kcode-codex-runtime-v2 = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtime-v2/generations/g-23f3-18c6a0bd001b63b3-2" }
 kcode-commit-session = { path = "data/kcode/kcode-rust-libs/kcode-commit-session/generations/g-38c9-18c60fede7966e78-0" }
 kcode-dev-tools = { path = "data/kcode/kcode-rust-libs/kcode-dev-tools/generations/g-141a-18c68a00acc5ce1b-0" }
-kcode-gemini-api = { path = "data/kcode/kcode-rust-libs/kcode-gemini-api/generations/g-24ad25-18c67672e274f035-0" }
+kcode-gemini-api = { path = "data/kcode/kcode-rust-libs/kcode-gemini-api/generations/g-19f1-18c72b2a30c946f1-0" }
 kcode-history-ingress-context = { path = "data/kcode/kcode-rust-libs/kcode-history-ingress-context/generations/g-1cb0-18c6f861bc73532f-0" }
-kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-23f3-18c6a0bd003493ae-4" }
+kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-27b0-18c72b44811ac673-0" }
 kcode-openai-api = { path = "data/kcode/kcode-rust-libs/kcode-openai-api/generations/g-b1e7-18c65999c584d09f-0" }
 kcode-rust-bins = { path = "data/kcode/kcode-rust-libs/kcode-rust-bins/generations/g-e5c-18c688799653cb78-0" }
 kcode-rust-libs-v2 = { path = "data/kcode/kcode-rust-libs/kcode-rust-libs-v2/generations/g-33ef-18c68a1dca33927f-0" }
-kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-18c0-18c70f96337cfb02-0" }
+kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-15d3-18c72b05513f5a02-0" }
 kcode-telegram-identity = { path = "data/kcode/kcode-rust-libs/kcode-telegram-identity/generations/g-4ed1-18c70c4992c16252-0" }
-kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-d08-18c70ec43206dd77-0" }
+kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-a8b-18c729c3c7842e89-0" }
 kcode-web-fetch = { path = "data/kcode/kcode-rust-libs/kcode-web-fetch/generations/g-35d0cb-18c516cf409b9ec1-19" }
 kcode-web-libs = { path = "data/kcode/kcode-rust-libs/kcode-web-libs/generations/g-281d1e-18c687bf9991dd9a-e" }
 

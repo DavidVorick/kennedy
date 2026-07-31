@@ -250,7 +250,12 @@ impl From<anyhow::Error> for ApiError {
         tracing::warn!(%error, "Kennedy orchestration stop request failed");
         if let Some(error) = error.downcast_ref::<crate::orchestration::ApiError>() {
             return Self {
-                status: error.status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                status: match error.code.as_str() {
+                    "invalid_request" => StatusCode::BAD_REQUEST,
+                    "not_found" => StatusCode::NOT_FOUND,
+                    "conflict" | "state_conflict" => StatusCode::CONFLICT,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                },
                 code: if error.code == "state_conflict" {
                     "state_conflict"
                 } else if error.code == "not_found" {

@@ -1,25 +1,19 @@
 mod context;
-mod http;
 mod prompts;
+mod services;
 mod session;
 mod worker;
 
 use std::{path::PathBuf, sync::Arc};
 
-pub(crate) use http::{Api, ApiError, LocalServices};
 pub(crate) use prompts::{Manuals, RuntimeModel, human_utc_datetime, runtime_description};
+pub(crate) use services::{Api, ApiError, LocalServices};
 pub(crate) use session::{AgentMode, Session};
 pub(crate) use worker::Orchestrator;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub system_prompts_directory: PathBuf,
-    #[cfg(test)]
-    pub kweb_base: String,
-    #[cfg(test)]
-    pub intelligence_base: String,
-    #[cfg(test)]
-    pub session_history_base: String,
     pub user_root_node_id: String,
     pub kennedy_root_node_id: String,
     pub telegram_max_media_bytes: usize,

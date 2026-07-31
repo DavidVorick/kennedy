@@ -32,7 +32,6 @@ kcode-telegram-identity.workspace = true
 kcode-web-semver-routing.workspace = true
 rusqlite.workspace = true
 rand.workspace = true
-reqwest.workspace = true
 rustls.workspace = true
 rpassword.workspace = true
 serde.workspace = true
@@ -43,5 +42,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-urlencoding = "2"
 zeroize.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

@@ -10,13 +10,14 @@ use std::{
 use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use kcode_server_object_envelopes::sanitize_file_name;
+use kcode_session_history::{SessionCommand, SessionRecord, SessionStopRequest};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 use uuid::Uuid;
 
 use super::{
     AgentMode, Api, Config, Manuals, RuntimeModel, Session,
-    http::data_url,
+    services::data_url,
     session::{SessionOptions, is_agent_loop_round_limit, validate_delivery_file_name},
 };
 
@@ -139,13 +140,8 @@ impl Orchestrator {
                 .api
                 .history_command_heads()
                 .await?
-                .get("commands")
-                .and_then(Value::as_array)
-                .is_some_and(|commands| {
-                    commands.iter().any(|command| {
-                        command.get("conversationId").and_then(Value::as_str) == Some(id)
-                    })
-                });
+                .iter()
+                .any(|command| command.conversation_id == id);
             if !has_command {
                 self.finish_idle_turn_stop(id).await?;
             }
@@ -155,7 +151,7 @@ impl Orchestrator {
             "scope":scope,
             "status":"stopping",
             "stopRequested":true,
-            "stopRequestId":request.get("id").cloned().unwrap_or(Value::Null),
+            "stopRequestId":request.id,
         }))
     }
 
@@ -206,10 +202,8 @@ impl Orchestrator {
     async fn initialize(&self) -> anyhow::Result<Runtime> {
         self.api.kmap_node(self.api.user_root_node_id())?;
         self.api.kmap_node(self.api.kennedy_root_node_id())?;
-        let (history, telegram) =
-            tokio::join!(self.api.history_health(), self.api.telegram_health());
-        history?;
-        telegram?;
+        self.api.history_health()?;
+        self.api.telegram_health();
         let manuals = Manuals::load(&self.config.system_prompts_directory)?;
         let runtime = Runtime {
             manuals,
@@ -245,19 +239,8 @@ impl Orchestrator {
 
     async fn create_wakeup_sessions(&self, marker: DateTime<Utc>) -> anyhow::Result<()> {
         let private_sessions = self.api.telegram_private_sessions().await?;
-        for private_session in private_sessions
-            .get("sessions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(telegram_user_id) = private_session
-                .get("telegramUserId")
-                .and_then(Value::as_i64)
-            else {
-                tracing::warn!("Telegram private-session discovery returned no numeric user ID");
-                continue;
-            };
+        for private_session in private_sessions {
+            let telegram_user_id = private_session.telegram_user_id;
             if let Err(error) = self.create_wakeup_session(telegram_user_id, marker).await {
                 tracing::warn!(
                     %telegram_user_id,
@@ -276,7 +259,7 @@ impl Orchestrator {
         marker: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         let runtime = self.runtime()?.clone();
-        let user = self.api.directory_user(telegram_user_id).await?;
+        let user = self.api.directory_user(telegram_user_id)?;
         let user_root = user
             .root_node_id
             .context("Telegram user root is not ready for a wakeup session")?;
@@ -331,55 +314,36 @@ impl Orchestrator {
             .api
             .history_command_heads()
             .await?
-            .get("commands")
-            .and_then(Value::as_array)
             .into_iter()
-            .flatten()
-            .filter_map(|command| {
-                command
-                    .get("conversationId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+            .map(|command| command.conversation_id)
             .collect::<HashSet<_>>();
         for request in self.pending_stops().await? {
-            if let Some(id) = request.get("sessionId").and_then(Value::as_str) {
-                let signaled = self.signal_stop(id).await;
-                if !signaled
-                    && request.get("scope").and_then(Value::as_str) == Some("turn")
-                    && !command_conversations.contains(id)
-                {
-                    self.finish_idle_turn_stop(id).await?;
-                }
+            let signaled = self.signal_stop(&request.session_id).await;
+            if !signaled
+                && request.scope == "turn"
+                && !command_conversations.contains(&request.session_id)
+            {
+                self.finish_idle_turn_stop(&request.session_id).await?;
             }
         }
         Ok(())
     }
 
-    async fn pending_stops(&self) -> anyhow::Result<Vec<Value>> {
-        Ok(self
-            .api
-            .history_stop_heads()
-            .await?
-            .get("stopRequests")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+    async fn pending_stops(&self) -> anyhow::Result<Vec<SessionStopRequest>> {
+        Ok(self.api.history_stop_heads().await?)
     }
 
-    async fn pending_stop(&self, session_id: &str) -> anyhow::Result<Option<Value>> {
+    async fn pending_stop(&self, session_id: &str) -> anyhow::Result<Option<SessionStopRequest>> {
         Ok(self
             .pending_stops()
             .await?
             .into_iter()
-            .find(|request| request.get("sessionId").and_then(Value::as_str) == Some(session_id)))
+            .find(|request| request.session_id == session_id))
     }
 
     async fn complete_pending_stop(&self, session_id: &str, outcome: Value) -> anyhow::Result<()> {
-        if let Some(request) = self.pending_stop(session_id).await?
-            && let Some(id) = request.get("id").and_then(Value::as_str)
-        {
-            self.api.history_complete_stop(id, outcome).await?;
+        if let Some(request) = self.pending_stop(session_id).await? {
+            self.api.history_complete_stop(&request.id, outcome).await?;
         }
         Ok(())
     }
@@ -405,7 +369,7 @@ impl Orchestrator {
             return Ok(());
         }
         let record = self.get_conversation(session_id).await?;
-        if record.get("phase").and_then(Value::as_str) != Some("active") {
+        if record.phase != "active" {
             return Ok(());
         }
         let record = Arc::new(Mutex::new(record));
@@ -481,15 +445,8 @@ impl Orchestrator {
         result
     }
 
-    async fn list_history(&self) -> anyhow::Result<Vec<Value>> {
-        Ok(self
-            .api
-            .history_list()
-            .await?
-            .get("conversations")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+    async fn list_history(&self) -> anyhow::Result<Vec<SessionRecord>> {
+        Ok(self.api.history_list().await?)
     }
 
     async fn conversation_lock(&self, id: &str) -> Arc<Mutex<()>> {
@@ -502,23 +459,11 @@ impl Orchestrator {
     }
 
     async fn sync_conversation_commands(self: &Arc<Self>) -> anyhow::Result<()> {
-        let commands = self
-            .api
-            .history_command_heads()
-            .await?
-            .get("commands")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let commands = self.api.history_command_heads().await?;
         for command in commands {
-            let id = required_string(&command, "id")?;
-            let conversation_id = required_string(&command, "conversationId")?;
-            if command
-                .get("cancelRequested")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && self.commands_in_flight.lock().await.contains(&id)
-            {
+            let id = command.id.clone();
+            let conversation_id = command.conversation_id.clone();
+            if command.cancel_requested && self.commands_in_flight.lock().await.contains(&id) {
                 self.signal_stop(&conversation_id).await;
                 continue;
             }
@@ -538,34 +483,27 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn process_conversation_command(&self, command: Value) -> anyhow::Result<()> {
-        let command_id = required_string(&command, "id")?;
-        let conversation_id = required_string(&command, "conversationId")?;
+    async fn process_conversation_command(&self, command: SessionCommand) -> anyhow::Result<()> {
+        let command_id = command.id.clone();
+        let conversation_id = command.conversation_id.clone();
         let lock = self.conversation_lock(&conversation_id).await;
         let _conversation_guard = lock.lock().await;
-        let command = if command.get("status").and_then(Value::as_str) == Some("pending") {
+        let command = if command.status == "pending" {
             self.api.history_claim_command(&command_id).await?
         } else {
             command
         };
         let record = self.get_conversation(&conversation_id).await?;
-        if record.get("phase").and_then(Value::as_str) != Some("active")
-            || !is_browser_conversation(&record)
-        {
+        if record.phase != "active" || !is_browser_conversation(&record) {
             self.complete_command(&command_id, json!({"status":"conversation_closed"}))
                 .await?;
             return Ok(());
         }
-        let kind = required_string(&command, "kind")?;
-        let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+        let kind = command.kind.clone();
+        let payload = command.payload.clone();
         let record = Arc::new(Mutex::new(record));
         if kind == "end" {
-            let mut state = record
-                .lock()
-                .await
-                .get("state")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let mut state = record.lock().await.state.clone();
             let abandoned_pending_turn = state
                 .get("pendingTurn")
                 .and_then(Value::as_bool)
@@ -588,11 +526,7 @@ impl Orchestrator {
             let locked = record.lock().await;
             self.session_for_record(&locked).await?
         };
-        if command
-            .get("cancelRequested")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        if command.cancel_requested {
             session.interrupt_current_turn()?;
             persist_record(&self.api, &record, session.snapshot()?, false).await?;
             self.complete_command(
@@ -835,9 +769,9 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn session_for_record(&self, record: &Value) -> anyhow::Result<Session> {
+    async fn session_for_record(&self, record: &SessionRecord) -> anyhow::Result<Session> {
         let runtime = self.runtime()?.clone();
-        let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+        let mut state = record.state.clone();
         let session_type = session_type(record);
         if matches!(session_type.as_str(), "telegram" | "telegram-group") {
             if !state.get("channel").is_some_and(Value::is_object) {
@@ -883,35 +817,34 @@ impl Orchestrator {
 
     async fn close_conversation(
         &self,
-        record: &Arc<Mutex<Value>>,
+        record: &Arc<Mutex<SessionRecord>>,
         session: &Session,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<()> {
         session.release_managed_sources().await;
         self.request_conversation_ingress(record, None).await
     }
 
     async fn request_conversation_ingress(
         &self,
-        record: &Arc<Mutex<Value>>,
+        record: &Arc<Mutex<SessionRecord>>,
         state: Option<Value>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<()> {
         let mut locked = record.lock().await;
-        let id = required_string(&locked, "id")?;
-        let state =
-            state.unwrap_or_else(|| locked.get("state").cloned().unwrap_or_else(|| json!({})));
+        let id = locked.id.clone();
+        let state = state.unwrap_or_else(|| locked.state.clone());
         let response = self
             .api
             .history_request_ingress(
                 &id,
                 kcode_session_history::Checkpoint {
-                    expected_version: version(&locked)?,
+                    expected_version: locked.version,
                     state,
                     user_activity: false,
                 },
             )
             .await?;
-        *locked = response.clone();
-        Ok(response)
+        *locked = response;
+        Ok(())
     }
 
     async fn complete_command(&self, id: &str, outcome: Value) -> anyhow::Result<()> {
@@ -919,24 +852,24 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn get_conversation(&self, id: &str) -> anyhow::Result<Value> {
+    async fn get_conversation(&self, id: &str) -> anyhow::Result<SessionRecord> {
         Ok(self.api.history_get_session(id).await?)
     }
 
-    async fn schedule_writer_job(self: &Arc<Self>, histories: &[Value]) -> anyhow::Result<()> {
+    async fn schedule_writer_job(
+        self: &Arc<Self>,
+        histories: &[SessionRecord],
+    ) -> anyhow::Result<()> {
         if self.writer_job_active.load(Ordering::Acquire) {
             return Ok(());
         }
         if let Some(record) = histories
             .iter()
-            .find(|record| {
-                record.get("phase").and_then(Value::as_str) == Some("active")
-                    && session_type(record) == "wakeup"
-            })
+            .find(|record| record.phase == "active" && session_type(record) == "wakeup")
             .cloned()
         {
             self.launch_writer_job("scheduled wakeup", move |worker| async move {
-                let id = required_string(&record, "id")?;
+                let id = record.id;
                 let record = worker.get_conversation(&id).await?;
                 worker.process_wakeup(record).await
             })
@@ -945,14 +878,11 @@ impl Orchestrator {
         }
         if let Some(record) = histories
             .iter()
-            .find(|record| {
-                record.get("phase").and_then(Value::as_str) == Some("active")
-                    && session_type(record) == "free-time"
-            })
+            .find(|record| record.phase == "active" && session_type(record) == "free-time")
             .cloned()
         {
             self.launch_writer_job("self time", move |worker| async move {
-                let id = required_string(&record, "id")?;
+                let id = record.id;
                 let record = worker.get_conversation(&id).await?;
                 worker.process_self_time(record).await
             })
@@ -961,7 +891,7 @@ impl Orchestrator {
         }
         if let Some(record) = next_ingress(histories, Utc::now()).cloned() {
             self.launch_writer_job("memory ingress", move |worker| async move {
-                let id = required_string(&record, "id")?;
+                let id = record.id;
                 let record = worker.get_conversation(&id).await?;
                 worker.process_ingress(record).await
             })
@@ -996,15 +926,15 @@ impl Orchestrator {
         });
     }
 
-    async fn process_ingress(&self, mut record: Value) -> anyhow::Result<()> {
-        let id = required_string(&record, "id")?;
+    async fn process_ingress(&self, mut record: SessionRecord) -> anyhow::Result<()> {
+        let id = record.id.clone();
         let rust_session_id = format!("kennedy:history-ingress:{id}");
         let mut stage = "prepare";
         let result = async {
-            if record.get("phase").and_then(Value::as_str) == Some("ingress_pending") {
+            if record.phase == "ingress_pending" {
                 record
-                    .get("state")
-                    .and_then(|state| state.get("sessionId"))
+                    .state
+                    .get("sessionId")
                     .and_then(Value::as_str)
                     .context("The queued session has no Session History ID")?;
                 stage = "claim";
@@ -1013,18 +943,18 @@ impl Orchestrator {
                     .history_start_ingress(
                         &id,
                         kcode_session_history::StartIngress {
-                            expected_version: version(&record)?,
+                            expected_version: record.version,
                             provenance_id: format!("session:{id}"),
                         },
                     )
                     .await?;
             }
-            if record.get("phase").and_then(Value::as_str) != Some("ingress_in_progress") {
+            if record.phase != "ingress_in_progress" {
                 return Ok(());
             }
             stage = "model_loop";
             let runtime = self.runtime()?.clone();
-            let state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+            let state = record.state.clone();
             let source_session_type = state
                 .get("sessionType")
                 .and_then(Value::as_str)
@@ -1101,12 +1031,12 @@ impl Orchestrator {
             let mut locked = record.lock().await;
             let completed = self
                 .api
-                .history_complete_ingress(&id, version(&locked)?)
+                .history_complete_ingress(&id, locked.version)
                 .await?;
             *locked = completed.clone();
             if let Some(batch) = completed
-                .get("state")
-                .and_then(|state| state.get("channel"))
+                .state
+                .get("channel")
                 .and_then(|channel| channel.get("groupIngressBatchId"))
                 .and_then(Value::as_str)
             {
@@ -1131,8 +1061,8 @@ impl Orchestrator {
     ) -> anyhow::Result<()> {
         let latest = self.get_conversation(id).await?;
         if !matches!(
-            latest.get("phase").and_then(Value::as_str),
-            Some("ingress_pending" | "ingress_in_progress")
+            latest.phase.as_str(),
+            "ingress_pending" | "ingress_in_progress"
         ) {
             return Ok(());
         }
@@ -1140,7 +1070,7 @@ impl Orchestrator {
             .history_fail_ingress(
                 id,
                 kcode_session_history::IngressFailure {
-                    expected_version: version(&latest)?,
+                    expected_version: latest.version,
                     stage: stage.to_owned(),
                     code: Some("ingress_error".into()),
                     message: bounded_error(error),
@@ -1153,10 +1083,10 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn process_self_time(&self, record: Value) -> anyhow::Result<()> {
+    async fn process_self_time(&self, record: SessionRecord) -> anyhow::Result<()> {
         let runtime = self.runtime()?.clone();
-        let id = required_string(&record, "id")?;
-        let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+        let id = record.id.clone();
+        let mut state = record.state.clone();
         if state.get("freeTime").is_none() {
             let intent = state
                 .get("selfTimeIntent")
@@ -1168,7 +1098,7 @@ impl Orchestrator {
             let requested = intent
                 .get("requestedAt")
                 .and_then(Value::as_str)
-                .or_else(|| record.get("started_at").and_then(Value::as_str))
+                .or(Some(record.started_at.as_str()))
                 .context("self-time request time is missing")?;
             let requested_at = DateTime::parse_from_rfc3339(requested)?.with_timezone(&Utc);
             let deadline =
@@ -1264,8 +1194,8 @@ impl Orchestrator {
             .history_complete(
                 &id,
                 kcode_session_history::Checkpoint {
-                    expected_version: version(&locked)?,
-                    state: locked.get("state").cloned().unwrap_or(Value::Null),
+                    expected_version: locked.version,
+                    state: locked.state.clone(),
                     user_activity: false,
                 },
             )
@@ -1283,8 +1213,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn process_wakeup(&self, record: Value) -> anyhow::Result<()> {
-        let id = required_string(&record, "id")?;
+    async fn process_wakeup(&self, record: SessionRecord) -> anyhow::Result<()> {
+        let id = record.id.clone();
         let mut session = self.session_for_record(&record).await?;
         session.stage_wakeup_opening()?;
         let record = Arc::new(Mutex::new(record));
@@ -1318,8 +1248,8 @@ impl Orchestrator {
             .history_complete(
                 &id,
                 kcode_session_history::Checkpoint {
-                    expected_version: version(&locked)?,
-                    state: locked.get("state").cloned().unwrap_or(Value::Null),
+                    expected_version: locked.version,
+                    state: locked.state.clone(),
                     user_activity: false,
                 },
             )
@@ -1403,10 +1333,8 @@ impl Orchestrator {
 
     async fn provision_directory(&self) -> anyhow::Result<()> {
         let runtime = self.runtime()?;
-        let (users, groups) = tokio::try_join!(
-            self.api.directory_provisioning_users(),
-            self.api.directory_provisioning_groups()
-        )?;
+        let users = self.api.directory_provisioning_users()?;
+        let groups = self.api.directory_provisioning_groups()?;
         for user in users {
             let handle = user.handle;
             let is_web = handle
@@ -1418,25 +1346,21 @@ impl Orchestrator {
                 let _guard = self.writer.lock().await;
                 self.api.bootstrap_node(None)?.id.to_string()
             };
-            self.api
-                .directory_complete_handle_root(
-                    &handle,
-                    root.parse()
-                        .context("created an invalid user root node ID")?,
-                )
-                .await?;
+            self.api.directory_complete_handle_root(
+                &handle,
+                root.parse()
+                    .context("created an invalid user root node ID")?,
+            )?;
         }
         for group in groups {
             let group_id = group.group_id;
             let _guard = self.writer.lock().await;
             let root = self.api.bootstrap_node(Some("Group Root"))?.id.to_string();
-            self.api
-                .directory_complete_group_root(
-                    &group_id,
-                    root.parse()
-                        .context("created an invalid group root node ID")?,
-                )
-                .await?;
+            self.api.directory_complete_group_root(
+                &group_id,
+                root.parse()
+                    .context("created an invalid group root node ID")?,
+            )?;
         }
         Ok(())
     }
@@ -1448,18 +1372,15 @@ impl Orchestrator {
             .context("Telegram event omitted user ID")?
             .parse::<i64>()
             .context("Telegram event has an invalid user ID")?;
-        let mut user = self.api.directory_user(id).await?;
+        let mut user = self.api.directory_user(id)?;
         if !user.root_ready {
             let _guard = self.writer.lock().await;
             let root = self.api.bootstrap_node(None)?.id.to_string();
-            user = self
-                .api
-                .directory_complete_user_root(
-                    id,
-                    root.parse()
-                        .context("created an invalid user root node ID")?,
-                )
-                .await?;
+            user = self.api.directory_complete_user_root(
+                id,
+                root.parse()
+                    .context("created an invalid user root node ID")?,
+            )?;
         }
         Ok(user)
     }
@@ -1468,18 +1389,15 @@ impl Orchestrator {
         &self,
         group_id: &str,
     ) -> anyhow::Result<kcode_telegram_identity::Group> {
-        let mut group = self.api.directory_group(group_id).await?;
+        let mut group = self.api.directory_group(group_id)?;
         if !group.root_ready {
             let _guard = self.writer.lock().await;
             let root = self.api.bootstrap_node(Some("Group Root"))?.id.to_string();
-            group = self
-                .api
-                .directory_complete_group_root(
-                    group_id,
-                    root.parse()
-                        .context("created an invalid group root node ID")?,
-                )
-                .await?;
+            group = self.api.directory_complete_group_root(
+                group_id,
+                root.parse()
+                    .context("created an invalid group root node ID")?,
+            )?;
         }
         Ok(group)
     }
@@ -1553,8 +1471,7 @@ impl Orchestrator {
                 let prepared = async {
                     let (bytes, mime) = self
                         .api
-                        .telegram_group_message_media(chat_id, numeric_message_id)
-                        .await?;
+                        .telegram_group_message_media(chat_id, numeric_message_id)?;
                     let result = self
                         .api
                         .extract_document(
@@ -1568,16 +1485,10 @@ impl Orchestrator {
                         )
                         .await?;
                     Ok::<_, anyhow::Error>((
-                        required_string(&result, "text")?,
+                        result.text,
                         None::<String>,
-                        result
-                            .get("format")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        result
-                            .get("truncated")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
+                        Some(result.format),
+                        result.truncated,
                     ))
                 }
                 .await;
@@ -1623,8 +1534,7 @@ impl Orchestrator {
                 if has_media {
                     let (size_bytes, downloaded_mime_type) = self
                         .api
-                        .telegram_group_message_media_metadata(chat_id, numeric_message_id)
-                        .await?;
+                        .telegram_group_message_media_metadata(chat_id, numeric_message_id)?;
                     let mime_type = normalized_file_mime_type(
                         message
                             .get("mimeType")
@@ -1875,7 +1785,7 @@ impl Orchestrator {
         let (record_arc, _) = self.telegram_session(event).await?;
         let conversation_id = {
             let locked = record_arc.lock().await;
-            required_string(&locked, "id")?
+            locked.id.clone()
         };
         *bound_conversation_id.lock().await = Some(conversation_id.clone());
         self.register_operation(&conversation_id, active.clone())
@@ -2060,17 +1970,17 @@ impl Orchestrator {
             }
             Err(error) => return Err(error),
         };
-        if record.get("phase").and_then(Value::as_str) != Some("active") {
+        if record.phase != "active" {
             return Ok(());
         }
-        let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+        let mut state = record.state.clone();
         state["orchestration"] =
             json!({"owner":"backend","status":"stopped","reason":"telegram-timeout"});
         self.api
             .history_request_ingress(
                 conversation_id,
                 kcode_session_history::Checkpoint {
-                    expected_version: version(&record)?,
+                    expected_version: record.version,
                     state: state.clone(),
                     user_activity: false,
                 },
@@ -2087,21 +1997,14 @@ impl Orchestrator {
             .api
             .telegram_private_sessions()
             .await?
-            .get("sessions")
-            .and_then(Value::as_array)
             .into_iter()
-            .flatten()
-            .filter_map(|session| session.get("currentConversationId").and_then(Value::as_str))
-            .map(str::to_owned)
+            .filter_map(|session| session.current_conversation_id)
             .collect::<HashSet<_>>();
         let histories = self.list_history().await?;
         for record in histories.iter().filter(|record| {
-            record.get("phase").and_then(Value::as_str) == Some("active")
+            record.phase == "active"
                 && session_type(record) == "telegram"
-                && record
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| !bound.contains(id))
+                && !bound.contains(&record.id)
         }) {
             self.queue_telegram_session_for_ingress(record, "telegram-detached")
                 .await?;
@@ -2111,7 +2014,7 @@ impl Orchestrator {
 
     async fn queue_expired_telegram_sessions(
         &self,
-        histories: &[Value],
+        histories: &[SessionRecord],
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         for record in histories
@@ -2126,14 +2029,14 @@ impl Orchestrator {
 
     async fn queue_telegram_session_for_ingress(
         &self,
-        summary: &Value,
+        summary: &SessionRecord,
         reason: &str,
     ) -> anyhow::Result<bool> {
-        let id = required_string(summary, "id")?;
+        let id = summary.id.clone();
         let lock = self.conversation_lock(&id).await;
         let _guard = lock.lock().await;
         let record = self.get_conversation(&id).await?;
-        if record.get("phase").and_then(Value::as_str) != Some("active")
+        if record.phase != "active"
             || !matches!(
                 session_type(&record).as_str(),
                 "telegram" | "telegram-group"
@@ -2145,7 +2048,7 @@ impl Orchestrator {
         {
             return Ok(false);
         }
-        let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+        let mut state = record.state.clone();
         state["orchestration"] = json!({
             "owner":"backend",
             "status":"stopped",
@@ -2155,7 +2058,7 @@ impl Orchestrator {
             .history_request_ingress(
                 &id,
                 kcode_session_history::Checkpoint {
-                    expected_version: version(&record)?,
+                    expected_version: record.version,
                     state: state.clone(),
                     user_activity: false,
                 },
@@ -2171,7 +2074,7 @@ impl Orchestrator {
     async fn telegram_session(
         &self,
         event: &Value,
-    ) -> anyhow::Result<(Arc<Mutex<Value>>, Session)> {
+    ) -> anyhow::Result<(Arc<Mutex<SessionRecord>>, Session)> {
         let histories = self.list_history().await?;
         let group = event.get("sessionKind").and_then(Value::as_str) == Some("group");
         let user_id = event
@@ -2182,15 +2085,10 @@ impl Orchestrator {
         let mut record = event
             .get("conversationId")
             .and_then(Value::as_str)
-            .and_then(|id| {
-                histories
-                    .iter()
-                    .find(|record| record.get("id").and_then(Value::as_str) == Some(id))
-                    .cloned()
-            });
+            .and_then(|id| histories.iter().find(|record| record.id == id).cloned());
         if record.is_none() {
             record = histories.into_iter().find(|record| {
-                record.get("phase").and_then(Value::as_str) == Some("active")
+                record.phase == "active"
                     && if group {
                         session_type(record) == "telegram-group"
                             && record_group_id(record) == group_id
@@ -2202,22 +2100,19 @@ impl Orchestrator {
         }
         let created = record
             .as_ref()
-            .is_none_or(|record| record.get("phase").and_then(Value::as_str) != Some("active"));
-        let (record, mut session) = if let Some(record) =
-            record.filter(|record| record.get("phase").and_then(Value::as_str) == Some("active"))
-        {
-            let record = self
-                .get_conversation(&required_string(&record, "id")?)
-                .await?;
-            let session = self.session_for_record(&record).await?;
-            (record, session)
-        } else {
-            self.create_telegram_session(event).await?
-        };
+            .is_none_or(|record| record.phase != "active");
+        let (record, mut session) =
+            if let Some(record) = record.filter(|record| record.phase == "active") {
+                let record = self.get_conversation(&record.id).await?;
+                let session = self.session_for_record(&record).await?;
+                (record, session)
+            } else {
+                self.create_telegram_session(event).await?
+            };
         let record = Arc::new(Mutex::new(record));
         let id = {
             let locked = record.lock().await;
-            required_string(&locked, "id")?
+            locked.id.clone()
         };
         if event.get("conversationId").and_then(Value::as_str) != Some(&id)
             || event.get("processingStartedAt").is_none()
@@ -2250,7 +2145,10 @@ impl Orchestrator {
         Ok((record, session))
     }
 
-    async fn create_telegram_session(&self, event: &Value) -> anyhow::Result<(Value, Session)> {
+    async fn create_telegram_session(
+        &self,
+        event: &Value,
+    ) -> anyhow::Result<(SessionRecord, Session)> {
         let runtime = self.runtime()?.clone();
         let user = self.directory_user(event).await?;
         let group = event.get("sessionKind").and_then(Value::as_str) == Some("group");
@@ -2310,7 +2208,7 @@ impl Orchestrator {
         let id = required_string(event, "id")?;
         match event.get("kind").and_then(Value::as_str).unwrap_or("text") {
             "voice" => {
-                let (bytes, mime) = self.api.telegram_event_media(&id).await?;
+                let (bytes, mime) = self.api.telegram_event_media(&id)?;
                 let filename = event
                     .get("fileName")
                     .and_then(Value::as_str)
@@ -2326,7 +2224,7 @@ impl Orchestrator {
                 ))
             }
             "document" => {
-                let (bytes, mime) = self.api.telegram_event_media(&id).await?;
+                let (bytes, mime) = self.api.telegram_event_media(&id)?;
                 let filename = event
                     .get("fileName")
                     .and_then(Value::as_str)
@@ -2347,12 +2245,10 @@ impl Orchestrator {
                 });
                 match extraction {
                     Ok(result) => {
-                        attachment["format"] = result.get("format").cloned().unwrap_or(Value::Null);
-                        attachment["text"] = result.get("text").cloned().unwrap_or(Value::Null);
-                        attachment["characters"] =
-                            result.get("characters").cloned().unwrap_or(Value::Null);
-                        attachment["truncated"] =
-                            result.get("truncated").cloned().unwrap_or(json!(false));
+                        attachment["format"] = json!(result.format);
+                        attachment["text"] = json!(result.text);
+                        attachment["characters"] = json!(result.characters);
+                        attachment["truncated"] = json!(result.truncated);
                     }
                     Err(error) => {
                         attachment["extractionError"] = json!(error.to_string());
@@ -2368,7 +2264,7 @@ impl Orchestrator {
                 ))
             }
             kind @ ("photo" | "video" | "animation" | "audio" | "video_note" | "sticker") => {
-                let (bytes, downloaded_mime) = self.api.telegram_event_media(&id).await?;
+                let (bytes, downloaded_mime) = self.api.telegram_event_media(&id)?;
                 let mime = event
                     .get("mimeType")
                     .and_then(Value::as_str)
@@ -2457,7 +2353,7 @@ impl Orchestrator {
             }
             Err(error) => return Err(error),
         };
-        if record.get("phase").and_then(Value::as_str) != Some("active") {
+        if record.phase != "active" {
             self.api
                 .telegram_complete_reset(
                     &id,
@@ -2474,8 +2370,8 @@ impl Orchestrator {
             .history_request_ingress(
                 conversation_id,
                 kcode_session_history::Checkpoint {
-                    expected_version: version(&record)?,
-                    state: record.get("state").cloned().unwrap_or(Value::Null),
+                    expected_version: record.version,
+                    state: record.state,
                     user_activity: false,
                 },
             )
@@ -2534,7 +2430,7 @@ impl Orchestrator {
             }
             Err(error) => return Err(error),
         };
-        if record.get("phase").and_then(Value::as_str) != Some("active") {
+        if record.phase != "active" {
             if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
                 self.api.telegram_complete_silent_group_reset(&id).await?;
             }
@@ -2651,26 +2547,24 @@ impl Orchestrator {
         let id = required_string(&batch, "id")?;
         if let Some(existing) = self.list_history().await?.into_iter().find(|record| {
             record
-                .get("state")
-                .and_then(|state| state.get("channel"))
+                .state
+                .get("channel")
                 .and_then(|channel| channel.get("groupIngressBatchId"))
                 .and_then(Value::as_str)
                 == Some(&id)
         }) {
-            match existing.get("phase").and_then(Value::as_str) {
-                Some("complete") => {
+            match existing.phase.as_str() {
+                "complete" => {
                     self.api.telegram_complete_group_ingress(&id).await?;
                 }
-                Some("active") => {
-                    let existing = self
-                        .get_conversation(&required_string(&existing, "id")?)
-                        .await?;
+                "active" => {
+                    let existing = self.get_conversation(&existing.id).await?;
                     self.api
                         .history_request_ingress(
-                            &required_string(&existing, "id")?,
+                            &existing.id,
                             kcode_session_history::Checkpoint {
-                                expected_version: version(&existing)?,
-                                state: existing.get("state").cloned().unwrap_or(Value::Null),
+                                expected_version: existing.version,
+                                state: existing.state,
                                 user_activity: false,
                             },
                         )
@@ -2733,10 +2627,10 @@ impl Orchestrator {
             .await?;
         self.api
             .history_request_ingress(
-                &required_string(&record, "id")?,
+                &record.id,
                 kcode_session_history::Checkpoint {
-                    expected_version: version(&record)?,
-                    state: record.get("state").cloned().unwrap_or(Value::Null),
+                    expected_version: record.version,
+                    state: record.state,
                     user_activity: false,
                 },
             )
@@ -2747,28 +2641,27 @@ impl Orchestrator {
 
 async fn persist_record(
     api: &Api,
-    record: &Arc<Mutex<Value>>,
+    record: &Arc<Mutex<SessionRecord>>,
     state: Value,
     user_activity: bool,
 ) -> anyhow::Result<()> {
     let mut record = record.lock().await;
-    let id = required_string(&record, "id")?;
+    let id = record.id.clone();
     let result = match api
         .history_checkpoint(
             &id,
             kcode_session_history::Checkpoint {
-                expected_version: version(&record)?,
+                expected_version: record.version,
                 state: state.clone(),
                 user_activity,
             },
-            false,
         )
         .await
     {
         Ok(result) => result,
         Err(error) if error.code == "state_conflict" => {
             let latest = api.history_get_session(&id).await?;
-            if latest.get("state") == Some(&state) {
+            if latest.state == state {
                 latest
             } else {
                 return Err(error.into());
@@ -2781,29 +2674,28 @@ async fn persist_record(
 }
 async fn persist_ingress_record(
     api: &Api,
-    record: &Arc<Mutex<Value>>,
+    record: &Arc<Mutex<SessionRecord>>,
     archive: Value,
 ) -> anyhow::Result<()> {
     let mut record = record.lock().await;
-    let id = required_string(&record, "id")?;
-    let mut state = record.get("state").cloned().unwrap_or_else(|| json!({}));
+    let id = record.id.clone();
+    let mut state = record.state.clone();
     state["historyIngress"] = archive;
     let result = match api
         .history_checkpoint(
             &id,
             kcode_session_history::Checkpoint {
-                expected_version: version(&record)?,
+                expected_version: record.version,
                 state: state.clone(),
                 user_activity: false,
             },
-            true,
         )
         .await
     {
         Ok(result) => result,
         Err(error) if error.code == "state_conflict" => {
             let latest = api.history_get_session(&id).await?;
-            if latest.get("state") == Some(&state) {
+            if latest.state == state {
                 latest
             } else {
                 return Err(error.into());
@@ -2814,20 +2706,17 @@ async fn persist_ingress_record(
     *record = result;
     Ok(())
 }
-fn session_type(record: &Value) -> String {
+fn session_type(record: &SessionRecord) -> String {
     record
-        .get("state")
-        .and_then(|state| state.get("sessionType"))
+        .state
+        .get("sessionType")
         .and_then(Value::as_str)
         .unwrap_or("conversation")
         .into()
 }
 
-fn stop_scope(record: &Value) -> &'static str {
-    let phase = record
-        .get("phase")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+fn stop_scope(record: &SessionRecord) -> &'static str {
+    let phase = record.phase.as_str();
     let session_type = session_type(record);
     if phase == "active"
         && matches!(
@@ -2858,14 +2747,14 @@ fn next_wakeup_marker(now: DateTime<Utc>) -> DateTime<Utc> {
     day_start + ChronoDuration::days(1)
 }
 
-fn next_ingress(histories: &[Value], now: DateTime<Utc>) -> Option<&Value> {
+fn next_ingress(histories: &[SessionRecord], now: DateTime<Utc>) -> Option<&SessionRecord> {
     histories
         .iter()
-        .filter(|record| match record.get("phase").and_then(Value::as_str) {
-            Some("ingress_in_progress") => true,
-            Some("ingress_pending") => record
-                .get("ingress_next_attempt_at")
-                .and_then(Value::as_str)
+        .filter(|record| match record.phase.as_str() {
+            "ingress_in_progress" => true,
+            "ingress_pending" => record
+                .ingress_next_attempt_at
+                .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .is_none_or(|next| next.with_timezone(&Utc) <= now),
             _ => false,
@@ -2873,9 +2762,9 @@ fn next_ingress(histories: &[Value], now: DateTime<Utc>) -> Option<&Value> {
         .min_by(|left, right| ingress_record_order(left, right))
 }
 
-fn ingress_record_order(left: &Value, right: &Value) -> std::cmp::Ordering {
-    let rank = |record: &Value| {
-        if record.get("phase").and_then(Value::as_str) == Some("ingress_in_progress") {
+fn ingress_record_order(left: &SessionRecord, right: &SessionRecord) -> std::cmp::Ordering {
+    let rank = |record: &SessionRecord| {
+        if record.phase == "ingress_in_progress" {
             0
         } else {
             1
@@ -2884,50 +2773,38 @@ fn ingress_record_order(left: &Value, right: &Value) -> std::cmp::Ordering {
     rank(left)
         .cmp(&rank(right))
         .then_with(|| ingress_record_time(left).cmp(&ingress_record_time(right)))
-        .then_with(|| {
-            left.get("id")
-                .and_then(Value::as_str)
-                .cmp(&right.get("id").and_then(Value::as_str))
-        })
+        .then_with(|| left.id.cmp(&right.id))
 }
 
-fn ingress_record_time(record: &Value) -> DateTime<Utc> {
-    ["updated_at", "source_created_at", "started_at"]
+fn ingress_record_time(record: &SessionRecord) -> DateTime<Utc> {
+    [&record.updated_at, &record.started_at]
         .into_iter()
-        .find_map(|field| {
-            record
-                .get(field)
-                .and_then(Value::as_str)
-                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .find_map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
                 .map(|value| value.with_timezone(&Utc))
         })
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
-fn is_browser_conversation(record: &Value) -> bool {
+fn is_browser_conversation(record: &SessionRecord) -> bool {
     session_type(record) == "conversation"
 }
-fn telegram_session_is_expired(record: &Value, now: DateTime<Utc>) -> bool {
-    if record.get("phase").and_then(Value::as_str) != Some("active")
+fn telegram_session_is_expired(record: &SessionRecord, now: DateTime<Utc>) -> bool {
+    if record.phase != "active"
         || !matches!(session_type(record).as_str(), "telegram" | "telegram-group")
-        || record
-            .get("state")
-            .and_then(|state| state.get("pendingTurn"))
-            .and_then(Value::as_bool)
-            == Some(true)
+        || record.state.get("pendingTurn").and_then(Value::as_bool) == Some(true)
     {
         return false;
     }
-    record
-        .get("started_at")
-        .and_then(Value::as_str)
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    DateTime::parse_from_rfc3339(&record.started_at)
+        .ok()
         .is_some_and(|started| now >= started.with_timezone(&Utc) + TELEGRAM_SESSION_MAX_AGE)
 }
-fn record_channel(record: &Value) -> Option<&Value> {
-    record.get("state").and_then(|state| state.get("channel"))
+fn record_channel(record: &SessionRecord) -> Option<&Value> {
+    record.state.get("channel")
 }
-fn record_group_id(record: &Value) -> Option<&str> {
+fn record_group_id(record: &SessionRecord) -> Option<&str> {
     record_channel(record)
         .and_then(|channel| {
             channel.get("groupId").or_else(|| {
@@ -2938,7 +2815,7 @@ fn record_group_id(record: &Value) -> Option<&str> {
         })
         .and_then(Value::as_str)
 }
-fn record_user_id(record: &Value) -> String {
+fn record_user_id(record: &SessionRecord) -> String {
     record_channel(record)
         .and_then(|channel| channel.get("telegramUserId"))
         .map(value_string)
@@ -3091,12 +2968,6 @@ fn missing_group_session_recovery(update: &Value) -> anyhow::Result<MissingGroup
             .context("backend response omitted telegramUserId")?,
     })
 }
-fn version(value: &Value) -> anyhow::Result<i64> {
-    value
-        .get("version")
-        .and_then(Value::as_i64)
-        .context("backend record omitted version")
-}
 fn string_array(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -3152,6 +3023,28 @@ fn telegram_timeout(event: &Value) -> Duration {
 mod tests {
     use super::*;
 
+    fn session_record(overrides: Value) -> SessionRecord {
+        let mut record = json!({
+            "id":"session",
+            "phase":"active",
+            "started_at":"2026-07-30T00:00:00Z",
+            "updated_at":"2026-07-30T00:00:00Z",
+            "state":{},
+            "provenance_id":null,
+            "version":1,
+            "last_user_message_at":null,
+            "ended_at":null,
+            "ingress_failure_count":0,
+            "ingress_failures":[],
+            "ingress_next_attempt_at":null
+        });
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(overrides.as_object().unwrap().clone());
+        serde_json::from_value(record).unwrap()
+    }
+
     #[test]
     fn wakeup_markers_are_strictly_future_four_hour_utc_boundaries() {
         let before = DateTime::parse_from_rfc3339("2026-07-28T03:59:59Z")
@@ -3172,36 +3065,36 @@ mod tests {
 
     #[test]
     fn browser_and_telegram_sessions_are_classified_from_current_control_state() {
-        let browser = json!({
+        let browser = session_record(json!({
             "phase":"active",
             "state":{
                 "sessionType":"conversation",
                 "orchestration":{"owner":"backend","status":"idle"}
             }
-        });
+        }));
         assert!(is_browser_conversation(&browser));
-        assert!(!is_browser_conversation(&json!({
+        assert!(!is_browser_conversation(&session_record(json!({
             "phase":"active",
             "state":{"sessionType":"telegram"}
-        })));
+        }))));
     }
 
     #[test]
     fn stop_scope_preserves_interactive_sessions_and_terminates_autonomous_work() {
         for session_type in ["conversation", "telegram", "telegram-group"] {
             assert_eq!(
-                stop_scope(&json!({
+                stop_scope(&session_record(json!({
                     "phase":"active",
                     "state":{"sessionType":session_type}
-                })),
+                }))),
                 "turn"
             );
         }
         assert_eq!(
-            stop_scope(&json!({
+            stop_scope(&session_record(json!({
                 "phase":"active",
                 "state":{"sessionType":"free-time"}
-            })),
+            }))),
             "self-time-run"
         );
         for (phase, session_type) in [
@@ -3210,10 +3103,10 @@ mod tests {
             ("ingress_in_progress", "telegram"),
         ] {
             assert_eq!(
-                stop_scope(&json!({
+                stop_scope(&session_record(json!({
                     "phase":phase,
                     "state":{"sessionType":session_type}
-                })),
+                }))),
                 "session"
             );
         }
@@ -3224,34 +3117,34 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let record = json!({
+        let record = session_record(json!({
             "phase":"active",
             "started_at":"2026-07-30T06:00:00Z",
             "state":{"sessionType":"telegram","pendingTurn":false}
-        });
+        }));
         assert!(telegram_session_is_expired(&record, now));
         assert!(!telegram_session_is_expired(
-            &json!({
+            &session_record(json!({
                 "phase":"active",
                 "started_at":"2026-07-30T06:00:01Z",
                 "state":{"sessionType":"telegram-group","pendingTurn":false}
-            }),
+            })),
             now
         ));
         assert!(!telegram_session_is_expired(
-            &json!({
+            &session_record(json!({
                 "phase":"active",
                 "started_at":"2026-07-30T05:00:00Z",
                 "state":{"sessionType":"telegram","pendingTurn":true}
-            }),
+            })),
             now
         ));
         assert!(!telegram_session_is_expired(
-            &json!({
+            &session_record(json!({
                 "phase":"ingress_pending",
                 "started_at":"2026-07-30T05:00:00Z",
                 "state":{"sessionType":"telegram","pendingTurn":false}
-            }),
+            })),
             now
         ));
     }
@@ -3308,29 +3201,27 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let histories = vec![
-            json!({
+            session_record(json!({
                 "id":"newest-not-due",
                 "phase":"ingress_pending",
                 "updated_at":"2026-07-25T02:59:00Z",
                 "ingress_next_attempt_at":"2026-07-25T03:01:00Z"
-            }),
-            json!({
+            })),
+            session_record(json!({
                 "id":"newer-due",
                 "phase":"ingress_pending",
                 "updated_at":"2026-07-25T02:30:00Z",
                 "ingress_next_attempt_at":null
-            }),
-            json!({
+            })),
+            session_record(json!({
                 "id":"oldest-due",
                 "phase":"ingress_pending",
                 "updated_at":"2026-07-25T01:30:00Z",
                 "ingress_next_attempt_at":"2026-07-25T02:00:00Z"
-            }),
+            })),
         ];
         assert_eq!(
-            next_ingress(&histories, now)
-                .and_then(|record| record.get("id"))
-                .and_then(Value::as_str),
+            next_ingress(&histories, now).map(|record| record.id.as_str()),
             Some("oldest-due")
         );
     }
@@ -3418,25 +3309,23 @@ mod tests {
 
     #[test]
     fn ingress_scheduler_resumes_claimed_work_before_pending_work() {
-        let pending = json!({
+        let pending = session_record(json!({
             "id":"pending",
             "phase":"ingress_pending",
             "updated_at":"2026-07-25T01:00:00Z"
-        });
-        let claimed = json!({
+        }));
+        let claimed = session_record(json!({
             "id":"claimed",
             "phase":"ingress_in_progress",
             "updated_at":"2026-07-25T02:00:00Z",
-            "source_created_at":"2026-07-25T00:00:00Z"
-        });
+            "state":{"sourceCreatedAt":"2026-07-25T00:00:00Z"}
+        }));
         let now = DateTime::parse_from_rfc3339("2026-07-25T03:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let histories = vec![pending, claimed];
         assert_eq!(
-            next_ingress(&histories, now)
-                .and_then(|record| record.get("id"))
-                .and_then(Value::as_str),
+            next_ingress(&histories, now).map(|record| record.id.as_str()),
             Some("claimed")
         );
     }

@@ -311,16 +311,10 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         user_root_node_id: system_roots.user.to_string(),
         kennedy_root_node_id: system_roots.kennedy.to_string(),
         telegram_max_media_bytes: args.telegram_max_voice_bytes,
-        #[cfg(test)]
-        kweb_base: String::new(),
-        #[cfg(test)]
-        intelligence_base: String::new(),
-        #[cfg(test)]
-        session_history_base: String::new(),
         telegram_web_user_handle: args.telegram_bootstrap_username,
         runtime_model: orchestration::RuntimeModel::from_intelligence(intelligence_runtime),
     };
-    let orchestration_api = orchestration::Api::local(
+    let orchestration_api = orchestration::Api::new(
         &orchestration,
         orchestration::LocalServices {
             kmap,
@@ -332,7 +326,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             dev_tools,
             telegram: telegram_service,
         },
-    )?;
+    );
     let orchestration_worker = orchestration::build(orchestration, orchestration_api);
     let history_router =
         session_history_http::router(history_service, orchestration_worker.clone());

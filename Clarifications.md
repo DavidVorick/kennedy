@@ -268,9 +268,13 @@ This document records user intention with regard to Kennedy.
 - Every Chatend exposes one continuously refreshed session status, regardless
   of transport, session kind, or lifecycle phase (including source
   conversation, history ingress, and completed archive). It visibly reports
-  current estimated context occupancy, the active failure-avoidance limit and
-  progress toward it, and exact cumulative cached input, non-cached input,
-  thinking, and output tokens. Those cumulative totals cover every
+  current estimated context occupancy, the estimated context size if every
+  active box used its latest fully hydrated canonical body, the active
+  failure-avoidance limit and progress toward it, and exact cumulative cached
+  input, non-cached input, thinking, and output tokens. The fully hydrated
+  estimate uses the same projection ordering, markers, footer, and latest
+  provider calibration as current occupancy; it is a hypothetical capacity
+  measurement, not lifetime usage. Those cumulative totals cover every
   model-backed provider call causally owned by the session, not only Kennedy's
   top-level turns: delegated-agent rounds and their tool-triggered inference,
   hosted search, media annotation, transcription, generation, and any other
@@ -385,12 +389,16 @@ This document records user intention with regard to Kennedy.
   values, and do not revise state after a failed call. This projection applies
   generically to managed source and any other box-aware tool.
 - A successful subagent call returns its one terminal assistant response as the
-  plain Ktool result to Kennedy. Do not wrap it in a redundant report, inject
-  the child context or trace into Kennedy's active context, or treat the
-  subagent's claim as proof that its task succeeded. Kennedy decides what to
-  inspect or verify through her own context and tools. Child failure or
-  cancellation returns an actionable tool error and must disclose when effects
-  may already have occurred.
+  plain Ktool result to Kennedy, followed only by a concise estimated cost line
+  in pennies with three digits after the decimal point. The cost is the
+  session-accounting delta causally owned by that subagent, including
+  tool-triggered descendant inference, and discloses any calls that could not
+  be priced. Do not otherwise wrap it in a redundant report, inject the child
+  context or trace into Kennedy's active context, or treat the subagent's claim
+  as proof that its task succeeded. Kennedy decides what to inspect or verify
+  through her own context and tools. Child failure or cancellation returns an
+  actionable tool error and must disclose when effects may already have
+  occurred.
 - Subagent effects remain subject to the parent session's permissions and
   transaction boundaries, and stopping the parent operation stops its active
   subagent work.
@@ -403,6 +411,23 @@ This document records user intention with regard to Kennedy.
   session history stores their accounting projection rather than creating a
   competing ledger. Cached input, uncached input, reasoning, and visible output
   must remain distinguishable where the provider reports them.
+- The intelligence boundary owns one dated, versioned catalog of the published
+  standard-tier prices for every model-backed endpoint Kennedy invokes.
+  Calculate cost from the actual model and provider-reported billing
+  dimensions, including cache reads and writes, reasoning at output rates,
+  modality-specific audio and image tokens, long-context tiers, duration
+  metering, and hosted-search charges where the provider reports them.
+  Preserve exact provider detail when available; label documented fallbacks
+  as estimates and quota-dependent search charges as conservative. A model,
+  failed call, or historical receipt that cannot be priced remains explicitly
+  unpriced rather than being treated as free. Cost amounts are estimates based
+  on public direct-API rates even when the provider is reached through a
+  subscription-authenticated harness.
+- At the transition into history ingress, Kennedy receives a fixed
+  model-visible snapshot of the session cost accumulated before ingress began,
+  expressed in pennies with three digits after the decimal point and with any
+  unpriced call count disclosed. Later ingress inference must not retroactively
+  change that boundary snapshot.
 - Discover effective model limits from the provider boundary and fail closed
   when they cannot be verified. Do not invent local context limits or allow
   provider-side automatic compaction to silently remove Kennedy's Kmap context.

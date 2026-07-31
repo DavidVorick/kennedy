@@ -34,7 +34,6 @@ pub(crate) struct Service {
 
 #[derive(Debug)]
 pub(crate) struct ServiceError {
-    pub status: u16,
     pub code: &'static str,
     pub message: String,
 }
@@ -88,7 +87,6 @@ impl ApiError {
 impl From<ApiError> for ServiceError {
     fn from(error: ApiError) -> Self {
         Self {
-            status: error.status.as_u16(),
             code: error.code,
             message: error.message,
         }
