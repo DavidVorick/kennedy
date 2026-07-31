@@ -9,6 +9,9 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use kcode_audio_ingress::{
+    ConfirmationState, CorrectionPacket, ObservationConfirmation, RecordingConfirmation,
+};
 use kcode_audio_session_ingress::{
     Coordinator, ErrorKind, IngressPiece as CoordinatorIngressPiece,
     Recording as CoordinatorRecording, RecordingInput,
@@ -82,6 +85,10 @@ pub(crate) fn router(service: Service) -> Router {
         .route(
             "/api/v1/audio-ingress/{recording_id}/retry",
             post(retry_recording),
+        )
+        .route(
+            "/api/v1/audio-ingress/{recording_id}/confirm-speakers",
+            post(confirm_speakers),
         )
         .route(
             "/api/v1/audio-ingress/pieces/{piece_id}/retry-ingress",
@@ -236,10 +243,16 @@ async fn recording_history(
         .recording_history(recording_id)
         .await
         .map_err(coordinator_error)?;
+    let chunks = history
+        .correction_packet
+        .as_ref()
+        .map(|packet| packet.chunks.clone())
+        .unwrap_or_default();
     Ok(Json(json!({
         "recording":BrowserRecording::from(history.recording),
         "final_transcript":history.final_transcript,
-        "chunks":[],
+        "correction_packet":history.correction_packet,
+        "chunks":chunks,
         "pieces":history.pieces.into_iter().map(IngressPiece::from).collect::<Vec<_>>(),
     })))
 }
@@ -257,8 +270,31 @@ async fn retry_recording(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ConfirmSpeakers {
+    observations: Vec<ObservationConfirmation>,
+}
+
+async fn confirm_speakers(
+    State(service): State<Service>,
+    AxumPath(recording_id): AxumPath<Uuid>,
+    Json(input): Json<ConfirmSpeakers>,
+) -> Result<Json<CorrectionPacket>, ApiError> {
+    service
+        .coordinator
+        .confirm_speakers(RecordingConfirmation {
+            recording_id,
+            observations: input.observations,
+        })
+        .await
+        .map(Json)
+        .map_err(coordinator_error)
+}
+
+#[derive(Deserialize)]
 struct RetryIngress {
     expected_version: i64,
+    #[serde(default)]
+    state: Option<Value>,
 }
 
 async fn retry_ingress(
@@ -271,6 +307,7 @@ async fn retry_ingress(
         .retry_ingress(kcode_audio_session_ingress::RetryIngress {
             piece_id,
             expected_version: input.expected_version,
+            state: input.state,
         })
         .await
         .map(Json)
@@ -286,17 +323,35 @@ struct BrowserRecording {
     size_bytes: u64,
     source_created_at: String,
     received_at: String,
+    updated_at: String,
     status: String,
     gemini_model: String,
     reconciliation_model: String,
     reconciliation_reasoning: String,
-    attempt_count: Option<u8>,
+    transcription_status: Option<Value>,
+    attempt_count: i64,
+    next_attempt_at: Option<String>,
+    last_error: Option<String>,
+    speaker_confirmation_state: Option<ConfirmationState>,
+    speaker_labels_clean: Option<bool>,
+    speaker_observation_count: Option<usize>,
     transcript_piece_count: usize,
     completed_piece_count: usize,
 }
 
 impl From<CoordinatorRecording> for BrowserRecording {
     fn from(recording: CoordinatorRecording) -> Self {
+        let (speaker_confirmation_state, speaker_labels_clean, speaker_observation_count) =
+            recording
+                .speaker_review
+                .map(|review| {
+                    (
+                        Some(review.confirmation_state),
+                        Some(review.clean),
+                        Some(review.observation_count),
+                    )
+                })
+                .unwrap_or((None, None, None));
         Self {
             id: recording.id,
             sha256: recording.sha256,
@@ -305,11 +360,18 @@ impl From<CoordinatorRecording> for BrowserRecording {
             size_bytes: recording.size_bytes,
             source_created_at: recording.source_created_at,
             received_at: recording.received_at,
+            updated_at: recording.updated_at,
             status: recording.status,
             gemini_model: recording.transcription_model,
             reconciliation_model: recording.reconciliation_model,
             reconciliation_reasoning: recording.reconciliation_reasoning,
+            transcription_status: recording.transcription_status,
             attempt_count: recording.attempt_count,
+            next_attempt_at: recording.next_attempt_at,
+            last_error: recording.last_error,
+            speaker_confirmation_state,
+            speaker_labels_clean,
+            speaker_observation_count,
             transcript_piece_count: recording.transcript_piece_count,
             completed_piece_count: recording.completed_piece_count,
         }
@@ -373,4 +435,96 @@ fn coordinator_error(error: kcode_audio_session_ingress::Error) -> ApiError {
         ),
     };
     ApiError::new(status, code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_dto_preserves_the_pre_extraction_wire_contract() {
+        let id = Uuid::nil();
+        let recording = BrowserRecording::from(CoordinatorRecording {
+            id,
+            sha256: "0".repeat(64),
+            original_filename: "voice.wav".into(),
+            content_type: "audio/wav",
+            size_bytes: 42,
+            source_created_at: "2026-07-31T00:00:00+00:00".into(),
+            received_at: "2026-07-31T00:01:00+00:00".into(),
+            updated_at: "2026-07-31T00:01:00+00:00".into(),
+            status: "failed".into(),
+            transcription_model: "transcription-model".into(),
+            reconciliation_model: "reconciliation-model".into(),
+            reconciliation_reasoning: "xhigh".into(),
+            transcription_status: None,
+            attempt_count: 5,
+            next_attempt_at: None,
+            last_error: Some("failed".into()),
+            speaker_review: None,
+            transcript_piece_count: 0,
+            completed_piece_count: 0,
+        });
+
+        assert_eq!(
+            serde_json::to_value(recording).unwrap(),
+            json!({
+                "id":id,
+                "sha256":"0".repeat(64),
+                "original_filename":"voice.wav",
+                "content_type":"audio/wav",
+                "size_bytes":42,
+                "source_created_at":"2026-07-31T00:00:00+00:00",
+                "received_at":"2026-07-31T00:01:00+00:00",
+                "updated_at":"2026-07-31T00:01:00+00:00",
+                "status":"failed",
+                "gemini_model":"transcription-model",
+                "reconciliation_model":"reconciliation-model",
+                "reconciliation_reasoning":"xhigh",
+                "transcription_status":null,
+                "attempt_count":5,
+                "next_attempt_at":null,
+                "last_error":"failed",
+                "speaker_confirmation_state":null,
+                "speaker_labels_clean":null,
+                "speaker_observation_count":null,
+                "transcript_piece_count":0,
+                "completed_piece_count":0,
+            })
+        );
+    }
+
+    #[test]
+    fn retry_dto_retains_optional_state_and_ignores_unknown_fields() {
+        let retry: RetryIngress = serde_json::from_value(json!({
+            "expected_version":7,
+            "state":{"kept":true},
+            "future_field":"ignored",
+        }))
+        .unwrap();
+
+        assert_eq!(retry.expected_version, 7);
+        assert_eq!(retry.state, Some(json!({"kept":true})));
+    }
+
+    #[test]
+    fn speaker_confirmation_body_requires_only_observation_assignments() {
+        let input: ConfirmSpeakers = serde_json::from_value(json!({
+            "observations":[{
+                "observation_key":{"object_id":"recording:chunk:0","piece_index":1},
+                "confirmed_full_name":"Human Choice",
+            }],
+        }))
+        .unwrap();
+
+        assert_eq!(input.observations.len(), 1);
+        assert_eq!(input.observations[0].confirmed_full_name, "Human Choice");
+        assert!(
+            serde_json::from_value::<ConfirmSpeakers>(json!({
+                "observations":[],
+                "recording_id":Uuid::nil(),
+            }))
+            .is_err()
+        );
+    }
 }

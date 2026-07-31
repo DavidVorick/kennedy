@@ -1980,12 +1980,13 @@ dependencies = [
 
 [[package]]
 name = "kcode-audio-ingress"
-version = "0.3.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "chrono",
  "futures",
  "hound",
+ "kcode-speech-classification",
  "ruopus",
  "rusqlite",
  "serde",
@@ -1998,9 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-audio-session-ingress"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "facd058931a06bf118c3c87501cebfa4e9451f15fb6403974c69bd82238a5368"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "kcode-audio-ingress",
@@ -2071,6 +2070,16 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "kcode-dev-tools-chatend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kcode-dev-tools",
+ "kcode-session-history",
+ "serde_json",
 ]
 
 [[package]]
@@ -2164,8 +2173,6 @@ dependencies = [
 [[package]]
 name = "kcode-kweb-db"
 version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7625d3dfb29f347c8889752795b2eb2166b5a2efb9e8785585ad9ce693c1a2a3"
 dependencies = [
  "base64",
  "chrono",
@@ -2232,6 +2239,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "kcode-speech-classification"
+version = "0.1.2"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2339,6 +2355,7 @@ dependencies = [
  "kcode-commit-session",
  "kcode-credential-vault",
  "kcode-dev-tools",
+ "kcode-dev-tools-chatend",
  "kcode-history-ingress-context",
  "kcode-intelligence-router",
  "kcode-kmap",
@@ -2347,6 +2364,7 @@ dependencies = [
  "kcode-kweb-db",
  "kcode-server-object-envelopes",
  "kcode-session-history",
+ "kcode-speech-classification",
  "kcode-telegram-identity",
  "kcode-tg-kennedy-bot",
  "kcode-web-semver-routing",

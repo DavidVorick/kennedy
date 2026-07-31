@@ -1,9 +1,10 @@
 [workspace]
 members = [
     "KennedyServer",
-    "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-15d3-18c72b05513f5a02-0",
+    "data/kcode/kcode-rust-libs/kcode-dev-tools-chatend/generations/g-74b-18c77ed5ae02cec0-0",
+    "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-499a-18c76391cdc01638-0",
     "data/kcode/kcode-rust-libs/kcode-telegram-identity/generations/g-4ed1-18c70c4992c16252-0",
-    "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-a8b-18c729c3c7842e89-0",
+    "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-433-18c77f50b5cecaba-0",
 ]
 resolver = "2"
 
@@ -27,17 +28,19 @@ kcode-credential-vault = "=0.1.0"
 kcode-history-ingress-context = "=0.1.0"
 kcode-kweb-context = "=0.2.0"
 kcode-kweb-db = "1.0"
-kcode-kmap = { path = "data/kcode/kcode-rust-libs/kcode-kmap/generations/g-1d5f-18c698573a30c90f-0" }
+kcode-kmap = { path = "data/kcode/kcode-rust-libs/kcode-kmap/generations/g-4d7f-18c763db68f4642d-0" }
 kcode-kmap-size = "=0.1.0"
 kcode-server-object-envelopes = "=0.1.0"
 kcode-tg-kennedy-bot = "=0.4.0"
-kcode-audio-ingress = "=0.3.1"
+kcode-audio-ingress = "0.5.2"
 # Exact because this crate is directly entrusted with the crates.io publication token.
 kcode-dev-tools = "=0.4.2"
+kcode-dev-tools-chatend = "0.1.0"
 kcode-session-history = "=0.1.2"
+kcode-speech-classification = "=0.1.2"
 kcode-telegram-identity = "=0.1.2"
 kcode-agent-runtime = "=0.1.1"
-kcode-audio-session-ingress = "0.1.0"
+kcode-audio-session-ingress = "=0.2.0"
 kcode-intelligence-router = "=0.2.1"
 kcode-web-semver-routing = "0.2.0"
 rand = "0.9"
@@ -59,20 +62,24 @@ hound = "3.5"
 
 [patch.crates-io]
 kcode-agent-runtime = { path = "data/kcode/kcode-rust-libs/kcode-agent-runtime/generations/g-23f3-18c6a0bd004a0de5-6" }
-kcode-audio-ingress = { path = "data/kcode/kcode-rust-libs/kcode-audio-ingress/generations/g-114e83-18c5e7aae6093a00-6" }
+kcode-audio-ingress = { path = "data/kcode/kcode-rust-libs/kcode-audio-ingress/generations/g-5f4-18c78069f87152d9-0" }
+kcode-audio-session-ingress = { path = "data/kcode/kcode-rust-libs/kcode-audio-session-ingress/generations/g-4f14-18c77cdcc8c16294-0" }
 kcode-codex-runtime = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtime/generations/g-35d0cb-18c5127f00359eb4-4" }
 kcode-codex-runtime-v2 = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtime-v2/generations/g-23f3-18c6a0bd001b63b3-2" }
 kcode-commit-session = { path = "data/kcode/kcode-rust-libs/kcode-commit-session/generations/g-38c9-18c60fede7966e78-0" }
 kcode-dev-tools = { path = "data/kcode/kcode-rust-libs/kcode-dev-tools/generations/g-141a-18c68a00acc5ce1b-0" }
+kcode-dev-tools-chatend = { path = "data/kcode/kcode-rust-libs/kcode-dev-tools-chatend/generations/g-74b-18c77ed5ae02cec0-0" }
 kcode-gemini-api = { path = "data/kcode/kcode-rust-libs/kcode-gemini-api/generations/g-19f1-18c72b2a30c946f1-0" }
 kcode-history-ingress-context = { path = "data/kcode/kcode-rust-libs/kcode-history-ingress-context/generations/g-1cb0-18c6f861bc73532f-0" }
-kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-27b0-18c72b44811ac673-0" }
+kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-30ef-18c77ca0d85312c1-0" }
+kcode-kweb-db = { path = "data/kcode/kcode-rust-libs/kcode-kweb-db/generations/g-4ccf-18c763ce73931ec2-0" }
 kcode-openai-api = { path = "data/kcode/kcode-rust-libs/kcode-openai-api/generations/g-b1e7-18c65999c584d09f-0" }
 kcode-rust-bins = { path = "data/kcode/kcode-rust-libs/kcode-rust-bins/generations/g-e5c-18c688799653cb78-0" }
 kcode-rust-libs-v2 = { path = "data/kcode/kcode-rust-libs/kcode-rust-libs-v2/generations/g-33ef-18c68a1dca33927f-0" }
-kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-15d3-18c72b05513f5a02-0" }
+kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-499a-18c76391cdc01638-0" }
+kcode-speech-classification = { path = "data/kcode/kcode-rust-libs/kcode-speech-classification/generations/g-161a-18c780bc40c8255d-0" }
 kcode-telegram-identity = { path = "data/kcode/kcode-rust-libs/kcode-telegram-identity/generations/g-4ed1-18c70c4992c16252-0" }
-kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-a8b-18c729c3c7842e89-0" }
+kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-433-18c77f50b5cecaba-0" }
 kcode-web-fetch = { path = "data/kcode/kcode-rust-libs/kcode-web-fetch/generations/g-35d0cb-18c516cf409b9ec1-19" }
 kcode-web-libs = { path = "data/kcode/kcode-rust-libs/kcode-web-libs/generations/g-281d1e-18c687bf9991dd9a-e" }
 

@@ -29,7 +29,12 @@ This document records user intention with regard to Kennedy.
   between components. Judge an extraction by total first-party implementation
   as well as server size: move code and tests rather than copying them, reuse
   existing transports, and do not add abstraction or supporting code that
-  consumes the deduplication benefit.
+  consumes the deduplication benefit. Treat capability extraction as an
+  ownership-only refactor unless the user explicitly requests a behavior
+  change: preserve observable APIs, state transitions, persistence contracts,
+  limits, filtering, retry semantics, failure isolation, and compatibility
+  with existing durable state. Do not rewrite these clarifications to
+  legitimize an incidental behavior change introduced during extraction.
 - Make the browser-facing HTTP router and API a final focused presentation
   library over typed capability libraries. Its handlers must not call back into
   KennedyServer implementation modules through callbacks, traits, or other
@@ -56,7 +61,11 @@ This document records user intention with regard to Kennedy.
   future requirements.
 - When an old persistence format or architecture is retired, preserve the
   original data for offline recovery, remove its live loader, and avoid carrying
-  permanent compatibility state into the new design.
+  permanent compatibility state into the new design. Accepted permanent history
+  is the narrow exception: when preserved legacy fields are sufficient to honor
+  a current user-visible contract, prefer bounded read-time interpretation over
+  destructively rewriting every historical record. Keep that compatibility in
+  the current capability owner and do not revive the retired persistence owner.
 
 ## Kmap and Durable Knowledge
 
@@ -431,9 +440,14 @@ This document records user intention with regard to Kennedy.
   Preserve exact provider detail when available; label documented fallbacks
   as estimates and quota-dependent search charges as conservative. A model,
   failed call, or historical receipt that cannot be priced remains explicitly
-  unpriced rather than being treated as free. Cost amounts are estimates based
-  on public direct-API rates even when the provider is reached through a
-  subscription-authenticated harness.
+  unpriced rather than being treated as free. A historical receipt whose
+  preserved actual model and metering are sufficient must be priced on read
+  through the intelligence boundary's applicable dated catalog without
+  rewriting the immutable receipt or session history; compatibility may use
+  mechanically associated session, subagent, or model-backed-tool metadata but
+  must not guess an unavailable model or billing dimension. Cost amounts are
+  estimates based on public direct-API rates even when the provider is reached
+  through a subscription-authenticated harness.
 - At the transition into history ingress, Kennedy receives a fixed
   model-visible snapshot of the session cost accumulated before ingress began,
   expressed in pennies with three digits after the decimal point and with any
@@ -502,6 +516,47 @@ This document records user intention with regard to Kennedy.
 - Model-backed media work must validate the actual media kind and capability.
   Treat transcription, translation, visual interpretation, and speaker
   identification as potentially wrong and preserve uncertainty.
+- Keep speaker classification inside KennedyServer as a typed in-process
+  capability. Do not interpose a separately operated socket or network sidecar
+  between Kennedy and the classifier. AudioIngress and Kennedy's explicit
+  classification Ktools share the same `SpeechClassifier` handle and database;
+  neither opens a private or parallel speaker store.
+- Audio speaker identity comes from the shared classifier, not from GPT.
+  Gemini performs chunk-local diarization and produces the speech-feature rows;
+  GPT may parse that unstructured analysis and reconcile overlapping transcript
+  content using only the classifier mappings supplied to it. GPT must not
+  guess, expand, or invent real speaker identities. When the library marks a
+  mapping uncertain, GPT's job is to preserve or point out that uncertainty,
+  not to independently identify the speaker.
+- Treat the classifier as practically strong once a person has more than five
+  representative samples, while retaining the explicit possibility of error.
+  Human review is the authority for final audio labels. A new classifier-aware
+  recording must receive one exact human-confirmed full name for every
+  correction-packet observation before its transcript is submitted to Session
+  History and Kmap ingress. Prefill review from classifier candidates, permit
+  every label to be corrected, apply the complete confirmation through
+  AudioIngress's typed confirmation operation, and include the confirmed
+  chunk-local mapping with the transcript ingress so the original reconciled
+  text need not be silently rewritten. Treat an accepted ingress as binding
+  the final label set: exact confirmation retries remain idempotent, while a
+  conflicting relabel after handoff is rejected rather than diverging from
+  immutable history. Existing completed recordings that predate correction
+  packets retain their established ingress behavior.
+- Give Kennedy explicit speaker-classification actions to identify, train, and
+  delete datapoints with the semantics owned by the classification library.
+  The library owns each complete model-facing operation, including its exact
+  argument decoding and result rendering; KennedyServer retains authorization,
+  blocking-task scheduling, and placement of the result in the session, and
+  must not duplicate the classifier feature schema or outcome translation.
+  Name the Ktools with the library-scoped operation names
+  `kcode-speech-classification/identify`, `kcode-speech-classification/train`,
+  and `kcode-speech-classification/delete`; do not embellish those operation
+  names with speaker or datapoint suffixes. Keep their standalone Kmap-ingress
+  manual focused on the callable API and rely on Kennedy's existing knowledge
+  of the library rather than restating or explaining all 24 datapoints.
+  Training accepts caller-supplied classification data; do not impose a
+  server-side “known labels only” rule, provenance gate, or other restriction
+  that narrows the library's training operation.
 - Store committed files in self-describing Kweb object envelopes so an object
   identifier is sufficient to recover safe metadata and exact bytes. Payload
   readers return the exact original bytes; the application storage envelope is
@@ -522,12 +577,16 @@ This document records user intention with regard to Kennedy.
   separate audio/session-ingress coordinator library owns the idempotent
   application handoff into Session History: deterministic piece identities,
   transcript splitting, complete file metadata, combined recording and ingress
-  state, submission of missing pieces, and ingress retries. Each transcript
-  piece is bounded to one quarter of the effective context window available to
-  its ingress session rather than a fixed token ceiling. The coordinator
-  exposes transport-neutral typed outcomes and does not own an HTTP or
-  serialization contract. KennedyServer retains transport admission and HTTP
-  presentation.
+  state, submission of missing pieces, and ingress retries. Bound each
+  transcript piece dynamically from the effective context window of the model
+  doing the ingress when its session is created. This segmentation calculation
+  is ephemeral: do not persist the model context, derived limit, piece length,
+  fingerprint, or a segmentation version merely to revalidate historical
+  pieces, and do not make newly invented metadata mandatory for existing
+  durable records. Already-ingressed pieces remain authoritative through their
+  deterministic identities. The coordinator exposes transport-neutral typed
+  outcomes and does not own an HTTP or serialization contract. KennedyServer
+  retains transport admission and HTTP presentation.
 - Vnote scanning should avoid rereading unchanged large recordings. Durable
   acceptance is the handoff boundary; the recording does not need to wait for
   later transcription or memory work.
@@ -569,6 +628,14 @@ This document records user intention with regard to Kennedy.
   needed for bounded live group context, media access, and pending Kmap ingress,
   and reclaim it once no live transport workflow needs it. Do not add an
   outbound transcript archive or durable outbox.
+- Preserve media captions as message text associated with the media delivery in
+  both directions. Inbound captions must reach Kennedy alongside the retained
+  original, including captions on voice notes. Outbound text accompanying an
+  attachment should be sent as that attachment's exact caption when Telegram
+  supports captions for the media kind and the text fits Telegram's caption
+  limit; otherwise deliver the complete text separately without truncating,
+  discarding, or duplicating it. A caption is delivery presentation metadata,
+  not part of the stored object's identity.
 - Kennedy's main agent may initiate a private Telegram delivery containing
   text, one or more staged or canonical Kweb object attachments, or both, to
   any explicitly targeted authorized user from any session, but only after
@@ -712,6 +779,13 @@ This document records user intention with regard to Kennedy.
 - Kennedy's managed Rust libraries, Web libraries, and Rust binaries use one
   shared development-tool boundary with small typed adapters and consistent
   session/lease behavior.
+- `kcode-dev-tools-chatend` is the narrow adapter between that development-tool
+  boundary and Chatend. It owns freeform source capture and reconciliation of
+  successful managed-source snapshots into one stable Chatend box per project.
+  Keep its API mechanical and minimal; it must not become another service or
+  orchestration layer. KennedyServer retains tool authorization and execution,
+  provider flow, context-capacity policy, Kweb object resolution, and Kmap
+  storage.
 - Editable source and immutable publications are separate. Published versions
   cannot be overwritten, and floating compatible selection resolves to an
   exact immutable artifact.

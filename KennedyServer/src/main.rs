@@ -13,6 +13,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use kcode_credential_vault::{CredentialVault, ExposeSecret, SecretString};
 use kcode_kweb_db::{Config as KwebConfig, NoopGossip, WriterId};
+use kcode_speech_classification::SpeechClassifier;
 use zeroize::{Zeroize, Zeroizing};
 
 const OPENAI_API_KEY_SECRET: &str = "openai-api-key";
@@ -21,6 +22,7 @@ const TELEGRAM_BOT_TOKEN_SECRET: &str = "telegram-bot-token";
 const CRATES_IO_KEY_SECRET: &str = "cratesio-key";
 const KWEB_WRITER_SIGNING_KEY_SECRET: &str = "kweb-writer-signing-key";
 const KWEB_WRITERS_SECRET: &str = "kweb-writers-by-priority";
+const SPEECH_CLASSIFICATION_DATABASE_PATH: &str = "./data/kennedy-speech-classification.sqlite3";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -186,6 +188,11 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kcode_codex_runtime::CatalogCache::new(kcode_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) =
         kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
+    let speech_classifier = SpeechClassifier::open(SPEECH_CLASSIFICATION_DATABASE_PATH)
+        .with_context(|| {
+            format!("opening speaker-classification database {SPEECH_CLASSIFICATION_DATABASE_PATH}")
+        })?;
+    let speech_classifier = Arc::new(speech_classifier);
     let dev_tools = kcode_dev_tools::Service::open(kcode_dev_tools::Config {
         rust_libraries_root: args.rust_libs_root.clone(),
         web_libraries_root: args.web_libs_root.clone(),
@@ -213,6 +220,10 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kcode_session_history::SessionHistory::open(kcode_session_history::Config {
             directory: args.session_directory,
             completed_list: args.session_history_file,
+            provider_cost_compatibility: Some(kcode_session_history::ProviderCostCompatibility {
+                session_model: legacy_session_provider_model,
+                estimator: legacy_provider_cost,
+            }),
         })?;
     let (intelligence_service, intelligence_runtime) =
         kcode_intelligence_router::open(kcode_intelligence_router::Config {
@@ -231,8 +242,12 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     })
     .await?;
     let telegram_service = telegram_runtime.service();
-    let kmap_service =
-        kmap_http::Service::new(kmap.clone(), system_roots, telegram_service.clone());
+    let kmap_service = kmap_http::Service::new(
+        kmap.clone(),
+        system_roots,
+        telegram_service.clone(),
+        history_service.clone(),
+    );
     let chunk_intelligence = intelligence_service.clone();
     let transcribe_chunk: kcode_audio_ingress::AudioChunkCall = Arc::new(move |request| {
         let intelligence = chunk_intelligence.clone();
@@ -246,7 +261,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 "audio/ogg",
             )
             .map_err(audio_intelligence_error)?;
-            user.transcribe_structured_audio(kcode_intelligence_router::StructuredAudioRequest {
+            user.analyze_audio(kcode_intelligence_router::AudioAnalysisRequest {
                 operation: "transcribe_chunk".into(),
                 prompt: request.prompt,
                 model: request.model,
@@ -295,9 +310,12 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kcode_audio_ingress::AudioTranscriber::new(transcribe_chunk, generate_text);
     let audio_state_database = args.audio_ingress_directory.join("state.sqlite3");
     migrate_audio_ingress_database(&args.legacy_audio_ingress_database, &audio_state_database)?;
-    let audio =
-        kcode_audio_ingress::AudioIngress::open(&args.audio_ingress_directory, audio_transcriber)
-            .await?;
+    let audio = kcode_audio_ingress::AudioIngress::open(
+        &args.audio_ingress_directory,
+        audio_transcriber,
+        Arc::clone(&speech_classifier),
+    )
+    .await?;
     let audio_coordinator = kcode_audio_session_ingress::Coordinator::new(
         audio,
         history_service.clone(),
@@ -327,6 +345,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             agents: agent_runtime,
             history: history_service.clone(),
             audio: audio_coordinator,
+            speech_classifier,
             directory: telegram_identity.clone(),
             dev_tools,
             telegram: telegram_service,
@@ -363,6 +382,7 @@ fn ensure_runtime_parent_directories(args: &Args, vault_path: &Path) -> anyhow::
         &args.session_history_file,
         &args.telegram_database,
         &args.user_database,
+        Path::new(SPEECH_CLASSIFICATION_DATABASE_PATH),
         &args.legacy_audio_ingress_database,
         &args.audio_ingress_directory,
         &args.intelligence_usage_directory,
@@ -594,6 +614,50 @@ fn prompt_confirmed_value(prompt: &str) -> anyhow::Result<String> {
     Ok(first)
 }
 
+fn legacy_session_provider_model(state: &serde_json::Value) -> Option<String> {
+    if let Some(model) = state
+        .get("providerModel")
+        .and_then(serde_json::Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+    {
+        return Some(model.strip_prefix("codex/").unwrap_or(model).to_owned());
+    }
+    let attribution = state
+        .get("commitAuthor")
+        .and_then(serde_json::Value::as_str)?;
+    let model = ["-minimal", "-low", "-medium", "-high", "-xhigh", "-max"]
+        .iter()
+        .find_map(|suffix| attribution.strip_suffix(suffix))
+        .unwrap_or(attribution);
+    (!model.trim().is_empty()).then(|| model.strip_prefix("codex/").unwrap_or(model).to_owned())
+}
+
+fn legacy_provider_cost(
+    model: &str,
+    metering: &kcode_session_history::chatend::ProviderMetering,
+) -> Option<kcode_session_history::chatend::ProviderCostEstimate> {
+    let metering = match metering {
+        kcode_session_history::chatend::ProviderMetering::Tokens(usage) => {
+            kcode_intelligence_router::Metering::Tokens(kcode_intelligence_router::TokenUsage {
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                thinking_tokens: usage.thinking_tokens,
+                output_tokens: usage.output_tokens,
+            })
+        }
+        kcode_session_history::chatend::ProviderMetering::DurationSeconds { seconds } => {
+            kcode_intelligence_router::Metering::DurationSeconds { seconds: *seconds }
+        }
+        kcode_session_history::chatend::ProviderMetering::Unavailable => return None,
+    };
+    let cost = kcode_intelligence_router::estimate_cost(model, &metering)?;
+    Some(kcode_session_history::chatend::ProviderCostEstimate {
+        usd_nanos: cost.usd_nanos,
+        accuracy: serde_json::to_value(cost.accuracy).ok()?,
+        pricing_version: cost.pricing_version,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +670,43 @@ mod tests {
         assert_eq!(CRATES_IO_KEY_SECRET, "cratesio-key");
         assert_eq!(KWEB_WRITER_SIGNING_KEY_SECRET, "kweb-writer-signing-key");
         assert_eq!(KWEB_WRITERS_SECRET, "kweb-writers-by-priority");
+    }
+
+    #[test]
+    fn legacy_session_model_prefers_exact_model_and_understands_old_attribution() {
+        assert_eq!(
+            legacy_session_provider_model(&serde_json::json!({
+                "providerModel":"gpt-5.6-terra",
+                "commitAuthor":"gpt-5.6-sol-xhigh"
+            }))
+            .as_deref(),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            legacy_session_provider_model(&serde_json::json!({
+                "commitAuthor":"gpt-5.6-sol-xhigh"
+            }))
+            .as_deref(),
+            Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn legacy_provider_cost_uses_the_intelligence_catalog() {
+        let cost = legacy_provider_cost(
+            "gpt-5.6-sol",
+            &kcode_session_history::chatend::ProviderMetering::Tokens(
+                kcode_session_history::chatend::ProviderTokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 20,
+                    thinking_tokens: 3,
+                    output_tokens: 4,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(cost.usd_nanos, 270_000);
+        assert_eq!(cost.pricing_version, "kennedy-provider-pricing-2026-07-30");
     }
 
     #[test]

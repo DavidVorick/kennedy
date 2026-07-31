@@ -14,12 +14,15 @@ use uuid::Uuid;
 use super::Config;
 use super::session::ResolvedObject;
 
+const TELEGRAM_CAPTION_LIMIT_UTF16: usize = 1_024;
+
 #[derive(Clone)]
 pub(crate) struct LocalServices {
     pub kmap: Kmap,
     pub intelligence: kcode_intelligence_router::Intelligence,
     pub history: kcode_session_history::SessionHistory,
     pub audio: kcode_audio_session_ingress::Coordinator,
+    pub speech_classifier: Arc<kcode_speech_classification::SpeechClassifier>,
     pub directory: std::sync::Arc<kcode_telegram_identity::Directory>,
     pub dev_tools: kcode_dev_tools::Service,
     pub agents: kcode_agent_runtime::AgentRuntime,
@@ -99,8 +102,11 @@ impl Api {
     pub(crate) fn history_session(
         &self,
         metadata: kcode_session_history::chatend::SessionMetadata,
+        provider_model: &str,
     ) -> anyhow::Result<kcode_session_history::Session> {
-        self.services.history.open_session(metadata)
+        self.services
+            .history
+            .open_session_with_provider_model(metadata, Some(provider_model))
     }
 
     pub fn kmap_node(&self, node_id: &str) -> Result<Node, ApiError> {
@@ -515,6 +521,20 @@ impl Api {
         Ok(execution)
     }
 
+    pub async fn execute_speech_classification_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<String, ApiError> {
+        let call = kcode_speech_classification::decode_ktool(name, &arguments)
+            .map_err(speech_ktool_error)?;
+        let classifier = Arc::clone(&self.services.speech_classifier);
+        tokio::task::spawn_blocking(move || classifier.execute_ktool(call))
+            .await
+            .map_err(speech_task_error)?
+            .map_err(speech_ktool_error)
+    }
+
     pub async fn release_managed_sources(&self, session_id: &str) {
         if let Err(error) = self.services.dev_tools.release(session_id.to_owned()).await {
             tracing::warn!(error=%error.message, "Managed-source session release failed");
@@ -757,13 +777,14 @@ impl Api {
         event_id: &str,
         conversation_id: &str,
         file: &ResolvedObject,
+        caption: Option<&str>,
         complete: bool,
     ) -> Result<Value, ApiError> {
         self.telegram()
             .send_event_attachment(
                 event_id.to_owned(),
                 conversation_id.to_owned(),
-                telegram_attachment(file),
+                telegram_attachment(file, caption),
                 complete,
             )
             .await
@@ -776,13 +797,14 @@ impl Api {
         conversation_id: &str,
         expected_conversation_id: Option<&str>,
         file: &ResolvedObject,
+        caption: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.telegram()
             .send_private_attachment(
                 telegram_user_id,
                 conversation_id.to_owned(),
                 expected_conversation_id.map(ToOwned::to_owned),
-                telegram_attachment(file),
+                telegram_attachment(file, caption),
             )
             .await
             .map_err(telegram_error)
@@ -792,9 +814,10 @@ impl Api {
         &self,
         group_id: &str,
         file: &ResolvedObject,
+        caption: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.telegram()
-            .send_group_attachment(group_id.to_owned(), telegram_attachment(file))
+            .send_group_attachment(group_id.to_owned(), telegram_attachment(file, caption))
             .await
             .map_err(telegram_error)
     }
@@ -1064,6 +1087,45 @@ fn audio_error(error: kcode_audio_session_ingress::Error) -> ApiError {
     }
 }
 
+fn speech_task_error(error: tokio::task::JoinError) -> ApiError {
+    tracing::error!(%error, "In-process speaker-classification task stopped unexpectedly");
+    ApiError {
+        code: "internal_error".into(),
+        message: "An unexpected Kennedy speaker-classification error occurred.".into(),
+    }
+}
+
+fn speech_ktool_error(error: kcode_speech_classification::KtoolError) -> ApiError {
+    let kcode_speech_classification::KtoolError::Classifier(error) = error else {
+        return ApiError {
+            code: "invalid_request".into(),
+            message: error.to_string(),
+        };
+    };
+    let internal = matches!(
+        error,
+        kcode_speech_classification::Error::UnsupportedSchema { .. }
+            | kcode_speech_classification::Error::Storage(_)
+            | kcode_speech_classification::Error::CorruptStorage(_)
+    );
+    ApiError {
+        code: match &error {
+            kcode_speech_classification::Error::Validation { .. } => "invalid_request",
+            kcode_speech_classification::Error::Conflict { .. } => "state_conflict",
+            kcode_speech_classification::Error::UnsupportedSchema { .. }
+            | kcode_speech_classification::Error::Storage(_)
+            | kcode_speech_classification::Error::CorruptStorage(_) => "internal_error",
+        }
+        .into(),
+        message: if internal {
+            tracing::error!(%error, "Speaker-classification storage failed");
+            "An unexpected Kennedy speaker-classification error occurred.".into()
+        } else {
+            error.to_string()
+        },
+    }
+}
+
 fn local_api_error(error: impl std::fmt::Display) -> ApiError {
     ApiError {
         code: "invalid_request".into(),
@@ -1078,15 +1140,31 @@ fn telegram_error(error: kcode_tg_kennedy_bot::Error) -> ApiError {
     }
 }
 
-fn telegram_attachment(file: &ResolvedObject) -> kcode_tg_kennedy_bot::Attachment {
+fn telegram_attachment(
+    file: &ResolvedObject,
+    caption: Option<&str>,
+) -> kcode_tg_kennedy_bot::Attachment {
     kcode_tg_kennedy_bot::Attachment {
         bytes: file.bytes.clone(),
         file_name: Some(file.file_name.clone()),
         media_type: Some(file.media_type.clone()),
         kind: telegram_native_kind(&file.media_type, file.transport_kind.as_deref())
             .map(ToOwned::to_owned),
-        caption: None,
+        caption: caption.map(ToOwned::to_owned),
     }
+}
+
+pub(crate) fn telegram_caption_for<'a>(file: &ResolvedObject, text: &'a str) -> Option<&'a str> {
+    if text.is_empty() || text.encode_utf16().count() > TELEGRAM_CAPTION_LIMIT_UTF16 {
+        return None;
+    }
+    if matches!(
+        telegram_native_kind(&file.media_type, file.transport_kind.as_deref()),
+        Some("video_note" | "sticker")
+    ) {
+        return None;
+    }
+    Some(text)
 }
 
 pub(crate) fn idempotency_id() -> String {
@@ -1218,6 +1296,38 @@ mod tests {
     }
 
     #[test]
+    fn speech_ktool_errors_keep_the_existing_public_failure_boundary() {
+        let malformed =
+            speech_ktool_error(kcode_speech_classification::KtoolError::InvalidArguments {
+                tool: kcode_speech_classification::IDENTIFY_TOOL,
+                source: serde_json::from_str::<Value>("{").unwrap_err(),
+            });
+        assert_eq!(malformed.code, "invalid_request");
+        assert_eq!(
+            malformed.message,
+            "decoding kcode-speech-classification/identify arguments"
+        );
+
+        let validation = speech_ktool_error(kcode_speech_classification::KtoolError::Classifier(
+            kcode_speech_classification::Error::Validation {
+                field: "row.perceived_age".into(),
+                message: "must be positive".into(),
+            },
+        ));
+        assert_eq!(validation.code, "invalid_request");
+        assert_eq!(validation.message, "row.perceived_age: must be positive");
+
+        let storage = speech_ktool_error(kcode_speech_classification::KtoolError::Classifier(
+            kcode_speech_classification::Error::Storage("private detail".into()),
+        ));
+        assert_eq!(storage.code, "internal_error");
+        assert_eq!(
+            storage.message,
+            "An unexpected Kennedy speaker-classification error occurred."
+        );
+    }
+
+    #[test]
     fn durable_work_uses_stable_valid_idempotency_ids() {
         let first = stable_idempotency_id("audio-ingress", "piece-1");
         assert_eq!(first, stable_idempotency_id("audio-ingress", "piece-1"));
@@ -1262,6 +1372,41 @@ mod tests {
         assert_eq!(telegram_native_kind("image/gif", None), Some("animation"));
         assert_eq!(
             telegram_native_kind("application/pdf", Some("document")),
+            None
+        );
+    }
+
+    #[test]
+    fn telegram_captions_are_exact_and_fall_back_when_telegram_cannot_attach_them() {
+        let file = |media_type: &str, transport_kind: Option<&str>| ResolvedObject {
+            object_id: "object".into(),
+            bytes: vec![1],
+            file_name: "object.bin".into(),
+            media_type: media_type.into(),
+            transport_kind: transport_kind.map(ToOwned::to_owned),
+        };
+        let exact = "  exact caption\n";
+        assert_eq!(
+            telegram_caption_for(&file("image/jpeg", Some("photo")), exact),
+            Some(exact)
+        );
+        assert_eq!(
+            telegram_caption_for(&file("application/pdf", Some("document")), exact),
+            Some(exact)
+        );
+        assert_eq!(
+            telegram_caption_for(&file("image/webp", Some("sticker")), exact),
+            None
+        );
+        assert_eq!(
+            telegram_caption_for(&file("video/mp4", Some("video_note")), exact),
+            None
+        );
+        assert_eq!(
+            telegram_caption_for(
+                &file("image/jpeg", Some("photo")),
+                &"x".repeat(TELEGRAM_CAPTION_LIMIT_UTF16 + 1),
+            ),
             None
         );
     }

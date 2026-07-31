@@ -17,8 +17,10 @@ use uuid::Uuid;
 
 use super::{
     AgentMode, Api, Config, Manuals, RuntimeModel, Session,
-    services::data_url,
-    session::{SessionOptions, is_agent_loop_round_limit, validate_delivery_file_name},
+    services::{data_url, telegram_caption_for},
+    session::{
+        ResolvedObject, SessionOptions, is_agent_loop_round_limit, validate_delivery_file_name,
+    },
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -48,6 +50,18 @@ struct TelegramEventRetry {
     failures: u32,
     not_before: Instant,
     last_error: String,
+}
+
+enum TelegramDelivery {
+    Object {
+        object_id: String,
+        file_name: Option<String>,
+    },
+    Text {
+        text: String,
+        response_warning: Value,
+        captionable: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -295,7 +309,6 @@ impl Orchestrator {
     }
 
     async fn poll_once(self: &Arc<Self>) -> anyhow::Result<()> {
-        self.api.synchronize_audio_ingress().await?;
         let histories = self.list_history().await?;
         self.signal_pending_stops().await?;
         self.queue_expired_telegram_sessions(&histories, Utc::now())
@@ -306,6 +319,7 @@ impl Orchestrator {
         self.sync_group_ingress().await?;
         self.sync_telegram_events().await?;
         self.schedule_writer_job(&histories).await?;
+        self.api.synchronize_audio_ingress().await?;
         Ok(())
     }
 
@@ -1883,18 +1897,10 @@ impl Orchestrator {
         event_id: &str,
         conversation_id: &str,
     ) -> anyhow::Result<()> {
-        enum Delivery {
-            Object {
-                object_id: String,
-                file_name: Option<String>,
-            },
-            Text(String, Value),
-        }
-
         let mut deliveries = Vec::new();
         for response in session.responses_for_external_event(event_id) {
             for (object_id, file_name) in telegram_response_object_deliveries(response) {
-                deliveries.push(Delivery::Object {
+                deliveries.push(TelegramDelivery::Object {
                     object_id,
                     file_name,
                 });
@@ -1904,13 +1910,14 @@ impl Orchestrator {
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                deliveries.push(Delivery::Text(
-                    text.to_owned(),
-                    response
+                deliveries.push(TelegramDelivery::Text {
+                    text: text.to_owned(),
+                    response_warning: response
                         .get("contextWarning")
                         .cloned()
                         .unwrap_or(Value::Null),
-                ));
+                    captionable: response.get("role").and_then(Value::as_str) == Some("kennedy"),
+                });
             }
         }
         anyhow::ensure!(
@@ -1918,17 +1925,17 @@ impl Orchestrator {
             "Kennedy completed the turn without a recoverable Telegram response"
         );
         let delivery_count = deliveries.len();
-        for (index, delivery) in deliveries.into_iter().enumerate() {
-            let complete = index + 1 == delivery_count;
-            match delivery {
-                Delivery::Object {
+        let mut index = 0;
+        while index < delivery_count {
+            match &deliveries[index] {
+                TelegramDelivery::Object {
                     object_id,
                     file_name,
                 } => {
-                    let mut file = session.resolve_object(&object_id)?;
+                    let mut file = session.resolve_object(object_id)?;
                     if let Some(file_name) = file_name {
-                        validate_delivery_file_name(&file_name)?;
-                        file.file_name = file_name;
+                        validate_delivery_file_name(file_name)?;
+                        file.file_name = file_name.clone();
                     }
                     anyhow::ensure!(
                         file.bytes.len() <= self.config.telegram_max_media_bytes,
@@ -1936,19 +1943,27 @@ impl Orchestrator {
                         file.bytes.len(),
                         self.config.telegram_max_media_bytes
                     );
+                    let caption = telegram_reply_caption(&deliveries, index, &file);
+                    let complete = caption.is_some() || index + 1 == delivery_count;
                     self.api
-                        .telegram_send_object(event_id, conversation_id, &file, complete)
+                        .telegram_send_object(event_id, conversation_id, &file, caption, complete)
                         .await?;
+                    index += if caption.is_some() { 2 } else { 1 };
                 }
-                Delivery::Text(text, response_warning) => {
+                TelegramDelivery::Text {
+                    text,
+                    response_warning,
+                    ..
+                } => {
                     self.api
                         .telegram_reply_event(
                             event_id,
                             conversation_id,
-                            &text,
+                            text,
                             response_warning.as_str(),
                         )
                         .await?;
+                    index += 1;
                 }
             }
         }
@@ -2948,6 +2963,26 @@ fn telegram_response_object_deliveries(response: &Value) -> Vec<(String, Option<
         .collect()
 }
 
+fn telegram_reply_caption<'a>(
+    deliveries: &'a [TelegramDelivery],
+    object_index: usize,
+    file: &ResolvedObject,
+) -> Option<&'a str> {
+    if object_index + 2 != deliveries.len() {
+        return None;
+    }
+    match &deliveries[object_index + 1] {
+        TelegramDelivery::Text {
+            text,
+            response_warning,
+            captionable: true,
+        } if response_warning.is_null() || response_warning.as_str() == Some("") => {
+            telegram_caption_for(file, text)
+        }
+        _ => None,
+    }
+}
+
 fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
     value
         .get(key)
@@ -3273,6 +3308,45 @@ mod tests {
             })),
             vec![("AAECAwQG".into(), Some("index-fallback.txt".into()))]
         );
+    }
+
+    #[test]
+    fn final_kennedy_text_becomes_one_exact_caption_when_supported() {
+        let file = ResolvedObject {
+            object_id: "object".into(),
+            bytes: vec![1],
+            file_name: "photo.jpg".into(),
+            media_type: "image/jpeg".into(),
+            transport_kind: Some("photo".into()),
+        };
+        let deliveries = vec![
+            TelegramDelivery::Object {
+                object_id: "object".into(),
+                file_name: None,
+            },
+            TelegramDelivery::Text {
+                text: "  exact caption\n".into(),
+                response_warning: Value::Null,
+                captionable: true,
+            },
+        ];
+        assert_eq!(
+            telegram_reply_caption(&deliveries, 0, &file),
+            Some("  exact caption\n")
+        );
+
+        let warning = vec![
+            TelegramDelivery::Object {
+                object_id: "object".into(),
+                file_name: None,
+            },
+            TelegramDelivery::Text {
+                text: "caption".into(),
+                response_warning: json!("warning"),
+                captionable: true,
+            },
+        ];
+        assert_eq!(telegram_reply_caption(&warning, 0, &file), None);
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub(crate) struct Service {
     kmap: Kmap,
     roots: SystemRoots,
     telegram: kcode_tg_kennedy_bot::Service,
+    history: kcode_session_history::SessionHistory,
 }
 
 impl Service {
@@ -59,11 +60,13 @@ impl Service {
         kmap: Kmap,
         roots: SystemRoots,
         telegram: kcode_tg_kennedy_bot::Service,
+        history: kcode_session_history::SessionHistory,
     ) -> Self {
         Self {
             kmap,
             roots,
             telegram,
+            history,
         }
     }
 
@@ -371,12 +374,37 @@ async fn get_session_archive(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = parse_object_id(&id)?;
-    let bytes = state.kmap.get_object(id)?;
-    let archive = serde_json::from_slice(&bytes).map_err(|error| {
+    let (bytes, provenance) = state.kmap.get_object_with_provenance(id)?;
+    let mut archive: Value = serde_json::from_slice(&bytes).map_err(|error| {
         ApiError::internal(format!(
             "session archive object {id} is not valid JSON: {error}"
         ))
     })?;
+    let session_state = json!({"commitAuthor":provenance.author});
+    match state
+        .history
+        .legacy_provider_cost_summary_for_archive(&archive, Some(&session_state))
+    {
+        Ok(Some(summary)) => {
+            if let Some(status) = archive
+                .pointer_mut("/context/status")
+                .and_then(Value::as_object_mut)
+            {
+                status.insert(
+                    "estimatedCostUsdNanos".into(),
+                    Value::from(summary.estimated_cost_usd_nanos),
+                );
+                status.insert(
+                    "unpricedProviderCalls".into(),
+                    Value::from(summary.unpriced_provider_calls),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, %id, "Could not reconstruct legacy session archive pricing");
+        }
+    }
     Ok(Json(archive))
 }
 
@@ -632,6 +660,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archived_session_cost_uses_authenticated_model_provenance_without_rewriting() {
+        let directory =
+            std::env::temp_dir().join(format!("kennedy-archive-cost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (kmap, roots) = initialize(
+            &directory.join("kweb"),
+            config(),
+            &directory.join("users.sqlite3"),
+        )
+        .unwrap();
+        let history = kcode_session_history::SessionHistory::open(kcode_session_history::Config {
+            directory: directory.join("sessions"),
+            completed_list: directory.join("completed.jsonl"),
+            provider_cost_compatibility: Some(kcode_session_history::ProviderCostCompatibility {
+                session_model: crate::legacy_session_provider_model,
+                estimator: crate::legacy_provider_cost,
+            }),
+        })
+        .unwrap();
+        let mut session = history
+            .create_session(kcode_session_history::NewSession {
+                kind: kcode_session_history::chatend::SessionKind::Conversation,
+                created_at: "2026-07-30T19:36:00Z".into(),
+                effective_context_tokens: 258_400,
+                channel: Value::Null,
+            })
+            .unwrap();
+        session
+            .record(
+                "2026-07-30T19:37:00Z",
+                kcode_session_history::chatend::EventKind::ProviderReceipt {
+                    manifest_hash: "legacy".into(),
+                    input_tokens: Some(30),
+                    output_tokens: Some(7),
+                    context_bytes: None,
+                    raw_context_tokens: None,
+                    provider_data: json!({
+                        "usageIsDelta":true,
+                        "nonCachedInputTokens":10,
+                        "cachedInputTokens":20,
+                        "thinkingTokens":3,
+                        "outputTokens":4
+                    }),
+                },
+            )
+            .unwrap();
+        let immutable_archive = session.archive_bytes().unwrap();
+        let raw: Value = serde_json::from_slice(&immutable_archive).unwrap();
+        assert_eq!(raw["context"]["status"]["estimatedCostUsdNanos"], 0);
+        assert_eq!(raw["context"]["status"]["unpricedProviderCalls"], 1);
+        let object_id = kmap
+            .store_object(
+                Provenance {
+                    author: "gpt-5.6-sol-xhigh".into(),
+                    source: "kennedy-session".into(),
+                    source_created_at: Utc::now(),
+                    data: String::new(),
+                },
+                immutable_archive.clone(),
+            )
+            .unwrap();
+        let telegram = kcode_tg_kennedy_bot::open(kcode_tg_kennedy_bot::Config {
+            database: directory.join("telegram.sqlite3"),
+            bot_token: None,
+            identity_sink: Arc::new(TestIdentitySink),
+            max_voice_bytes: 1024,
+        })
+        .await
+        .unwrap();
+        let response = get_session_archive(
+            State(Service::new(
+                kmap.clone(),
+                roots,
+                telegram.service(),
+                history,
+            )),
+            Path(object_id.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.0["context"]["status"]["estimatedCostUsdNanos"],
+            270_000
+        );
+        assert_eq!(response.0["context"]["status"]["unpricedProviderCalls"], 0);
+        assert_eq!(kmap.get_object(object_id).unwrap(), immutable_archive);
+        drop(session);
+        drop(kmap);
+        drop(telegram);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn main_health_includes_the_in_process_telegram_transport() {
         let directory =
             std::env::temp_dir().join(format!("kennedy-health-{}", uuid::Uuid::new_v4()));
@@ -650,9 +771,20 @@ mod tests {
         })
         .await
         .unwrap();
-        let response = health(State(Service::new(kmap, roots, telegram.service())))
-            .await
-            .unwrap();
+        let history = kcode_session_history::SessionHistory::open(kcode_session_history::Config {
+            directory: directory.join("sessions"),
+            completed_list: directory.join("completed.jsonl"),
+            provider_cost_compatibility: None,
+        })
+        .unwrap();
+        let response = health(State(Service::new(
+            kmap,
+            roots,
+            telegram.service(),
+            history,
+        )))
+        .await
+        .unwrap();
         assert_eq!(response.0["service"], "kennedy-server");
         assert_eq!(response.0["status"], "ok");
         assert_eq!(response.0["kmap"], "ready");
