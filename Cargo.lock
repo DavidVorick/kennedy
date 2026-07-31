@@ -1997,6 +1997,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-audio-session-ingress"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "facd058931a06bf118c3c87501cebfa4e9451f15fb6403974c69bd82238a5368"
+dependencies = [
+ "chrono",
+ "kcode-audio-ingress",
+ "kcode-session-history",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-codex-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2319,6 +2333,7 @@ dependencies = [
  "hex",
  "kcode-agent-runtime",
  "kcode-audio-ingress",
+ "kcode-audio-session-ingress",
  "kcode-codex-runtime",
  "kcode-codex-runtime-v2",
  "kcode-commit-session",

@@ -19,7 +19,7 @@ pub(crate) struct LocalServices {
     pub kmap: Kmap,
     pub intelligence: kcode_intelligence_router::Intelligence,
     pub history: kcode_session_history::SessionHistory,
-    pub audio: crate::audio_ingress::Service,
+    pub audio: kcode_audio_session_ingress::Coordinator,
     pub directory: std::sync::Arc<kcode_telegram_identity::Directory>,
     pub dev_tools: kcode_dev_tools::Service,
     pub agents: kcode_agent_runtime::AgentRuntime,
@@ -1046,10 +1046,21 @@ fn history_error(error: kcode_session_history::Error) -> ApiError {
     }
 }
 
-fn audio_error(error: crate::audio_ingress::ServiceError) -> ApiError {
+fn audio_error(error: kcode_audio_session_ingress::Error) -> ApiError {
+    let internal = error.kind() == kcode_audio_session_ingress::ErrorKind::Internal;
     ApiError {
-        code: error.code.into(),
-        message: error.message,
+        code: match error.kind() {
+            kcode_audio_session_ingress::ErrorKind::InvalidInput => "invalid_request",
+            kcode_audio_session_ingress::ErrorKind::NotFound => "not_found",
+            kcode_audio_session_ingress::ErrorKind::Conflict => "state_conflict",
+            kcode_audio_session_ingress::ErrorKind::Internal => "internal_error",
+        }
+        .into(),
+        message: if internal {
+            "An unexpected Kennedy audio error occurred.".into()
+        } else {
+            error.message().into()
+        },
     }
 }
 

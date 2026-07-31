@@ -30,6 +30,14 @@ This document records user intention with regard to Kennedy.
   as well as server size: move code and tests rather than copying them, reuse
   existing transports, and do not add abstraction or supporting code that
   consumes the deduplication benefit.
+- Make the browser-facing HTTP router and API a final focused presentation
+  library over typed capability libraries. Its handlers must not call back into
+  KennedyServer implementation modules through callbacks, traits, or other
+  dependency inversion; first give transport-independent workflows needed by
+  both HTTP and backend orchestration a cohesive library owner. Keep the
+  KennedyServer executable as the bootstrap and lifecycle composition root that
+  constructs those services, imports the API library, binds the listener, and
+  supervises runtimes.
 - Managed libraries maintained only by LLMs are source-first: their code and
   tests are the specification. Do not add a separate `Specification.md` that
   duplicates an ingestible codebase; retain only documentation required by the
@@ -271,10 +279,13 @@ This document records user intention with regard to Kennedy.
   current estimated context occupancy, the estimated context size if every
   active box used its latest fully hydrated canonical body, the active
   failure-avoidance limit and progress toward it, and exact cumulative cached
-  input, non-cached input, thinking, and output tokens. The fully hydrated
-  estimate uses the same projection ordering, markers, footer, and latest
-  provider calibration as current occupancy; it is a hypothetical capacity
-  measurement, not lifetime usage. Those cumulative totals cover every
+  input, non-cached input, thinking, and output tokens. The same visible status
+  reports cumulative estimated session cost at standard API rates in pennies
+  with three digits after the decimal point, including the count of any
+  provider calls that remain unpriced. The fully hydrated estimate uses the
+  same projection ordering, markers, footer, and latest provider calibration
+  as current occupancy; it is a hypothetical capacity measurement, not
+  lifetime usage. Those cumulative totals cover every
   model-backed provider call causally owned by the session, not only Kennedy's
   top-level turns: delegated-agent rounds and their tool-triggered inference,
   hosted search, media annotation, transcription, generation, and any other
@@ -507,9 +518,16 @@ This document records user intention with regard to Kennedy.
   actions. A failed native send must remain visible as that failure rather than
   silently changing the semantic delivery type.
 - AudioIngress owns durable intake, retained originals, processing state,
-  retries, and the completed transcript behind a small typed library API.
-  KennedyServer owns transport admission, transcript splitting, and submission
-  of pieces to Session History for memory ingress.
+  retries, and the completed transcript behind a small typed library API. One
+  separate audio/session-ingress coordinator library owns the idempotent
+  application handoff into Session History: deterministic piece identities,
+  transcript splitting, complete file metadata, combined recording and ingress
+  state, submission of missing pieces, and ingress retries. Each transcript
+  piece is bounded to one quarter of the effective context window available to
+  its ingress session rather than a fixed token ceiling. The coordinator
+  exposes transport-neutral typed outcomes and does not own an HTTP or
+  serialization contract. KennedyServer retains transport admission and HTTP
+  presentation.
 - Vnote scanning should avoid rereading unchanged large recordings. Durable
   acceptance is the handoff boundary; the recording does not need to wait for
   later transcription or memory work.

@@ -298,12 +298,17 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let audio =
         kcode_audio_ingress::AudioIngress::open(&args.audio_ingress_directory, audio_transcriber)
             .await?;
-    let audio_service = audio_ingress::Service::open(
+    let audio_coordinator = kcode_audio_session_ingress::Coordinator::new(
         audio,
         history_service.clone(),
+        kcode_audio_session_ingress::Config {
+            user_id: system_roots.user.to_string(),
+            effective_context_tokens: intelligence_runtime.context_window_tokens,
+        },
+    )?;
+    let audio_service = audio_ingress::Service::open(
+        audio_coordinator.clone(),
         args.audio_ingress_max_upload_bytes,
-        system_roots.user.to_string(),
-        intelligence_runtime.context_window_tokens,
     )?;
     let audio_ingress_router = audio_ingress::router(audio_service.clone());
     let orchestration = orchestration::Config {
@@ -321,7 +326,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             intelligence: intelligence_service,
             agents: agent_runtime,
             history: history_service.clone(),
-            audio: audio_service,
+            audio: audio_coordinator,
             directory: telegram_identity.clone(),
             dev_tools,
             telegram: telegram_service,
