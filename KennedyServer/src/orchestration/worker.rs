@@ -2220,6 +2220,21 @@ impl Orchestrator {
     }
 
     async fn telegram_input(&self, event: &Value) -> anyhow::Result<(String, Value)> {
+        let Some(batch) = event
+            .get("batchedEvents")
+            .and_then(Value::as_array)
+            .filter(|batch| batch.len() > 1)
+        else {
+            return self.telegram_event_input(event).await;
+        };
+        let mut inputs = Vec::with_capacity(batch.len());
+        for batched_event in batch {
+            inputs.push(self.telegram_event_input(batched_event).await?);
+        }
+        merge_telegram_batch_inputs(event, inputs)
+    }
+
+    async fn telegram_event_input(&self, event: &Value) -> anyhow::Result<(String, Value)> {
         let id = required_string(event, "id")?;
         match event.get("kind").and_then(Value::as_str).unwrap_or("text") {
             "voice" => {
@@ -2991,6 +3006,39 @@ fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
         .map(str::to_owned)
         .with_context(|| format!("backend response omitted {key}"))
 }
+
+fn merge_telegram_batch_inputs(
+    event: &Value,
+    inputs: Vec<(String, Value)>,
+) -> anyhow::Result<(String, Value)> {
+    let mut texts = Vec::new();
+    let mut attachments = Vec::new();
+    let mut event_ids = Vec::with_capacity(inputs.len());
+    for (text, metadata) in inputs {
+        if !text.is_empty() {
+            texts.push(text);
+        }
+        if let Some(media) = metadata.get("media").filter(|value| value.is_object()) {
+            attachments.push(media.clone());
+        }
+        if let Some(items) = metadata.get("attachments").and_then(Value::as_array) {
+            attachments.extend(items.iter().cloned());
+        }
+        if let Some(id) = metadata.get("externalEventId").and_then(Value::as_str) {
+            event_ids.push(id.to_owned());
+        }
+    }
+    Ok((
+        texts.join("\n\n"),
+        json!({
+            "externalEventId":required_string(event, "id")?,
+            "externalEventIds":event_ids,
+            "inputKind":"batch",
+            "attachments":attachments,
+        }),
+    ))
+}
+
 fn missing_group_session_recovery(update: &Value) -> anyhow::Result<MissingGroupSessionRecovery> {
     if update.get("resetRequired").and_then(Value::as_bool) == Some(true) {
         return Ok(MissingGroupSessionRecovery::CompleteSilentReset);
@@ -3078,6 +3126,50 @@ mod tests {
             .unwrap()
             .extend(overrides.as_object().unwrap().clone());
         serde_json::from_value(record).unwrap()
+    }
+
+    #[test]
+    fn telegram_batch_becomes_one_ordered_user_turn_with_every_attachment() {
+        let (text, metadata) = merge_telegram_batch_inputs(
+            &json!({"id":"batch-event"}),
+            vec![
+                (
+                    "first message".into(),
+                    json!({"externalEventId":"event-1","inputKind":"text"}),
+                ),
+                (
+                    String::new(),
+                    json!({
+                        "externalEventId":"event-2",
+                        "inputKind":"voice",
+                        "media":{"id":"telegram:event-2","kind":"voice"},
+                    }),
+                ),
+                (
+                    "third message".into(),
+                    json!({
+                        "externalEventId":"event-3",
+                        "inputKind":"document",
+                        "attachments":[{"id":"telegram:event-3","kind":"document"}],
+                    }),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(text, "first message\n\nthird message");
+        assert_eq!(metadata["externalEventId"], "batch-event");
+        assert_eq!(
+            metadata["externalEventIds"],
+            json!(["event-1", "event-2", "event-3"])
+        );
+        assert_eq!(
+            metadata["attachments"],
+            json!([
+                {"id":"telegram:event-2","kind":"voice"},
+                {"id":"telegram:event-3","kind":"document"},
+            ])
+        );
     }
 
     #[test]

@@ -623,6 +623,20 @@ This document records user intention with regard to Kennedy.
 - Keep a separate durable session for each participant and group, distinct from
   direct messages and from the participant's sessions in other groups. Preserve
   strict order within a stream while allowing unrelated streams to progress.
+- Treat an eligible Telegram group whose active roster is exactly Kennedy and
+  one human as conversationally equivalent to a direct message: every accepted
+  message from that human invokes Kennedy without requiring a mention, command,
+  or reply to Kennedy. Keep the group session, root, and thread-capable
+  transport identity distinct rather than collapsing it into the human's
+  private session.
+- Debounce ordinary inbound messages in direct chats and those two-person
+  groups for 20 seconds after the newest accepted message. Each further message
+  accepted on that stream during the interval restarts the full 20-second wait;
+  once the stream is quiet, deliver the accumulated messages to Kennedy in
+  order as one user turn, preserving every message and attachment. Keep this
+  gathering state durable so a restart neither loses the batch nor bypasses its
+  remaining wait. Larger groups retain explicit invocation behavior and are
+  not subject to this direct-message batching rule.
 - Telegram transport does not own permanent message history; Kennedy's ordinary
   session and Kmap lifecycle does. Retain only the transport working state
   needed for bounded live group context, media access, and pending Kmap ingress,
