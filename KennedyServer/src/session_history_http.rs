@@ -15,27 +15,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use kcode_session_history::{NewCommand, NewObject, RetryIngress, SessionHistory, StartSession};
+use kcode_session_history::{
+    NewCommand, NewCurrentWorkStop, NewObject, RetryIngress, SessionHistory, StartSession,
+};
 use serde_json::{Value, json};
-use std::sync::Arc;
-
-use crate::orchestration::Orchestrator;
 
 const MAX_OBJECT_BYTES: usize = 32 * 1024 * 1024 * 1024;
 
-#[derive(Clone)]
-struct HttpState {
-    history: SessionHistory,
-    orchestrator: Arc<Orchestrator>,
-}
-
-impl axum::extract::FromRef<HttpState> for SessionHistory {
-    fn from_ref(state: &HttpState) -> Self {
-        state.history.clone()
-    }
-}
-
-pub(crate) fn router(history: SessionHistory, orchestrator: Arc<Orchestrator>) -> Router {
+pub(crate) fn router(history: SessionHistory) -> Router {
     Router::new()
         .route("/api/v1/conversations/health", get(health))
         .route("/api/v1/conversations/summaries", get(list))
@@ -57,10 +44,7 @@ pub(crate) fn router(history: SessionHistory, orchestrator: Arc<Orchestrator>) -
             post(retry_ingress),
         )
         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
-        .with_state(HttpState {
-            history,
-            orchestrator,
-        })
+        .with_state(history)
 }
 
 async fn health(State(history): State<SessionHistory>) -> Result<Json<Value>, ApiError> {
@@ -192,10 +176,25 @@ async fn object(
 }
 
 async fn stop(
-    State(state): State<HttpState>,
+    State(history): State<SessionHistory>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(state.orchestrator.request_stop(&id).await?))
+    let request = history
+        .request_current_work_stop(
+            &id,
+            NewCurrentWorkStop {
+                idempotency_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .await?
+        .value;
+    Ok(Json(json!({
+        "id":id,
+        "scope":request.scope,
+        "status":"stopping",
+        "stopRequested":true,
+        "stopRequestId":request.id,
+    })))
 }
 
 async fn retry_ingress(
@@ -245,31 +244,6 @@ impl From<kcode_session_history::Error> for ApiError {
     }
 }
 
-impl From<anyhow::Error> for ApiError {
-    fn from(error: anyhow::Error) -> Self {
-        tracing::warn!(%error, "Kennedy orchestration stop request failed");
-        if let Some(error) = error.downcast_ref::<crate::orchestration::ApiError>() {
-            return Self {
-                status: match error.code.as_str() {
-                    "invalid_request" => StatusCode::BAD_REQUEST,
-                    "not_found" => StatusCode::NOT_FOUND,
-                    "conflict" | "state_conflict" => StatusCode::CONFLICT,
-                    _ => StatusCode::INTERNAL_SERVER_ERROR,
-                },
-                code: if error.code == "state_conflict" {
-                    "state_conflict"
-                } else if error.code == "not_found" {
-                    "not_found"
-                } else {
-                    "internal_error"
-                },
-                message: error.message.clone(),
-            };
-        }
-        Self::internal(error)
-    }
-}
-
 fn history_status(kind: kcode_session_history::ErrorKind) -> StatusCode {
     match kind {
         kcode_session_history::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
@@ -286,5 +260,55 @@ impl IntoResponse for ApiError {
             Json(json!({"error":{"code":self.code,"message":self.message}})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_response_preserves_the_browser_contract_without_orchestration_state() {
+        let root = std::env::temp_dir().join(format!(
+            "kennedy-session-history-http-stop-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let history = SessionHistory::open(kcode_session_history::Config {
+            directory: root.join("sessions"),
+            completed_list: root.join("session-history.txt"),
+            provider_cost_compatibility: None,
+        })
+        .unwrap();
+        let record = history
+            .start(StartSession {
+                idempotency_id: "start".into(),
+                started_at: "2026-08-01T00:00:00Z".into(),
+                session_type: "conversation".into(),
+                duration_minutes: None,
+                custom_prompt: None,
+            })
+            .await
+            .unwrap()
+            .value;
+
+        let Json(response) = stop(State(history.clone()), Path(record.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response["id"], record.id);
+        assert_eq!(response["scope"], "turn");
+        assert_eq!(response["status"], "stopping");
+        assert_eq!(response["stopRequested"], true);
+        assert_eq!(
+            response["stopRequestId"],
+            history.stop_heads().await.unwrap()[0].id
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

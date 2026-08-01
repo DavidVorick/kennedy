@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use kcode_server_object_envelopes::sanitize_file_name;
 use kcode_session_history::{SessionCommand, SessionRecord, SessionStopRequest};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use uuid::Uuid;
 
 use super::{
@@ -64,35 +64,6 @@ enum TelegramDelivery {
     },
 }
 
-#[derive(Clone)]
-struct ActiveOperation {
-    operation_id: Uuid,
-    stopped: Arc<AtomicBool>,
-    notification: Arc<Notify>,
-}
-
-impl ActiveOperation {
-    fn new(operation_id: Uuid) -> Self {
-        Self {
-            operation_id,
-            stopped: Arc::new(AtomicBool::new(false)),
-            notification: Arc::new(Notify::new()),
-        }
-    }
-
-    fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-        self.notification.notify_waiters();
-    }
-
-    async fn stopped(&self) {
-        if self.stopped.load(Ordering::Acquire) {
-            return;
-        }
-        self.notification.notified().await;
-    }
-}
-
 enum TurnCompletion {
     Finished,
     Stopped,
@@ -110,7 +81,7 @@ pub(crate) struct Orchestrator {
     group_updates_in_flight: Mutex<HashSet<String>>,
     group_ingress_in_flight: Mutex<HashSet<String>>,
     directory_in_flight: Mutex<HashSet<String>>,
-    active_operations: Mutex<HashMap<String, ActiveOperation>>,
+    active_operations: Mutex<HashMap<String, Uuid>>,
     conversation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     last_poll_error: RwLock<Option<String>>,
 }
@@ -133,40 +104,6 @@ impl Orchestrator {
             conversation_locks: Mutex::new(HashMap::new()),
             last_poll_error: RwLock::new(None),
         }
-    }
-
-    pub(crate) async fn request_stop(&self, id: &str) -> anyhow::Result<Value> {
-        let record = self.get_conversation(id).await?;
-        let scope = stop_scope(&record);
-        let request = self
-            .api
-            .history_request_stop(
-                id,
-                kcode_session_history::NewStopRequest {
-                    idempotency_id: Uuid::new_v4().to_string(),
-                    scope: scope.into(),
-                },
-            )
-            .await?;
-        let signaled = self.signal_stop(id).await;
-        if scope == "turn" && !signaled {
-            let has_command = self
-                .api
-                .history_command_heads()
-                .await?
-                .iter()
-                .any(|command| command.conversation_id == id);
-            if !has_command {
-                self.finish_idle_turn_stop(id).await?;
-            }
-        }
-        Ok(json!({
-            "id":id,
-            "scope":scope,
-            "status":"stopping",
-            "stopRequested":true,
-            "stopRequestId":request.id,
-        }))
     }
 
     pub(crate) async fn run(self: Arc<Self>) -> anyhow::Result<()> {
@@ -332,8 +269,7 @@ impl Orchestrator {
             .map(|command| command.conversation_id)
             .collect::<HashSet<_>>();
         for request in self.pending_stops().await? {
-            let signaled = self.signal_stop(&request.session_id).await;
-            if !signaled
+            if !self.operation_is_active(&request.session_id).await
                 && request.scope == "turn"
                 && !command_conversations.contains(&request.session_id)
             {
@@ -362,21 +298,14 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn signal_stop(&self, session_id: &str) -> bool {
-        let active = self.active_operations.lock().await.get(session_id).cloned();
-        if let Some(active) = active {
-            let _ = self.api.cancel_intelligence(active.operation_id);
-            active.stop();
-            true
-        } else {
-            false
-        }
+    async fn operation_is_active(&self, session_id: &str) -> bool {
+        self.active_operations.lock().await.contains_key(session_id)
     }
 
     async fn finish_idle_turn_stop(&self, session_id: &str) -> anyhow::Result<()> {
         let lock = self.conversation_lock(session_id).await;
         let _guard = lock.lock().await;
-        if self.signal_stop(session_id).await {
+        if self.operation_is_active(session_id).await {
             return Ok(());
         }
         if self.pending_stop(session_id).await?.is_none() {
@@ -405,27 +334,18 @@ impl Orchestrator {
             .await
     }
 
-    async fn register_operation(
-        &self,
-        session_id: &str,
-        active: ActiveOperation,
-    ) -> anyhow::Result<()> {
+    async fn register_operation(&self, session_id: &str, operation_id: Uuid) {
         self.active_operations
             .lock()
             .await
-            .insert(session_id.to_owned(), active.clone());
-        if self.pending_stop(session_id).await?.is_some() {
-            let _ = self.api.cancel_intelligence(active.operation_id);
-            active.stop();
-        }
-        Ok(())
+            .insert(session_id.to_owned(), operation_id);
     }
 
     async fn remove_operation(&self, session_id: &str, operation_id: Uuid) {
         let mut active = self.active_operations.lock().await;
         if active
             .get(session_id)
-            .is_some_and(|operation| operation.operation_id == operation_id)
+            .is_some_and(|operation| *operation == operation_id)
         {
             active.remove(session_id);
         }
@@ -435,27 +355,34 @@ impl Orchestrator {
         &self,
         session_id: &str,
         session: &mut Session,
-        active: ActiveOperation,
+        operation_id: Uuid,
         checkpoint: C,
     ) -> anyhow::Result<TurnCompletion>
     where
         C: FnMut(Value) -> F,
         F: std::future::Future<Output = anyhow::Result<()>>,
     {
-        self.register_operation(session_id, active.clone()).await?;
+        self.register_operation(session_id, operation_id).await;
+        let stop = match self.api.history_listen_for_stop(session_id) {
+            Ok(stop) => stop,
+            Err(error) => {
+                self.remove_operation(session_id, operation_id).await;
+                return Err(error.into());
+            }
+        };
         let result: anyhow::Result<TurnCompletion> = {
-            let turn = session.run_pending_turn(active.operation_id, checkpoint);
+            let turn = session.run_pending_turn(operation_id, checkpoint);
             tokio::pin!(turn);
             tokio::select! {
                 biased;
-                _ = active.stopped() => Ok({
-                    let _ = self.api.cancel_intelligence(active.operation_id);
+                _ = stop.requested() => Ok({
+                    let _ = self.api.cancel_intelligence(operation_id);
                     TurnCompletion::Stopped
                 }),
                 result = &mut turn => result.map(|_| TurnCompletion::Finished),
             }
         };
-        self.remove_operation(session_id, active.operation_id).await;
+        self.remove_operation(session_id, operation_id).await;
         result
     }
 
@@ -476,9 +403,7 @@ impl Orchestrator {
         let commands = self.api.history_command_heads().await?;
         for command in commands {
             let id = command.id.clone();
-            let conversation_id = command.conversation_id.clone();
             if command.cancel_requested && self.commands_in_flight.lock().await.contains(&id) {
-                self.signal_stop(&conversation_id).await;
                 continue;
             }
             let mut in_flight = self.commands_in_flight.lock().await;
@@ -585,18 +510,23 @@ impl Orchestrator {
                     }
                     session.orchestration = json!({"owner":"backend","status":"working"});
                     persist_record(&self.api, &record, session.snapshot()?, true).await?;
-                    let active = ActiveOperation::new(Uuid::new_v4());
+                    let operation_id = Uuid::new_v4();
                     let api = self.api.clone();
                     let saved_record = record.clone();
                     let result = self
-                        .run_session_turn(&conversation_id, &mut session, active, move |state| {
-                            let api = api.clone();
-                            let record = saved_record.clone();
-                            async move {
-                                persist_record(&api, &record, state, false).await?;
-                                Ok(())
-                            }
-                        })
+                        .run_session_turn(
+                            &conversation_id,
+                            &mut session,
+                            operation_id,
+                            move |state| {
+                                let api = api.clone();
+                                let record = saved_record.clone();
+                                async move {
+                                    persist_record(&api, &record, state, false).await?;
+                                    Ok(())
+                                }
+                            },
+                        )
                         .await;
                     if matches!(&result, Ok(TurnCompletion::Stopped)) {
                         session.interrupt_current_turn()?;
@@ -670,18 +600,23 @@ impl Orchestrator {
                     session.reset_exhausted_turn_rounds_for_retry();
                     session.orchestration = json!({"owner":"backend","status":"working"});
                     persist_record(&self.api, &record, session.snapshot()?, false).await?;
-                    let active = ActiveOperation::new(Uuid::new_v4());
+                    let operation_id = Uuid::new_v4();
                     let api = self.api.clone();
                     let saved_record = record.clone();
                     let result = self
-                        .run_session_turn(&conversation_id, &mut session, active, move |state| {
-                            let api = api.clone();
-                            let record = saved_record.clone();
-                            async move {
-                                persist_record(&api, &record, state, false).await?;
-                                Ok(())
-                            }
-                        })
+                        .run_session_turn(
+                            &conversation_id,
+                            &mut session,
+                            operation_id,
+                            move |state| {
+                                let api = api.clone();
+                                let record = saved_record.clone();
+                                async move {
+                                    persist_record(&api, &record, state, false).await?;
+                                    Ok(())
+                                }
+                            },
+                        )
                         .await;
                     if matches!(&result, Ok(TurnCompletion::Stopped)) {
                         session.interrupt_current_turn()?;
@@ -1020,19 +955,14 @@ impl Orchestrator {
                 let api = self.api.clone();
                 let saved_record = record.clone();
                 let completion = self
-                    .run_session_turn(
-                        &id,
-                        &mut session,
-                        ActiveOperation::new(Uuid::new_v4()),
-                        move |session_state| {
-                            let api = api.clone();
-                            let record = saved_record.clone();
-                            async move {
-                                persist_ingress_record(&api, &record, session_state).await?;
-                                Ok(())
-                            }
-                        },
-                    )
+                    .run_session_turn(&id, &mut session, Uuid::new_v4(), move |session_state| {
+                        let api = api.clone();
+                        let record = saved_record.clone();
+                        async move {
+                            persist_ingress_record(&api, &record, session_state).await?;
+                            Ok(())
+                        }
+                    })
                     .await?;
                 if matches!(completion, TurnCompletion::Stopped) {
                     session.interrupt_current_turn()?;
@@ -1155,12 +1085,12 @@ impl Orchestrator {
         let timeout = (deadline - Utc::now() + ChronoDuration::minutes(6))
             .to_std()
             .unwrap_or(Duration::ZERO);
-        let active = ActiveOperation::new(Uuid::new_v4());
+        let operation_id = Uuid::new_v4();
         let api = self.api.clone();
         let saved = record_arc.clone();
         let result = tokio::time::timeout(
             timeout,
-            self.run_session_turn(&id, &mut session, active.clone(), move |state| {
+            self.run_session_turn(&id, &mut session, operation_id, move |state| {
                 let api = api.clone();
                 let record = saved.clone();
                 async move {
@@ -1186,9 +1116,8 @@ impl Orchestrator {
                 .to_owned(),
             Ok(Err(error)) => return Err(error),
             Err(_) => {
-                let _ = self.api.cancel_intelligence(active.operation_id);
-                active.stop();
-                self.remove_operation(&id, active.operation_id).await;
+                let _ = self.api.cancel_intelligence(operation_id);
+                self.remove_operation(&id, operation_id).await;
                 "hard-stop".into()
             }
         };
@@ -1236,19 +1165,14 @@ impl Orchestrator {
         let api = self.api.clone();
         let saved = record.clone();
         let completion = self
-            .run_session_turn(
-                &id,
-                &mut session,
-                ActiveOperation::new(Uuid::new_v4()),
-                move |state| {
-                    let api = api.clone();
-                    let record = saved.clone();
-                    async move {
-                        persist_record(&api, &record, state, false).await?;
-                        Ok(())
-                    }
-                },
-            )
+            .run_session_turn(&id, &mut session, Uuid::new_v4(), move |state| {
+                let api = api.clone();
+                let record = saved.clone();
+                async move {
+                    persist_record(&api, &record, state, false).await?;
+                    Ok(())
+                }
+            })
             .await?;
         if matches!(completion, TurnCompletion::Stopped) {
             session.interrupt_current_turn()?;
@@ -1651,34 +1575,25 @@ impl Orchestrator {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        let active = ActiveOperation::new(Uuid::new_v4());
-        self.active_operations
-            .lock()
-            .await
-            .insert(format!("telegram:{id}"), active.clone());
-        let conversation_id = Arc::new(Mutex::new(
-            event
-                .get("conversationId")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        ));
-        if let Some(conversation_id) = conversation_id.lock().await.clone() {
-            self.active_operations
-                .lock()
-                .await
-                .insert(conversation_id, active.clone());
+        let operation_id = Uuid::new_v4();
+        let initial_conversation_id = event
+            .get("conversationId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(conversation_id) = &initial_conversation_id {
+            self.register_operation(conversation_id, operation_id).await;
         }
+        let conversation_id = Arc::new(Mutex::new(initial_conversation_id.clone()));
         let result = tokio::time::timeout(
             telegram_timeout(&event),
-            self.process_telegram_event(&event, active.clone(), conversation_id.clone()),
+            self.process_telegram_event(&event, operation_id, conversation_id.clone()),
         )
         .await;
-        self.active_operations
-            .lock()
-            .await
-            .remove(&format!("telegram:{id}"));
         if let Some(conversation_id) = conversation_id.lock().await.clone() {
-            self.remove_operation(&conversation_id, active.operation_id)
+            self.remove_operation(&conversation_id, operation_id).await;
+        }
+        if let Some(initial_conversation_id) = initial_conversation_id {
+            self.remove_operation(&initial_conversation_id, operation_id)
                 .await;
         }
         match result {
@@ -1708,7 +1623,7 @@ impl Orchestrator {
                 }
             }
             Err(_) => {
-                let _ = self.api.cancel_intelligence(active.operation_id);
+                let _ = self.api.cancel_intelligence(operation_id);
                 let conversation = conversation_id.lock().await.clone();
                 if let Some(conversation_id) = &conversation
                     && let Err(error) = self
@@ -1772,7 +1687,7 @@ impl Orchestrator {
     async fn process_telegram_event(
         &self,
         event: &Value,
-        active: ActiveOperation,
+        operation_id: Uuid,
         bound_conversation_id: Arc<Mutex<Option<String>>>,
     ) -> anyhow::Result<()> {
         let id = required_string(event, "id")?;
@@ -1802,8 +1717,8 @@ impl Orchestrator {
             locked.id.clone()
         };
         *bound_conversation_id.lock().await = Some(conversation_id.clone());
-        self.register_operation(&conversation_id, active.clone())
-            .await?;
+        self.register_operation(&conversation_id, operation_id)
+            .await;
         let lock = self.conversation_lock(&conversation_id).await;
         let _guard = lock.lock().await;
         let mut session = {
@@ -1843,7 +1758,7 @@ impl Orchestrator {
             let api = self.api.clone();
             let saved = record_arc.clone();
             let completion = self
-                .run_session_turn(&conversation_id, &mut session, active, move |state| {
+                .run_session_turn(&conversation_id, &mut session, operation_id, move |state| {
                     let api = api.clone();
                     let record = saved.clone();
                     async move {
@@ -2745,23 +2660,6 @@ fn session_type(record: &SessionRecord) -> String {
         .into()
 }
 
-fn stop_scope(record: &SessionRecord) -> &'static str {
-    let phase = record.phase.as_str();
-    let session_type = session_type(record);
-    if phase == "active"
-        && matches!(
-            session_type.as_str(),
-            "conversation" | "telegram" | "telegram-group"
-        )
-    {
-        "turn"
-    } else if phase == "active" && session_type == "free-time" {
-        "self-time-run"
-    } else {
-        "session"
-    }
-}
-
 fn next_wakeup_marker(now: DateTime<Utc>) -> DateTime<Utc> {
     let day_start = now
         .date_naive()
@@ -3204,39 +3102,6 @@ mod tests {
             "phase":"active",
             "state":{"sessionType":"telegram"}
         }))));
-    }
-
-    #[test]
-    fn stop_scope_preserves_interactive_sessions_and_terminates_autonomous_work() {
-        for session_type in ["conversation", "telegram", "telegram-group"] {
-            assert_eq!(
-                stop_scope(&session_record(json!({
-                    "phase":"active",
-                    "state":{"sessionType":session_type}
-                }))),
-                "turn"
-            );
-        }
-        assert_eq!(
-            stop_scope(&session_record(json!({
-                "phase":"active",
-                "state":{"sessionType":"free-time"}
-            }))),
-            "self-time-run"
-        );
-        for (phase, session_type) in [
-            ("active", "wakeup"),
-            ("ingress_pending", "conversation"),
-            ("ingress_in_progress", "telegram"),
-        ] {
-            assert_eq!(
-                stop_scope(&session_record(json!({
-                    "phase":phase,
-                    "state":{"sessionType":session_type}
-                }))),
-                "session"
-            );
-        }
     }
 
     #[test]

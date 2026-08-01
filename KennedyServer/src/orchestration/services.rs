@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use kcode_kmap::{CreateProvenance, Kmap, NodeContents, NodeWrite};
+use kcode_kweb_manager::{CreateProvenance, KwebManager, NodeContents, NodeWrite};
 use kcode_kweb_db::{Node, NodeId, ObjectId, Owner, Provenance};
 use kcode_server_object_envelopes::{StoredFile, StoredProvenance, decode_file, encode_file};
 use serde_json::Value;
@@ -18,7 +18,7 @@ const TELEGRAM_CAPTION_LIMIT_UTF16: usize = 1_024;
 
 #[derive(Clone)]
 pub(crate) struct LocalServices {
-    pub kmap: Kmap,
+    pub kmap: KwebManager,
     pub intelligence: kcode_intelligence_router::Intelligence,
     pub history: kcode_session_history::SessionHistory,
     pub audio: kcode_audio_session_ingress::Coordinator,
@@ -33,6 +33,7 @@ pub(crate) struct LocalServices {
 pub(crate) struct ApiError {
     pub code: String,
     pub message: String,
+    pub receipt: Option<kcode_intelligence_router::UsageReceipt>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -202,7 +203,10 @@ impl Api {
         &self,
         user_id: &str,
         request: kcode_intelligence_router::SearchRequest,
-    ) -> Result<kcode_intelligence_router::SearchResponse, ApiError> {
+    ) -> Result<
+        kcode_intelligence_router::Accounted<kcode_intelligence_router::SearchResponse>,
+        ApiError,
+    > {
         self.services
             .intelligence
             .for_user(user_id)
@@ -287,16 +291,13 @@ impl Api {
             .map_err(history_error)
     }
 
-    pub async fn history_request_stop(
+    pub fn history_listen_for_stop(
         &self,
         id: &str,
-        input: kcode_session_history::NewStopRequest,
-    ) -> Result<kcode_session_history::SessionStopRequest, ApiError> {
+    ) -> Result<kcode_session_history::StopListener, ApiError> {
         self.services
             .history
-            .request_stop(id, input)
-            .await
-            .map(|created| created.value)
+            .listen_for_stop(id)
             .map_err(history_error)
     }
 
@@ -558,20 +559,13 @@ impl Api {
             .map_err(telegram_error)
     }
 
-    pub async fn telegram_send_private_message(
+    pub async fn telegram_send_cold_private_message(
         &self,
         telegram_user_id: i64,
-        conversation_id: &str,
-        expected_conversation_id: Option<&str>,
         text: &str,
     ) -> Result<Value, ApiError> {
         self.telegram()
-            .send_private_message(
-                telegram_user_id,
-                conversation_id.to_owned(),
-                expected_conversation_id.map(ToOwned::to_owned),
-                text.to_owned(),
-            )
+            .send_cold_private_message(telegram_user_id, text.to_owned())
             .await
             .map_err(telegram_error)
     }
@@ -791,21 +785,14 @@ impl Api {
             .map_err(telegram_error)
     }
 
-    pub async fn telegram_send_private_object(
+    pub async fn telegram_send_cold_private_object(
         &self,
         telegram_user_id: i64,
-        conversation_id: &str,
-        expected_conversation_id: Option<&str>,
         file: &ResolvedObject,
         caption: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.telegram()
-            .send_private_attachment(
-                telegram_user_id,
-                conversation_id.to_owned(),
-                expected_conversation_id.map(ToOwned::to_owned),
-                telegram_attachment(file, caption),
-            )
+            .send_cold_private_attachment(telegram_user_id, telegram_attachment(file, caption))
             .await
             .map_err(telegram_error)
     }
@@ -869,7 +856,10 @@ impl Api {
         filename: String,
         mime: &str,
         parent_operation_id: Uuid,
-    ) -> Result<kcode_intelligence_router::TranscriptionResponse, ApiError> {
+    ) -> Result<
+        kcode_intelligence_router::Accounted<kcode_intelligence_router::TranscriptionResponse>,
+        ApiError,
+    > {
         self.services
             .intelligence
             .for_user(user_id)
@@ -913,7 +903,10 @@ impl Api {
         filename: String,
         mime: &str,
         parent_operation_id: Uuid,
-    ) -> Result<kcode_intelligence_router::AnnotationResponse, ApiError> {
+    ) -> Result<
+        kcode_intelligence_router::Accounted<kcode_intelligence_router::AnnotationResponse>,
+        ApiError,
+    > {
         self.services
             .intelligence
             .for_user(user_id)
@@ -936,7 +929,10 @@ impl Api {
         prompt: &str,
         references: Vec<(Vec<u8>, String, String)>,
         parent_operation_id: Uuid,
-    ) -> Result<kcode_intelligence_router::ImageResponse, ApiError> {
+    ) -> Result<
+        kcode_intelligence_router::Accounted<kcode_intelligence_router::ImageResponse>,
+        ApiError,
+    > {
         let references = references
             .into_iter()
             .map(|(bytes, filename, mime)| {
@@ -1009,11 +1005,11 @@ impl AgentTurn {
     }
 }
 
-fn kmap_error(error: kcode_kmap::Error) -> ApiError {
+fn kmap_error(error: kcode_kweb_manager::Error) -> ApiError {
     let (code, message) = match error.kind() {
-        kcode_kmap::ErrorKind::InvalidInput => ("invalid_request", error.to_string()),
-        kcode_kmap::ErrorKind::NotFound => ("not_found", error.to_string()),
-        kcode_kmap::ErrorKind::Conflict => ("conflict", error.to_string()),
+        kcode_kweb_manager::ErrorKind::InvalidInput => ("invalid_request", error.to_string()),
+        kcode_kweb_manager::ErrorKind::NotFound => ("not_found", error.to_string()),
+        kcode_kweb_manager::ErrorKind::Conflict => ("conflict", error.to_string()),
         _ => (
             "internal_error",
             "An unexpected Kmap database error occurred.".into(),
@@ -1022,6 +1018,7 @@ fn kmap_error(error: kcode_kmap::Error) -> ApiError {
     ApiError {
         code: code.into(),
         message,
+        receipt: None,
     }
 }
 
@@ -1029,6 +1026,7 @@ fn intelligence_error(error: kcode_intelligence_router::Error) -> ApiError {
     ApiError {
         code: error.code().into(),
         message: error.message().into(),
+        receipt: error.receipt().cloned(),
     }
 }
 
@@ -1042,6 +1040,7 @@ fn directory_error(error: kcode_telegram_identity::Error) -> ApiError {
     ApiError {
         code: code.into(),
         message: error.message().into(),
+        receipt: None,
     }
 }
 
@@ -1059,6 +1058,7 @@ fn dev_tools_error(error: kcode_dev_tools::ToolError) -> ApiError {
     ApiError {
         code: error.code.into(),
         message: error.message,
+        receipt: None,
     }
 }
 
@@ -1066,6 +1066,7 @@ fn history_error(error: kcode_session_history::Error) -> ApiError {
     ApiError {
         code: error.kind.code().into(),
         message: error.message,
+        receipt: None,
     }
 }
 
@@ -1084,6 +1085,7 @@ fn audio_error(error: kcode_audio_session_ingress::Error) -> ApiError {
         } else {
             error.message().into()
         },
+        receipt: None,
     }
 }
 
@@ -1092,6 +1094,7 @@ fn speech_task_error(error: tokio::task::JoinError) -> ApiError {
     ApiError {
         code: "internal_error".into(),
         message: "An unexpected Kennedy speaker-classification error occurred.".into(),
+        receipt: None,
     }
 }
 
@@ -1100,6 +1103,7 @@ fn speech_ktool_error(error: kcode_speech_classification::KtoolError) -> ApiErro
         return ApiError {
             code: "invalid_request".into(),
             message: error.to_string(),
+            receipt: None,
         };
     };
     let internal = matches!(
@@ -1123,6 +1127,7 @@ fn speech_ktool_error(error: kcode_speech_classification::KtoolError) -> ApiErro
         } else {
             error.to_string()
         },
+        receipt: None,
     }
 }
 
@@ -1130,6 +1135,7 @@ fn local_api_error(error: impl std::fmt::Display) -> ApiError {
     ApiError {
         code: "invalid_request".into(),
         message: error.to_string(),
+        receipt: None,
     }
 }
 
@@ -1137,6 +1143,7 @@ fn telegram_error(error: kcode_tg_kennedy_bot::Error) -> ApiError {
     ApiError {
         code: error.code().to_owned(),
         message: error.message().to_owned(),
+        receipt: None,
     }
 }
 

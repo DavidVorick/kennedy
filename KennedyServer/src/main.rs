@@ -220,10 +220,9 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         kcode_session_history::SessionHistory::open(kcode_session_history::Config {
             directory: args.session_directory,
             completed_list: args.session_history_file,
-            provider_cost_compatibility: Some(kcode_session_history::ProviderCostCompatibility {
-                session_model: legacy_session_provider_model,
-                estimator: legacy_provider_cost,
-            }),
+            provider_cost_compatibility: Some(
+                kcode_intelligence_chatend::provider_cost_compatibility(),
+            ),
         })?;
     let (intelligence_service, intelligence_runtime) =
         kcode_intelligence_router::open(kcode_intelligence_router::Config {
@@ -272,7 +271,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 parent_operation_id: None,
             })
             .await
-            .map(|response| response.text)
+            .map(|response| response.value.text)
             .map_err(audio_intelligence_error)
         })
     });
@@ -302,7 +301,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 parent_operation_id: None,
             })
             .await
-            .map(|response| response.text)
+            .map(|response| response.value.text)
             .map_err(audio_intelligence_error)
         })
     });
@@ -352,8 +351,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         },
     );
     let orchestration_worker = orchestration::build(orchestration, orchestration_api);
-    let history_router =
-        session_history_http::router(history_service, orchestration_worker.clone());
+    let history_router = session_history_http::router(history_service);
     tokio::try_join!(
         kmap_http::serve_with_listener(
             kmap_service,
@@ -614,50 +612,6 @@ fn prompt_confirmed_value(prompt: &str) -> anyhow::Result<String> {
     Ok(first)
 }
 
-fn legacy_session_provider_model(state: &serde_json::Value) -> Option<String> {
-    if let Some(model) = state
-        .get("providerModel")
-        .and_then(serde_json::Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-    {
-        return Some(model.strip_prefix("codex/").unwrap_or(model).to_owned());
-    }
-    let attribution = state
-        .get("commitAuthor")
-        .and_then(serde_json::Value::as_str)?;
-    let model = ["-minimal", "-low", "-medium", "-high", "-xhigh", "-max"]
-        .iter()
-        .find_map(|suffix| attribution.strip_suffix(suffix))
-        .unwrap_or(attribution);
-    (!model.trim().is_empty()).then(|| model.strip_prefix("codex/").unwrap_or(model).to_owned())
-}
-
-fn legacy_provider_cost(
-    model: &str,
-    metering: &kcode_session_history::chatend::ProviderMetering,
-) -> Option<kcode_session_history::chatend::ProviderCostEstimate> {
-    let metering = match metering {
-        kcode_session_history::chatend::ProviderMetering::Tokens(usage) => {
-            kcode_intelligence_router::Metering::Tokens(kcode_intelligence_router::TokenUsage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                thinking_tokens: usage.thinking_tokens,
-                output_tokens: usage.output_tokens,
-            })
-        }
-        kcode_session_history::chatend::ProviderMetering::DurationSeconds { seconds } => {
-            kcode_intelligence_router::Metering::DurationSeconds { seconds: *seconds }
-        }
-        kcode_session_history::chatend::ProviderMetering::Unavailable => return None,
-    };
-    let cost = kcode_intelligence_router::estimate_cost(model, &metering)?;
-    Some(kcode_session_history::chatend::ProviderCostEstimate {
-        usd_nanos: cost.usd_nanos,
-        accuracy: serde_json::to_value(cost.accuracy).ok()?,
-        pricing_version: cost.pricing_version,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,43 +624,6 @@ mod tests {
         assert_eq!(CRATES_IO_KEY_SECRET, "cratesio-key");
         assert_eq!(KWEB_WRITER_SIGNING_KEY_SECRET, "kweb-writer-signing-key");
         assert_eq!(KWEB_WRITERS_SECRET, "kweb-writers-by-priority");
-    }
-
-    #[test]
-    fn legacy_session_model_prefers_exact_model_and_understands_old_attribution() {
-        assert_eq!(
-            legacy_session_provider_model(&serde_json::json!({
-                "providerModel":"gpt-5.6-terra",
-                "commitAuthor":"gpt-5.6-sol-xhigh"
-            }))
-            .as_deref(),
-            Some("gpt-5.6-terra")
-        );
-        assert_eq!(
-            legacy_session_provider_model(&serde_json::json!({
-                "commitAuthor":"gpt-5.6-sol-xhigh"
-            }))
-            .as_deref(),
-            Some("gpt-5.6-sol")
-        );
-    }
-
-    #[test]
-    fn legacy_provider_cost_uses_the_intelligence_catalog() {
-        let cost = legacy_provider_cost(
-            "gpt-5.6-sol",
-            &kcode_session_history::chatend::ProviderMetering::Tokens(
-                kcode_session_history::chatend::ProviderTokenUsage {
-                    input_tokens: 10,
-                    cached_input_tokens: 20,
-                    thinking_tokens: 3,
-                    output_tokens: 4,
-                },
-            ),
-        )
-        .unwrap();
-        assert_eq!(cost.usd_nanos, 270_000);
-        assert_eq!(cost.pricing_version, "kennedy-provider-pricing-2026-07-30");
     }
 
     #[test]

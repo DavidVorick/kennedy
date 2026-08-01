@@ -30,7 +30,7 @@ use kcode_kweb_context::{
 use kcode_kweb_db::{NodeId, ObjectId};
 use kcode_server_object_envelopes::{StoredFile, encode_file, sanitize_file_name};
 use kcode_session_history::{
-    NewSession, Session as HistorySession, SessionRecord,
+    NewSession, Session as HistorySession,
     chatend::{
         BoxContent, BoxId, BoxOwner, EventId, EventKind, ObjectMetadata, PendingId, Representation,
         SessionKind, SessionMetadata,
@@ -181,7 +181,6 @@ impl KwebPlan {
 
 pub(crate) struct Session {
     api: Api,
-    manuals: Manuals,
     runtime: RuntimeModel,
     journal: HistorySession,
     plan: KwebPlan,
@@ -560,9 +559,6 @@ fn subagent_state_updates(
 struct KennedySubagentHost<'a> {
     session: &'a mut Session,
     captures: HashMap<String, FreeformWrite>,
-    parent_operation_id: Uuid,
-    pending_manifest_hash: Option<String>,
-    provider_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -698,7 +694,6 @@ impl Session {
             journal.state().completed_session_object.is_some() || commit_receipt.is_some();
         let mut session = Self {
             api,
-            manuals,
             runtime,
             journal,
             plan,
@@ -1049,17 +1044,6 @@ impl Session {
         text: &str,
         metadata: Value,
     ) -> anyhow::Result<()> {
-        self.stage_source_message_with_attachments(kennedy, text, metadata, &[], false)
-    }
-
-    fn stage_source_message_with_attachments(
-        &mut self,
-        kennedy: bool,
-        text: &str,
-        mut metadata: Value,
-        attachments: &[ResolvedObjectDelivery],
-        reuse_pending_objects: bool,
-    ) -> anyhow::Result<()> {
         let external_event_id = metadata
             .get("externalEventId")
             .and_then(Value::as_str)
@@ -1074,55 +1058,13 @@ impl Session {
         } else {
             "User message"
         };
-        let mut object_ids = Vec::with_capacity(attachments.len());
-        let mut descriptors = Vec::with_capacity(attachments.len());
-        for attachment in attachments {
-            let object_id =
-                if attachment.object.object_id.starts_with("pending:") && !reuse_pending_objects {
-                    self.journal
-                        .stage_object(
-                            now(),
-                            attachment.object.media_type.clone(),
-                            Some(attachment.object.file_name.clone()),
-                            json!({
-                                "source":"kennedy-direct-message",
-                                "kind":attachment.object.transport_kind,
-                            }),
-                            &attachment.object.bytes,
-                        )?
-                        .to_string()
-                } else {
-                    attachment.object.object_id.clone()
-                };
-            let mut descriptor = json!({
-                "fileName":attachment.file_name,
-                "mimeType":attachment.object.media_type,
-                "sizeBytes":attachment.object.bytes.len(),
-            });
-            if let Some(kind) = attachment.object.transport_kind.as_deref() {
-                descriptor["kind"] = json!(kind);
-            }
-            if object_id.starts_with("pending:") {
-                descriptor["pendingId"] = json!(object_id);
-            } else {
-                descriptor["objectId"] = json!(object_id);
-            }
-            object_ids.push(object_id);
-            descriptors.push(descriptor);
-        }
-        if !descriptors.is_empty() {
-            if !metadata.is_object() {
-                metadata = json!({});
-            }
-            metadata["attachments"] = json!(descriptors);
-        }
         self.journal.create_box(
             now(),
             name,
             owner,
             BoxContent {
                 text: text.into(),
-                objects: object_ids.clone(),
+                objects: Vec::new(),
                 metadata: metadata.clone(),
             },
         )?;
@@ -1131,10 +1073,6 @@ impl Session {
             "content":text,
             "metadata":metadata,
         });
-        if !object_ids.is_empty() {
-            transcript["objects"] = json!(object_ids);
-            transcript["attachments"] = json!(descriptors);
-        }
         if let Some(id) = &external_event_id {
             transcript["externalEventId"] = json!(id);
         }
@@ -1508,98 +1446,28 @@ impl Session {
         }
     }
 
-    fn record_provider_usage(
+    fn project_descendant<T>(
         &mut self,
-        manifest_hash: &str,
-        usage: Option<&kcode_codex_runtime_v2::TokenUsage>,
-        previous: Option<&kcode_codex_runtime_v2::TokenUsage>,
-    ) -> anyhow::Result<()> {
-        let context_bytes = self.journal.state().render().len() as u64;
-        let raw_context_tokens = self.journal.state().projection().raw_estimated_tokens;
-        let provider_data = usage
-            .map(|usage| {
-                let previous_input = previous.map(|value| value.input_tokens).unwrap_or_default();
-                let previous_cached = previous
-                    .map(|value| value.cached_input_tokens)
-                    .unwrap_or_default();
-                let previous_output = previous
-                    .map(|value| value.output_tokens)
-                    .unwrap_or_default();
-                let previous_thinking = previous
-                    .map(|value| value.reasoning_output_tokens)
-                    .unwrap_or_default();
-                let input_delta = usage.input_tokens.saturating_sub(previous_input);
-                let cached_delta = usage.cached_input_tokens.saturating_sub(previous_cached);
-                let output_delta = usage.output_tokens.saturating_sub(previous_output);
-                let thinking_delta = usage
-                    .reasoning_output_tokens
-                    .saturating_sub(previous_thinking);
-                let normalized = kcode_intelligence_router::TokenUsage {
-                    input_tokens: input_delta.saturating_sub(cached_delta),
-                    cached_input_tokens: cached_delta,
-                    thinking_tokens: thinking_delta,
-                    output_tokens: output_delta.saturating_sub(thinking_delta),
-                };
-                let mut provider_data = json!({
-                    "usageIsDelta":true,
-                    "providerModel":self.runtime.model,
-                    "nonCachedInputTokens":normalized.input_tokens,
-                    "cachedInputTokens":normalized.cached_input_tokens,
-                    "thinkingTokens":normalized.thinking_tokens,
-                    "outputTokens":normalized.output_tokens,
-                    "providerCumulativeInputTokens":usage.input_tokens,
-                    "providerCumulativeOutputTokens":usage.output_tokens,
-                    "providerCumulativeCachedInputTokens":usage.cached_input_tokens,
-                    "providerCumulativeReasoningOutputTokens":usage.reasoning_output_tokens,
-                });
-                attach_cost_estimate(
-                    &mut provider_data,
-                    kcode_intelligence_router::estimate_token_cost(&self.runtime.model, normalized)
-                        .as_ref(),
-                );
-                provider_data
-            })
-            .unwrap_or(Value::Null);
-        self.journal.record(
-            now(),
-            EventKind::ProviderReceipt {
-                manifest_hash: manifest_hash.into(),
-                input_tokens: usage
-                    .map(|usage| usage.last_input_tokens.unwrap_or(usage.input_tokens)),
-                output_tokens: usage
-                    .map(|usage| usage.last_output_tokens.unwrap_or(usage.output_tokens)),
-                context_bytes: Some(context_bytes),
-                raw_context_tokens: Some(raw_context_tokens),
-                provider_data,
-            },
-        )?;
-        Ok(())
-    }
-
-    fn record_descendant_usage(
-        &mut self,
-        source: &str,
-        parent_operation_id: Uuid,
-        model: &str,
-        usage: Option<&kcode_intelligence_router::TokenUsage>,
-        cost: Option<&kcode_intelligence_router::CostEstimate>,
-    ) -> anyhow::Result<()> {
-        let event = descendant_provider_receipt(source, parent_operation_id, model, usage, cost);
-        self.journal.record(now(), event)?;
-        Ok(())
-    }
-
-    fn record_descendant_metering(
-        &mut self,
-        source: &str,
-        parent_operation_id: Uuid,
-        model: &str,
-        metering: &kcode_intelligence_router::Metering,
-        cost: Option<&kcode_intelligence_router::CostEstimate>,
-    ) -> anyhow::Result<()> {
-        let event = descendant_metering_receipt(source, parent_operation_id, model, metering, cost);
-        self.journal.record(now(), event)?;
-        Ok(())
+        outcome: Result<kcode_intelligence_router::Accounted<T>, super::ApiError>,
+    ) -> anyhow::Result<T> {
+        match outcome {
+            Ok(accounted) => {
+                kcode_intelligence_chatend::record_descendant_receipt(
+                    &mut self.journal,
+                    &accounted.receipt,
+                )?;
+                Ok(accounted.value)
+            }
+            Err(error) => {
+                if let Some(receipt) = &error.receipt {
+                    kcode_intelligence_chatend::record_descendant_receipt(
+                        &mut self.journal,
+                        receipt,
+                    )?;
+                }
+                Err(error.into())
+            }
+        }
     }
 
     async fn run_agent_loop<C, F>(
@@ -1629,6 +1497,10 @@ impl Session {
             let projection = self.journal.state().projection();
             let input = projection.render();
             let manifest_hash = hex::encode(Sha256::digest(input.as_bytes()));
+            let mut provider_accounting = kcode_intelligence_chatend::TopLevelCall::new(
+                manifest_hash.clone(),
+                self.runtime.model.clone(),
+            );
             self.journal.record(
                 now(),
                 EventKind::InferenceSubmitted {
@@ -1659,7 +1531,6 @@ impl Session {
             let mut used_tool = false;
             let mut emitted_response = false;
             let mut pending_freeform_write: Option<PendingFreeformWrite> = None;
-            let mut last_provider_usage: Option<kcode_codex_runtime_v2::TokenUsage> = None;
             let completed = loop {
                 let event = turn
                     .next_event()
@@ -1677,12 +1548,7 @@ impl Session {
                         checkpoint(self.snapshot()?).await?;
                     }
                     kcode_codex_runtime_v2::AgentEvent::UsageUpdated(usage) => {
-                        self.record_provider_usage(
-                            &manifest_hash,
-                            Some(&usage),
-                            last_provider_usage.as_ref(),
-                        )?;
-                        last_provider_usage = Some(usage);
+                        provider_accounting.usage_updated(&mut self.journal, &now(), &usage)?;
                         checkpoint(self.snapshot()?).await?;
                     }
                     kcode_codex_runtime_v2::AgentEvent::ToolCall(native) => {
@@ -1830,15 +1696,7 @@ impl Session {
                     kcode_codex_runtime_v2::AgentEvent::Completed(completed) => break completed,
                 }
             };
-            if completed.usage.as_ref() != last_provider_usage.as_ref() {
-                self.record_provider_usage(
-                    &manifest_hash,
-                    completed.usage.as_ref(),
-                    last_provider_usage.as_ref(),
-                )?;
-            } else if completed.usage.is_none() && last_provider_usage.is_none() {
-                self.record_provider_usage(&manifest_hash, None, None)?;
-            }
+            provider_accounting.completed(&mut self.journal, &now(), completed.usage.as_ref())?;
             let mut completion_recovery = ContextRecovery::NotNeeded;
             let answer = if let Some(pending) = pending_freeform_write {
                 let result_metadata = pending.request.clone();
@@ -1968,9 +1826,6 @@ impl Session {
             let mut host = KennedySubagentHost {
                 session: self,
                 captures: HashMap::new(),
-                parent_operation_id,
-                pending_manifest_hash: None,
-                provider_model: None,
             };
             runtime
                 .run(
@@ -2208,15 +2063,9 @@ impl Session {
             )
         };
 
-        let private_sessions = self
-            .api
-            .telegram_private_sessions()
-            .await
-            .context("discovering established Telegram private chats")?;
-        let private_session = private_sessions
-            .into_iter()
-            .find(|session| session.telegram_user_id == telegram_user_id)
-            .context("This Telegram user has not opened a private chat with Kennedy.")?;
+        self.api
+            .directory_user(telegram_user_id)
+            .context("resolving the authorized Telegram user")?;
         if !attachments.is_empty() {
             let maximum = self.api.telegram_max_media_bytes();
             for attachment in &attachments {
@@ -2228,158 +2077,20 @@ impl Session {
                 );
             }
         }
-        let expected_conversation_id = private_session.current_conversation_id;
-
-        let directory_user = self
-            .api
-            .directory_user(telegram_user_id)
-            .context("resolving the authorized Telegram user")?;
-        let user_root = directory_user
-            .root_node_id
-            .clone()
-            .context("The Telegram user's Kennedy root is not ready.")?;
-        let histories = self
-            .api
-            .history_list()
-            .await
-            .context("listing Kennedy sessions for the Telegram user")?;
-        let selected = active_direct_session_for_user(
-            &histories,
-            &user_root,
-            expected_conversation_id.as_deref(),
-        );
-        let current_session_id = self.journal.state().metadata.session_id.clone();
-        let metadata = json!({
-            "kind":"telegram-direct-message",
-            "sentByKennedy":true,
-            "telegramUserId":telegram_user_id,
-            "sourceSessionId":current_session_id,
-        });
-
-        let conversation_id = if selected.map(|record| record.id.as_str())
-            == Some(current_session_id.as_str())
-        {
-            self.stage_source_message_with_attachments(
-                true,
-                &message,
-                metadata,
-                &attachments,
-                true,
-            )?;
-            current_session_id
-        } else if let Some(summary) = selected {
-            let id = summary.id.clone();
-            let record = self
-                .api
-                .history_get_session(&id)
-                .await
-                .context("opening the Telegram user's active Kennedy session")?;
-            let state = record.state.clone();
-            let session_type = state
-                .get("sessionType")
-                .and_then(Value::as_str)
-                .unwrap_or("conversation")
-                .to_owned();
-            let mut options =
-                SessionOptions::conversation(session_type, string_values(state.get("rootNodeIds")));
-            options.reference_root_node_ids = string_values(state.get("referenceRootNodeIds"));
-            options.channel = state.get("channel").cloned().unwrap_or(Value::Null);
-            options.free_time = state.get("freeTime").cloned().unwrap_or(Value::Null);
-            options.orchestration = state
-                .get("orchestration")
-                .cloned()
-                .unwrap_or_else(|| json!({"owner":"backend","status":"idle"}));
-            let mut target = Session::new(
-                self.api.clone(),
-                self.manuals.clone(),
-                self.runtime.clone(),
-                options,
-                Some(&state),
-            )
-            .await?;
-            target.stage_source_message_with_attachments(
-                true,
-                &message,
-                metadata,
-                &attachments,
-                false,
-            )?;
-            self.api
-                .history_checkpoint(
-                    &id,
-                    kcode_session_history::Checkpoint {
-                        expected_version: record.version,
-                        state: target.snapshot()?,
-                        user_activity: false,
-                    },
-                )
-                .await
-                .context("attaching the direct message to the active Kennedy session")?;
-            id
-        } else {
-            let kennedy_root = self.api.kennedy_root_node_id().to_owned();
-            let mut options =
-                SessionOptions::conversation("telegram", vec![user_root, kennedy_root]);
-            options.channel = json!({
-                "kind":"telegram",
-                "telegramUserId":telegram_user_id,
-                "username":directory_user.current_username.or(Some(directory_user.handle)),
-                "displayName":directory_user.display_name,
-            });
-            let mut target = Session::new(
-                self.api.clone(),
-                self.manuals.clone(),
-                self.runtime.clone(),
-                options,
-                None,
-            )
-            .await?;
-            target.stage_source_message_with_attachments(
-                true,
-                &message,
-                metadata,
-                &attachments,
-                false,
-            )?;
-            let state = target.snapshot()?;
-            let id = target.journal.state().metadata.session_id.clone();
-            self.api
-                .history_register(kcode_session_history::RegisterSession {
-                    id: id.clone(),
-                    started_at: target.started_at.clone(),
-                    state,
-                })
-                .await
-                .context("creating a Telegram session for the direct message")?;
-            id
-        };
 
         let caption_attachment = telegram_caption_attachment(&attachments, &message);
-        let mut delivery_expected_conversation_id = expected_conversation_id.as_deref();
         if !message.is_empty() && caption_attachment.is_none() {
             self.api
-                .telegram_send_private_message(
-                    telegram_user_id,
-                    &conversation_id,
-                    expected_conversation_id.as_deref(),
-                    &message,
-                )
+                .telegram_send_cold_private_message(telegram_user_id, &message)
                 .await
                 .context("sending the Telegram direct message")?;
-            delivery_expected_conversation_id = Some(&conversation_id);
         }
         for (index, attachment) in attachments.iter().enumerate() {
             let mut delivery_object = attachment.object.clone();
             delivery_object.file_name = attachment.file_name.clone();
             let caption = (caption_attachment == Some(index)).then_some(message.as_str());
             self.api
-                .telegram_send_private_object(
-                    telegram_user_id,
-                    &conversation_id,
-                    delivery_expected_conversation_id,
-                    &delivery_object,
-                    caption,
-                )
+                .telegram_send_cold_private_object(telegram_user_id, &delivery_object, caption)
                 .await
                 .with_context(|| {
                     format!(
@@ -2387,7 +2098,6 @@ impl Session {
                         attachment.object.object_id
                     )
                 })?;
-            delivery_expected_conversation_id = Some(&conversation_id);
         }
         let attachment_summary = match attachments.len() {
             0 => String::new(),
@@ -2395,7 +2105,7 @@ impl Session {
             count => format!(" with {count} attachments"),
         };
         Ok(format!(
-            "Sent a Telegram direct message{attachment_summary} to user {telegram_user_id} and attached it to session {conversation_id}."
+            "Sent a cold Telegram direct message{attachment_summary} to user {telegram_user_id}."
         ))
     }
 
@@ -2651,11 +2361,12 @@ impl Session {
                 let user_id = self
                     .root_node_ids
                     .first()
-                    .context("session has no user root for intelligence accounting")?;
-                let result = self
+                    .context("session has no user root for intelligence accounting")?
+                    .clone();
+                let outcome = self
                     .api
                     .search(
-                        user_id,
+                        &user_id,
                         kcode_intelligence_router::SearchRequest {
                             question: nonempty_string(&call.arguments, "question", 4_000)?,
                             model,
@@ -2663,14 +2374,8 @@ impl Session {
                             parent_operation_id: Some(operation_id),
                         },
                     )
-                    .await?;
-                self.record_descendant_usage(
-                    "web_search",
-                    operation_id,
-                    &result.model,
-                    result.usage.as_ref(),
-                    result.cost.as_ref(),
-                )?;
+                    .await;
+                let result = self.project_descendant(outcome)?;
                 render_web_search_result(&result)
             }
             "WebFetch" => {
@@ -2762,11 +2467,12 @@ impl Session {
                 let user_id = self
                     .root_node_ids
                     .first()
-                    .context("session has no user root for intelligence accounting")?;
-                let result = self
+                    .context("session has no user root for intelligence accounting")?
+                    .clone();
+                let outcome = self
                     .api
                     .transcribe_audio(
-                        user_id,
+                        &user_id,
                         &model,
                         &prompt,
                         object.bytes,
@@ -2774,14 +2480,8 @@ impl Session {
                         &object.media_type,
                         operation_id,
                     )
-                    .await?;
-                self.record_descendant_metering(
-                    "audio_transcription",
-                    operation_id,
-                    &result.model,
-                    &result.metering,
-                    result.cost.as_ref(),
-                )?;
+                    .await;
+                let result = self.project_descendant(outcome)?;
                 render_audio_transcription_result(
                     &object.object_id,
                     &object.file_name,
@@ -2799,11 +2499,12 @@ impl Session {
                 let user_id = self
                     .root_node_ids
                     .first()
-                    .context("session has no user root for intelligence accounting")?;
-                let result = self
+                    .context("session has no user root for intelligence accounting")?
+                    .clone();
+                let outcome = self
                     .api
                     .annotate_media(
-                        user_id,
+                        &user_id,
                         &model,
                         &prompt,
                         media.bytes,
@@ -2811,14 +2512,8 @@ impl Session {
                         &media.media_type,
                         operation_id,
                     )
-                    .await?;
-                self.record_descendant_usage(
-                    "media_annotation",
-                    operation_id,
-                    &result.model,
-                    result.usage.as_ref(),
-                    result.cost.as_ref(),
-                )?;
+                    .await;
+                let result = self.project_descendant(outcome)?;
                 render_media_annotation_result(
                     &media.object_id,
                     &media.file_name,
@@ -2846,17 +2541,11 @@ impl Session {
                     .first()
                     .context("session has no user root for intelligence accounting")?
                     .clone();
-                let result = self
+                let outcome = self
                     .api
                     .generate_image(&user_id, &model, &prompt, references, operation_id)
-                    .await?;
-                self.record_descendant_usage(
-                    "image_generation",
-                    operation_id,
-                    &result.model,
-                    result.usage.as_ref(),
-                    result.cost.as_ref(),
-                )?;
+                    .await;
+                let result = self.project_descendant(outcome)?;
                 let size = result.bytes.len();
                 let file_name =
                     format!("generated-image.{}", image_extension(&result.content_type));
@@ -3622,217 +3311,9 @@ impl kcode_agent_runtime::Host for KennedySubagentHost<'_> {
         })
     }
 
-    fn record(&mut self, label: &str, value: Value) -> anyhow::Result<()> {
-        if label == "subagent_started" {
-            self.provider_model = Some(
-                value
-                    .get("providerModel")
-                    .and_then(Value::as_str)
-                    .context("subagent start record has no provider model")?
-                    .to_owned(),
-            );
-        }
-        if label == "subagent_inference_submitted" {
-            anyhow::ensure!(
-                self.pending_manifest_hash.is_none(),
-                "subagent submitted another inference before recording the prior receipt"
-            );
-            self.pending_manifest_hash = Some(
-                value
-                    .get("manifestHash")
-                    .and_then(Value::as_str)
-                    .context("subagent inference submission has no manifest hash")?
-                    .to_owned(),
-            );
-        }
-        if label == "subagent_provider_receipt" {
-            let manifest_hash = self
-                .pending_manifest_hash
-                .take()
-                .context("subagent provider receipt has no matching inference submission")?;
-            let event = subagent_provider_receipt(
-                manifest_hash,
-                self.parent_operation_id,
-                self.provider_model.as_deref(),
-                &value,
-            )?;
-            self.session.journal.record(now(), event)?;
-            return Ok(());
-        }
-        self.session.journal.record(
-            now(),
-            EventKind::Note {
-                label: label.into(),
-                value,
-            },
-        )?;
-        Ok(())
+    fn record(&mut self, event: kcode_agent_runtime::AuditEvent) -> anyhow::Result<()> {
+        kcode_intelligence_chatend::record_subagent_event(&mut self.session.journal, &now(), &event)
     }
-}
-
-fn subagent_provider_receipt(
-    manifest_hash: String,
-    parent_operation_id: Uuid,
-    model: Option<&str>,
-    receipt: &Value,
-) -> anyhow::Result<EventKind> {
-    let round = receipt
-        .get("round")
-        .and_then(Value::as_u64)
-        .context("subagent provider receipt has no round")?;
-    let mut provider_data = match receipt.get("usage") {
-        None | Some(Value::Null) => json!({
-            "source":"subagent",
-            "parentOperationId":parent_operation_id,
-            "providerModel":model,
-            "round":round,
-            "usageIsDelta":true,
-            "metering":"unavailable",
-            "reportedUsage":Value::Null,
-        }),
-        Some(usage) => {
-            let input = provider_usage_u64(usage, "inputTokens")?;
-            let cached = provider_usage_u64(usage, "cachedInputTokens")?;
-            let output = provider_usage_u64(usage, "outputTokens")?;
-            let thinking = provider_usage_u64(usage, "reasoningOutputTokens")?;
-            let normalized = kcode_intelligence_router::TokenUsage {
-                input_tokens: input.saturating_sub(cached),
-                cached_input_tokens: cached,
-                thinking_tokens: thinking,
-                output_tokens: output.saturating_sub(thinking),
-            };
-            json!({
-                "source":"subagent",
-                "parentOperationId":parent_operation_id,
-                "providerModel":model,
-                "round":round,
-                "usageIsDelta":true,
-                "metering":"tokens",
-                "nonCachedInputTokens":normalized.input_tokens,
-                "cachedInputTokens":normalized.cached_input_tokens,
-                "thinkingTokens":normalized.thinking_tokens,
-                "outputTokens":normalized.output_tokens,
-                "providerInputTokens":input,
-                "providerOutputTokens":output,
-                "reportedUsage":usage,
-            })
-        }
-    };
-    let cost = receipt
-        .get("usage")
-        .filter(|usage| !usage.is_null())
-        .and_then(|usage| {
-            let input = provider_usage_u64(usage, "inputTokens").ok()?;
-            let cached = provider_usage_u64(usage, "cachedInputTokens").ok()?;
-            let output = provider_usage_u64(usage, "outputTokens").ok()?;
-            let thinking = provider_usage_u64(usage, "reasoningOutputTokens").ok()?;
-            kcode_intelligence_router::estimate_token_cost(
-                model?,
-                kcode_intelligence_router::TokenUsage {
-                    input_tokens: input.saturating_sub(cached),
-                    cached_input_tokens: cached,
-                    thinking_tokens: thinking,
-                    output_tokens: output.saturating_sub(thinking),
-                },
-            )
-        });
-    attach_cost_estimate(&mut provider_data, cost.as_ref());
-    Ok(EventKind::ProviderReceipt {
-        manifest_hash,
-        // A subagent's provider input is not Kennedy's Chatend input. Keep it
-        // out of the current-context calibration while still accumulating its
-        // exact token categories in the session status.
-        input_tokens: None,
-        output_tokens: None,
-        context_bytes: None,
-        raw_context_tokens: None,
-        provider_data,
-    })
-}
-
-fn provider_usage_u64(usage: &Value, key: &str) -> anyhow::Result<u64> {
-    usage
-        .get(key)
-        .and_then(Value::as_u64)
-        .with_context(|| format!("subagent provider usage has no {key}"))
-}
-
-fn descendant_provider_receipt(
-    source: &str,
-    parent_operation_id: Uuid,
-    model: &str,
-    usage: Option<&kcode_intelligence_router::TokenUsage>,
-    cost: Option<&kcode_intelligence_router::CostEstimate>,
-) -> EventKind {
-    let mut provider_data = match usage {
-        None => json!({
-            "source":source,
-            "parentOperationId":parent_operation_id,
-            "providerModel":model,
-            "usageIsDelta":true,
-            "metering":"unavailable",
-        }),
-        Some(usage) => json!({
-            "source":source,
-            "parentOperationId":parent_operation_id,
-            "providerModel":model,
-            "usageIsDelta":true,
-            "metering":"tokens",
-            "nonCachedInputTokens":usage.input_tokens,
-            "cachedInputTokens":usage.cached_input_tokens,
-            "thinkingTokens":usage.thinking_tokens,
-            "outputTokens":usage.output_tokens,
-            "reportedUsage":usage,
-        }),
-    };
-    attach_cost_estimate(&mut provider_data, cost);
-    descendant_receipt_event(provider_data)
-}
-
-fn descendant_metering_receipt(
-    source: &str,
-    parent_operation_id: Uuid,
-    model: &str,
-    metering: &kcode_intelligence_router::Metering,
-    cost: Option<&kcode_intelligence_router::CostEstimate>,
-) -> EventKind {
-    if let kcode_intelligence_router::Metering::Tokens(usage) = metering {
-        let mut provider_data = json!({
-            "source":source,
-            "parentOperationId":parent_operation_id,
-            "providerModel":model,
-            "usageIsDelta":true,
-            "metering":"tokens",
-            "nonCachedInputTokens":usage.input_tokens,
-            "cachedInputTokens":usage.cached_input_tokens,
-            "thinkingTokens":usage.thinking_tokens,
-            "outputTokens":usage.output_tokens,
-            "reportedUsage":metering,
-        });
-        attach_cost_estimate(&mut provider_data, cost);
-        return descendant_receipt_event(provider_data);
-    }
-    let mut provider_data = json!({
-        "source":source,
-        "parentOperationId":parent_operation_id,
-        "providerModel":model,
-        "usageIsDelta":true,
-        "metering":metering,
-    });
-    attach_cost_estimate(&mut provider_data, cost);
-    descendant_receipt_event(provider_data)
-}
-
-fn attach_cost_estimate(
-    provider_data: &mut Value,
-    cost: Option<&kcode_intelligence_router::CostEstimate>,
-) {
-    let Some(cost) = cost else {
-        return;
-    };
-    provider_data["estimatedCostUsdNanos"] = json!(cost.usd_nanos);
-    provider_data["costAccuracy"] = json!(cost.accuracy);
-    provider_data["pricingVersion"] = json!(cost.pricing_version);
 }
 
 fn cost_summary(label: &str, estimated_cost_usd_nanos: u64, unpriced_calls: u64) -> String {
@@ -3849,17 +3330,6 @@ fn cost_summary(label: &str, estimated_cost_usd_nanos: u64, unpriced_calls: u64)
             "Estimated {label}: {pennies} pennies at standard API rates; {unpriced_calls} provider {} could not be priced.",
             if unpriced_calls == 1 { "call" } else { "calls" }
         )
-    }
-}
-
-fn descendant_receipt_event(provider_data: Value) -> EventKind {
-    EventKind::ProviderReceipt {
-        manifest_hash: format!("descendant:{}", Uuid::new_v4()),
-        input_tokens: None,
-        output_tokens: None,
-        context_bytes: None,
-        raw_context_tokens: None,
-        provider_data,
     }
 }
 
@@ -4721,47 +4191,6 @@ fn message_metadata_without_attachment_payloads(value: &Value) -> Value {
     value
 }
 
-fn string_values(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect()
-}
-
-fn active_direct_session_for_user<'a>(
-    records: &'a [SessionRecord],
-    user_root: &str,
-    expected_conversation_id: Option<&str>,
-) -> Option<&'a SessionRecord> {
-    records
-        .iter()
-        .filter(|record| {
-            if record.phase != "active" {
-                return false;
-            }
-            let state = &record.state;
-            matches!(
-                state.get("sessionType").and_then(Value::as_str),
-                Some("conversation" | "telegram")
-            ) && string_values(state.get("rootNodeIds"))
-                .iter()
-                .any(|root| root == user_root)
-        })
-        .min_by_key(|record| {
-            let session_type = record.state.get("sessionType").and_then(Value::as_str);
-            if expected_conversation_id == Some(record.id.as_str()) {
-                0
-            } else if session_type == Some("telegram") {
-                1
-            } else {
-                2
-            }
-        })
-}
-
 #[derive(Debug, Eq, PartialEq)]
 struct BoxTextObject {
     box_id: BoxId,
@@ -4861,7 +4290,7 @@ fn render_box_text_objects(objects: &[BoxTextObject]) -> String {
 fn call_ktool_definition() -> kcode_codex_runtime_v2::DynamicTool {
     kcode_codex_runtime_v2::DynamicTool::new(
         "call_ktool",
-        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may display an object with an optional recipient-visible filename using {\"name\":\"EmitObject\",\"arguments\":{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}}. She may send an authorized user a private Telegram message, optionally with Kweb object attachments and per-attachment delivery filenames, from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\",{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}]}}. Kennedy may likewise send text and attachments to any known Telegram group, addressed by its canonical Kweb root, with {\"name\":\"SendTelegramGroupMessage\",\"arguments\":{\"group\":{\"rootNodeId\":\"AAAAAAAE\"},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\"]}}.",
+        "Call one Kennedy Ktool. The provider function remains registered even if its explaining system-prompt box is dehydrated. Kennedy may display an object with an optional recipient-visible filename using {\"name\":\"EmitObject\",\"arguments\":{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}}. She may make an out-of-band cold delivery to an authorized user's private Telegram chat, optionally with Kweb object attachments and per-attachment delivery filenames, from any session with {\"name\":\"SendTelegramDM\",\"arguments\":{\"user\":{\"telegramUserId\":42},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\",{\"objectId\":\"AAECAwQF\",\"fileName\":\"report.pdf\"}]}}. Kennedy may likewise send text and attachments to any known Telegram group, addressed by its canonical Kweb root, with {\"name\":\"SendTelegramGroupMessage\",\"arguments\":{\"group\":{\"rootNodeId\":\"AAAAAAAE\"},\"message\":\"Exact message text.\",\"attachments\":[\"pending:1\"]}}.",
         json!({
             "type":"object",
             "additionalProperties":false,
@@ -5337,28 +4766,6 @@ mod tests {
 
     use super::*;
 
-    fn session_record(overrides: Value) -> SessionRecord {
-        let mut record = json!({
-            "id":"session",
-            "phase":"active",
-            "started_at":"2026-07-30T00:00:00Z",
-            "updated_at":"2026-07-30T00:00:00Z",
-            "state":{},
-            "provenance_id":null,
-            "version":1,
-            "last_user_message_at":null,
-            "ended_at":null,
-            "ingress_failure_count":0,
-            "ingress_failures":[],
-            "ingress_next_attempt_at":null
-        });
-        record
-            .as_object_mut()
-            .unwrap()
-            .extend(overrides.as_object().unwrap().clone());
-        serde_json::from_value(record).unwrap()
-    }
-
     #[test]
     fn wakeup_opening_uses_the_acquired_marker_verbatim() {
         let marker = DateTime::parse_from_rfc3339("2026-07-28T04:00:00Z")
@@ -5367,30 +4774,6 @@ mod tests {
         assert_eq!(
             wakeup_opening(marker),
             "The time is 04:00 UTC on 2026-07-28. Determine whether you have any messages you would like to send the user"
-        );
-    }
-
-    #[test]
-    fn cold_dm_prefers_the_transport_binding_then_an_active_private_session() {
-        let records = vec![
-            session_record(
-                json!({"id":"browser","phase":"active","state":{"sessionType":"conversation","rootNodeIds":["user"]}}),
-            ),
-            session_record(
-                json!({"id":"telegram","phase":"active","state":{"sessionType":"telegram","rootNodeIds":["user"]}}),
-            ),
-            session_record(
-                json!({"id":"wakeup","phase":"active","state":{"sessionType":"wakeup","rootNodeIds":["user"]}}),
-            ),
-        ];
-        assert_eq!(
-            active_direct_session_for_user(&records, "user", Some("browser"))
-                .map(|record| record.id.as_str()),
-            Some("browser")
-        );
-        assert_eq!(
-            active_direct_session_for_user(&records, "user", None).map(|record| record.id.as_str()),
-            Some("telegram")
         );
     }
 
@@ -5538,28 +4921,49 @@ mod tests {
                 },
             )
             .unwrap();
-        journal
-            .record(
-                "t3",
-                subagent_provider_receipt(
-                    "subagent-manifest".into(),
-                    Uuid::nil(),
-                    Some("gpt-5.6-sol"),
-                    &json!({
-                        "round":1,
-                        "usage":{
-                            "inputTokens":250,
-                            "cachedInputTokens":50,
-                            "outputTokens":60,
-                            "reasoningOutputTokens":20,
-                            "lastInputTokens":250,
-                            "lastOutputTokens":60,
-                        }
-                    }),
-                )
-                .unwrap(),
-            )
-            .unwrap();
+        let receipt = serde_json::from_value(json!({
+            "version":3,
+            "id":Uuid::new_v4(),
+            "recordedAt":"2026-07-31T00:00:00Z",
+            "userId":"user",
+            "operationId":Uuid::new_v4(),
+            "parentOperationId":Uuid::nil(),
+            "operation":"agent_turn",
+            "requestedModel":"gpt-5.6-sol",
+            "actualModel":"gpt-5.6-sol",
+            "metering":{
+                "kind":"tokens",
+                "inputTokens":200,
+                "cachedInputTokens":50,
+                "thinkingTokens":20,
+                "outputTokens":40,
+            },
+            "cost":{
+                "usdNanos":2_825_000,
+                "accuracy":"exact",
+                "pricingVersion":"kennedy-provider-pricing-2026-07-30",
+            },
+        }))
+        .unwrap();
+        kcode_intelligence_chatend::record_subagent_event(
+            &mut journal,
+            "t3",
+            &kcode_agent_runtime::AuditEvent::ProviderReceipt {
+                parent_operation_id: Uuid::nil(),
+                round: 1,
+                manifest_hash: "subagent-manifest".into(),
+                usage: Some(kcode_codex_runtime_v2::TokenUsage {
+                    input_tokens: 250,
+                    cached_input_tokens: 50,
+                    output_tokens: 60,
+                    reasoning_output_tokens: 20,
+                    last_input_tokens: Some(250),
+                    last_output_tokens: Some(60),
+                }),
+                receipt,
+            },
+        )
+        .unwrap();
 
         let status = &journal.state().projection().status;
         assert_eq!(status.current_context_tokens, 400);
@@ -5582,43 +4986,6 @@ mod tests {
         assert_eq!(provider_data["providerModel"], "gpt-5.6-sol");
         assert_eq!(provider_data["estimatedCostUsdNanos"], 2_825_000);
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn descendant_tool_usage_keeps_router_categories_exact_and_exclusive() {
-        let operation_id = Uuid::new_v4();
-        let usage = kcode_intelligence_router::TokenUsage {
-            input_tokens: 200,
-            cached_input_tokens: 50,
-            thinking_tokens: 30,
-            output_tokens: 40,
-        };
-        let cost =
-            kcode_intelligence_router::estimate_token_cost("gemini-3.1-flash-lite", usage).unwrap();
-        let receipt = descendant_provider_receipt(
-            "web_search",
-            operation_id,
-            "gemini-3.1-flash-lite",
-            Some(&usage),
-            Some(&cost),
-        );
-        let EventKind::ProviderReceipt {
-            input_tokens,
-            provider_data,
-            ..
-        } = receipt
-        else {
-            panic!("descendant usage was not stored as a provider receipt");
-        };
-
-        assert_eq!(input_tokens, None);
-        assert_eq!(provider_data["source"], "web_search");
-        assert_eq!(provider_data["parentOperationId"], operation_id.to_string());
-        assert_eq!(provider_data["nonCachedInputTokens"], 200);
-        assert_eq!(provider_data["cachedInputTokens"], 50);
-        assert_eq!(provider_data["estimatedCostUsdNanos"], cost.usd_nanos);
-        assert_eq!(provider_data["thinkingTokens"], 30);
-        assert_eq!(provider_data["outputTokens"], 40);
     }
 
     #[test]
@@ -5902,6 +5269,14 @@ mod tests {
                 .description
                 .contains("SendTelegramGroupMessage")
         );
+    }
+
+    #[test]
+    fn telegram_dm_tool_describes_out_of_band_cold_delivery() {
+        let description = call_ktool_definition().description;
+        assert!(description.contains("out-of-band cold delivery"));
+        assert!(description.contains("SendTelegramDM"));
+        assert!(description.contains("EmitObject"));
     }
 
     #[test]

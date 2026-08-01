@@ -2005,6 +2005,7 @@ dependencies = [
  "kcode-audio-ingress",
  "kcode-session-history",
  "serde_json",
+ "sha2 0.10.9",
  "tracing",
  "uuid",
 ]
@@ -2116,6 +2117,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-intelligence-chatend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kcode-agent-runtime",
+ "kcode-codex-runtime-v2",
+ "kcode-intelligence-router",
+ "kcode-session-history",
+ "serde_json",
+]
+
+[[package]]
 name = "kcode-intelligence-router"
 version = "0.2.1"
 dependencies = [
@@ -2132,18 +2145,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "kcode-kmap"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "kcode-commit-session",
- "kcode-kweb-db",
- "kcode-server-object-envelopes",
- "rusqlite",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2172,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-kweb-db"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "base64",
  "chrono",
@@ -2180,6 +2181,18 @@ dependencies = [
  "fs2",
  "hex",
  "rand 0.9.5",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "kcode-kweb-manager"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "kcode-commit-session",
+ "kcode-kweb-db",
+ "kcode-server-object-envelopes",
+ "rusqlite",
  "sha2 0.10.9",
 ]
 
@@ -2252,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-telegram-identity"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2266,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-tg-kennedy-bot"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2357,11 +2370,12 @@ dependencies = [
  "kcode-dev-tools",
  "kcode-dev-tools-chatend",
  "kcode-history-ingress-context",
+ "kcode-intelligence-chatend",
  "kcode-intelligence-router",
- "kcode-kmap",
  "kcode-kmap-size",
  "kcode-kweb-context",
  "kcode-kweb-db",
+ "kcode-kweb-manager",
  "kcode-server-object-envelopes",
  "kcode-session-history",
  "kcode-speech-classification",

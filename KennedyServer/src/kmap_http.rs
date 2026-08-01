@@ -11,7 +11,7 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use kcode_kmap::{ErrorKind as KmapErrorKind, Kmap};
+use kcode_kweb_manager::{ErrorKind as KmapErrorKind, KwebManager};
 use kcode_kweb_db::{
     Config, Error as KwebError, KwebDb, Node, NodeData, NodeId, ObjectId, Owner, Provenance,
 };
@@ -49,7 +49,7 @@ pub(crate) struct SystemRoots {
 
 #[derive(Clone)]
 pub(crate) struct Service {
-    kmap: Kmap,
+    kmap: KwebManager,
     roots: SystemRoots,
     telegram: kcode_tg_kennedy_bot::Service,
     history: kcode_session_history::SessionHistory,
@@ -57,7 +57,7 @@ pub(crate) struct Service {
 
 impl Service {
     pub(crate) fn new(
-        kmap: Kmap,
+        kmap: KwebManager,
         roots: SystemRoots,
         telegram: kcode_tg_kennedy_bot::Service,
         history: kcode_session_history::SessionHistory,
@@ -139,8 +139,8 @@ impl From<KwebError> for ApiError {
     }
 }
 
-impl From<kcode_kmap::Error> for ApiError {
-    fn from(error: kcode_kmap::Error) -> Self {
+impl From<kcode_kweb_manager::Error> for ApiError {
+    fn from(error: kcode_kweb_manager::Error) -> Self {
         match error.kind() {
             KmapErrorKind::InvalidInput => Self::invalid(error.to_string()),
             KmapErrorKind::NotFound => Self::not_found(error.to_string()),
@@ -164,7 +164,7 @@ pub(crate) fn initialize(
     kweb_root: &FilePath,
     config: Config,
     identity_database: &FilePath,
-) -> anyhow::Result<(Kmap, SystemRoots)> {
+) -> anyhow::Result<(KwebManager, SystemRoots)> {
     let mut identity = Connection::open(identity_database).with_context(|| {
         format!(
             "opening identity database {} for system roots",
@@ -234,7 +234,7 @@ pub(crate) fn initialize(
     database
         .get_node(roots.kennedy)
         .map_err(anyhow::Error::new)?;
-    let kmap = Kmap::open(database, identity_database)
+    let kmap = KwebManager::open(database, identity_database)
         .map_err(anyhow::Error::new)
         .context("opening Kmap application service")?;
     Ok((kmap, roots))
@@ -504,7 +504,7 @@ async fn get_history(
     })))
 }
 
-fn node_response(kmap: &Kmap, node: &Node) -> Result<Value, ApiError> {
+fn node_response(kmap: &KwebManager, node: &Node) -> Result<Value, ApiError> {
     let mut seen = HashSet::new();
     let mut connection_summaries = Vec::new();
     for connection_id in node
@@ -560,7 +560,7 @@ fn provenance_response(provenance: &StoredProvenance) -> Value {
     })
 }
 
-fn load_provenance(kmap: &Kmap, id: ObjectId) -> Result<StoredProvenance, ApiError> {
+fn load_provenance(kmap: &KwebManager, id: ObjectId) -> Result<StoredProvenance, ApiError> {
     let bytes = kmap.get_object(id)?;
     decode_provenance(&bytes)
         .map_err(|error| ApiError::internal(format!("invalid provenance object {id}: {error}")))
@@ -673,10 +673,9 @@ mod tests {
         let history = kcode_session_history::SessionHistory::open(kcode_session_history::Config {
             directory: directory.join("sessions"),
             completed_list: directory.join("completed.jsonl"),
-            provider_cost_compatibility: Some(kcode_session_history::ProviderCostCompatibility {
-                session_model: crate::legacy_session_provider_model,
-                estimator: crate::legacy_provider_cost,
-            }),
+            provider_cost_compatibility: Some(
+                kcode_intelligence_chatend::provider_cost_compatibility(),
+            ),
         })
         .unwrap();
         let mut session = history

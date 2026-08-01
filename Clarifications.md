@@ -92,12 +92,15 @@ This document records user intention with regard to Kennedy.
   KennedyServer owns node fetching, root selection, the staged mutation plan,
   synchronization timing, model-facing tool-result presentation, and commit
   decisions; it must not retain a parallel Kweb-box parser or slot reconciler.
-- After KennedyServer bootstraps and validates its application-owned roots, one
-  small typed Kmap library exclusively owns the live `KwebDb` handle. That
-  library owns typed node reads, idempotent provenance and ordinary node
-  mutations, opaque object storage, and session commits; KennedyServer retains
-  root policy and genuine HTTP presentation. Do not retain a parallel database
-  handle or route same-process Kmap calls through HTTP paths or JSON values.
+- After KennedyServer bootstraps and validates its application-owned roots,
+  `kcode-kweb-manager` exclusively owns the live `KwebDb` handle. The manager
+  owns typed node reads, idempotent provenance and ordinary node mutations,
+  opaque object storage, and session commits; KennedyServer retains root policy
+  and genuine HTTP presentation. Do not retain a parallel database handle or
+  route same-process Kmap calls through HTTP paths or JSON values. Kweb's signed
+  creating transaction is the sole durable source of object provenance; the
+  manager must not copy that provenance into a sidecar table, and it deletes
+  the retired duplicate table when opening an existing receipt database.
 - Fixed connections are deliberately placed references, not task slots or a
   priority system. Graph hygiene belongs to Kennedy; the harness should not
   silently promote or rearrange connections.
@@ -330,6 +333,13 @@ This document records user intention with regard to Kennedy.
   changes happen in explicitly writable history-ingress, audio-ingress,
   self-time, or other backend-owned sessions.
 - Stopping work is an orchestration control, not a request for history ingress.
+  Session History owns the typed durable stop request, derives its scope from
+  the durable lifecycle and session kind, marks queued turn work for
+  cancellation, and notifies a same-process listener before accepting a stop
+  aimed at live work. Browser HTTP requests this owner-level operation directly
+  and must not depend on KennedyServer's orchestration worker. The worker owns
+  cancelling descendant execution, unwinding the live turn, and completing the
+  stop through the existing durable lifecycle.
   In an interactive user session, stop only the current Kennedy turn: cancel
   its descendant work, preserve accepted input and completed effects, close any
   interrupted invocation visibly, and leave the session active and ready for
@@ -431,6 +441,18 @@ This document records user intention with regard to Kennedy.
   session history stores their accounting projection rather than creating a
   competing ledger. Cached input, uncached input, reasoning, and visible output
   must remain distinguishable where the provider reports them.
+- Keep the application handoff from intelligence accounting into Session
+  History in one narrow mechanical adapter library. Its only stateful workflow
+  reconciles cumulative live and final usage for one top-level Kennedy call;
+  descendant projection consumes the router's canonical usage receipt, and
+  subagent projection consumes a self-contained typed runtime audit event.
+  The adapter records those projections through Session History's typed API and
+  does not expose event builders or raw JSON for KennedyServer to assemble. It
+  does not own provider calls, pricing policy, canonical receipt persistence,
+  session lifecycle, or context preparation. Router successes and failures
+  surface the exact canonical receipt with operation lineage, and agent-runtime
+  events carry their own correlation data so KennedyServer need not reconstruct
+  provider accounting from ordered strings or partial events.
 - The intelligence boundary owns one dated, versioned catalog of the published
   standard-tier prices for every model-backed endpoint Kennedy invokes.
   Calculate cost from the actual model and provider-reported billing
@@ -663,12 +685,18 @@ This document records user intention with regard to Kennedy.
   attachment-count ceiling or reject repeated object references; existing
   request, session, object-size, and provider constraints are the relevant
   bounds.
-- An initiated private message belongs to the targeted user's already-active
-  direct Kennedy session when one exists, preferring the transport's current
-  session and then another private Telegram session; create a new private
-  Telegram session when none is active. Record the Kennedy-authored text and
-  attachment references in that session and atomically bind each successful
-  delivery to it.
+- An out-of-band private delivery made through `SendTelegramDM` is a cold
+  Telegram transport action. Do not create, select, bind, checkpoint, or
+  otherwise mutate a target Kennedy session for it, do not add its text or
+  attachment references to the target's Session History, and do not queue
+  history ingress on its behalf. Preserve any current private-session pointer
+  unchanged so an already-operating session in that chat continues to receive
+  later inbound events normally; when none is active, only a later accepted
+  inbound event may create a session through ordinary Telegram intake. This is
+  distinct from Kennedy replying within an active private Telegram session:
+  ordinary reply text, emitted objects, native media, filenames, and captions
+  remain owned by and recorded in that session and use its bound event-delivery
+  workflow.
 - Kennedy's main agent may likewise initiate a Telegram delivery to any
   explicitly targeted known group from any session, including browser,
   private or group Telegram, history-ingress, audio-ingress, wakeup, and
