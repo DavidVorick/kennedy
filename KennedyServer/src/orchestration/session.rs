@@ -1363,6 +1363,16 @@ impl Session {
     pub(crate) fn interrupt_current_turn(&mut self) -> anyhow::Result<()> {
         self.journal.repair_unfinished_tools(now())?;
         let notice = "The user stopped this agent turn.";
+        let mut metadata = json!({"transcriptRole":"system","userStopped":true});
+        let mut transcript_entry = json!({
+            "role":"system",
+            "content":notice,
+            "userStopped":true,
+        });
+        if let Some(external_event_id) = &self.pending_external_event_id {
+            metadata["externalEventId"] = json!(external_event_id);
+            transcript_entry["externalEventId"] = json!(external_event_id);
+        }
         self.journal.create_box(
             now(),
             "Turn stopped",
@@ -1370,14 +1380,10 @@ impl Session {
             BoxContent {
                 text: notice.into(),
                 objects: Vec::new(),
-                metadata: json!({"transcriptRole":"system","userStopped":true}),
+                metadata,
             },
         )?;
-        self.transcript.push(json!({
-            "role":"system",
-            "content":notice,
-            "userStopped":true,
-        }));
+        self.transcript.push(transcript_entry);
         self.pending_turn = false;
         self.pending_external_event_id = None;
         self.orchestration =
@@ -3458,6 +3464,16 @@ fn transcript_from_journal(journal: &HistorySession) -> Vec<Value> {
             {
                 entry["contextOverflowWarning"] = json!(true);
             }
+            if state
+                .canonical
+                .content
+                .metadata
+                .get("userStopped")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                entry["userStopped"] = json!(true);
+            }
             Some(entry)
         })
         .collect()
@@ -3474,19 +3490,32 @@ fn is_terminal_external_response(entry: &Value) -> bool {
 }
 
 fn restore_pending_turn(restored: Option<&Value>, transcript: &[Value]) -> (bool, Option<String>) {
-    let answered = |id: &str| {
-        transcript.iter().any(|candidate| {
-            is_terminal_external_response(candidate)
-                && candidate.get("externalEventId").and_then(Value::as_str) == Some(id)
-        })
-    };
-    let journal_pending_external = transcript.iter().rev().find_map(|entry| {
-        if entry.get("role").and_then(Value::as_str) != Some("user") {
-            return None;
+    let mut unanswered_external = Vec::<String>::new();
+    let mut answered_external = HashSet::<String>::new();
+    for entry in transcript {
+        if entry.get("role").and_then(Value::as_str) == Some("user") {
+            if let Some(id) = entry.get("externalEventId").and_then(Value::as_str) {
+                answered_external.remove(id);
+                unanswered_external.retain(|candidate| candidate != id);
+                unanswered_external.push(id.to_owned());
+            }
+            continue;
         }
-        let id = entry.get("externalEventId").and_then(Value::as_str)?;
-        (!answered(id)).then(|| id.to_owned())
-    });
+        if !is_terminal_external_response(entry) {
+            continue;
+        }
+        if let Some(id) = entry.get("externalEventId").and_then(Value::as_str) {
+            answered_external.insert(id.to_owned());
+            unanswered_external.retain(|candidate| candidate != id);
+        } else if entry.get("userStopped").and_then(Value::as_bool) == Some(true)
+            && let Some(id) = unanswered_external.pop()
+        {
+            // Older stop boxes did not identify their user event. A stop closes
+            // the most recent unanswered turn that precedes it in the journal.
+            answered_external.insert(id);
+        }
+    }
+    let journal_pending_external = unanswered_external.last().cloned();
     let restored_pending = restored
         .and_then(|state| state.get("pendingTurn"))
         .and_then(Value::as_bool)
@@ -3496,10 +3525,11 @@ fn restore_pending_turn(restored: Option<&Value>, transcript: &[Value]) -> (bool
         .and_then(Value::as_str);
     // The response box is journaled before the lifecycle checkpoint that clears
     // the turn, so recovery must tolerate a crash between those two writes.
-    let restored_external_answered = restored_external.is_some_and(&answered);
+    let restored_external_answered =
+        restored_external.is_some_and(|id| answered_external.contains(id));
     let pending_external_event_id = journal_pending_external.or_else(|| {
         restored_external
-            .filter(|id| !answered(id))
+            .filter(|id| !answered_external.contains(*id))
             .map(str::to_owned)
     });
     let pending_turn =
@@ -4812,6 +4842,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn journaled_legacy_stop_closes_the_preceding_external_turn() {
+        let restored = json!({
+            "pendingTurn":true,
+            "pendingExternalEventId":"stopped-event",
+        });
+        let transcript = vec![
+            json!({"role":"user","content":"question","externalEventId":"stopped-event"}),
+            json!({
+                "role":"system",
+                "content":"The user stopped this agent turn.",
+                "userStopped":true,
+            }),
+        ];
+
+        assert_eq!(
+            restore_pending_turn(Some(&restored), &transcript),
+            (false, None)
+        );
+    }
+
     fn test_journal(label: &str, effective_context_tokens: u64) -> (PathBuf, HistorySession) {
         let root = std::env::temp_dir().join(format!(
             "kennedy-ingress-context-{label}-{}-{}",
@@ -4839,6 +4890,49 @@ mod tests {
             .join("sessions")
             .join(format!("{}.session-log", journal.id()));
         (path, journal)
+    }
+
+    #[test]
+    fn user_stopped_marker_survives_journal_transcript_recovery() {
+        let (path, mut journal) = test_journal("stopped-turn", 1_000);
+        journal
+            .create_box(
+                "t1",
+                "User message",
+                BoxOwner::User,
+                BoxContent {
+                    text: "question".into(),
+                    objects: Vec::new(),
+                    metadata: json!({"externalEventId":"stopped-event"}),
+                },
+            )
+            .unwrap();
+        journal
+            .create_box(
+                "t2",
+                "Turn stopped",
+                BoxOwner::Controller,
+                BoxContent {
+                    text: "The user stopped this agent turn.".into(),
+                    objects: Vec::new(),
+                    metadata: json!({"transcriptRole":"system","userStopped":true}),
+                },
+            )
+            .unwrap();
+
+        let transcript = transcript_from_journal(&journal);
+        assert_eq!(transcript[1].get("userStopped"), Some(&json!(true)));
+        assert_eq!(
+            restore_pending_turn(
+                Some(&json!({
+                    "pendingTurn":true,
+                    "pendingExternalEventId":"stopped-event",
+                })),
+                &transcript,
+            ),
+            (false, None)
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

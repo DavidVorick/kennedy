@@ -33,7 +33,7 @@ pub(crate) struct LocalServices {
 pub(crate) struct ApiError {
     pub code: String,
     pub message: String,
-    pub receipt: Option<kcode_intelligence_router::UsageReceipt>,
+    pub receipt: Option<Box<kcode_intelligence_router::UsageReceipt>>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -1026,7 +1026,7 @@ fn intelligence_error(error: kcode_intelligence_router::Error) -> ApiError {
     ApiError {
         code: error.code().into(),
         message: error.message().into(),
-        receipt: error.receipt().cloned(),
+        receipt: error.receipt().cloned().map(Box::new),
     }
 }
 

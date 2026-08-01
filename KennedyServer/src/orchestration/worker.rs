@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{
     AgentMode, Api, Config, Manuals, RuntimeModel, Session,
-    services::{data_url, telegram_caption_for},
+    services::{ApiError, data_url, telegram_caption_for},
     session::{
         ResolvedObject, SessionOptions, is_agent_loop_round_limit, validate_delivery_file_name,
     },
@@ -805,6 +805,14 @@ impl Orchestrator {
         Ok(self.api.history_get_session(id).await?)
     }
 
+    async fn get_listed_conversation(&self, id: &str) -> anyhow::Result<Option<SessionRecord>> {
+        match self.api.history_get_session(id).await {
+            Ok(record) => Ok(Some(record)),
+            Err(error) if listed_session_disappeared(&error) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn schedule_writer_job(
         self: &Arc<Self>,
         histories: &[SessionRecord],
@@ -819,7 +827,9 @@ impl Orchestrator {
         {
             self.launch_writer_job("scheduled wakeup", move |worker| async move {
                 let id = record.id;
-                let record = worker.get_conversation(&id).await?;
+                let Some(record) = worker.get_listed_conversation(&id).await? else {
+                    return Ok(());
+                };
                 worker.process_wakeup(record).await
             })
             .await;
@@ -832,7 +842,9 @@ impl Orchestrator {
         {
             self.launch_writer_job("self time", move |worker| async move {
                 let id = record.id;
-                let record = worker.get_conversation(&id).await?;
+                let Some(record) = worker.get_listed_conversation(&id).await? else {
+                    return Ok(());
+                };
                 worker.process_self_time(record).await
             })
             .await;
@@ -841,7 +853,9 @@ impl Orchestrator {
         if let Some(record) = next_ingress(histories, Utc::now()).cloned() {
             self.launch_writer_job("memory ingress", move |worker| async move {
                 let id = record.id;
-                let record = worker.get_conversation(&id).await?;
+                let Some(record) = worker.get_listed_conversation(&id).await? else {
+                    return Ok(());
+                };
                 worker.process_ingress(record).await
             })
             .await;
@@ -2970,6 +2984,9 @@ fn value_string(value: &Value) -> String {
 fn bounded_error(error: &anyhow::Error) -> String {
     format!("{error:#}").chars().take(1_000).collect()
 }
+fn listed_session_disappeared(error: &ApiError) -> bool {
+    error.code == "not_found"
+}
 fn telegram_event_retry_delay(failures: u32) -> Duration {
     let exponent = failures.saturating_sub(1).min(5);
     Duration::from_secs((2_u64 << exponent).min(60))
@@ -3003,6 +3020,20 @@ fn telegram_timeout(event: &Value) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listed_session_not_found_is_a_completed_transition() {
+        assert!(listed_session_disappeared(&ApiError {
+            code: "not_found".into(),
+            message: "Session not found.".into(),
+            receipt: None,
+        }));
+        assert!(!listed_session_disappeared(&ApiError {
+            code: "internal_error".into(),
+            message: "storage unavailable".into(),
+            receipt: None,
+        }));
+    }
 
     fn session_record(overrides: Value) -> SessionRecord {
         let mut record = json!({

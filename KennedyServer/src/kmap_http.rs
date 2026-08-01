@@ -381,31 +381,39 @@ async fn get_session_archive(
         ))
     })?;
     let session_state = json!({"commitAuthor":provenance.author});
-    match state
-        .history
-        .legacy_provider_cost_summary_for_archive(&archive, Some(&session_state))
-    {
-        Ok(Some(summary)) => {
-            if let Some(status) = archive
-                .pointer_mut("/context/status")
-                .and_then(Value::as_object_mut)
-            {
-                status.insert(
-                    "estimatedCostUsdNanos".into(),
-                    Value::from(summary.estimated_cost_usd_nanos),
-                );
-                status.insert(
-                    "unpricedProviderCalls".into(),
-                    Value::from(summary.unpriced_provider_calls),
-                );
+    if archive_supports_pricing_overlay(&archive) {
+        match state
+            .history
+            .legacy_provider_cost_summary_for_archive(&archive, Some(&session_state))
+        {
+            Ok(Some(summary)) => {
+                if let Some(status) = archive
+                    .pointer_mut("/context/status")
+                    .and_then(Value::as_object_mut)
+                {
+                    status.insert(
+                        "estimatedCostUsdNanos".into(),
+                        Value::from(summary.estimated_cost_usd_nanos),
+                    );
+                    status.insert(
+                        "unpricedProviderCalls".into(),
+                        Value::from(summary.unpriced_provider_calls),
+                    );
+                }
             }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, %id, "Could not reconstruct legacy session archive pricing");
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, %id, "Could not reconstruct legacy session archive pricing");
+            }
         }
     }
     Ok(Json(archive))
+}
+
+fn archive_supports_pricing_overlay(archive: &Value) -> bool {
+    archive
+        .pointer("/context/status")
+        .is_some_and(Value::is_object)
 }
 
 async fn get_object_file(
@@ -657,6 +665,22 @@ mod tests {
         fn observe_group(&self, _group_id: &str) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn pre_status_chatend_archives_do_not_attempt_a_pricing_overlay() {
+        let archive = json!({
+            "format":"kennedy-chatend",
+            "version":1,
+            "session":{"sessionId":"legacy-session"},
+            "events":[],
+            "context":{"estimatedTokens":100},
+        });
+
+        assert!(!archive_supports_pricing_overlay(&archive));
+        assert!(archive_supports_pricing_overlay(&json!({
+            "context":{"status":{}}
+        })));
     }
 
     #[tokio::test]

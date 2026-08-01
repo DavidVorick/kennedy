@@ -851,6 +851,10 @@ This document records user intention with regard to Kennedy.
   credentials or comparably critical data and the narrower trust boundary has
   a concrete justification. Ordinary source, rendering, routing, and Web
   library dependencies are not exact-pinned merely for predictability.
+- Kennedy's production workspace consumes published managed Rust libraries
+  from crates.io. A local Kcode generation may temporarily override a crate
+  only while actively developing an unpublished version; remove that override
+  once the required version is published.
 - Kennedy's managed check and publication tools own the workflow. Avoid adding
   deployment scripts or another publication path around them.
 - Managed Rust checks and publications automatically apply rustfmt to their
