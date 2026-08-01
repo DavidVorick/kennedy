@@ -2123,9 +2123,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-gemini-api"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cac62a12b510b1a45fba2603a4eff1238ec75de4cf6713a25cc8216e71834482"
+checksum = "5d8364db24e5a9308e4ce752d3bf7a8a06600e9ce0d4fbdc50e976a9c7247f74"
 dependencies = [
  "base64",
  "chrono",
@@ -2185,9 +2185,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-intelligence-router"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47ae325ed7feb241b1a0677acc2bab0df204c8368a28aa833a44b19ef3585ae8"
+checksum = "197d5efa8d6b2cb34101432da4aeff14e50880edd50b47de391e852819f140aa"
 dependencies = [
  "anyhow",
  "chrono",

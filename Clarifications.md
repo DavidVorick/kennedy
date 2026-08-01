@@ -17,9 +17,12 @@ This document records user intention with regard to Kennedy.
 - Reduce KennedyServer by extracting cohesive Rust capabilities into managed
   Kcode libraries, starting with the least-coupled boundaries. An extracted
   library should normally contain 300-3,000 lines of code, expose a lightweight
-  well-defined API, and materially simplify what KennedyServer owns; its public
-  operations should complete the capability's internal workflow rather than
-  require callers to sequence planning, application, or other intermediate
+  well-defined API, and materially simplify what KennedyServer owns. Every
+  managed Kcode library must remain strictly below 5,000 lines of first-party
+  code including tests; split capabilities before they reach that ceiling
+  rather than treating tests or internal modules as outside the boundary. Its
+  public operations should complete the capability's internal workflow rather
+  than require callers to sequence planning, application, or other intermediate
   steps. Return only outcomes needed for decisions that genuinely remain
   outside the boundary. Do not create pass-through crates that merely relocate
   server-specific glue. Prefer focused new libraries over casually making an
