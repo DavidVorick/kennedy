@@ -2146,6 +2146,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-http-api"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ecd3b698ad8855389bedcfe402c0aba923aed177b6ce2e94234cf760b10c85"
+dependencies = [
+ "axum",
+ "chrono",
+ "hex",
+ "kcode-audio-ingress",
+ "kcode-audio-session-ingress",
+ "kcode-kweb-db",
+ "kcode-kweb-manager",
+ "kcode-server-object-envelopes",
+ "kcode-session-history",
+ "kcode-tg-kennedy-bot",
+ "kcode-web-semver-routing",
+ "serde",
+ "serde_json",
+ "tower-http 0.7.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-intelligence-chatend"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2434,6 +2458,7 @@ dependencies = [
  "kcode-dev-tools",
  "kcode-dev-tools-chatend",
  "kcode-history-ingress-context",
+ "kcode-http-api",
  "kcode-intelligence-chatend",
  "kcode-intelligence-router",
  "kcode-kmap-size",
@@ -2445,9 +2470,7 @@ dependencies = [
  "kcode-speech-classification",
  "kcode-telegram-identity",
  "kcode-tg-kennedy-bot",
- "kcode-web-semver-routing",
  "rand 0.9.5",
- "reqwest 0.13.4",
  "rpassword",
  "rusqlite",
  "rustls",
@@ -2455,7 +2478,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
- "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -4352,7 +4374,6 @@ dependencies = [
  "bytes",
  "http",
  "http-body",
- "http-body-util",
  "percent-encoding",
  "pin-project-lite",
  "tower-layer",

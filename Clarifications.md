@@ -35,14 +35,17 @@ This document records user intention with regard to Kennedy.
   limits, filtering, retry semantics, failure isolation, and compatibility
   with existing durable state. Do not rewrite these clarifications to
   legitimize an incidental behavior change introduced during extraction.
-- Make the browser-facing HTTP router and API a final focused presentation
-  library over typed capability libraries. Its handlers must not call back into
+- `kcode-http-api` owns the complete browser-facing HTTP router and API as a
+  final focused presentation library over typed capability libraries, including
+  route composition, wire DTOs, multipart admission, HTTP errors, response and
+  cache headers, request limits, tracing middleware, the Web-library router,
+  and the deliberately tiny root loader. Its handlers must not call back into
   KennedyServer implementation modules through callbacks, traits, or other
   dependency inversion; first give transport-independent workflows needed by
   both HTTP and backend orchestration a cohesive library owner. Keep the
   KennedyServer executable as the bootstrap and lifecycle composition root that
-  constructs those services, imports the API library, binds the listener, and
-  supervises runtimes.
+  constructs those services, selects and validates application roots, imports
+  `kcode-http-api`, binds and serves the listener, and supervises runtimes.
 - Managed libraries maintained only by LLMs are source-first: their code and
   tests are the specification. Do not add a separate `Specification.md` that
   duplicates an ingestible codebase; retain only documentation required by the
@@ -96,7 +99,8 @@ This document records user intention with regard to Kennedy.
   `kcode-kweb-manager` exclusively owns the live `KwebDb` handle. The manager
   owns typed node reads, idempotent provenance and ordinary node mutations,
   opaque object storage, and session commits; KennedyServer retains root policy
-  and genuine HTTP presentation. Do not retain a parallel database handle or
+  and supplies the selected roots and manager handle to `kcode-http-api` for
+  genuine browser presentation. Do not retain a parallel database handle or
   route same-process Kmap calls through HTTP paths or JSON values. Kweb's signed
   creating transaction is the sole durable source of object provenance; the
   manager must not copy that provenance into a sidecar table, and it deletes
@@ -608,7 +612,8 @@ This document records user intention with regard to Kennedy.
   durable records. Already-ingressed pieces remain authoritative through their
   deterministic identities. The coordinator exposes transport-neutral typed
   outcomes and does not own an HTTP or serialization contract. KennedyServer
-  retains transport admission and HTTP presentation.
+  retains application service construction, while `kcode-http-api` owns browser
+  transport admission and HTTP presentation.
 - Vnote scanning should avoid rereading unchanged large recordings. Durable
   acceptance is the handoff boundary; the recording does not need to wait for
   later transcription or memory work.

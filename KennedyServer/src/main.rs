@@ -1,7 +1,5 @@
-mod audio_ingress;
-mod kmap_http;
+mod kmap_bootstrap;
 mod orchestration;
-mod session_history_http;
 
 use std::{
     path::{Path, PathBuf},
@@ -187,7 +185,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     let codex_catalog_cache =
         kcode_codex_runtime::CatalogCache::new(kcode_codex_runtime::DEFAULT_CODEX_EXECUTABLE);
     let (kmap, system_roots) =
-        kmap_http::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
+        kmap_bootstrap::initialize(&args.kweb_root, kweb_config, &args.user_database)?;
     let speech_classifier = SpeechClassifier::open(SPEECH_CLASSIFICATION_DATABASE_PATH)
         .with_context(|| {
             format!("opening speaker-classification database {SPEECH_CLASSIFICATION_DATABASE_PATH}")
@@ -211,7 +209,7 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
                 .display()
         )
     })?;
-    let web_lib_router = kcode_web_semver_routing::router(dev_tools.web_publications_root());
+    let web_publications_root = dev_tools.web_publications_root().to_path_buf();
     let telegram_identity = std::sync::Arc::new(kcode_telegram_identity::Directory::open(
         &args.user_database,
         &args.telegram_bootstrap_username,
@@ -241,12 +239,6 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
     })
     .await?;
     let telegram_service = telegram_runtime.service();
-    let kmap_service = kmap_http::Service::new(
-        kmap.clone(),
-        system_roots,
-        telegram_service.clone(),
-        history_service.clone(),
-    );
     let chunk_intelligence = intelligence_service.clone();
     let transcribe_chunk: kcode_audio_ingress::AudioChunkCall = Arc::new(move |request| {
         let intelligence = chunk_intelligence.clone();
@@ -323,11 +315,16 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
             effective_context_tokens: intelligence_runtime.context_window_tokens,
         },
     )?;
-    let audio_service = audio_ingress::Service::open(
-        audio_coordinator.clone(),
-        args.audio_ingress_max_upload_bytes,
-    )?;
-    let audio_ingress_router = audio_ingress::router(audio_service.clone());
+    let http_router = kcode_http_api::router(kcode_http_api::Config {
+        kmap: kmap.clone(),
+        user_root_node_id: system_roots.user,
+        kennedy_root_node_id: system_roots.kennedy,
+        telegram: telegram_service.clone(),
+        session_history: history_service.clone(),
+        audio_ingress: audio_coordinator.clone(),
+        audio_max_upload_bytes: args.audio_ingress_max_upload_bytes,
+        web_publications_root,
+    })?;
     let orchestration = orchestration::Config {
         system_prompts_directory: args.system_prompts_dir.clone(),
         user_root_node_id: system_roots.user.to_string(),
@@ -351,16 +348,17 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         },
     );
     let orchestration_worker = orchestration::build(orchestration, orchestration_api);
-    let history_router = session_history_http::router(history_service);
     tokio::try_join!(
-        kmap_http::serve_with_listener(
-            kmap_service,
-            kmap_http::MergedRouters::new(history_router, audio_ingress_router, web_lib_router),
-            kweb_listener,
-        ),
+        serve_http(kweb_listener, http_router),
         telegram_runtime.run(),
         orchestration::run(orchestration_worker),
     )?;
+    Ok(())
+}
+
+async fn serve_http(listener: tokio::net::TcpListener, router: axum::Router) -> anyhow::Result<()> {
+    tracing::info!(address=%listener.local_addr()?, "Kennedy main HTTP server ready");
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
@@ -698,82 +696,6 @@ mod tests {
         let session = include_str!("orchestration/session.rs");
         assert!(worker.contains("Native Rust orchestration worker ready"));
         assert!(session.contains("struct Session"));
-    }
-
-    #[tokio::test]
-    async fn published_router_serves_the_floating_html_ui_contract() {
-        let root = std::env::temp_dir().join(format!(
-            "kennedy-web-routing-integration-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        for version in ["0.1.0", "0.1.2"] {
-            let version_root = root.join(format!("module/kcode-kui-loader/v{version}"));
-            std::fs::create_dir_all(&version_root).unwrap();
-            std::fs::write(
-                version_root.join("kcode-web.json"),
-                format!(
-                    r#"{{"name":"kcode-kui-loader","version":"{version}","entry":"index.js","tests":"tests.js"}}"#
-                ),
-            )
-            .unwrap();
-            std::fs::write(
-                version_root.join("index.html"),
-                format!("<!doctype html><title>Kennedy {version}</title>\n"),
-            )
-            .unwrap();
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let router_root = root.clone();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, kcode_web_semver_routing::router(router_root))
-                .await
-                .unwrap();
-        });
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-
-        let floating = client
-            .get(format!(
-                "http://{address}/lib/kcode-kui-loader/v0.1/index.html"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(floating.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(
-            floating.headers()[reqwest::header::LOCATION],
-            "/lib/kcode-kui-loader/v0.1.2/index.html"
-        );
-        assert_eq!(
-            floating.headers()[reqwest::header::CACHE_CONTROL],
-            "no-store, max-age=0"
-        );
-
-        let exact = client
-            .get(format!(
-                "http://{address}/lib/kcode-kui-loader/v0.1.2/index.html"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(exact.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            exact.headers()[reqwest::header::CONTENT_TYPE],
-            "text/html; charset=utf-8"
-        );
-        assert_eq!(
-            exact.headers()[reqwest::header::CACHE_CONTROL],
-            "public, max-age=31536000, immutable"
-        );
-        assert!(exact.text().await.unwrap().contains("Kennedy 0.1.2"));
-
-        server.abort();
-        let _ = server.await;
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

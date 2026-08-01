@@ -24,6 +24,7 @@ kcode-credential-vault.workspace = true
 kcode-dev-tools.workspace = true
 kcode-dev-tools-chatend.workspace = true
 kcode-history-ingress-context.workspace = true
+kcode-http-api.workspace = true
 kcode-intelligence-chatend.workspace = true
 kcode-intelligence-router.workspace = true
 kcode-kweb-context.workspace = true
@@ -33,7 +34,6 @@ kcode-kmap-size.workspace = true
 kcode-server-object-envelopes.workspace = true
 kcode-tg-kennedy-bot.workspace = true
 kcode-telegram-identity.workspace = true
-kcode-web-semver-routing.workspace = true
 rusqlite.workspace = true
 rand.workspace = true
 rustls.workspace = true
@@ -42,11 +42,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-reqwest.workspace = true

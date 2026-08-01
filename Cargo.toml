@@ -29,6 +29,7 @@ kcode-credential-vault = "=0.1.0"
 kcode-dev-tools = "=0.4.3"
 kcode-dev-tools-chatend = "0.1.1"
 kcode-history-ingress-context = "0.1.1"
+kcode-http-api = "0.1.0"
 kcode-intelligence-chatend = "0.1.0"
 kcode-intelligence-router = "0.2.2"
 kcode-kmap-size = "0.1.0"
@@ -42,17 +43,14 @@ kcode-speech-classification = "0.1.2"
 kcode-telegram-identity = "=0.1.5"
 # Exact because this transport is directly entrusted with the Telegram bot token.
 kcode-tg-kennedy-bot = "=0.5.1"
-kcode-web-semver-routing = "0.2.0"
 rand = "0.9"
 rpassword = "7.5.4"
-reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "multipart", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.7", features = ["cors", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
