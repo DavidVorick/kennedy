@@ -333,21 +333,34 @@ async fn run_server(args: Args, vault_path: PathBuf) -> anyhow::Result<()> {
         telegram_web_user_handle: args.telegram_bootstrap_username,
         runtime_model: orchestration::RuntimeModel::from_intelligence(intelligence_runtime),
     };
+    let telegram_sessions = kcode_telegram_session_coordinator::Service::new(
+        telegram_service.clone(),
+        telegram_identity.clone(),
+    );
+    let session_service =
+        kcode_kennedy_sessions::Service::new(kcode_kennedy_sessions::Capabilities {
+            kmap: kmap.clone(),
+            intelligence: intelligence_service.clone(),
+            agents: agent_runtime,
+            history: history_service.clone(),
+            speech_classifier,
+            dev_tools: dev_tools.clone(),
+            telegram: telegram_sessions,
+        });
     let orchestration_api = orchestration::Api::new(
         &orchestration,
         orchestration::LocalServices {
             kmap,
             intelligence: intelligence_service,
-            agents: agent_runtime,
             history: history_service.clone(),
             audio: audio_coordinator,
-            speech_classifier,
             directory: telegram_identity.clone(),
             dev_tools,
             telegram: telegram_service,
         },
     );
-    let orchestration_worker = orchestration::build(orchestration, orchestration_api);
+    let orchestration_worker =
+        orchestration::build(orchestration, orchestration_api, session_service);
     tokio::try_join!(
         serve_http(kweb_listener, http_router),
         telegram_runtime.run(),
@@ -693,9 +706,11 @@ mod tests {
     #[test]
     fn native_orchestration_remains_a_rust_backend_concern() {
         let worker = include_str!("orchestration/worker.rs");
-        let session = include_str!("orchestration/session.rs");
         assert!(worker.contains("Native Rust orchestration worker ready"));
-        assert!(session.contains("struct Session"));
+        assert_eq!(
+            std::any::type_name::<orchestration::Session>(),
+            "kcode_kennedy_sessions::Session"
+        );
     }
 
     #[tokio::test]

@@ -3,16 +3,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use kcode_kweb_db::{Node, NodeId, ObjectId, Owner, Provenance};
+use kcode_kweb_db::{Node, NodeId, Owner, Provenance};
 use kcode_kweb_manager::{CreateProvenance, KwebManager, NodeContents, NodeWrite};
-use kcode_server_object_envelopes::{StoredFile, StoredProvenance, decode_file, encode_file};
+use kcode_server_object_envelopes::StoredProvenance;
 use serde_json::Value;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::Config;
-use super::session::ResolvedObject;
+use kcode_kennedy_sessions::ResolvedObject;
 
 const TELEGRAM_CAPTION_LIMIT_UTF16: usize = 1_024;
 
@@ -22,10 +22,8 @@ pub(crate) struct LocalServices {
     pub intelligence: kcode_intelligence_router::Intelligence,
     pub history: kcode_session_history::SessionHistory,
     pub audio: kcode_audio_session_ingress::Coordinator,
-    pub speech_classifier: Arc<kcode_speech_classification::SpeechClassifier>,
     pub directory: std::sync::Arc<kcode_telegram_identity::Directory>,
     pub dev_tools: kcode_dev_tools::Service,
-    pub agents: kcode_agent_runtime::AgentRuntime,
     pub telegram: kcode_tg_kennedy_bot::Service,
 }
 
@@ -33,7 +31,6 @@ pub(crate) struct LocalServices {
 pub(crate) struct ApiError {
     pub code: String,
     pub message: String,
-    pub receipt: Option<Box<kcode_intelligence_router::UsageReceipt>>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -50,11 +47,6 @@ pub(crate) struct Api {
     user_root_node_id: String,
     kennedy_root_node_id: String,
     telegram_user_locks: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
-    telegram_group_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-}
-
-pub(crate) struct AgentTurn {
-    turn: Box<kcode_intelligence_router::AgentTurn>,
 }
 
 impl Api {
@@ -64,7 +56,6 @@ impl Api {
             user_root_node_id: config.user_root_node_id.clone(),
             kennedy_root_node_id: config.kennedy_root_node_id.clone(),
             telegram_user_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            telegram_group_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -80,34 +71,8 @@ impl Api {
             .clone()
     }
 
-    pub(crate) async fn telegram_group_lock(&self, group_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.telegram_group_locks
-            .lock()
-            .await
-            .entry(group_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
     fn telegram(&self) -> &kcode_tg_kennedy_bot::Service {
         &self.services.telegram
-    }
-
-    pub(crate) fn create_history_session(
-        &self,
-        input: kcode_session_history::NewSession,
-    ) -> anyhow::Result<kcode_session_history::Session> {
-        self.services.history.create_session(input)
-    }
-
-    pub(crate) fn history_session(
-        &self,
-        metadata: kcode_session_history::chatend::SessionMetadata,
-        provider_model: &str,
-    ) -> anyhow::Result<kcode_session_history::Session> {
-        self.services
-            .history
-            .open_session_with_provider_model(metadata, Some(provider_model))
     }
 
     pub fn kmap_node(&self, node_id: &str) -> Result<Node, ApiError> {
@@ -123,110 +88,10 @@ impl Api {
         &self.kennedy_root_node_id
     }
 
-    pub(crate) fn commit_kweb_session(
-        &self,
-        input: kcode_commit_session::CommitRequest,
-    ) -> Result<kcode_commit_session::CommitReceipt, ApiError> {
-        self.services.kmap.commit_session(input).map_err(kmap_error)
-    }
-
-    pub(crate) fn kmap_file(&self, object_id: &str) -> Result<StoredFile, ApiError> {
-        let object_id = object_id.parse::<ObjectId>().map_err(local_api_error)?;
-        let bytes = self
-            .services
-            .kmap
-            .get_object(object_id)
-            .map_err(kmap_error)?;
-        decode_file(object_id, bytes).map_err(local_api_error)
-    }
-
-    pub(crate) fn save_generated_image(
-        &self,
-        bytes: Vec<u8>,
-        file_name: &str,
-        media_type: &str,
-        model: &str,
-    ) -> Result<String, ApiError> {
-        let bytes = encode_file(
-            "generated-image",
-            Some(file_name),
-            media_type,
-            Some("image"),
-            bytes,
-        )
-        .map_err(local_api_error)?;
-        self.services
-            .kmap
-            .store_object(
-                Provenance {
-                    author: model.into(),
-                    source: "kennedy-generated-image".into(),
-                    source_created_at: chrono::Utc::now(),
-                    data: "Image generated or modified through Kennedy intelligence.".into(),
-                },
-                bytes,
-            )
-            .map(|id| id.to_string())
-            .map_err(kmap_error)
-    }
-
-    pub async fn start_agent_turn(
-        &self,
-        user_id: &str,
-        operation_id: Uuid,
-        request: kcode_codex_runtime_v2::AgentRequest,
-    ) -> Result<AgentTurn, ApiError> {
-        self.services
-            .intelligence
-            .for_user(user_id)
-            .map_err(intelligence_error)?
-            .start_agent_turn(operation_id, None, request)
-            .await
-            .map(|turn| AgentTurn {
-                turn: Box::new(turn),
-            })
-            .map_err(intelligence_error)
-    }
-
-    pub(crate) fn agent_runtime(&self) -> kcode_agent_runtime::AgentRuntime {
-        self.services.agents.clone()
-    }
-
     pub fn cancel_intelligence(&self, operation_id: Uuid) -> Result<bool, ApiError> {
         self.services
             .intelligence
             .cancel(operation_id)
-            .map_err(intelligence_error)
-    }
-
-    pub async fn search(
-        &self,
-        user_id: &str,
-        request: kcode_intelligence_router::SearchRequest,
-    ) -> Result<
-        kcode_intelligence_router::Accounted<kcode_intelligence_router::SearchResponse>,
-        ApiError,
-    > {
-        self.services
-            .intelligence
-            .for_user(user_id)
-            .map_err(intelligence_error)?
-            .search(request)
-            .await
-            .map_err(intelligence_error)
-    }
-
-    pub async fn fetch(
-        &self,
-        user_id: &str,
-        request: kcode_intelligence_router::FetchRequest,
-    ) -> Result<kcode_intelligence_router::FetchResponse, ApiError> {
-        self.services
-            .intelligence
-            .for_user(user_id)
-            .map_err(intelligence_error)?
-            .fetch(request)
-            .await
             .map_err(intelligence_error)
     }
 
@@ -444,16 +309,6 @@ impl Api {
             .map_err(directory_error)
     }
 
-    pub fn directory_group_for_root(
-        &self,
-        root_node_id: kcode_kweb_db::NodeId,
-    ) -> Result<kcode_telegram_identity::Group, ApiError> {
-        self.services
-            .directory
-            .group_for_root(root_node_id)
-            .map_err(directory_error)
-    }
-
     pub fn directory_complete_handle_root(
         &self,
         handle: &str,
@@ -487,55 +342,6 @@ impl Api {
             .map_err(directory_error)
     }
 
-    pub async fn managed_source_execute(
-        &self,
-        session_id: &str,
-        name: &str,
-        arguments: Value,
-        objects: Vec<Vec<u8>>,
-    ) -> Result<kcode_dev_tools::ToolExecution, ApiError> {
-        let mut execution = self
-            .services
-            .dev_tools
-            .execute(session_id.to_owned(), name.to_owned(), arguments, objects)
-            .await
-            .map_err(dev_tools_error)?;
-        let mut object_ids = Vec::with_capacity(execution.objects.len());
-        for bytes in std::mem::take(&mut execution.objects) {
-            object_ids.push(
-                self.services
-                    .kmap
-                    .store_object(
-                        Provenance {
-                            author: "Kennedy".into(),
-                            source: "kennedy-rust-binary".into(),
-                            source_created_at: chrono::Utc::now(),
-                            data: "Output payload from a managed Rust-binary call.".into(),
-                        },
-                        bytes,
-                    )
-                    .map_err(kmap_error)?
-                    .to_string(),
-            );
-        }
-        append_object_ids(&mut execution.text, &object_ids);
-        Ok(execution)
-    }
-
-    pub async fn execute_speech_classification_tool(
-        &self,
-        name: &str,
-        arguments: Value,
-    ) -> Result<String, ApiError> {
-        let call = kcode_speech_classification::decode_ktool(name, &arguments)
-            .map_err(speech_ktool_error)?;
-        let classifier = Arc::clone(&self.services.speech_classifier);
-        tokio::task::spawn_blocking(move || classifier.execute_ktool(call))
-            .await
-            .map_err(speech_task_error)?
-            .map_err(speech_ktool_error)
-    }
-
     pub async fn release_managed_sources(&self, session_id: &str) {
         if let Err(error) = self.services.dev_tools.release(session_id.to_owned()).await {
             tracing::warn!(error=%error.message, "Managed-source session release failed");
@@ -546,37 +352,11 @@ impl Api {
         let _ = self.telegram().status();
     }
 
-    pub fn telegram_max_media_bytes(&self) -> u64 {
-        self.telegram().status().max_media_bytes as u64
-    }
-
     pub async fn telegram_private_sessions(
         &self,
     ) -> Result<Vec<kcode_tg_kennedy_bot::PrivateSession>, ApiError> {
         self.telegram()
             .list_private_sessions()
-            .await
-            .map_err(telegram_error)
-    }
-
-    pub async fn telegram_send_cold_private_message(
-        &self,
-        telegram_user_id: i64,
-        text: &str,
-    ) -> Result<Value, ApiError> {
-        self.telegram()
-            .send_cold_private_message(telegram_user_id, text.to_owned())
-            .await
-            .map_err(telegram_error)
-    }
-
-    pub async fn telegram_send_group_message(
-        &self,
-        group_id: &str,
-        text: &str,
-    ) -> Result<Value, ApiError> {
-        self.telegram()
-            .send_group_message(group_id.to_owned(), text.to_owned())
             .await
             .map_err(telegram_error)
     }
@@ -785,30 +565,6 @@ impl Api {
             .map_err(telegram_error)
     }
 
-    pub async fn telegram_send_cold_private_object(
-        &self,
-        telegram_user_id: i64,
-        file: &ResolvedObject,
-        caption: Option<&str>,
-    ) -> Result<Value, ApiError> {
-        self.telegram()
-            .send_cold_private_attachment(telegram_user_id, telegram_attachment(file, caption))
-            .await
-            .map_err(telegram_error)
-    }
-
-    pub async fn telegram_send_group_object(
-        &self,
-        group_id: &str,
-        file: &ResolvedObject,
-        caption: Option<&str>,
-    ) -> Result<Value, ApiError> {
-        self.telegram()
-            .send_group_attachment(group_id.to_owned(), telegram_attachment(file, caption))
-            .await
-            .map_err(telegram_error)
-    }
-
     pub fn bootstrap_node(&self, short_name: Option<&str>) -> Result<Node, ApiError> {
         let (short_name, short_description, long_description) = bootstrap_root_metadata(short_name);
         let source_created_at = chrono::Utc::now();
@@ -846,36 +602,6 @@ impl Api {
         .map_err(kmap_error)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn transcribe_audio(
-        &self,
-        user_id: &str,
-        model: &str,
-        prompt: &str,
-        bytes: Vec<u8>,
-        filename: String,
-        mime: &str,
-        parent_operation_id: Uuid,
-    ) -> Result<
-        kcode_intelligence_router::Accounted<kcode_intelligence_router::TranscriptionResponse>,
-        ApiError,
-    > {
-        self.services
-            .intelligence
-            .for_user(user_id)
-            .map_err(intelligence_error)?
-            .transcribe(kcode_intelligence_router::TranscriptionRequest {
-                prompt: prompt.to_owned(),
-                model: model.to_owned(),
-                media: kcode_intelligence_router::Media::audio(bytes, filename, mime)
-                    .map_err(intelligence_error)?,
-                operation_id: Uuid::new_v4(),
-                parent_operation_id: Some(parent_operation_id),
-            })
-            .await
-            .map_err(intelligence_error)
-    }
-
     pub async fn extract_document(
         &self,
         bytes: Vec<u8>,
@@ -888,67 +614,6 @@ impl Api {
                 bytes,
                 file_name: filename,
                 content_type: mime.to_owned(),
-            })
-            .await
-            .map_err(intelligence_error)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn annotate_media(
-        &self,
-        user_id: &str,
-        model: &str,
-        prompt: &str,
-        bytes: Vec<u8>,
-        filename: String,
-        mime: &str,
-        parent_operation_id: Uuid,
-    ) -> Result<
-        kcode_intelligence_router::Accounted<kcode_intelligence_router::AnnotationResponse>,
-        ApiError,
-    > {
-        self.services
-            .intelligence
-            .for_user(user_id)
-            .map_err(intelligence_error)?
-            .annotate(kcode_intelligence_router::AnnotationRequest {
-                prompt: prompt.to_owned(),
-                model: model.to_owned(),
-                media: media_for_annotation(bytes, filename, mime).map_err(intelligence_error)?,
-                operation_id: Uuid::new_v4(),
-                parent_operation_id: Some(parent_operation_id),
-            })
-            .await
-            .map_err(intelligence_error)
-    }
-
-    pub async fn generate_image(
-        &self,
-        user_id: &str,
-        model: &str,
-        prompt: &str,
-        references: Vec<(Vec<u8>, String, String)>,
-        parent_operation_id: Uuid,
-    ) -> Result<
-        kcode_intelligence_router::Accounted<kcode_intelligence_router::ImageResponse>,
-        ApiError,
-    > {
-        let references = references
-            .into_iter()
-            .map(|(bytes, filename, mime)| {
-                media_for_image(bytes, filename, &mime).map_err(intelligence_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.services
-            .intelligence
-            .for_user(user_id)
-            .map_err(intelligence_error)?
-            .generate_image(kcode_intelligence_router::ImageRequest {
-                model: model.to_owned(),
-                prompt: prompt.to_owned(),
-                references,
-                operation_id: Uuid::new_v4(),
-                parent_operation_id: Some(parent_operation_id),
             })
             .await
             .map_err(intelligence_error)
@@ -983,28 +648,6 @@ fn bootstrap_root_metadata(short_name: Option<&str>) -> (&str, &'static str, &'s
     }
 }
 
-impl AgentTurn {
-    pub(crate) async fn next_event(
-        &mut self,
-    ) -> Option<Result<kcode_codex_runtime_v2::AgentEvent, ApiError>> {
-        match self.turn.next_event().await {
-            Ok(event) => event.map(Ok),
-            Err(error) => Some(Err(intelligence_error(error))),
-        }
-    }
-
-    pub(crate) async fn respond(
-        &mut self,
-        call_id: &str,
-        result: kcode_codex_runtime_v2::ToolResult,
-    ) -> Result<(), ApiError> {
-        self.turn
-            .respond(call_id, result)
-            .await
-            .map_err(intelligence_error)
-    }
-}
-
 fn kmap_error(error: kcode_kweb_manager::Error) -> ApiError {
     let (code, message) = match error.kind() {
         kcode_kweb_manager::ErrorKind::InvalidInput => ("invalid_request", error.to_string()),
@@ -1018,7 +661,6 @@ fn kmap_error(error: kcode_kweb_manager::Error) -> ApiError {
     ApiError {
         code: code.into(),
         message,
-        receipt: None,
     }
 }
 
@@ -1026,7 +668,6 @@ fn intelligence_error(error: kcode_intelligence_router::Error) -> ApiError {
     ApiError {
         code: error.code().into(),
         message: error.message().into(),
-        receipt: error.receipt().cloned().map(Box::new),
     }
 }
 
@@ -1040,25 +681,6 @@ fn directory_error(error: kcode_telegram_identity::Error) -> ApiError {
     ApiError {
         code: code.into(),
         message: error.message().into(),
-        receipt: None,
-    }
-}
-
-fn append_object_ids(text: &mut String, object_ids: &[String]) {
-    if object_ids.is_empty() {
-        return;
-    }
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(&object_ids.join("\n"));
-}
-
-fn dev_tools_error(error: kcode_dev_tools::ToolError) -> ApiError {
-    ApiError {
-        code: error.code.into(),
-        message: error.message,
-        receipt: None,
     }
 }
 
@@ -1066,7 +688,6 @@ fn history_error(error: kcode_session_history::Error) -> ApiError {
     ApiError {
         code: error.kind.code().into(),
         message: error.message,
-        receipt: None,
     }
 }
 
@@ -1085,49 +706,6 @@ fn audio_error(error: kcode_audio_session_ingress::Error) -> ApiError {
         } else {
             error.message().into()
         },
-        receipt: None,
-    }
-}
-
-fn speech_task_error(error: tokio::task::JoinError) -> ApiError {
-    tracing::error!(%error, "In-process speaker-classification task stopped unexpectedly");
-    ApiError {
-        code: "internal_error".into(),
-        message: "An unexpected Kennedy speaker-classification error occurred.".into(),
-        receipt: None,
-    }
-}
-
-fn speech_ktool_error(error: kcode_speech_classification::KtoolError) -> ApiError {
-    let kcode_speech_classification::KtoolError::Classifier(error) = error else {
-        return ApiError {
-            code: "invalid_request".into(),
-            message: error.to_string(),
-            receipt: None,
-        };
-    };
-    let internal = matches!(
-        error,
-        kcode_speech_classification::Error::UnsupportedSchema { .. }
-            | kcode_speech_classification::Error::Storage(_)
-            | kcode_speech_classification::Error::CorruptStorage(_)
-    );
-    ApiError {
-        code: match &error {
-            kcode_speech_classification::Error::Validation { .. } => "invalid_request",
-            kcode_speech_classification::Error::Conflict { .. } => "state_conflict",
-            kcode_speech_classification::Error::UnsupportedSchema { .. }
-            | kcode_speech_classification::Error::Storage(_)
-            | kcode_speech_classification::Error::CorruptStorage(_) => "internal_error",
-        }
-        .into(),
-        message: if internal {
-            tracing::error!(%error, "Speaker-classification storage failed");
-            "An unexpected Kennedy speaker-classification error occurred.".into()
-        } else {
-            error.to_string()
-        },
-        receipt: None,
     }
 }
 
@@ -1135,7 +713,6 @@ fn local_api_error(error: impl std::fmt::Display) -> ApiError {
     ApiError {
         code: "invalid_request".into(),
         message: error.to_string(),
-        receipt: None,
     }
 }
 
@@ -1143,7 +720,6 @@ fn telegram_error(error: kcode_tg_kennedy_bot::Error) -> ApiError {
     ApiError {
         code: error.code().to_owned(),
         message: error.message().to_owned(),
-        receipt: None,
     }
 }
 
@@ -1188,63 +764,6 @@ pub(crate) fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", BASE64.encode(bytes))
 }
 
-fn media_for_annotation(
-    bytes: Vec<u8>,
-    filename: String,
-    mime: &str,
-) -> kcode_intelligence_router::Result<kcode_intelligence_router::Media> {
-    let normalized = mime
-        .split(';')
-        .next()
-        .unwrap_or("application/octet-stream")
-        .trim()
-        .to_ascii_lowercase();
-    let kind = if normalized.starts_with("image/") {
-        kcode_intelligence_router::MediaKind::Image
-    } else if normalized.starts_with("audio/")
-        || matches!(normalized.as_str(), "application/ogg" | "video/ogg")
-        || filename.rsplit_once('.').is_some_and(|(_, extension)| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "ogg" | "oga" | "opus"
-            )
-        })
-    {
-        kcode_intelligence_router::MediaKind::Audio
-    } else if normalized.starts_with("video/") {
-        kcode_intelligence_router::MediaKind::Video
-    } else {
-        return Err(kcode_intelligence_router::Error::invalid(
-            "annotation requires image, audio, or video media",
-        ));
-    };
-    kcode_intelligence_router::Media::new(kind, bytes, filename, normalized)
-}
-
-fn media_for_image(
-    bytes: Vec<u8>,
-    filename: String,
-    mime: &str,
-) -> kcode_intelligence_router::Result<kcode_intelligence_router::Media> {
-    let normalized = mime
-        .split(';')
-        .next()
-        .unwrap_or("application/octet-stream")
-        .trim()
-        .to_ascii_lowercase();
-    if !normalized.starts_with("image/") {
-        return Err(kcode_intelligence_router::Error::invalid(
-            "image references must use an image content type",
-        ));
-    }
-    kcode_intelligence_router::Media::new(
-        kcode_intelligence_router::MediaKind::Image,
-        bytes,
-        filename,
-        normalized,
-    )
-}
-
 fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Option<&'static str> {
     match transport_kind {
         Some("photo") => return Some("photo"),
@@ -1271,68 +790,6 @@ fn telegram_native_kind(media_type: &str, transport_kind: Option<&str>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn binary_output_ids_preserve_exact_guest_text() {
-        let mut text = "plain text".to_owned();
-        append_object_ids(&mut text, &[]);
-        assert_eq!(text, "plain text");
-
-        append_object_ids(&mut text, &["object-1".into()]);
-        assert_eq!(text, "plain text\nobject-1");
-
-        let mut text = "already terminated\n".to_owned();
-        append_object_ids(&mut text, &["one".into(), "two".into()]);
-        assert_eq!(text, "already terminated\none\ntwo");
-    }
-
-    #[test]
-    fn known_ogg_audio_is_not_misclassified_as_video() {
-        let media = media_for_annotation(vec![1], "voice.ogg".into(), "video/ogg").unwrap();
-        assert_eq!(media.kind, kcode_intelligence_router::MediaKind::Audio);
-        assert_eq!(media.content_type, "audio/ogg");
-    }
-
-    #[test]
-    fn image_generation_references_require_image_media() {
-        let media =
-            media_for_image(vec![1], "reference.png".into(), "image/png; charset=binary").unwrap();
-        assert_eq!(media.kind, kcode_intelligence_router::MediaKind::Image);
-        assert_eq!(media.content_type, "image/png");
-        assert!(media_for_image(vec![1], "notes.txt".into(), "text/plain").is_err());
-    }
-
-    #[test]
-    fn speech_ktool_errors_keep_the_existing_public_failure_boundary() {
-        let malformed =
-            speech_ktool_error(kcode_speech_classification::KtoolError::InvalidArguments {
-                tool: kcode_speech_classification::IDENTIFY_TOOL,
-                source: serde_json::from_str::<Value>("{").unwrap_err(),
-            });
-        assert_eq!(malformed.code, "invalid_request");
-        assert_eq!(
-            malformed.message,
-            "decoding kcode-speech-classification/identify arguments"
-        );
-
-        let validation = speech_ktool_error(kcode_speech_classification::KtoolError::Classifier(
-            kcode_speech_classification::Error::Validation {
-                field: "row.perceived_age".into(),
-                message: "must be positive".into(),
-            },
-        ));
-        assert_eq!(validation.code, "invalid_request");
-        assert_eq!(validation.message, "row.perceived_age: must be positive");
-
-        let storage = speech_ktool_error(kcode_speech_classification::KtoolError::Classifier(
-            kcode_speech_classification::Error::Storage("private detail".into()),
-        ));
-        assert_eq!(storage.code, "internal_error");
-        assert_eq!(
-            storage.message,
-            "An unexpected Kennedy speaker-classification error occurred."
-        );
-    }
 
     #[test]
     fn durable_work_uses_stable_valid_idempotency_ids() {

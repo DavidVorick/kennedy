@@ -2,6 +2,7 @@ use std::{collections::HashMap, path::Path};
 
 use anyhow::Context;
 use chrono::{DateTime, Datelike, Timelike, Utc};
+use kcode_kennedy_sessions::RuntimeModel;
 
 const PROMPT_FILES: [(&str, &str); 12] = [
     ("identity", "KennedyIdentity.txt"),
@@ -20,36 +21,6 @@ const PROMPT_FILES: [(&str, &str); 12] = [
 
 #[derive(Clone, Debug)]
 pub(crate) struct Manuals(HashMap<String, String>);
-
-#[derive(Clone, Debug)]
-pub(crate) struct RuntimeModel {
-    pub model: String,
-    pub reasoning_effort: String,
-    pub context_window_tokens: u64,
-}
-
-impl RuntimeModel {
-    pub(crate) fn from_intelligence(runtime: kcode_intelligence_router::RuntimeModel) -> Self {
-        Self {
-            model: runtime.model,
-            reasoning_effort: runtime.reasoning_effort,
-            context_window_tokens: runtime.context_window_tokens,
-        }
-    }
-
-    pub(crate) fn attribution(&self) -> String {
-        format!("{}-{}", self.model, self.reasoning_effort)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn testing() -> Self {
-        Self {
-            model: "gpt-5.6-sol".into(),
-            reasoning_effort: "xhigh".into(),
-            context_window_tokens: 1_000_000,
-        }
-    }
-}
 
 impl Manuals {
     pub(crate) fn load(directory: &Path) -> anyhow::Result<Self> {
@@ -203,6 +174,14 @@ mod tests {
         )
     }
 
+    fn testing_runtime() -> RuntimeModel {
+        RuntimeModel {
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: "xhigh".into(),
+            context_window_tokens: 1_000_000,
+        }
+    }
+
     #[test]
     fn human_time_uses_ordinals_and_unambiguous_twelve_hour_clock() {
         assert_eq!(
@@ -222,7 +201,7 @@ mod tests {
     #[test]
     fn telegram_layers_are_scoped_to_telegram_channels() {
         let manuals = testing_manuals();
-        let runtime = RuntimeModel::testing();
+        let runtime = testing_runtime();
         let browser = manuals
             .compose_conversation(&runtime, "conversation", "")
             .unwrap();
@@ -253,7 +232,7 @@ mod tests {
     #[test]
     fn wakeup_sessions_have_their_own_autonomous_write_prompt() {
         let prompt = testing_manuals()
-            .compose_conversation(&RuntimeModel::testing(), "wakeup", "")
+            .compose_conversation(&testing_runtime(), "wakeup", "")
             .unwrap();
         assert!(prompt.contains("[wakeupSession]"));
         assert!(prompt.contains("[writeTools]"));

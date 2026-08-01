@@ -1,14 +1,14 @@
-mod context;
 mod prompts;
 mod services;
-mod session;
 mod worker;
 
 use std::{path::PathBuf, sync::Arc};
 
-pub(crate) use prompts::{Manuals, RuntimeModel, human_utc_datetime, runtime_description};
+pub(crate) use kcode_kennedy_sessions::{
+    AgentMode, RuntimeModel, Service as SessionService, Session,
+};
+pub(crate) use prompts::Manuals;
 pub(crate) use services::{Api, ApiError, LocalServices};
-pub(crate) use session::{AgentMode, Session};
 pub(crate) use worker::Orchestrator;
 
 #[derive(Clone, Debug)]
@@ -25,8 +25,8 @@ pub(crate) struct Config {
 ///
 /// Kennedy-owned services are already open and are called through cloned
 /// in-process handles, including the Telegram transport.
-pub(crate) fn build(config: Config, api: Api) -> Arc<Orchestrator> {
-    Arc::new(Orchestrator::new(config, api))
+pub(crate) fn build(config: Config, api: Api, sessions: SessionService) -> Arc<Orchestrator> {
+    Arc::new(Orchestrator::new(config, api, sessions))
 }
 
 pub(crate) async fn run(worker: Arc<Orchestrator>) -> anyhow::Result<()> {

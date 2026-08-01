@@ -1967,9 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-agent-runtime"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce9677ea666232a5b6add2b60a4b40a0344f9dd10059d1f11c75195c53fb1fb7"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -2205,6 +2203,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-kennedy-sessions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "hex",
+ "kcode-agent-runtime",
+ "kcode-commit-session",
+ "kcode-dev-tools",
+ "kcode-dev-tools-chatend",
+ "kcode-history-ingress-context",
+ "kcode-intelligence-chatend",
+ "kcode-intelligence-router",
+ "kcode-kweb-context",
+ "kcode-kweb-db",
+ "kcode-kweb-manager",
+ "kcode-server-object-envelopes",
+ "kcode-session-history",
+ "kcode-speech-classification",
+ "kcode-telegram-session-coordinator",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-kmap-size"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2361,6 +2389,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-telegram-session-coordinator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-kweb-db",
+ "kcode-server-object-envelopes",
+ "kcode-telegram-identity",
+ "kcode-tg-kennedy-bot",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kcode-tg-kennedy-bot"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2452,23 +2494,20 @@ dependencies = [
  "kcode-audio-ingress",
  "kcode-audio-session-ingress",
  "kcode-codex-runtime",
- "kcode-codex-runtime-v2",
- "kcode-commit-session",
  "kcode-credential-vault",
  "kcode-dev-tools",
- "kcode-dev-tools-chatend",
- "kcode-history-ingress-context",
  "kcode-http-api",
  "kcode-intelligence-chatend",
  "kcode-intelligence-router",
+ "kcode-kennedy-sessions",
  "kcode-kmap-size",
- "kcode-kweb-context",
  "kcode-kweb-db",
  "kcode-kweb-manager",
  "kcode-server-object-envelopes",
  "kcode-session-history",
  "kcode-speech-classification",
  "kcode-telegram-identity",
+ "kcode-telegram-session-coordinator",
  "kcode-tg-kennedy-bot",
  "rand 0.9.5",
  "rpassword",

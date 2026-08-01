@@ -17,10 +17,13 @@ This document records user intention with regard to Kennedy.
 - Reduce KennedyServer by extracting cohesive Rust capabilities into managed
   Kcode libraries, starting with the least-coupled boundaries. An extracted
   library should normally contain 300-3,000 lines of code, expose a lightweight
-  well-defined API, and materially simplify what KennedyServer owns. Every
-  managed Kcode library must remain strictly below 5,000 lines of first-party
-  code including tests; split capabilities before they reach that ceiling
-  rather than treating tests or internal modules as outside the boundary. Its
+  well-defined API, and materially simplify what KennedyServer owns. Every new
+  or expanded managed Kcode library must remain strictly below 5,000 lines of
+  first-party code including tests; split capabilities before they reach that
+  ceiling rather than treating tests or internal modules as outside the
+  boundary. Pre-existing libraries that already exceed the ceiling need not be
+  remediated as part of unrelated work, but must not be expanded without first
+  restoring a compliant boundary. Its
   public operations should complete the capability's internal workflow rather
   than require callers to sequence planning, application, or other intermediate
   steps. Return only outcomes needed for decisions that genuinely remain
@@ -95,9 +98,11 @@ This document records user intention with regard to Kennedy.
   model and mechanically reconciles Kennedy's chosen projection into Chatend,
   including stable box identity, typed metadata, permanent bounded
   recent-connection boxes, and preservation of representation choices.
-  KennedyServer owns node fetching, root selection, the staged mutation plan,
-  synchronization timing, model-facing tool-result presentation, and commit
-  decisions; it must not retain a parallel Kweb-box parser or slot reconciler.
+  `kcode-kennedy-sessions` owns node fetching within a selected session, the
+  staged mutation plan, synchronization timing, model-facing tool-result
+  presentation, and final commit mechanics. KennedyServer selects the roots
+  and must not retain a parallel Kweb-box parser, slot reconciler, or staged
+  plan.
 - After KennedyServer bootstraps and validates its application-owned roots,
   `kcode-kweb-manager` exclusively owns the live `KwebDb` handle. The manager
   owns typed node reads, idempotent provenance and ordinary node mutations,
@@ -192,16 +197,25 @@ This document records user intention with regard to Kennedy.
 - Session History exclusively owns active session logs, lifecycle/control
   journals, pending session objects, and completion receipts. KennedyServer uses
   its typed API and must not manipulate the same files independently.
+- One focused `kcode-kennedy-sessions` library owns the complete mechanical
+  lifecycle of a logical Kennedy session: Session History and Chatend
+  projection, staged Kweb state and revalidation, tool authorization and
+  dispatch, object resolution, provider-loop hosting, checkpoints, recovery,
+  and final archive/commit mechanics. Its boundary is one concrete capability
+  service plus complete session operations, not a callback for every tool.
+  KennedyServer composes the application prompt, selects roots and runtime,
+  schedules outer work, and decides which external workflow should start or
+  finish; it must not retain a parallel session implementation.
 - One small context-capacity policy library owns the complete mechanical
   preparation of Chatend representations: initial history-ingress hydration,
   summary preservation, live overflow recovery, protected-content ordering,
   largest-first reduction, durable application, and final capacity
   measurement. Its public workflows are outcome-level preparation and recovery
   calls rather than separately exposed planning or application steps.
-  KennedyServer owns prompt and runtime selection, the visible overflow
-  warning and transport delivery, Kweb revalidation, ingress lifecycle events,
-  and the decision to continue ingress or finalize and commit a session that
-  cannot fit even after permitted reduction.
+  `kcode-kennedy-sessions` owns application of the visible overflow warning,
+  Kweb revalidation, ingress lifecycle events, and mechanical continuation or
+  finalization after recovery. KennedyServer retains prompt and runtime
+  selection plus outer transport delivery and job scheduling.
 - Session completion synchronizes its immutable receipt before removing active
   files. Concurrent readers must treat a journal that disappears after
   enumeration as a completed lifecycle transition, not as storage corruption
@@ -488,6 +502,12 @@ This document records user intention with regard to Kennedy.
 - Kennedy conversation generation uses the provider's native turn and tool
   protocol with one `call_ktool` bridge. Preserve native call identity and raw
   tool results rather than inventing a parallel tool protocol.
+- `kcode-agent-runtime` owns the provider-round loop shared by primary and
+  delegated agents, including streamed output, native `call_ktool` parsing,
+  continuation, cancellation, captures, receipts, and the round limit. The
+  session supplies prepared context and executes authorized calls through one
+  small host interface; the runtime does not own Kennedy prompts, Kmap, tool
+  policy, or session persistence.
 - The provider-visible prompt should contain Kennedy's intentional Chatend, not
   ambient repository instructions, plugins, shell state, credentials, or
   unrelated host capabilities.
@@ -629,6 +649,12 @@ This document records user intention with regard to Kennedy.
 - The Telegram library is transport plus a durable ordered queue. It does not
   compose Kennedy prompts, run tools, mutate Kmap, own Kennedy users, or unlock
   credentials.
+- `kcode-telegram-session-coordinator` owns Kennedy-specific session delivery
+  mechanics over the typed Telegram transport and identity directory: delivery
+  argument validation, per-user and per-group serialization, fresh group-root
+  resolution, attachment limits and caption/native-media presentation, retained
+  group-context rendering, and retained-media lookup. It does not own prompts,
+  Kmap objects, the directory, transport persistence, or logical sessions.
 - Telegram is an in-process KennedyServer capability, not a loopback
   microservice. Its library exposes a typed service handle plus the supervised
   Telegram polling runtime; KennedyServer must call that handle directly
@@ -711,14 +737,14 @@ This document records user intention with regard to Kennedy.
   self-time sessions. The group tool has the same text, attachment, delivery
   filename, size, MIME, and native-media capabilities as initiated private
   delivery, targets the group's canonical Kmap root rather than exposing a raw
-  Telegram chat ID, and remains unavailable to subagents. KennedyServer resolves
-  that root through the group directory, while Telegram transport resolves the
-  current chat and must freshly enforce the ordinary administrator,
-  complete-roster, and historical-whitelist requirements before sending. The
-  tool invocation and ordinary source-session/Kmap lifecycle are the durable
-  record; do not create or select a participant session merely to own a
-  group-wide delivery. Successful items may be followed by a later failed item
-  without rollback. Use only ordinary bounded in-memory transport retries:
+  Telegram chat ID, and remains unavailable to subagents. The Telegram session
+  coordinator resolves that root through the group directory, while Telegram
+  transport resolves the current chat and must freshly enforce the ordinary
+  administrator, complete-roster, and historical-whitelist requirements before
+  sending. The tool invocation and ordinary source-session/Kmap lifecycle are
+  the durable record; do not create or select a participant session merely to
+  own a group-wide delivery. Successful items may be followed by a later failed
+  item without rollback. Use only ordinary bounded in-memory transport retries:
   failure ends the attempt, and no durable replay or exactly-once mechanism is
   required.
 - Invocation controls when Kennedy responds, not which accepted bounded group
@@ -833,8 +859,9 @@ This document records user intention with regard to Kennedy.
   boundary and Chatend. It owns freeform source capture and reconciliation of
   successful managed-source snapshots into one stable Chatend box per project.
   Keep its API mechanical and minimal; it must not become another service or
-  orchestration layer. KennedyServer retains tool authorization and execution,
-  provider flow, context-capacity policy, Kweb object resolution, and Kmap
+  orchestration layer. `kcode-kennedy-sessions` retains tool authorization and
+  execution plus Kweb object resolution; the agent-runtime and context-capacity
+  owners retain their respective mechanical workflows, and Kmap retains
   storage.
 - Editable source and immutable publications are separate. Published versions
   cannot be overwritten, and floating compatible selection resolves to an

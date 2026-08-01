@@ -15,13 +15,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 use uuid::Uuid;
 
-use super::{
-    AgentMode, Api, Config, Manuals, RuntimeModel, Session,
-    services::{ApiError, data_url, telegram_caption_for},
-    session::{
-        ResolvedObject, SessionOptions, is_agent_loop_round_limit, validate_delivery_file_name,
-    },
-};
+use super::services::{data_url, telegram_caption_for};
+use super::{AgentMode, Api, ApiError, Config, Manuals, RuntimeModel, Session, SessionService};
+use kcode_kennedy_sessions::{ResolvedObject, SessionOptions, validate_delivery_file_name};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_RETRY: Duration = Duration::from_secs(2);
@@ -72,6 +68,7 @@ enum TurnCompletion {
 pub(crate) struct Orchestrator {
     config: Config,
     api: Api,
+    sessions: SessionService,
     runtime: OnceCell<Runtime>,
     writer: Arc<Mutex<()>>,
     writer_job_active: AtomicBool,
@@ -87,10 +84,11 @@ pub(crate) struct Orchestrator {
 }
 
 impl Orchestrator {
-    pub(crate) fn new(config: Config, api: Api) -> Self {
+    pub(crate) fn new(config: Config, api: Api, sessions: SessionService) -> Self {
         Self {
             config,
             api,
+            sessions,
             runtime: OnceCell::new(),
             writer: Arc::new(Mutex::new(())),
             writer_job_active: AtomicBool::new(false),
@@ -173,6 +171,42 @@ impl Orchestrator {
             .context("orchestration runtime is not initialized")
     }
 
+    async fn open_session(
+        &self,
+        runtime: Runtime,
+        options: SessionOptions,
+        restored: Option<&Value>,
+    ) -> anyhow::Result<Session> {
+        let system_prompt = if matches!(options.mode, AgentMode::Ingress { .. }) {
+            runtime.manuals.compose_ingress(
+                &runtime.model,
+                options
+                    .source_session_type
+                    .as_deref()
+                    .unwrap_or("conversation"),
+            )?
+        } else {
+            let session_context = if options.session_type == "free-time" {
+                self_time_schedule(&options.free_time)
+            } else {
+                String::new()
+            };
+            runtime.manuals.compose_conversation(
+                &runtime.model,
+                &options.session_type,
+                &session_context,
+            )?
+        };
+        Session::new(
+            self.sessions.clone(),
+            system_prompt,
+            runtime.model,
+            options,
+            restored,
+        )
+        .await
+    }
+
     async fn run_wakeup_scheduler(self: Arc<Self>) {
         loop {
             let marker = next_wakeup_marker(Utc::now());
@@ -214,8 +248,10 @@ impl Orchestrator {
         let user_root = user
             .root_node_id
             .context("Telegram user root is not ready for a wakeup session")?;
-        let mut options =
-            SessionOptions::conversation("wakeup", vec![user_root, runtime.kennedy_root_node_id]);
+        let mut options = SessionOptions::conversation(
+            "wakeup",
+            vec![user_root, runtime.kennedy_root_node_id.clone()],
+        );
         options.mode = AgentMode::Wakeup;
         options.channel = json!({
             "kind":"wakeup",
@@ -225,14 +261,7 @@ impl Orchestrator {
             "wakeupMarker":marker.to_rfc3339(),
         });
         options.orchestration = json!({"owner":"backend","status":"scheduled"});
-        let mut session = Session::new(
-            self.api.clone(),
-            runtime.manuals,
-            runtime.model,
-            options,
-            None,
-        )
-        .await?;
+        let mut session = self.open_session(runtime, options, None).await?;
         session.stage_wakeup_opening()?;
         let state = session.snapshot()?;
         self.api
@@ -359,8 +388,8 @@ impl Orchestrator {
         checkpoint: C,
     ) -> anyhow::Result<TurnCompletion>
     where
-        C: FnMut(Value) -> F,
-        F: std::future::Future<Output = anyhow::Result<()>>,
+        C: FnMut(Value) -> F + Send,
+        F: std::future::Future<Output = anyhow::Result<()>> + Send,
     {
         self.register_operation(session_id, operation_id).await;
         let stop = match self.api.history_listen_for_stop(session_id) {
@@ -544,7 +573,7 @@ impl Orchestrator {
                         return Ok(());
                     }
                     if let Err(error) = result {
-                        let round_limit = is_agent_loop_round_limit(&error);
+                        let round_limit = kcode_agent_runtime::is_session_round_limit(&error);
                         session.orchestration = if is_cancelled(&error) {
                             json!({"owner":"backend","status":"stopped"})
                         } else if round_limit {
@@ -634,7 +663,7 @@ impl Orchestrator {
                         return Ok(());
                     }
                     if let Err(error) = result {
-                        let round_limit = is_agent_loop_round_limit(&error);
+                        let round_limit = kcode_agent_runtime::is_session_round_limit(&error);
                         session.orchestration = if is_cancelled(&error) {
                             json!({"owner":"backend","status":"stopped"})
                         } else if round_limit {
@@ -754,14 +783,7 @@ impl Orchestrator {
             "wakeup" => AgentMode::Wakeup,
             _ => AgentMode::Conversation,
         };
-        Session::new(
-            self.api.clone(),
-            runtime.manuals,
-            runtime.model,
-            options,
-            Some(&state),
-        )
-        .await
+        self.open_session(runtime, options, Some(&state)).await
     }
 
     async fn close_conversation(
@@ -954,14 +976,7 @@ impl Orchestrator {
                 rust_lib_session_id: Some(rust_session_id.clone()),
             };
             let restored = ingress_restore_state(&state);
-            let mut session = Session::new(
-                self.api.clone(),
-                runtime.manuals,
-                runtime.model,
-                options,
-                Some(restored),
-            )
-            .await?;
+            let mut session = self.open_session(runtime, options, Some(restored)).await?;
             let record = Arc::new(Mutex::new(record));
             persist_ingress_record(&self.api, &record, session.snapshot()?).await?;
             if !session.completed {
@@ -1078,14 +1093,9 @@ impl Orchestrator {
             .and_then(Value::as_str)
             .map(str::to_owned);
         options.orchestration = json!({"owner":"backend","status":"running"});
-        let mut session = Session::new(
-            self.api.clone(),
-            runtime.manuals.clone(),
-            runtime.model.clone(),
-            options,
-            Some(&state),
-        )
-        .await?;
+        let mut session = self
+            .open_session(runtime.clone(), options, Some(&state))
+            .await?;
         session.stage_free_time_opening();
         let record_arc = Arc::new(Mutex::new(record));
         persist_record(&self.api, &record_arc, session.snapshot()?, true).await?;
@@ -1247,14 +1257,7 @@ impl Orchestrator {
         options.free_time = free;
         options.provenance_id = provenance_id;
         options.orchestration = json!({"owner":"backend","status":"running"});
-        let mut session = Session::new(
-            self.api.clone(),
-            runtime.manuals.clone(),
-            runtime.model.clone(),
-            options,
-            None,
-        )
-        .await?;
+        let mut session = self.open_session(runtime.clone(), options, None).await?;
         session.stage_free_time_opening();
         let state = session.snapshot()?;
         self.api
@@ -2128,14 +2131,7 @@ impl Orchestrator {
             SessionOptions::conversation(if group { "telegram-group" } else { "telegram" }, roots);
         options.channel = channel;
         options.reference_root_node_ids = references;
-        let session = Session::new(
-            self.api.clone(),
-            runtime.manuals,
-            runtime.model,
-            options,
-            None,
-        )
-        .await?;
+        let session = self.open_session(runtime, options, None).await?;
         let state = session.snapshot()?;
         let record = self
             .api
@@ -2542,20 +2538,13 @@ impl Orchestrator {
         let group_root = group
             .root_node_id
             .context("Telegram group root is not ready")?;
-        let roots = vec![group_root.clone(), runtime.kennedy_root_node_id];
+        let roots = vec![group_root.clone(), runtime.kennedy_root_node_id.clone()];
         let channel = json!({"kind":"telegram-group","chatId":batch.get("chatId").cloned().unwrap_or(Value::Null),"groupId":group_id,"groupRootNodeId":group_root,"groupIngressBatchId":id,"backgroundIngress":true,"groupContext":context});
         let mut options = SessionOptions::conversation("telegram-group", roots.clone());
         options.channel = channel;
         options.reference_root_node_ids = participant_references(&context, &roots);
         options.source_session_type = Some("telegram-group".into());
-        let mut session = Session::new(
-            self.api.clone(),
-            runtime.manuals,
-            runtime.model,
-            options,
-            None,
-        )
-        .await?;
+        let mut session = self.open_session(runtime, options, None).await?;
         for message in context
             .get("messages")
             .and_then(Value::as_array)
@@ -2981,6 +2970,19 @@ fn value_string(value: &Value) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string())
 }
+fn self_time_schedule(value: &Value) -> String {
+    value
+        .get("deadlineAt")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|deadline| {
+            format!(
+                "The self-time deadline is {}.",
+                super::prompts::human_utc_datetime(deadline.with_timezone(&Utc))
+            )
+        })
+        .unwrap_or_else(|| "The self-time deadline was not supplied.".into())
+}
 fn bounded_error(error: &anyhow::Error) -> String {
     format!("{error:#}").chars().take(1_000).collect()
 }
@@ -3026,12 +3028,10 @@ mod tests {
         assert!(listed_session_disappeared(&ApiError {
             code: "not_found".into(),
             message: "Session not found.".into(),
-            receipt: None,
         }));
         assert!(!listed_session_disappeared(&ApiError {
             code: "internal_error".into(),
             message: "storage unavailable".into(),
-            receipt: None,
         }));
     }
 
