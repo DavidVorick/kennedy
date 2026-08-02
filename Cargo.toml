@@ -17,7 +17,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
 hex = "0.4"
 http = "1"
-kcode-agent-runtime = "0.2.1"
+kcode-agent-runtime = "0.2.2"
 kcode-audio-ingress = "0.5.3"
 kcode-audio-session-ingress = "0.2.1"
 kcode-codex-runtime = "0.1.1"
@@ -32,6 +32,8 @@ kcode-history-ingress-context = "0.1.1"
 kcode-http-api = "0.1.0"
 kcode-intelligence-chatend = "0.1.0"
 kcode-intelligence-router = "0.2.3"
+# Exact because the application composition root is entrusted with reusable credentials.
+kcode-kennedy-app = "=0.1.0"
 kcode-kennedy-sessions = "0.1.0"
 kcode-kmap-size = "0.1.0"
 kcode-kweb-context = "0.2.1"
@@ -69,6 +71,8 @@ debug = 1
 incremental = false
 
 [patch.crates-io]
-kcode-agent-runtime = { path = "data/kcode/kcode-rust-libs/kcode-agent-runtime/generations/g-a5808-18c7ae77d3216bdd-4" }
-kcode-kennedy-sessions = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-sessions/generations/g-local-0" }
-kcode-telegram-session-coordinator = { path = "data/kcode/kcode-rust-libs/kcode-telegram-session-coordinator/generations/g-local-0" }
+kcode-agent-runtime = { path = "data/kcode/kcode-rust-libs/kcode-agent-runtime/generations/g-f67d-18c7d6e12139804b-0" }
+kcode-kennedy-roots = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-roots/generations/g-9e25-18c7d84abead2918-0" }
+kcode-kennedy-orchestration = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-orchestration/generations/g-9d68-18c7d82fe4ac32c8-0" }
+kcode-kennedy-telegram-runtime = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-telegram-runtime/generations/g-b796-18c7d85f7c53e227-0" }
+kcode-kennedy-app = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-app/generations/g-bbc9-18c7d878ce219be2-0" }

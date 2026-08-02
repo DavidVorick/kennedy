@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-agent-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "hex",
@@ -2203,8 +2203,87 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-kennedy-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hex",
+ "kcode-agent-runtime",
+ "kcode-audio-ingress",
+ "kcode-audio-session-ingress",
+ "kcode-codex-runtime",
+ "kcode-credential-vault",
+ "kcode-dev-tools",
+ "kcode-http-api",
+ "kcode-intelligence-chatend",
+ "kcode-intelligence-router",
+ "kcode-kennedy-orchestration",
+ "kcode-kennedy-roots",
+ "kcode-kennedy-sessions",
+ "kcode-kennedy-telegram-runtime",
+ "kcode-kmap-size",
+ "kcode-kweb-db",
+ "kcode-session-history",
+ "kcode-speech-classification",
+ "kcode-telegram-identity",
+ "kcode-telegram-session-coordinator",
+ "kcode-tg-kennedy-bot",
+ "rpassword",
+ "rusqlite",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "kcode-kennedy-orchestration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "kcode-agent-runtime",
+ "kcode-audio-session-ingress",
+ "kcode-dev-tools",
+ "kcode-intelligence-router",
+ "kcode-kennedy-sessions",
+ "kcode-kweb-db",
+ "kcode-kweb-manager",
+ "kcode-session-history",
+ "kcode-telegram-identity",
+ "kcode-tg-kennedy-bot",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kcode-kennedy-roots"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-kweb-db",
+ "kcode-kweb-manager",
+ "kcode-server-object-envelopes",
+ "kcode-telegram-identity",
+ "rusqlite",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-kennedy-sessions"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c43c48e60f145445594fffb7d188981dfa6edc7a5819a9c36af3cbd0de056533"
 dependencies = [
  "anyhow",
  "base64",
@@ -2227,6 +2306,25 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kcode-kennedy-telegram-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-agent-runtime",
+ "kcode-kennedy-orchestration",
+ "kcode-kennedy-roots",
+ "kcode-kennedy-sessions",
+ "kcode-server-object-envelopes",
+ "kcode-session-history",
+ "kcode-telegram-identity",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",
@@ -2391,6 +2489,8 @@ dependencies = [
 [[package]]
 name = "kcode-telegram-session-coordinator"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0127be8ad49e8139d75d3b2133e54dcaad511344f53a7730ad74258e7f00cdab"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2484,43 +2584,7 @@ name = "kennedy-server"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "axum",
- "base64",
- "chrono",
- "clap",
- "ed25519-dalek",
- "hex",
- "kcode-agent-runtime",
- "kcode-audio-ingress",
- "kcode-audio-session-ingress",
- "kcode-codex-runtime",
- "kcode-credential-vault",
- "kcode-dev-tools",
- "kcode-http-api",
- "kcode-intelligence-chatend",
- "kcode-intelligence-router",
- "kcode-kennedy-sessions",
- "kcode-kmap-size",
- "kcode-kweb-db",
- "kcode-kweb-manager",
- "kcode-server-object-envelopes",
- "kcode-session-history",
- "kcode-speech-classification",
- "kcode-telegram-identity",
- "kcode-telegram-session-coordinator",
- "kcode-tg-kennedy-bot",
- "rand 0.9.5",
- "rpassword",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zeroize",
+ "kcode-kennedy-app",
 ]
 
 [[package]]
