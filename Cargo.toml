@@ -69,10 +69,3 @@ incremental = false
 [profile.test]
 debug = 1
 incremental = false
-
-[patch.crates-io]
-kcode-agent-runtime = { path = "data/kcode/kcode-rust-libs/kcode-agent-runtime/generations/g-f67d-18c7d6e12139804b-0" }
-kcode-kennedy-roots = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-roots/generations/g-9e25-18c7d84abead2918-0" }
-kcode-kennedy-orchestration = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-orchestration/generations/g-9d68-18c7d82fe4ac32c8-0" }
-kcode-kennedy-telegram-runtime = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-telegram-runtime/generations/g-b796-18c7d85f7c53e227-0" }
-kcode-kennedy-app = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-app/generations/g-bbc9-18c7d878ce219be2-0" }

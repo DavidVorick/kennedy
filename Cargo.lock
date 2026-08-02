@@ -1968,6 +1968,8 @@ dependencies = [
 [[package]]
 name = "kcode-agent-runtime"
 version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35d04e69decf090d3ea41c25414ca6224ee57b23e5bb979b263a4b3b7a9f1921"
 dependencies = [
  "anyhow",
  "hex",
@@ -2205,6 +2207,8 @@ dependencies = [
 [[package]]
 name = "kcode-kennedy-app"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad37cdba22f3f6a2e693ec42cdd1f13f7617a451867906a24e86486a1d601664"
 dependencies = [
  "anyhow",
  "axum",
@@ -2244,6 +2248,8 @@ dependencies = [
 [[package]]
 name = "kcode-kennedy-orchestration"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a59cee54185f168f1eee4fae3fc33e2aae177a20c9c3673eb8e98715f0ee08b2"
 dependencies = [
  "anyhow",
  "base64",
@@ -2267,6 +2273,8 @@ dependencies = [
 [[package]]
 name = "kcode-kennedy-roots"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65a8a418393fe939dda00221896596e5f84daff4c317c5d35cb8821ee8f03ba4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2314,6 +2322,8 @@ dependencies = [
 [[package]]
 name = "kcode-kennedy-telegram-runtime"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fc63aa324aa3c641f267807ea59a3edfd6355a0881824b00e18c632a2b74d3d"
 dependencies = [
  "anyhow",
  "chrono",
