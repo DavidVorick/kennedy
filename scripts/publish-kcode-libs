@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repository="$(cd -- "$script_dir/.." && pwd -P)"
+
+cd -- "$repository"
+exec cargo run --quiet --package kennedy-kcode-publisher -- "$@"

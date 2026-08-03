@@ -14,11 +14,11 @@ This document records user intention with regard to Kennedy.
 - Same-process components should normally communicate through small typed Rust
   APIs. HTTP belongs at genuine transport boundaries, not between parts of one
   process.
-- Reduce KennedyServer by extracting cohesive Rust capabilities into managed
-  Kcode libraries, starting with the least-coupled boundaries. An extracted
-  library should normally contain 300-3,000 lines of code, expose a lightweight
-  well-defined API, and materially simplify what KennedyServer owns. Every new
-  or expanded managed Kcode library must remain strictly below 5,000 lines of
+- Keep Kennedy capabilities in cohesive managed Kcode libraries. A managed
+  capability library should normally contain 300-3,000 lines of code, expose a
+  lightweight well-defined API, and materially simplify the total application
+  architecture. Every new or expanded managed Kcode library must remain
+  strictly below 5,000 lines of
   first-party code including tests; split capabilities before they reach that
   ceiling rather than treating tests or internal modules as outside the
   boundary. Pre-existing libraries that already exceed the ceiling need not be
@@ -28,36 +28,41 @@ This document records user intention with regard to Kennedy.
   than require callers to sequence planning, application, or other intermediate
   steps. Return only outcomes needed for decisions that genuinely remain
   outside the boundary. Do not create pass-through crates that merely relocate
-  server-specific glue. Prefer focused new libraries over casually making an
-  existing managed library larger, but optimize for the simplest total
-  architecture: extend the clear owner of a capability when doing so removes
-  duplicate implementation or parallel ownership and leaves a lighter boundary
-  between components. Judge an extraction by total first-party implementation
-  as well as server size: move code and tests rather than copying them, reuse
-  existing transports, and do not add abstraction or supporting code that
-  consumes the deduplication benefit. Treat capability extraction as an
-  ownership-only refactor unless the user explicitly requests a behavior
-  change: preserve observable APIs, state transitions, persistence contracts,
-  limits, filtering, retry semantics, failure isolation, and compatibility
-  with existing durable state. Do not rewrite these clarifications to
-  legitimize an incidental behavior change introduced during extraction.
+  server-specific glue. When decomposing an existing managed library, keep its
+  caller-facing boundary stable: existing consumers must not need a new direct
+  dependency, changed imports, or newly exposed internal sequencing solely
+  because of the split. Preserve existing type paths through re-exports or a
+  substantive facade while giving the extracted mechanics one clear owner.
+  Prefer focused new libraries over casually making an existing managed library
+  larger, but optimize for the simplest total architecture: extend the clear
+  owner of a capability when doing so removes duplicate implementation or
+  parallel ownership and leaves a lighter boundary between components. Judge an
+  extraction by total first-party implementation as well as server size: move
+  code and tests rather than copying them, reuse existing transports, and do not
+  add abstraction or supporting code that consumes the deduplication benefit.
+  Treat capability extraction as an ownership-only refactor unless the user
+  explicitly requests a behavior change: preserve observable APIs, state
+  transitions, persistence contracts, limits, filtering, retry semantics,
+  failure isolation, and compatibility with existing durable state. Do not
+  rewrite these clarifications to legitimize an incidental behavior change
+  introduced during extraction.
 - `kcode-kennedy-app` is Kennedy's top-level application bootstrap and lifecycle
   composition library. It owns CLI parsing and maintenance commands, vault
   prompting and application secret names, service construction, application
   root selection, the shared in-process capability graph, readiness ordering,
-  listener binding, and runtime supervision. Because it receives reusable
-  credentials it is security-critical and must be exact-pinned and inspected
-  before every upgrade. The KennedyServer executable is deliberately a
-  one-line-equivalent wrapper that invokes this library and owns no parallel
-  application behavior.
+  listener binding, and runtime supervision. KennedyServer deliberately treats
+  the latest published `kcode-kennedy-app` release as its application update
+  boundary and accepts the highest available version rather than exact-pinning
+  it. The KennedyServer executable is a one-line-equivalent wrapper that invokes
+  this sole direct dependency and owns no parallel application behavior.
 - `kcode-http-api` owns the complete browser-facing HTTP router and API as a
-  final focused presentation library over typed capability libraries, including
+  focused presentation library over typed capability libraries, including
   route composition, wire DTOs, multipart admission, HTTP errors, response and
   cache headers, request limits, tracing middleware, the Web-library router,
   and the deliberately tiny root loader. Its handlers must not call back into
   application implementation modules through callbacks, traits, or other
-  dependency inversion; first give transport-independent workflows needed by
-  both HTTP and backend orchestration a cohesive library owner.
+  dependency inversion. Any transport-independent workflow shared by HTTP and
+  backend orchestration must have a cohesive typed library owner.
 - Managed libraries maintained only by LLMs are source-first: their code and
   tests are the specification. Do not add a separate `Specification.md` that
   duplicates an ingestible codebase; retain only documentation required by the
@@ -104,11 +109,14 @@ This document records user intention with regard to Kennedy.
   model and mechanically reconciles Kennedy's chosen projection into Chatend,
   including stable box identity, typed metadata, permanent bounded
   recent-connection boxes, and preservation of representation choices.
-  `kcode-kennedy-sessions` owns node fetching within a selected session, the
-  staged mutation plan, synchronization timing, model-facing tool-result
-  presentation, and final commit mechanics. The Kennedy application selects
-  the roots and must not retain a parallel Kweb-box parser, slot reconciler, or
-  staged plan.
+  `kcode-kennedy-kweb-loader` owns atomic batch fetching and projection of
+  durable nodes into that context plus legacy stored-node decoding; it remains
+  read-only and owns neither roots nor session policy. `kcode-kennedy-sessions`
+  owns selection of node IDs within a session, the staged mutation plan,
+  synchronization timing, model-facing tool-result presentation, and final
+  commit mechanics. The Kennedy application selects the roots and must not
+  retain a parallel Kweb-box parser, slot reconciler, staged plan, or durable
+  node loader.
 - One focused Kennedy-root library owns the mechanics for bootstrapping and
   validating the application system roots and reconciling user and Telegram
   group root assignments. The top-level application supplies the configured
@@ -208,9 +216,15 @@ This document records user intention with regard to Kennedy.
 
 ## Sessions, Chatend, and Context
 
-- Session History exclusively owns active session logs, lifecycle/control
-  journals, pending session objects, and completion receipts. Kennedy uses
-  its typed API and must not manipulate the same files independently.
+- `kcode-session-history` exclusively owns the caller-facing Session History
+  capability: active session creation and discovery, lifecycle/control
+  journals, pending session objects, and completion receipts. Its focused
+  `kcode-chatend` implementation dependency owns the provider-independent
+  box/event state machine, exact context projection, replay, and mechanical
+  synchronization of mutable Chatend state through `kcode-session-log`.
+  `kcode-session-history` creates and opens those sessions and re-exports the
+  original Chatend types and paths; existing consumers must neither depend on
+  `kcode-chatend` directly nor manipulate the same files independently.
 - One focused `kcode-kennedy-sessions` library owns the complete mechanical
   lifecycle of a logical Kennedy session: Session History and Chatend
   projection, staged Kweb state and revalidation, tool authorization and
@@ -317,8 +331,9 @@ This document records user intention with regard to Kennedy.
   unprotected candidates have been exhausted. A Kennedy result is a semantic
   box class covering anything Kennedy produced or caused to be produced,
   including Kennedy messages, tool invocations, tool results, and managed tool
-  state; do not infer it only from the current low-level box-owner variant. If
-  protected content must also be reduced, exhaust other protected classes
+  state; classify it semantically rather than deriving it solely from any
+  storage enum or representation detail. If protected content must also be
+  reduced, exhaust other protected classes
   before touching those ten recent Kennedy results, retaining largest-first
   ordering within each protection tier.
 - Treat current context occupancy and cumulative provider usage as different
@@ -450,13 +465,15 @@ This document records user intention with regard to Kennedy.
   context needed to choose it.
 - Stateful Ktools retain exact canonical history while projecting only one
   current value into the box-free subagent context. When a successful tool call
-  revises that value, keep the earlier call in its existing concise successful
-  representation when suitable, replace only the superseded bulky payload, and
-  move the latest complete value to the bottom of the context after the call
-  that produced it. Do not invent a special marker syntax when the ordinary
-  representation is already compact, do not duplicate complete old and new
-  values, and do not revise state after a failed call. This projection applies
-  generically to managed source and any other box-aware tool.
+  revises that value, keep the earlier call in place and replace its superseded
+  output with the generic marker `[Tool output was displayed here, but has since
+  been updated and now appears elsewhere in the context]`. Move the latest
+  complete value to the bottom of the context after the call that produced it,
+  so only one complete rendering of a tool-owned state is visible and its
+  chronology is unambiguous. Do not duplicate complete old and new values, and
+  do not revise state after a failed call. This projection applies generically
+  to managed source and any other box-aware tool; exact audit history remains
+  unchanged.
 - A successful subagent call returns its one terminal assistant response as the
   plain Ktool result to Kennedy, followed only by a concise estimated cost line
   in pennies with three digits after the decimal point. The cost is the
@@ -572,7 +589,11 @@ This document records user intention with regard to Kennedy.
   advanced-document-only gate in Kennedy application code.
 - User-supplied voice and media reach Kennedy as originals without eager
   transport-generated interpretation. Kennedy chooses whether and how to
-  transcribe or annotate them, including the exact model and bounded prompt.
+  transcribe or annotate them, including the exact model and prompt. Kennedy's
+  session, intelligence-routing, and provider-adapter layers must preserve a
+  nonblank caller prompt unchanged without imposing an arbitrary character or
+  byte ceiling; only a provider's actual request or context constraint may
+  reject its size.
 - Every object-consuming Ktool accepts both a pending object staged in the
   current logical session and an authorized canonical object from the object
   store. Resolve both forms through the same session boundary before applying
@@ -667,6 +688,19 @@ This document records user intention with regard to Kennedy.
 - The Telegram library is transport plus a durable ordered queue. It does not
   compose Kennedy prompts, run tools, mutate Kmap, own Kennedy users, or unlock
   credentials.
+- `kcode-telegram-transport-state` exclusively owns Telegram's SQLite handle,
+  schema and migrations, polling cursor, accepted-event queue and batching,
+  private and group session pointers, stable group and membership ledger,
+  quarantine evaluation from caller-supplied live observations, retained
+  working context and media, edit reconciliation, and delivery state
+  transitions. `kcode-tg-kennedy-bot` remains the unchanged application-facing
+  facade and owns the Bot API client, polling and update decoding, live identity
+  and roster acquisition, downloads, retries, and actual sends. Their boundary
+  uses typed records and opaque consuming admission or delivery capabilities at
+  the unavoidable external-I/O seams; it must not expose SQLite, Teloxide,
+  arbitrary JSON, batch internals, or caller-assembled persistence steps.
+  Existing callers continue to use only `kcode-tg-kennedy-bot`'s public types
+  and complete operations.
 - `kcode-telegram-session-coordinator` owns Kennedy-specific session delivery
   mechanics over the typed Telegram transport and identity directory: delivery
   argument validation, per-user and per-group serialization, fresh group-root
@@ -688,13 +722,19 @@ This document records user intention with regard to Kennedy.
   microservice. Its library exposes a typed service handle plus the supervised
   Telegram polling runtime; the application must call that handle directly
   rather than encode routes, JSON bodies, multipart requests, or HTTP status
-  errors for same-process work. The main server listener (normally port 4321)
-  exclusively owns browser-visible health at `/health`; do not restore a
-  second Telegram listener or port 4324. Telegram's external Bot API remains a
-  genuine HTTP transport boundary.
+  errors for same-process work. The main application listener exclusively owns
+  browser-visible health at `/health`; Telegram must not expose an application
+  listener or health endpoint. Telegram's external Bot API remains a genuine
+  HTTP transport boundary.
 - Kennedy owns the user directory, whitelist, root assignments, and
-  authorization policy. Bootstrap a handle through trust-on-first-use, then
-  treat the stable numeric Telegram identity as authoritative.
+  authorization policy. A preauthorized Telegram handle is sufficient
+  temporary authority before it has a stable numeric-ID binding and must not
+  by itself block private or group admission. On the first observation whose
+  normalized current handle exactly matches that unresolved entry, atomically
+  bind the observed stable numeric Telegram identity through trust-on-first-use
+  and thereafter treat that numeric identity as authoritative. A missing or
+  mismatched handle must still fail closed, and a later handle change or reuse
+  must never transfer an established numeric identity's authority.
 - Telegram users are trusted participants in the shared Kmap. Do not bolt a
   separate confidentiality model onto Telegram sessions.
 - Group identity is opaque and stable. Group roots belong to Kennedy's user
@@ -921,13 +961,23 @@ This document records user intention with regard to Kennedy.
   exact version pin only when a dependency is directly entrusted with API
   credentials or comparably critical data and the narrower trust boundary has
   a concrete justification. Ordinary source, rendering, routing, and Web
-  library dependencies are not exact-pinned merely for predictability.
+  library dependencies are not exact-pinned merely for predictability. The
+  explicitly trusted `kcode-kennedy-app` application-update boundary defined
+  under Overall Direction is the sole exception.
 - Kennedy's production workspace consumes published managed Rust libraries
   from crates.io. A local Kcode generation may temporarily override a crate
   only while actively developing an unpublished version; remove that override
   once the required version is published.
-- Kennedy's managed check and publication tools own the workflow. Avoid adding
-  deployment scripts or another publication path around them.
+- Kennedy's managed check and publication tools own each library's validation
+  and release operation. One offline operator utility may coordinate a batch of
+  current managed Rust-library releases: it unlocks Kennedy's ordinary
+  credential vault for the crates.io key, skips exact versions that are already
+  published so interrupted runs resume safely, orders unpublished libraries by
+  their managed-library dependencies, and waits for each release to become
+  registry-visible before publishing its dependents. This coordinator must use
+  the managed publication operation rather than duplicate its checks, fail
+  closed while Kennedy is running, and never expose the publication credential
+  in output, arguments, or source.
 - Managed Rust checks and publications automatically apply rustfmt to their
   disposable source before the remaining validation. Formatting differences
   that rustfmt can repair must not become model-facing failures or consume
@@ -1018,6 +1068,8 @@ This document records user intention with regard to Kennedy.
   feature policy, maintenance exclusion, and backup decisions; it must not
   duplicate or bypass the library's encrypted persistence format.
 - A library that receives a reusable credential is security-critical. Pin and
-  inspect the exact source used, and repeat that review before upgrading it.
+  inspect the exact source used, and repeat that review before upgrading it,
+  except for the explicitly trusted `kcode-kennedy-app` application-update
+  boundary defined under Overall Direction.
 - Maintenance operations that require exclusive persistence access must fail
   closed while Kennedy may still be running.

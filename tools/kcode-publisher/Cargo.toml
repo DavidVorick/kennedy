@@ -1,0 +1,18 @@
+[package]
+name = "kennedy-kcode-publisher"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Exact because the utility passes the vault passphrase and reads the reusable token.
+kcode-credential-vault = "=0.1.1"
+# Exact because the utility directly entrusts this library with the crates.io token.
+kcode-rust-libs-v2 = "=1.2.3"
+# Exact because this dependency directly receives the credential-vault passphrase.
+rpassword = "=7.5.4"
+toml = "0.9"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -22,3 +22,18 @@ should behave or be designed, preserve the durable user intention in
 appending a chronological implementation note. Prefer general intent, rationale,
 negative requirements, and regression boundaries over versions, routes,
 completed migrations, or mechanics that are clearer in current code and tests.
+
+When working with kcode libraries, the LLM agent must keep a very light touch.
+The only top level files that are allowed are Cargo.toml and Documentation.md.
+There should be no license file, no changelist file, no readme, and no
+dependency audit file.
+
+When splitting kcode libraries into smaller components, an LLM agent must keep
+clean and minimal API boundaries. When splitting code, behavior must be
+preserved as much as possible, except where clear bugs are identified. Bugs
+must be confirmed with the user before they are fixed, as must all other
+non-cosmetic changes.
+
+Do not use exact-pin versions for any libraries unless the calling library is
+itself passing API key material to the library that it is calling. All other
+libraries must accept any compatibility-preserving update automatically.

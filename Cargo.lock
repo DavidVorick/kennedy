@@ -1096,7 +1096,7 @@ version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59a98bbaacea1c0eb6a0876280051b892eb73594fd90cf3b20e9c817029c57d2"
 dependencies = [
- "toml",
+ "toml 0.5.11",
 ]
 
 [[package]]
@@ -1967,9 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-agent-runtime"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35d04e69decf090d3ea41c25414ca6224ee57b23e5bb979b263a4b3b7a9f1921"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "hex",
@@ -1981,10 +1979,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-audio-history-handoff"
+version = "0.1.1"
+dependencies = [
+ "kcode-audio-ingress",
+ "kcode-audio-transcript-plan",
+ "kcode-session-history",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-audio-ingress"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc39f66cd55c7fd9d3c65d86b278e9df5898bcda00afd6b199081df822531cd0"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2003,12 +2010,12 @@ dependencies = [
 
 [[package]]
 name = "kcode-audio-session-ingress"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a80bc3236c775c428580892a62c7959bd0d3829baa0b5e070d7f09876a5ab2ee"
+version = "0.2.5"
 dependencies = [
  "chrono",
+ "kcode-audio-history-handoff",
  "kcode-audio-ingress",
+ "kcode-audio-session-view",
  "kcode-session-history",
  "serde_json",
  "tracing",
@@ -2016,10 +2023,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "kcode-checksummed-frame-log"
+name = "kcode-audio-session-view"
+version = "0.1.1"
+dependencies = [
+ "kcode-audio-history-handoff",
+ "kcode-audio-ingress",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "kcode-audio-transcript-plan"
+version = "0.1.1"
+dependencies = [
+ "kcode-audio-ingress",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "kcode-chatend"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "034a1955966e2718be09e6013f896642b847db9f6f0a4880b2407681f212a88c"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-session-log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kcode-checksummed-frame-log"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "sha2 0.10.9",
@@ -2027,9 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-codex-runtime"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4a77afacbb149c53666ba87cdff84fdce9dfeacadf40a040ba890ee96fbfb85"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "hex",
@@ -2043,9 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-codex-runtime-v2"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4880f790dc9a685f18d77c11f203689c874029f96b25597cb2b52d97f566a98"
+version = "0.1.4"
 dependencies = [
  "base64",
  "serde_json",
@@ -2054,9 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-commit-session"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6be5d758d17cc927ee59a8583d8275bdec43f15da124baa409b1583e390669"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "kcode-kweb-db",
@@ -2068,9 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-credential-vault"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00d8545b81d1495f70170784e2087ae671b10a1f38a332049e1a4b614528b38c"
+version = "0.1.1"
 dependencies = [
  "age",
  "serde",
@@ -2081,9 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-dev-tools"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "959dc58853ee1a60af93e52db8e3d9ad1dabddb6122c6d92b96ac5587fba12e7"
+version = "0.4.4"
 dependencies = [
  "http",
  "kcode-rust-bins",
@@ -2110,9 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-doc-extraction"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "410f9679775bff1571f6769a8e4c649ee50929c4920382a256e41ec689a28c39"
+version = "0.2.1"
 dependencies = [
  "calamine",
  "pdf-extract",
@@ -2123,9 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-gemini-api"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d8364db24e5a9308e4ce752d3bf7a8a06600e9ce0d4fbdc50e976a9c7247f74"
+version = "0.4.4"
 dependencies = [
  "base64",
  "chrono",
@@ -2185,9 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-intelligence-router"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "197d5efa8d6b2cb34101432da4aeff14e50880edd50b47de391e852819f140aa"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2206,9 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-kennedy-app"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad37cdba22f3f6a2e693ec42cdd1f13f7617a451867906a24e86486a1d601664"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2246,6 +2263,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-kennedy-box-text-objects"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kcode-session-history",
+ "serde_json",
+]
+
+[[package]]
+name = "kcode-kennedy-kweb-loader"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "kcode-kweb-context",
+ "kcode-kweb-db",
+ "kcode-kweb-manager",
+ "serde_json",
+]
+
+[[package]]
 name = "kcode-kennedy-orchestration"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2272,9 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-kennedy-roots"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65a8a418393fe939dda00221896596e5f84daff4c317c5d35cb8821ee8f03ba4"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2288,10 +2323,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcode-kennedy-session-services"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-agent-runtime",
+ "kcode-commit-session",
+ "kcode-dev-tools",
+ "kcode-intelligence-router",
+ "kcode-kweb-db",
+ "kcode-kweb-manager",
+ "kcode-server-object-envelopes",
+ "kcode-session-history",
+ "kcode-speech-classification",
+ "kcode-telegram-session-coordinator",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kcode-kennedy-sessions"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c43c48e60f145445594fffb7d188981dfa6edc7a5819a9c36af3cbd0de056533"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "base64",
@@ -2304,6 +2359,9 @@ dependencies = [
  "kcode-history-ingress-context",
  "kcode-intelligence-chatend",
  "kcode-intelligence-router",
+ "kcode-kennedy-box-text-objects",
+ "kcode-kennedy-kweb-loader",
+ "kcode-kennedy-session-services",
  "kcode-kweb-context",
  "kcode-kweb-db",
  "kcode-kweb-manager",
@@ -2342,9 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-kmap-size"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1d56efa87e36df8d73802a6c87df8152e29c1285bffd19924c284a322f788b7"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "kcode-kweb-db",
@@ -2352,9 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-kweb-context"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "029420b7e636e4dc7d9922367879df59fb26019f8533b47e2deab3efcb22d523"
+version = "0.2.2"
 dependencies = [
  "hex",
  "kcode-kweb-db",
@@ -2366,9 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-kweb-db"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "432271ead0bcea31f63403190af602f098dd8c05e18c19352143b629b9c27ab6"
+version = "1.0.5"
 dependencies = [
  "base64",
  "chrono",
@@ -2395,9 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-openai-api"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2ac991109b1453b68ec4a73bf83529ff2f4a60c8b0f5d7dfbf9dca6055cab3c"
+version = "0.2.2"
 dependencies = [
  "base64",
  "reqwest 0.13.4",
@@ -2407,9 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-pending-object-store"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2debec2b143bf9a21dafdec19d3d3fd7e0711124a14ab51fccb7be2ff9c108f3"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "sha2 0.10.9",
@@ -2417,41 +2465,60 @@ dependencies = [
 
 [[package]]
 name = "kcode-rust-bins"
-version = "3.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8be23508c134dc8c1012685ab69de4a5db07ac4ebdd75661b35df7e8c590417"
+version = "3.1.3"
 dependencies = [
  "semver",
 ]
 
 [[package]]
 name = "kcode-rust-libs-v2"
-version = "1.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81f8218fea83872212bf859544e074bccd294ed6e89871994f0b9854f68a102a"
+version = "1.2.3"
 
 [[package]]
 name = "kcode-server-object-envelopes"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10cb6dde12f227d9a1e3bb35a247653beb4511ab1148315bd69b8c8e4d513c81"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "kcode-kweb-db",
 ]
 
 [[package]]
-name = "kcode-session-history"
-version = "0.1.3"
+name = "kcode-session-control-journal"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1c48323a748bcd94d708b9e5708d21fea6f3fdef1fbbc945f1584150cf5b63c"
+checksum = "01a45a3b671255b18983da5ff897020415bb8daeb1d331ed9fd18b69a9e0b416"
 dependencies = [
  "anyhow",
- "chrono",
- "kcode-session-log",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "uuid",
+]
+
+[[package]]
+name = "kcode-session-control-state"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7978e87235d1233b551f5d579492f6533a21d6b0c852709d16287c635648807a"
+dependencies = [
+ "anyhow",
+ "kcode-session-control-journal",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "kcode-session-history"
+version = "0.1.6"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-chatend",
+ "kcode-session-control-state",
+ "kcode-session-log",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",
@@ -2459,9 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-session-log"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bede89e1b9f47e9d6f956f46eb193f36739245c097575cf7b9ea5bc0dd55c45a"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "kcode-checksummed-frame-log",
@@ -2483,9 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-telegram-identity"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d42a26c8651bfc0e35c45b5d946b58560618ba965410963adfa5adfa445212ae"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2494,6 +2557,24 @@ dependencies = [
  "rusqlite",
  "serde",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "kcode-telegram-native-media"
+version = "0.1.1"
+dependencies = [
+ "kcode-telegram-request-policy",
+ "teloxide",
+]
+
+[[package]]
+name = "kcode-telegram-request-policy"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "teloxide",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2513,29 +2594,58 @@ dependencies = [
 ]
 
 [[package]]
-name = "kcode-tg-kennedy-bot"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63894ee5527138a092a5ead17085fa757668958c9841800c2799b2d33a60769d"
+name = "kcode-telegram-text-delivery"
+version = "0.1.1"
+dependencies = [
+ "kcode-telegram-request-policy",
+ "teloxide",
+]
+
+[[package]]
+name = "kcode-telegram-transport-state"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "futures",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "kcode-telegram-update-dispatch"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "futures",
+ "teloxide",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kcode-tg-kennedy-bot"
+version = "0.5.7"
+dependencies = [
+ "anyhow",
+ "futures",
+ "kcode-telegram-native-media",
+ "kcode-telegram-request-policy",
+ "kcode-telegram-text-delivery",
+ "kcode-telegram-transport-state",
+ "kcode-telegram-update-dispatch",
  "serde",
  "serde_json",
  "teloxide",
  "tokio",
  "tracing",
- "uuid",
  "zeroize",
 ]
 
 [[package]]
 name = "kcode-web-fetch"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fa5bb5ab1b1cb3c75d0d0657f645a77c26396c94d51682912d60ab473f24732"
+version = "0.1.3"
 dependencies = [
  "html2text",
  "reqwest 0.13.4",
@@ -2544,9 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-web-libs"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acfd872da159c72304ae9dca3a19754c8c715194f0fe47750136acdd1c190e4"
+version = "0.3.2"
 dependencies = [
  "fs2",
  "semver",
@@ -2558,9 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "kcode-web-semver-routing"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fcfaecb9e606a85fa65cfcbf1d58ae375432a40afa5afa2227e1949b6890f36"
+version = "0.2.1"
 dependencies = [
  "axum",
  "semver",
@@ -2590,10 +2696,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kennedy-kcode-publisher"
+version = "0.1.0"
+dependencies = [
+ "kcode-credential-vault",
+ "kcode-rust-libs-v2",
+ "rpassword",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "kennedy-server"
 version = "0.2.1"
 dependencies = [
- "anyhow",
  "kcode-kennedy-app",
 ]
 
@@ -3874,6 +3989,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4437,6 +4561,45 @@ checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+dependencies = [
+ "winnow 1.0.4",
+]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tower"
@@ -5095,6 +5258,18 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wit-bindgen"

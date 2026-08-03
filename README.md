@@ -42,6 +42,17 @@ cargo run -p kennedy-server
 Use `cargo run -p kennedy-server -- --help` for current options and maintenance
 commands.
 
+To inspect or publish the current managed Rust-library releases in dependency
+order, stop Kennedy and run:
+
+```sh
+scripts/publish-kcode-libs --plan
+scripts/publish-kcode-libs
+```
+
+The publisher skips exact versions that crates.io already has, so rerunning it
+after an interrupted batch resumes at the first unpublished version.
+
 ## Persistence Safety
 
 Kennedy-owned runtime state defaults beneath `data/`. Do not manually edit,
