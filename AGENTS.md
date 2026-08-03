@@ -37,3 +37,13 @@ non-cosmetic changes.
 Do not use exact-pin versions for any libraries unless the calling library is
 itself passing API key material to the library that it is calling. All other
 libraries must accept any compatibility-preserving update automatically.
+
+Edge cases and boundary conditions are only to be checked only at the point
+where they are imminent. For example, if you are calling a library, and that
+library can only handle files of a certain size, the check that the files do
+not exceed the max size supported by the library should be performed **by the
+library**. It is not the caller's responsibility to sanitize input before
+calling a library - it is the library's responsibility to sanitize the input
+after it is called. Could should not sanitize input, check for boundary
+conditions, or handle edge cases unless the fault/error would happen within its
+own logic.

@@ -964,10 +964,14 @@ This document records user intention with regard to Kennedy.
   library dependencies are not exact-pinned merely for predictability. The
   explicitly trusted `kcode-kennedy-app` application-update boundary defined
   under Overall Direction is the sole exception.
-- Kennedy's production workspace consumes published managed Rust libraries
-  from crates.io. A local Kcode generation may temporarily override a crate
-  only while actively developing an unpublished version; remove that override
-  once the required version is published.
+- Every Kennedy-owned Cargo project consumes published managed Rust libraries
+  from crates.io, including the production workspace, auxiliary utilities,
+  inactive crates, and development or repair tools. Keep editable Kcode source
+  separate from Cargo dependency resolution: do not use dependency paths,
+  `[patch]` entries, Cargo source replacement, or other local-generation
+  tracking to wire managed libraries into any Kennedy-owned Cargo project.
+  Publish a required managed-library version before a Kennedy project depends
+  on it.
 - Kennedy's managed check and publication tools own each library's validation
   and release operation. One offline operator utility may coordinate a batch of
   current managed Rust-library releases: it unlocks Kennedy's ordinary

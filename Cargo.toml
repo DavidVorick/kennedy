@@ -13,51 +13,6 @@ license = "MIT"
 # This bootstrap workspace deliberately follows the highest published application release.
 kcode-kennedy-app = "*"
 
-# Temporary managed-source overrides while these coordinated releases are unpublished.
-[patch.crates-io]
-kcode-agent-runtime = { path = "data/kcode/kcode-rust-libs/kcode-agent-runtime/generations/g-f67d-18c7d6e12139804b-0" }
-kcode-chatend = { path = "data/kcode/kcode-rust-libs/kcode-chatend/generations/g-1fff-18c833dc0b274d6b-2" }
-kcode-gemini-api = { path = "data/kcode/kcode-rust-libs/kcode-gemini-api/generations/g-b715-18c82fe3f9814471-0" }
-kcode-audio-history-handoff = { path = "data/kcode/kcode-rust-libs/kcode-audio-history-handoff/generations/g-c9d5-18c830935bd3db63-0" }
-kcode-audio-ingress = { path = "data/kcode/kcode-rust-libs/kcode-audio-ingress/generations/g-12816-18c830f7dee23543-0" }
-kcode-audio-session-ingress = { path = "data/kcode/kcode-rust-libs/kcode-audio-session-ingress/generations/g-c9d7-18c830935cc80b8f-0" }
-kcode-audio-session-view = { path = "data/kcode/kcode-rust-libs/kcode-audio-session-view/generations/g-c9d8-18c830935ce8b051-0" }
-kcode-audio-transcript-plan = { path = "data/kcode/kcode-rust-libs/kcode-audio-transcript-plan/generations/g-c9d9-18c830935d0a47ec-0" }
-kcode-checksummed-frame-log = { path = "data/kcode/kcode-rust-libs/kcode-checksummed-frame-log/generations/g-c225-18c8305993644e09-0" }
-kcode-codex-runtime = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtime/generations/g-c227-18c8305993969bde-0" }
-kcode-codex-runtime-v2 = { path = "data/kcode/kcode-rust-libs/kcode-codex-runtime-v2/generations/g-c229-18c8305993c0876b-0" }
-kcode-commit-session = { path = "data/kcode/kcode-rust-libs/kcode-commit-session/generations/g-c22b-18c8305993ee7c6c-0" }
-kcode-credential-vault = { path = "data/kcode/kcode-rust-libs/kcode-credential-vault/generations/g-c22d-18c830599418602d-0" }
-kcode-dev-tools = { path = "data/kcode/kcode-rust-libs/kcode-dev-tools/generations/g-c22f-18c830599444ccf5-0" }
-kcode-doc-extraction = { path = "data/kcode/kcode-rust-libs/kcode-doc-extraction/generations/g-c231-18c8305994711bc9-0" }
-kcode-intelligence-router = { path = "data/kcode/kcode-rust-libs/kcode-intelligence-router/generations/g-c235-18c8305994c4f84a-0" }
-kcode-kennedy-app = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-app/generations/g-1f6f-18c83477db64f243-0" }
-kcode-kennedy-box-text-objects = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-box-text-objects/generations/g-2124-18c833f578d45526-0" }
-kcode-kennedy-kweb-loader = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-kweb-loader/generations/g-c239-18c830599515c2c2-0" }
-kcode-kennedy-roots = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-roots/generations/g-c9da-18c830935d2b57e1-0" }
-kcode-kennedy-session-services = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-session-services/generations/g-c23d-18c8305995620d83-0" }
-kcode-kennedy-sessions = { path = "data/kcode/kcode-rust-libs/kcode-kennedy-sessions/generations/g-1ca2d4-18c832a381001216-66" }
-kcode-kmap-size = { path = "data/kcode/kcode-rust-libs/kcode-kmap-size/generations/g-c241-18c8305995ba873b-0" }
-kcode-kweb-context = { path = "data/kcode/kcode-rust-libs/kcode-kweb-context/generations/g-c243-18c8305995e51714-0" }
-kcode-kweb-db = { path = "data/kcode/kcode-rust-libs/kcode-kweb-db/generations/g-c9db-18c830935d53e6b1-0" }
-kcode-openai-api = { path = "data/kcode/kcode-rust-libs/kcode-openai-api/generations/g-b714-18c82fe3f8c252cd-0" }
-kcode-pending-object-store = { path = "data/kcode/kcode-rust-libs/kcode-pending-object-store/generations/g-c247-18c830599647d6ef-0" }
-kcode-rust-bins = { path = "data/kcode/kcode-rust-libs/kcode-rust-bins/generations/g-c249-18c83059967b0805-0" }
-kcode-rust-libs-v2 = { path = "data/kcode/kcode-rust-libs/kcode-rust-libs-v2/generations/g-c24d-18c8305996d6b6aa-0" }
-kcode-server-object-envelopes = { path = "data/kcode/kcode-rust-libs/kcode-server-object-envelopes/generations/g-c24f-18c830599703a2d0-0" }
-kcode-session-history = { path = "data/kcode/kcode-rust-libs/kcode-session-history/generations/g-4c82-18c83435fe3a803f-0" }
-kcode-session-log = { path = "data/kcode/kcode-rust-libs/kcode-session-log/generations/g-c251-18c83059972d0775-0" }
-kcode-telegram-identity = { path = "data/kcode/kcode-rust-libs/kcode-telegram-identity/generations/g-c255-18c83059978e81ef-0" }
-kcode-telegram-native-media = { path = "data/kcode/kcode-rust-libs/kcode-telegram-native-media/generations/g-c807-18c8307fd0a0b208-0" }
-kcode-telegram-request-policy = { path = "data/kcode/kcode-rust-libs/kcode-telegram-request-policy/generations/g-c259-18c8305997e284a2-0" }
-kcode-telegram-text-delivery = { path = "data/kcode/kcode-rust-libs/kcode-telegram-text-delivery/generations/g-c25b-18c830599805cc98-0" }
-kcode-telegram-transport-state = { path = "data/kcode/kcode-rust-libs/kcode-telegram-transport-state/generations/g-4d7f-18c834e8c3082f04-0" }
-kcode-telegram-update-dispatch = { path = "data/kcode/kcode-rust-libs/kcode-telegram-update-dispatch/generations/g-c808-18c8307fd0c76653-0" }
-kcode-tg-kennedy-bot = { path = "data/kcode/kcode-rust-libs/kcode-tg-kennedy-bot/generations/g-4d88-18c834e8c361300a-0" }
-kcode-web-fetch = { path = "data/kcode/kcode-rust-libs/kcode-web-fetch/generations/g-c261-18c83059989028b7-0" }
-kcode-web-libs = { path = "data/kcode/kcode-rust-libs/kcode-web-libs/generations/g-c263-18c8305998bbbe5c-0" }
-kcode-web-semver-routing = { path = "data/kcode/kcode-rust-libs/kcode-web-semver-routing/generations/g-c265-18c8305998e920b9-0" }
-
 [profile.dev]
 debug = 1
 incremental = false
