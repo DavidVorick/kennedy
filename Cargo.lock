@@ -129,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "android_system_properties"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
+checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
 dependencies = [
  "libc",
 ]
@@ -1995,14 +1995,15 @@ dependencies = [
 
 [[package]]
 name = "kcode-audio-ingress"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a9f97f0d2cbd2dbbb40364b8c03faf3fc53d156505b9ffc15fd02eb709d1020"
+checksum = "af3f95668c079a81836bd168188242fa1fba12b95be608b235d0f7a71ac5d324"
 dependencies = [
  "anyhow",
  "chrono",
  "futures",
  "hound",
+ "kcode-audio-speaker-review",
  "kcode-speaker-extract",
  "kcode-speaker-system",
  "ruopus",
@@ -2017,9 +2018,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-audio-session-ingress"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0f02ba5f96109166aeb397a7f55c0d5dc64888ed5abdbf54cc9294f3ec35124"
+checksum = "b0dffbb308445ae7401b4f2bce77700a404dff2cfe8a336aadad01748b62564e"
 dependencies = [
  "chrono",
  "kcode-audio-history-handoff",
@@ -2041,6 +2042,19 @@ dependencies = [
  "kcode-audio-history-handoff",
  "kcode-audio-ingress",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "kcode-audio-speaker-review"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d30e92fac90b7430a5d5c4e4ca3a4c1f3975cbd4034763e8e81dd78e53de0bdb"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kcode-speaker-system",
+ "serde",
  "uuid",
 ]
 
@@ -2162,9 +2176,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-dev-tools-chatend"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afd189af55116d5cc54f0067b7488f405f39b193be744708fd11177027badf15"
+checksum = "f91bc8e268665cb6d49e0ac3d5e2244b51d7744ec598176990be043490411768"
 dependencies = [
  "anyhow",
  "kcode-dev-tools",
@@ -2502,9 +2516,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-kennedy-sessions"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e954803b326397490585a5b6b1be1e4f05f90b73f12f5aabd18f3afc4d0f0ac4"
+checksum = "5c1f514d9e895ffecc5cdfb8742cfa20ddcb8a051de42bfadb9285c65af0d433"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2523,6 +2537,7 @@ dependencies = [
  "kcode-kennedy-session-presentation",
  "kcode-kennedy-session-services",
  "kcode-kennedy-session-tool-contracts",
+ "kcode-kennedy-subagent-context",
  "kcode-kweb-context",
  "kcode-kweb-db",
  "kcode-kweb-manager",
@@ -2537,6 +2552,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kcode-kennedy-subagent-context"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911972d0b121fbba5bc7fc11d9aac1c7404023527d448824f989b722e169f7e1"
+dependencies = [
+ "anyhow",
+ "kcode-agent-runtime",
+ "kcode-dev-tools",
+ "kcode-kweb-context",
 ]
 
 [[package]]
@@ -2613,9 +2640,9 @@ dependencies = [
 
 [[package]]
 name = "kcode-kweb-context"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c63e35209d886d64176d8c0d653ccb7ac34b3e187d2b524ed7e92b159a011815"
+checksum = "10a149598d831e1865c943aed781cdb144d496c50fbdf950baca6134ea377aa0"
 dependencies = [
  "hex",
  "kcode-kweb-db",

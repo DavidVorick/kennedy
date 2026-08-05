@@ -11,6 +11,12 @@ This document records user intention with regard to Kennedy.
   duplicated state when they no longer have a concrete job.
 - Give every piece of durable state and every workflow one clear owner. Avoid
   two components independently interpreting or mutating the same persistence.
+- Do not hold a persistence lock or other shared-state guard across a call into
+  a separately stateful capability, provider or network work, or an `await`.
+  When a multi-step workflow must serialize, give it one explicit owner lane
+  and keep each persistence critical section local to the store it protects.
+  Speaker-review persistence and classifier work must not occupy async runtime
+  workers or prevent unrelated browser views from loading.
 - Same-process components should normally communicate through small typed Rust
   APIs. HTTP belongs at genuine transport boundaries, not between parts of one
   process.
@@ -284,8 +290,12 @@ This document records user intention with regard to Kennedy.
   warning while the task stays completed; a process interruption may lose that
   award because credits are gamification points rather than financial value.
 - The task UI shows the current user's balance and reuses the ordinary Kennedy
-  conversation and composer. It pages categories and tasks, lazily loads the
-  selected task neighborhood, follows graph links, and hides completed,
+  conversation and composer. Tasks are a mode of the conversation-history
+  sidebar rather than a separate global view: selected-task detail appears
+  above the category and paginated task explorer while the active conversation,
+  composer, and Chatend remain mounted and visible. Opening an exact task ID
+  from a conversation selects that sidebar mode and task. The UI lazily loads
+  the selected task neighborhood, follows graph links, and hides completed,
   removed, and queued-orphan tasks. The existing browser-selected user root is
   the current identity boundary; adding browser authentication or a new
   conversation/session type is outside this capability.
@@ -567,12 +577,28 @@ This document records user intention with regard to Kennedy.
   ambient host instructions, or provider conversation state. The backend
   resolves the exact selected nodes at launch and records an inspectable
   context manifest.
+- A Ktool invoked by a subagent must not create, revise, summarize, hydrate,
+  dehydrate, or otherwise manipulate the parent agent's provider-facing
+  Chatend. Keep the tool invocation, ordinary result, and any tool-owned
+  current-state projection inside the subagent context. Durable audit facts,
+  usage accounting, pending objects, transactional Kmap mutations, managed
+  source mutations, and other authorized application effects may remain owned
+  by the parent session without becoming parent prompt material. The terminal
+  subagent response is the ordinary parent-visible tool result.
 - Every Ktool otherwise permitted by the parent session is callable through
-  the normal bridge, but the subsystem does not inject a Ktool catalog or any
-  tool manuals. Kennedy must teach a subagent the relevant calls through the
-  selected node descriptions or task prompt. Subagents cannot launch
-  subagents; delegation strategy remains with Kennedy because she has the Kmap
-  context needed to choose it.
+  the normal bridge except nested `RunSubagent`, parent-session lifecycle
+  control, and box-presentation controls that have no meaning in a box-free
+  child. The subsystem does not inject a Ktool catalog or any tool manuals.
+  Kennedy must teach a subagent the relevant calls through the selected node
+  descriptions or task prompt. Delegation strategy remains with Kennedy
+  because she has the Kmap context needed to choose it.
+- `EmitObject`, `SendTelegramDM`, and `SendTelegramGroupMessage` are explicitly
+  delegable effects. A successful delegated object emission reaches the user
+  through the same ordinary Kennedy-message presentation and transcript record
+  as a direct invocation. Delegated Telegram tools retain their ordinary cold
+  delivery, source-session audit, eligibility, attachment, and reply-bridge
+  semantics without projecting their tool output into the parent context or
+  creating a target session.
 - Stateful Ktools retain exact canonical history while projecting only one
   current value into the box-free subagent context. When a successful tool call
   revises that value, keep the earlier call in place and replace its superseded
@@ -929,14 +955,14 @@ This document records user intention with regard to Kennedy.
   limit; otherwise deliver the complete text separately without truncating,
   discarding, or duplicating it. A caption is delivery presentation metadata,
   not part of the stored object's identity.
-- Kennedy's main agent may initiate a private Telegram delivery containing
-  text, one or more staged or canonical Kweb object attachments, or both, to
-  any explicitly targeted authorized user from any session, but only after
-  that user has opened a private chat with the bot. The tool accepts the stable
-  numeric user identity and object references, with an optional
-  recipient-visible delivery filename for each attachment; Telegram transport
-  resolves the private chat without exposing chat IDs to Kennedy or the
-  Kennedy application. Apply the ordinary outbound-media size, filename, MIME,
+- Kennedy may initiate a private Telegram delivery directly or through a
+  subagent, containing text, one or more staged or canonical Kweb object
+  attachments, or both, to any explicitly targeted authorized user from any
+  session, but only after that user has opened a private chat with the bot. The
+  tool accepts the stable numeric user identity and object references, with an
+  optional recipient-visible delivery filename for each attachment; Telegram
+  transport resolves the private chat without exposing chat IDs to Kennedy or
+  the Kennedy application. Apply the ordinary outbound-media size, filename, MIME,
   and native-media rules rather than creating a separate attachment store or
   embedding raw bytes in tool arguments. Do not impose a tool-specific
   attachment-count ceiling or reject repeated object references; existing
@@ -969,14 +995,14 @@ This document records user intention with regard to Kennedy.
   Kennedy at the next safe inference boundary without interrupting her current
   provider or tool work, and fall back to ordinary authorized Telegram intake
   if its source session has already become immutable before handoff.
-- Kennedy's main agent may likewise initiate a Telegram delivery to any
-  explicitly targeted known group from any session, including browser,
-  private or group Telegram, history-ingress, audio-ingress, wakeup, and
-  self-time sessions. The group tool has the same text, attachment, delivery
-  filename, size, MIME, and native-media capabilities as initiated private
-  delivery, targets the group's canonical Kmap root rather than exposing a raw
-  Telegram chat ID, and remains unavailable to subagents. The Telegram session
-  coordinator resolves that root through the group directory, while Telegram
+- Kennedy may likewise initiate a Telegram delivery directly or through a
+  subagent to any explicitly targeted known group from any session, including
+  browser, private or group Telegram, history-ingress, audio-ingress, wakeup,
+  and self-time sessions. The group tool has the same text, attachment,
+  delivery filename, size, MIME, and native-media capabilities as initiated
+  private delivery and targets the group's canonical Kmap root rather than
+  exposing a raw Telegram chat ID. The Telegram session coordinator resolves
+  that root through the group directory, while Telegram
   transport resolves the current chat and must freshly enforce the ordinary
   administrator, complete-roster, and historical-whitelist requirements before
   sending. The tool invocation and ordinary source-session/Kmap lifecycle are
@@ -1025,6 +1051,9 @@ This document records user intention with regard to Kennedy.
 - Background observation must not rebuild an unchanged interactive browser
   view. Polling preserves live media playback, native controls, local form
   state, focus, disclosures, and scroll until presentation state truly changes.
+- Conversation-history enumeration uses only bounded summaries. Load a
+  completed immutable archive only for the currently selected record; never
+  hydrate completed history in the background or retain unselected archives.
 - Do not present accepted journal writes as a separate vague “saving” state.
   Surface real failures rather than suggesting that durable state is pending
   when it is not.

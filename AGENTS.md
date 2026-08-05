@@ -23,6 +23,11 @@ listing out the full set of proposed changes before making any changes. The
     + Whether or not the architecture could be materially simplified while
       still achieving the desired objectives (establish this last).
 
+Before declaring any change to Rust code or Cargo metadata complete, run
+`cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`
+from the workspace root; do not claim completion unless it passes, and report
+any inability to run it as a blocker.
+
 `Clarifications.md` is binding repository guidance, not optional background.
 Before reviewing, planning, or changing this project, every LLM agent must read
 `Clarifications.md` in full and follow every applicable instruction throughout
