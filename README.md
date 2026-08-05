@@ -14,8 +14,9 @@ inactive managed-library generations that the workspace does not resolve.
 
 - `KennedyServer/src/` contains the server, HTTP adapters, orchestration, Kmap
   integration, and background workers.
-- `KennedyServer/runtime/system-prompts/` contains live prompt layers loaded at
-  startup.
+- `kcode-kennedy-prompts` contains Kennedy's bundled static prompt layers;
+  orchestration opens them through its typed library boundary without runtime
+  prompt files.
 - `scripts/` contains the offline backup and constrained Codex runtime helpers.
 - `data/` is ignored runtime state. It also contains Kennedy-managed source and
   immutable publications. Treat it as user data, not disposable build output.
@@ -33,14 +34,24 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Run the server with:
+Run the optimized server with:
 
 ```sh
-cargo run -p kennedy-server
+scripts/run-kennedy
 ```
 
-Use `cargo run -p kennedy-server -- --help` for current options and maintenance
-commands.
+The launcher refreshes the locked `kcode-kennedy-app` release and its
+SemVer-compatible dependency graph before building and running Kennedy. Use
+`scripts/run-kennedy --help` for current options and maintenance commands.
+
+To capture a CPU flamegraph from the running server, run:
+
+```sh
+scripts/profile-kennedy
+```
+
+Press Ctrl-C after the high-CPU interval. The interactive SVG is written to
+`data/kennedy-cpu.svg`.
 
 To inspect or publish the current managed Rust-library releases in dependency
 order, stop Kennedy and run:

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repository="$(cd -- "$script_dir/.." && pwd -P)"
+
+cd -- "$repository"
+cargo update --package kcode-kennedy-app --recursive
+exec cargo run --release --package kennedy-server -- "$@"

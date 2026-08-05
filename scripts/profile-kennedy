@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+die() {
+    printf 'profile-kennedy: %s\n' "$*" >&2
+    exit 1
+}
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repository="$(cd -- "$script_dir/.." && pwd -P)"
+output="$repository/data/kennedy-cpu.svg"
+
+command -v flamegraph >/dev/null 2>&1 ||
+    die "flamegraph is not installed; run: cargo install flamegraph --locked"
+command -v pgrep >/dev/null 2>&1 ||
+    die "pgrep is not installed"
+perf_command="${PERF:-perf}"
+command -v "$perf_command" >/dev/null 2>&1 ||
+    die "perf is not installed; on Debian run: sudo apt install linux-perf"
+
+root_arguments=()
+if (( EUID != 0 )); then
+    command -v sudo >/dev/null 2>&1 ||
+        die "sudo is required to attach the profiler to kennedy-server"
+    root_arguments+=(--root)
+fi
+
+mapfile -t server_pids < <(pgrep -x kennedy-server || true)
+case "${#server_pids[@]}" in
+    0) die "kennedy-server is not running" ;;
+    1) ;;
+    *) die "more than one kennedy-server process is running" ;;
+esac
+
+mkdir -p -- "$repository/data"
+printf 'Capturing kennedy-server PID %s. Press Ctrl-C to finish and write %s\n' \
+    "${server_pids[0]}" "$output"
+exec flamegraph \
+    "${root_arguments[@]}" \
+    --pid "${server_pids[0]}" \
+    --freq 199 \
+    --output "$output"

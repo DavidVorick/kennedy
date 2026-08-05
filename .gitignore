@@ -4,3 +4,5 @@
 .env
 .tools/
 .vnote-ingress-sha256-cache-v1
+perf.data
+perf.data*

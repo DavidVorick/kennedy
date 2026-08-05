@@ -14,16 +14,17 @@ This document records user intention with regard to Kennedy.
 - Same-process components should normally communicate through small typed Rust
   APIs. HTTP belongs at genuine transport boundaries, not between parts of one
   process.
-- Keep Kennedy capabilities in cohesive managed Kcode libraries. A managed
-  capability library should normally contain 300-3,000 lines of code, expose a
-  lightweight well-defined API, and materially simplify the total application
-  architecture. Every new or expanded managed Kcode library must remain
-  strictly below 5,000 lines of
-  first-party code including tests; split capabilities before they reach that
-  ceiling rather than treating tests or internal modules as outside the
-  boundary. Pre-existing libraries that already exceed the ceiling need not be
-  remediated as part of unrelated work, but must not be expanded without first
-  restoring a compliant boundary. Its
+- Keep Kennedy capabilities in cohesive managed Kcode libraries. The target
+  size for each managed Rust, Web, or binary library is below 500 lines of
+  first-party code including tests, with a clean API boundary and a minimal
+  number of operations and inputs. New libraries must meet that target. When
+  feature work touches a pre-existing larger library, keep the work focused and
+  make one obvious capability extraction that prevents the library from moving
+  farther away from the target; comprehensive unrelated cleanup is not
+  required. Do not satisfy the target through pass-through libraries,
+  duplicated tests, or artificial boundaries whose documentation and call
+  sequencing are more complicated than the code they move. A managed
+  capability library's
   public operations should complete the capability's internal workflow rather
   than require callers to sequence planning, application, or other intermediate
   steps. Return only outcomes needed for decisions that genuinely remain
@@ -46,6 +47,11 @@ This document records user intention with regard to Kennedy.
   failure isolation, and compatibility with existing durable state. Do not
   rewrite these clarifications to legitimize an incidental behavior change
   introduced during extraction.
+- Judge API simplicity by the amount of documentation needed to explain the
+  complete contract, not by raw function count. Prefer plainly named,
+  complete domain operations over generic request enums, string dispatch, or
+  multiplexed `read` and `execute` entry points. Shared types should clarify
+  repeated data without hiding which operations a caller may perform.
 - `kcode-kennedy-app` is Kennedy's top-level application bootstrap and lifecycle
   composition library. It owns CLI parsing and maintenance commands, vault
   prompting and application secret names, service construction, application
@@ -53,8 +59,13 @@ This document records user intention with regard to Kennedy.
   listener binding, and runtime supervision. KennedyServer deliberately treats
   the latest published `kcode-kennedy-app` release as its application update
   boundary and accepts the highest available version rather than exact-pinning
-  it. The KennedyServer executable is a one-line-equivalent wrapper that invokes
-  this sole direct dependency and owns no parallel application behavior.
+  it. Kennedy's canonical operator launch refreshes the locked resolution of
+  that dependency and its SemVer-compatible dependency graph before building
+  and running the optimized server, so an ordinary launch adopts newly
+  published compatible capability releases without a separate maintenance
+  step. The KennedyServer executable is a
+  one-line-equivalent wrapper that invokes this sole direct dependency and owns
+  no parallel application behavior.
 - `kcode-http-api` owns the complete browser-facing HTTP router and API as a
   focused presentation library over typed capability libraries, including
   route composition, wire DTOs, multipart admission, HTTP errors, response and
@@ -211,8 +222,81 @@ This document records user intention with regard to Kennedy.
 - Keep one global Kweb writer lane until there is a demonstrated need for
   finer-grained write concurrency. Read-only sessions should remain concurrent,
   and a session that becomes a writer must revalidate what it read.
+- The administrator may edit Kmap through one browser-facing durable command
+  lane. Each accepted command is persisted before it waits for the global Kweb
+  writer lane and is recovered and resubmitted after process restart. The lane
+  exposes its queued, applying, committed, and failed records rather than
+  hiding retry state; in-memory notification is only an optimization. Writer
+  unavailability retries with backoff, while stale expected revisions and
+  invalid operations fail visibly. Every successful command is exactly one
+  signed Kweb transaction, even when the Kennedy operation atomically creates
+  or updates several nodes. Commands are not batched, and committed Kweb
+  history remains the authoritative replay record. Until the deferred privacy
+  upgrade is explicitly resumed, this API and UI are administrator-only and do
+  not add a parallel ownership, privacy, or authorization policy.
+- Administrator Kmap commands preserve the exact behavior of Kennedy's current
+  `CreateNode`, `UpdateNode`, `ConnectNodes`, `ConsolidateFanout`, and
+  `SetFixedConnection` operations. The browser supplies the expected visible
+  transaction of every affected durable node, and the writer revalidates those
+  expectations only after acquiring its lane. Provenance identifies the
+  durable administrator command automatically; browser arguments do not
+  manufacture model or session provenance.
 - Kmap maintenance measurements may be deliberately approximate when their
   purpose is operational guidance rather than an exact accounting system.
+
+## Tasks and Credits
+
+- Kennedy's task board is a graph-shaped work organizer. Categories and tasks
+  have stable identifiers, and tasks may belong to multiple categories, have
+  one assigned authenticated user, carry a nonnegative credit value, and link
+  to child and related tasks. Child links express strict sub-requirements for
+  presentation but do not impose execution order. Child links may form cycles,
+  including self-cycles. Related links are symmetric.
+- Kennedy alone creates, updates, completes, or removes task-board state. Her
+  task operations are create, look up by known identifier, update, and remove;
+  category operations are create, look up by known identifier, and remove.
+  Assignment, credit values, categories, child links, and related links are
+  fields of task creation or update. Kennedy has no global task/category list
+  or search operation and navigates through identifiers and graph neighbors.
+  Ordinary users may page and browse their visible categories and tasks but
+  may not mutate them.
+- Task identifiers have the exact form `task-id-` followed by twelve lowercase
+  hexadecimal characters. Browser conversation transcripts recognize only
+  exact identifiers, expose them as safe task-opening controls, and let users
+  copy an identifier for discussion with Kennedy.
+- Completing or removing a task removes it from the ordinary board, detaches
+  its graph links, and preserves completed tasks only in a disk-backed archive
+  that has no browsing UI. Completion is allowed regardless of child state.
+  Any child that loses its final parent through completion or removal is pushed
+  onto a durable LIFO orphan stack.
+- Orphan-stack membership is the sole orphan marker. A zero-parent task outside
+  the stack is an ordinary independent task. Kennedy may inspect only the top
+  orphan. If she does nothing it remains on top; deleting it removes it; any
+  successful nonterminal update removes that top task from the stack and puts
+  it back in the board either independently or with the parents she chose.
+  Lower queued orphans are not resolved out of order, and newer pushes become
+  the top.
+- Credit balances live in a separate SQLite capability keyed by immutable
+  authenticated user identifiers. Its domain API consists of `balance` and
+  `award`; it intentionally has no ledger, history, spending, transfer,
+  idempotency, or outbox mechanism. Task completion commits first and then
+  attempts a best-effort credit award. An award failure is surfaced as a
+  warning while the task stays completed; a process interruption may lose that
+  award because credits are gamification points rather than financial value.
+- The task UI shows the current user's balance and reuses the ordinary Kennedy
+  conversation and composer. It pages categories and tasks, lazily loads the
+  selected task neighborhood, follows graph links, and hides completed,
+  removed, and queued-orphan tasks. The existing browser-selected user root is
+  the current identity boundary; adding browser authentication or a new
+  conversation/session type is outside this capability.
+- At tens of thousands of tasks, the browser and server must avoid periodic
+  full-board snapshots. Poll only small task and credit revisions, stop polling
+  while the page is hidden, and fetch paginated lists and selected
+  neighborhoods on demand. SQLite uses WAL, indexed relationship and ownership
+  lookups, separate short read connections, one short writer lane, and
+  set-based completion/orphan updates. Do not hold its writer lane during JSON
+  processing, model work, or credit calls. Kennedy is responsible for avoiding
+  pathological fanout; the task board adds no degree limit or cycle check.
 
 ## Sessions, Chatend, and Context
 
@@ -225,6 +309,18 @@ This document records user intention with regard to Kennedy.
   `kcode-session-history` creates and opens those sessions and re-exports the
   original Chatend types and paths; existing consumers must neither depend on
   `kcode-chatend` directly nor manipulate the same files independently.
+- Treat the lifecycle/control journal as the cheap active-session index.
+  Frequent discovery, summary listing, and command/stop-head polling must
+  project bounded summaries directly from control state and must not open or
+  replay transcript logs. The control projection preserves the fields needed
+  for list decisions and presentation, including a bounded first-user title
+  and current box and event counts, at normal mutation or checkpoint
+  boundaries. Missing legacy summary fields remain optional and may be
+  enriched only when that particular session is explicitly opened, never by
+  bulk enumeration. Enumeration ignores transcript files whose control journal
+  is absent or has no lifecycle. Transcript checksum validation remains
+  mandatory when a full session or transcript-dependent operation explicitly
+  opens it, or when its transcript is recovered.
 - One focused `kcode-kennedy-sessions` library owns the complete mechanical
   lifecycle of a logical Kennedy session: Session History and Chatend
   projection, staged Kweb state and revalidation, tool authorization and
@@ -237,6 +333,20 @@ This document records user intention with regard to Kennedy.
   transport workflows. Focused runtimes schedule outer work and decide which
   external workflow should start or finish; none may retain a parallel session
   implementation.
+- Every running logical session may receive authorized external user turns,
+  including conversation, Telegram, history-ingress, audio-ingress, self-time,
+  wakeup, and other backend-owned session kinds. Session History owns their
+  durable ordered pending state, while Kennedy orchestration owns transport
+  submission, notification, idempotent draining, and completion races. The
+  session stages each accepted turn as ordinary user-owned Chatend content at
+  a safe semantic boundary before the next provider inference; never mutate a
+  live Session concurrently, cancel valid work merely because input arrived,
+  or let session completion strand an already accepted turn. Kennedy normally
+  continues working while a response is absent. She may explicitly await a
+  response when useful, and that wait is satisfied by the next authorized user
+  turn routed to the same source session whether it arrives through its main UI
+  or Telegram path; waiting is an explicit session action, not an implicit
+  blocking mode for outbound delivery.
 - One small context-capacity policy library owns the complete mechanical
   preparation of Chatend representations: initial history-ingress hydration,
   summary preservation, live overflow recovery, protected-content ordering,
@@ -604,47 +714,91 @@ This document records user intention with regard to Kennedy.
 - Model-backed media work must validate the actual media kind and capability.
   Treat transcription, translation, visual interpretation, and speaker
   identification as potentially wrong and preserve uncertainty.
-- Keep speaker classification inside Kennedy's application process as a typed in-process
-  capability. Do not interpose a separately operated socket or network sidecar
-  between Kennedy and the classifier. AudioIngress and Kennedy's explicit
-  classification Ktools share the same `SpeechClassifier` handle and database;
-  neither opens a private or parallel speaker store.
+- Keep speaker classification inside Kennedy's application process as one small,
+  typed capability. Its application-facing mutation contract is deliberately
+  limited to opening one store and identifying, training, or deleting an
+  observation; audio review may also enumerate the distinct known speaker names
+  through the same typed handle. The
+  new 24-value feature representation and statistical classifier are internal
+  implementation details, not reasons to expose source objects, segments,
+  attempts, samples, recording quality, artifact lineage, datasets, evaluation,
+  or model-lifecycle orchestration. Do not interpose a separately operated
+  socket or network sidecar. AudioIngress and Kennedy's explicit classification
+  Ktools share the same classifier handle and database; neither opens a private
+  or parallel speaker store.
 - Audio speaker identity comes from the shared classifier, not from GPT.
-  Gemini performs chunk-local diarization and produces the speech-feature rows;
-  GPT may parse that unstructured analysis and reconcile overlapping transcript
-  content using only the classifier mappings supplied to it. GPT must not
-  guess, expand, or invent real speaker identities. When the library marks a
-  mapping uncertain, GPT's job is to preserve or point out that uncertainty,
-  not to independently identify the speaker.
+  Gemini performs diarization, writes a complete transcript with stable
+  first-appearance speaker labels, translations faithful to the original
+  uncertainty and vulgarity, useful contextual annotations, and useful
+  correction, language, and accent coaching for audibly non-native speech, then
+  provides the 24-value feature analysis. Gemini is not told about recording
+  chunking and must not be made to serialize the conversation as a large
+  collection of transcript JSON objects. After every Gemini result is durable,
+  one recording-wide GPT call parses only the feature analyses into narrowly
+  internal machine data for classifier coordination. Do not replace this one
+  batch with per-chunk GPT calls or prompt-caching machinery absent a concrete
+  need. The browser presents each complete raw Gemini result rather than
+  labeling or dumping internal parsed JSON as its transcript. Only after every
+  chunk has human-approved speaker resolutions may one second recording-wide
+  GPT call produce the final transcript from the original raw Gemini results
+  prefixed by those authoritative mappings. That final call reconciles overlap,
+  preserves appropriate translations, annotations, and coaching, filters out
+  feature analysis, and must not guess, expand, or invent real speaker
+  identities.
 - Treat the classifier as practically strong once a person has more than five
   representative samples, while retaining the explicit possibility of error.
-  Human review is the authority for final audio labels. A new classifier-aware
-  recording must receive one exact human-confirmed full name for every
-  correction-packet observation before its transcript is submitted to Session
-  History and Kmap ingress. Prefill review from classifier candidates, permit
-  every label to be corrected, apply the complete confirmation through
-  AudioIngress's typed confirmation operation, and include the confirmed
-  chunk-local mapping with the transcript ingress so the original reconciled
-  text need not be silently rewritten. Treat an accepted ingress as binding
-  the final label set: exact confirmation retries remain idempotent, while a
-  conflicting relabel after handoff is rejected rather than diverging from
-  immutable history. Existing completed recordings that predate correction
-  packets retain their established ingress behavior.
-- Give Kennedy explicit speaker-classification actions to identify, train, and
-  delete datapoints with the semantics owned by the classification library.
-  The library owns each complete model-facing operation, including its exact
-  argument decoding and result rendering; Kennedy's session capability retains authorization,
-  blocking-task scheduling, and placement of the result in the session, and
-  must not duplicate the classifier feature schema or outcome translation.
-  Name the Ktools with the library-scoped operation names
-  `kcode-speech-classification/identify`, `kcode-speech-classification/train`,
-  and `kcode-speech-classification/delete`; do not embellish those operation
-  names with speaker or datapoint suffixes. Keep their standalone Kmap-ingress
-  manual focused on the callable API and rely on Kennedy's existing knowledge
-  of the library rather than restating or explaining all 24 datapoints.
-  Training accepts caller-supplied classification data; do not impose a
-  server-side “known labels only” rule, provenance gate, or other restriction
-  that narrows the library's training operation.
+  Human review is the authority for final audio labels. Review and signoff are
+  chunk-scoped. The review must provide an audio player for each exact source
+  interval beside the complete raw Gemini result and its observations; never
+  ask a human to identify a speaker from labels, classifier scores, or text
+  without letting them hear the retained audio. For each observation, prefill
+  the classifier's best name, show only its zero-relative score and the
+  runner-up score, provide a dropdown of known speakers and a textbox for a new
+  name, and allow an explicit unknown resolution. The background score is
+  always zero and is neither persisted nor displayed. Human-review players
+  receive only their exact source intervals as native WAV slices read by
+  seeking into the retained original. Do not reread the complete
+  recording, resample it, or transcode it to another codec for browser review.
+  A named resolution is trained when a compatible feature row exists; an
+  unknown resolution is not added to the classifier and does not block final
+  transcription. Do not show a
+  clean/unclean judgment in the UI. Every observation in a chunk must be
+  resolved before that whole chunk is signed off, and every chunk must be
+  signed off before final transcript generation, Session History submission,
+  or Kmap ingress. Automatic clean-chunk signoff and unsigned training remain
+  intentionally deferred until real training behavior supports explicit
+  thresholds. Treat accepted ingress as binding the final label set: exact
+  confirmation retries remain idempotent, while a conflicting relabel after
+  handoff is rejected rather than diverging from immutable history. A finalized
+  recording with an obsolete unsigned correction packet is resolved at the
+  audio-to-History boundary. If accepted History ingress exists, preserve the
+  recording as complete and never present that packet for relabeling. If no
+  ingress exists, archive the exact old transcript and packet for offline
+  recovery, clear the active result, and run the retained WAV through the
+  current analysis and human-review pipeline so approved current-schema
+  datapoints and a properly reconciled transcript can be produced. Completed
+  recordings without correction packets retain their established behavior.
+- Outside the finalized-recording recovery above, a retained correction packet
+  from a retired, incompatible speaker-feature schema must not make audio
+  ingress globally unavailable. Preserve the packet and its human-review gate,
+  accept the final human labels through the ordinary confirmation operation,
+  and do not invent a translation into the current classifier feature schema
+  or train an incompatible historical row into the current classifier.
+- Give Kennedy exactly three explicit speaker-classification actions: identify,
+  train, and delete. Preserve the old classifier's direct observation-key,
+  cohort, feature-row, and outcome semantics: identify scores a row and
+  atomically retains an accepted result, train adds or corrects a labelled row,
+  and delete is idempotent. The library owns each complete operation, including
+  its exact argument decoding and result rendering; Kennedy retains
+  authorization, blocking-task scheduling, and placement of the result in the
+  session, and must not duplicate the feature schema or outcome translation.
+  Name the Ktools `kcode-speaker-system/identify`,
+  `kcode-speaker-system/train`, and `kcode-speaker-system/delete`; do not add
+  speaker or datapoint suffixes. Keep their standalone Kmap-ingress manual
+  focused on the callable API rather than restating all 24 values. Training
+  accepts caller-supplied classification data, including arbitrary speaker
+  names; do not impose a server-side “known labels only” rule, provenance gate,
+  or other restriction that narrows the operation.
 - Store committed files in self-describing Kweb object envelopes so an object
   identifier is sufficient to recover safe metadata and exact bytes. Payload
   readers return the exact original bytes; the application storage envelope is
@@ -800,6 +954,21 @@ This document records user intention with regard to Kennedy.
   ordinary reply text, emitted objects, native media, filenames, and captions
   remain owned by and recorded in that session and use its bound event-delivery
   workflow.
+- Preserve a short-lived reply bridge from every successful
+  `SendTelegramDM` item to the already-existing source session. When the
+  authorized recipient uses Telegram's direct-reply action on any exact
+  outbound message or attachment produced by that delivery, route the accepted
+  response into the source session's external-turn path rather than the
+  recipient's ordinary private Telegram session. This source correlation does
+  not make the cold send bind, select, or mutate the recipient's target-session
+  pointer. Telegram transport owns only the provider message-ID correlation and
+  accepted transport event needed until handoff; it is bounded working state,
+  not an outbound transcript or durable delivery outbox. Session History owns
+  the pending external turn and the source Chatend remains the durable record.
+  A direct reply must remain accepted across restart, become visible to
+  Kennedy at the next safe inference boundary without interrupting her current
+  provider or tool work, and fall back to ordinary authorized Telegram intake
+  if its source session has already become immutable before handoff.
 - Kennedy's main agent may likewise initiate a Telegram delivery to any
   explicitly targeted known group from any session, including browser,
   private or group Telegram, history-ingress, audio-ingress, wakeup, and
@@ -853,12 +1022,18 @@ This document records user intention with regard to Kennedy.
 - Repair a bad frontend release by publishing a corrected immutable version.
   Exact publications remain immutable; floating compatible selection makes a
   newer patch live.
+- Background observation must not rebuild an unchanged interactive browser
+  view. Polling preserves live media playback, native controls, local form
+  state, focus, disclosures, and scroll until presentation state truly changes.
 - Do not present accepted journal writes as a separate vague “saving” state.
   Surface real failures rather than suggesting that durable state is pending
   when it is not.
 - Keep the composer editable while Kennedy works so the user can draft, but do
-  not send another turn until the current one completes. Preserve one local
-  draft per live conversation.
+  not ordinarily send another turn until the current one completes. When
+  Kennedy has explicitly begun an external-response wait for that source
+  session, permit the authorized user to submit the awaited response through
+  the same composer without opening a competing turn. Preserve one local draft
+  per live conversation.
 - A live operation needs an explicit stop control. Stopping must cancel the
   active model or tool work without losing the already accepted user command.
 - Keep a closed conversation selected while its history ingress continues.
@@ -874,6 +1049,24 @@ This document records user intention with regard to Kennedy.
 - Preserve an exact provider-boundary view for debugging. Human-friendly views
   may summarize presentation, but they must not rewrite the recorded bytes and
   claim that the result is exact.
+- The Memory Explorer presents one local chronological journey through Kmap as
+  a literal ordered stack of unique canonical nodes. The first entry is the
+  selected root and has no incoming pointer. A node is appended only on its
+  first visit in the current journey, with exactly one downward pointer from
+  the earlier stack entry whose fixed or recent connection was actually used;
+  unrelated graph edges are not rendered as journey pointers. Revisiting an
+  existing entry selects it without appending, moving, or changing its pointer.
+  Stack entries select the main node view and do not expand in place.
+- Truncating a journey entry removes every later entry and pointer. Dehydrating
+  an entry preserves its stack position and pointer but removes its outgoing
+  fixed and recent connections from the aggregate open-connection view and
+  makes it non-selectable until a rehydration refetches its current backend
+  state. The selected hydrated node is shown in the main panel; beneath it, the
+  explorer shows all fixed and recent connections from every hydrated journey
+  entry, grouped by source. Fixed traversal pointers are blue and recent
+  traversal pointers are yellow. Connection details may reveal target text
+  without counting as navigation. The journey is browser-local presentation,
+  while Kmap mutations and pending command state remain backend-durable.
 - Do not inject backend-controlled content as HTML. Render text and untrusted
   metadata through safe DOM operations.
 
@@ -1020,6 +1213,13 @@ This document records user intention with regard to Kennedy.
 ## System Prompts and Learned Strategy
 
 - Preserve `KennedyIdentity.txt` as Kennedy's identity statement.
+- One focused `kcode-kennedy-prompts` library owns the exact static runtime
+  prompt-layer text, including `KennedyIdentity.txt`, and exposes it through a
+  read-only typed API. Kennedy opens those bundled layers from the library and
+  must not locate or read a configurable system-prompt directory at runtime.
+  Kennedy orchestration retains selection and composition of session and
+  channel layers, dynamic context, and current runtime facts; the prompt
+  library owns none of that policy.
 - Keep live system prompts small, layered, and single-purpose: identity, one
   session type, channel-specific context where applicable, Kmap basics,
   critical navigation tools, writable tools when allowed, the native harness
@@ -1054,6 +1254,9 @@ This document records user intention with regard to Kennedy.
   `data/` tree by default so it remains available inside the development
   sandbox. Retain individual path overrides rather than inventing a second
   data-root abstraction.
+- Keep the canonical operator CPU profile at `data/kennedy-cpu.svg`. Capture it
+  by sampling the single running Kennedy server, without adding profiler logic
+  to the application or changing its workflow.
 - Back up the complete opaque `data/` tree while Kennedy is stopped. Do not
   interpret or selectively copy current formats; unknown future files, SQLite
   sidecars, Kweb objects, recovery material, and legacy archives all belong in

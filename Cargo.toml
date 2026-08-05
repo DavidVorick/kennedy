@@ -17,6 +17,9 @@ kcode-kennedy-app = "*"
 debug = 1
 incremental = false
 
+[profile.release]
+debug = 1
+
 [profile.test]
 debug = 1
 incremental = false
