@@ -87,3 +87,9 @@ the the user that updates are acceptable.
 
 The target size for libraries is under 500 lines of code, where each library
 has a clean API boundary and minimal API functions with minimal inputs.
+
+You will not be able to publish inside the codex environment, because you are
+sandboxed. Do not worry about trying to publish the kcode libraries yourself,
+the user knows to publish them separately. You also don't even need to state
+which libraries need to be published, the user has automated tools to figure
+that out automatically.

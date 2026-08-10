@@ -1,1 +1,0 @@
-This session belongs to a Telegram conversation. Kennedy's backend authenticates the participant and destination, supplies the Telegram material as conversation context, and relays Kennedy's final response during a live user-facing turn. Telegram is only the transport; the durable Chatend and tool loop remain owned by Kennedy's backend.

@@ -27,7 +27,11 @@ This document records user intention with regard to Kennedy.
   feature work touches a pre-existing larger library, keep the work focused and
   make one obvious capability extraction that prevents the library from moving
   farther away from the target; comprehensive unrelated cleanup is not
-  required. Do not satisfy the target through pass-through libraries,
+  required. A localized behavior change that removes code and remains within
+  its clear capability owner need not force an extraction solely because that
+  owner is already over the target when the extraction would make the total
+  architecture or internal sequencing more complicated. Do not satisfy the
+  target through pass-through libraries,
   duplicated tests, or artificial boundaries whose documentation and call
   sequencing are more complicated than the code they move. A managed
   capability library's
@@ -59,7 +63,7 @@ This document records user intention with regard to Kennedy.
   multiplexed `read` and `execute` entry points. Shared types should clarify
   repeated data without hiding which operations a caller may perform.
 - `kcode-kennedy-app` is Kennedy's top-level application bootstrap and lifecycle
-  composition library. It owns CLI parsing and maintenance commands, vault
+  composition library. It owns CLI policy and maintenance commands, vault
   prompting and application secret names, service construction, application
   root selection, the shared in-process capability graph, readiness ordering,
   listener binding, and runtime supervision. KennedyServer deliberately treats
@@ -71,7 +75,9 @@ This document records user intention with regard to Kennedy.
   published compatible capability releases without a separate maintenance
   step. The KennedyServer executable is a
   one-line-equivalent wrapper that invokes this sole direct dependency and owns
-  no parallel application behavior.
+  no parallel application behavior. One focused CLI library owns only the
+  mechanical command syntax and stable argument defaults; it does not own
+  application policy, credentials, service construction, or dispatch.
 - `kcode-http-api` owns the complete browser-facing HTTP router and API as a
   focused presentation library over typed capability libraries, including
   route composition, wire DTOs, multipart admission, HTTP errors, response and
@@ -122,10 +128,12 @@ This document records user intention with regard to Kennedy.
   layout, application validation, and model attribution.
   Kweb owns durable resource ownership, privacy evaluation, and owner-only
   mutation enforcement.
-- One small typed Kweb-context library owns the in-session loaded/fixed node
+- One small typed Kweb-context library owns the in-session full-node selection
   model and mechanically reconciles Kennedy's chosen projection into Chatend,
-  including stable box identity, typed metadata, permanent bounded
-  recent-connection boxes, and preservation of representation choices.
+  including stable box identity, typed metadata, permanent bounded combined
+  connection-summary boxes, and preservation of representation choices. A
+  focused node component owns the shared node types, legacy JSON decoding, and
+  full-node body formatter without owning projection policy or persistence.
   `kcode-kennedy-kweb-loader` owns atomic batch fetching and projection of
   durable nodes into that context plus legacy stored-node decoding; it remains
   read-only and owns neither roots nor session policy. `kcode-kennedy-sessions`
@@ -155,24 +163,32 @@ This document records user intention with regard to Kennedy.
 - Fixed connections are deliberately placed references, not task slots or a
   priority system. Graph hygiene belongs to Kennedy; the harness should not
   silently promote or rearrange connections.
-- The context projection gives each explicitly loaded node one full box and
-  each of its fixed connections one full box, without an arbitrary
-  fixed-connection count cap. There is no active-connection category. All
-  recent connections included in the projection are fanout-only and accumulate
-  in globally deduplicated summary boxes containing each node's name and short
-  description, with at most eight unique connections per box. Only the newest
-  box may contain fewer than eight; newly discovered connections fill that box
-  before another is created. A recent-connections box is never retired once
-  created, and a full box's membership and canonical snapshot are frozen,
-  though any such box may still be dehydrated or summarized. Recent connections
-  are never automatically promoted to full nodes. An explicitly loaded node
+- The context projection gives each root or explicitly requested node one full
+  box. For every full node, visit its fixed connections in stored order and
+  then its recent connections in stored order; project both categories into one
+  globally deduplicated, first-seen summary stream containing canonical node
+  ID, name, and short description. Each permanent summary box contains at most
+  eight unique connections. Each synchronization places its newly discovered
+  connections into one or more new summary boxes rather than filling any
+  existing partial or empty box. A connection-summary box is never retired or
+  revised with later discoveries once created; its membership and canonical
+  snapshot are frozen, though it may still be dehydrated or summarized.
+  Neither fixed nor recent connections are
+  automatically promoted to full nodes by default. The Kennedy binary exposes
+  an operator-only `--fixed` compatibility mode that additionally loads fixed
+  targets as full nodes and includes those full nodes' outgoing fixed and recent
+  connections in the same summary stream. There is no active-connection
+  category and no arbitrary full- or summary-node count cap; active context
+  capacity is the limit. An explicitly loaded node
   uses the concise header
   `[box {box_id} | Kweb loaded node | hydrated]`: its identifier and short name
   belong in the node body rather than being duplicated in the header, and its
   Kweb resource owner belongs in that node data rather than exposing Chatend's
-  internal tool ownership in the header. Loaded-node, fixed-connection, and
+  internal tool ownership in the header. Loaded-node, compatibility-fixed, and
   staged-node boxes use the same full node-body representation and differ only
-  in their declared box type. Full node text has no active-connection field.
+  in their declared box type. The separate fixed and recent ID lists in each
+  full node body remain the authoritative category/source mapping for entries
+  in the combined summaries. Full node text has no active-connection field.
 - Use canonical Kweb node and object identifiers at every Kennedy boundary.
   Do not introduce session-local aliases for already-durable resources.
 - Kennedy users share one graph, but Kweb itself filters every node and object
@@ -289,6 +305,10 @@ This document records user intention with regard to Kennedy.
   attempts a best-effort credit award. An award failure is surfaced as a
   warning while the task stays completed; a process interruption may lose that
   award because credits are gamification points rather than financial value.
+- A single task update may both change fields and complete the task. Validate
+  and apply every supplied field in the same task-board transaction before
+  archiving and detaching the task; the post-commit credit award uses the
+  resulting assignment and credit value.
 - The task UI shows the current user's balance and reuses the ordinary Kennedy
   conversation and composer. Tasks are a mode of the conversation-history
   sidebar rather than a separate global view: selected-task detail appears
@@ -371,6 +391,11 @@ This document records user intention with regard to Kennedy.
   files. Concurrent readers must treat a journal that disappears after
   enumeration as a completed lifecycle transition, not as storage corruption
   or a request-wide failure; other I/O failures remain visible and actionable.
+- A context-layout change that deliberately has no mutable-session migration
+  must use a clean operational boundary: finish every session opened under the
+  old layout before activating the new release. Completed archives remain
+  immutable, read-only historical projections and are not rewritten or reopened
+  merely to adopt the new layout.
 - A source conversation and its later history ingress are one logical session
   and one ordered event history. UI and model views are projections of that
   history, not independently authoritative transcript copies.
@@ -379,6 +404,15 @@ This document records user intention with regard to Kennedy.
 - Every item visible to Kennedy belongs to the box model. Canonical content,
   its current representation, and the history of changes to that representation
   are distinct concerns.
+- `NoteToSelf` is available to Kennedy and to box-free subagents. It accepts
+  exactly one nonblank message without an arbitrary length ceiling and renders
+  `[note to self: <message>]`, preserving the exact message inside the wrapper.
+  In a primary session the Kennedy-owned invocation box stays in canonical
+  Chatend history but creates neither a separate result box nor a user-facing
+  transcript or transport message. In a subagent the same rendering stays only
+  in that child's context and never changes the parent Chatend. Notes create no
+  Kmap state, object, or separate store; ordinary context-capacity and box
+  representation behavior remains authoritative.
 - Chatend box headers expose the box identity, name/type, representation, and
   staleness needed to manage context, but never expose Chatend's internal box
   owner. Every projected user message and user-visible Kennedy message carries
@@ -425,15 +459,23 @@ This document records user intention with regard to Kennedy.
   Kennedy's typed session capability constructs the provider-visible projection,
   enforces capacity,
   and retains enough exact boundary data to explain what the provider received.
-- The UI's Context View is a transparent rendering of the exact UTF-8 Chatend
-  string supplied as the model input for the current state. It may render
+- The UI's Context View is a transparent rendering of the most recent exact
+  UTF-8 Chatend string actually submitted as model input, not a newly projected
+  approximation of the current state. It may render
   newlines, tabs, and other whitespace normally for readability and may show
   labels or a byte count outside the payload, but it must not trim, reflow,
   annotate, unescape, or semantically reconstruct the payload itself. Provider
   transport envelopes and JSONL request records are distinct diagnostics and
-  must never be substituted for model context. Active, history-ingress, audio,
-  Telegram, self-time, and immutable completed views derive this string through
-  the same authoritative backend projection.
+  must never be substituted for model context. Retain the normalized
+  caller-controlled provider material submitted with that string—provider,
+  model, reasoning effort, base and developer instructions, native tool
+  definitions, round, and submission time—and expose it in a separate
+  human-readable `Structured Material` view without injecting JSON or that
+  material into the Context View string. Active, history-ingress, audio,
+  Telegram, self-time, and immutable completed views derive both views from the
+  same authoritative provider-submission record. When an older session has
+  only a replayed projection, keep it inspectable but label it reconstructed;
+  never claim its text is the exact submitted input.
 - Crossing the active context limit is a recoverable condition in every
   top-level session kind, not a reason to reject newly accepted user input,
   Kennedy output, tool calls or results, or managed-state changes. Preserve the
@@ -492,17 +534,31 @@ This document records user intention with regard to Kennedy.
   usage results, including multiple inference steps within one Kennedy turn,
   and reconcile live updates with the final call receipt without double
   counting.
-- The model-visible context footer lists stale boxes first and context size
-  last. Its final line shows only the current estimated context size and the
-  active failure-avoidance limit, labeled `current context size` and
-  `max context size`; do not expose the larger provider window as an
-  `effective` value that Kennedy could mistake for usable capacity.
-  Immediately above that line, show the current time including the year,
-  refreshed whenever Chatend is projected. Recalculate and attach the footer
-  after every Ktool result before allowing the provider's next inference;
-  sequential tool use must expose the current time and remaining capacity
-  between calls rather than showing only the values from the beginning of the
-  turn.
+- Keep the model-visible projection prefix byte-stable across ordinary turns.
+  Its only continuously refreshed suffix consists of transient lines for every
+  active finite execution budget that can affect the current inference:
+  provider rounds remaining, provider-call time remaining, the enclosing turn
+  deadline, and self-time work or hard-stop deadlines when applicable.
+  Calculate those lines from live counters and absolute deadlines, refresh
+  them after every Ktool result, and never persist them as boxes, events,
+  transcript content, or immutable history. A small dependency-free
+  runtime-budget library owns that typed calculation and rendering; Session
+  History supplies the live counters and deadlines while Chatend only composes
+  caller-supplied transient lines into the projection. Do not append a moving
+  current-time, stale-box, or context-size footer.
+- Persist sparse model-visible housekeeping markers at their event positions.
+  During a warm cache epoch append `[new stale boxes: ...]` only when previously
+  unreported boxes have become stale. After dehydration, rehydration,
+  summarization, canonical replacement, projection reordering, context-limit
+  change, or another known prefix rewrite, discard all historical housekeeping
+  marker projections and append one consolidated `[stale boxes: ...]` marker
+  if stale boxes remain. Do not retain superseded tool state merely to preserve
+  a cache prefix; the correct current projection takes priority and the cache
+  miss is planned. Context-size markers are likewise persistent and sparse:
+  emit none until current estimated occupancy is strictly greater than 30% of
+  the active limit, then emit another only after at least 10,000 additional
+  estimated tokens. A known prefix rewrite discards historical size markers
+  and starts this threshold policy again from the rewritten projection.
 - Conversation sessions read the Kmap but do not mutate it. Durable graph
   changes happen in explicitly writable history-ingress, audio-ingress,
   self-time, or other backend-owned sessions.
@@ -559,12 +615,23 @@ This document records user intention with regard to Kennedy.
 - Kennedy may delegate a focused task through an explicit subagent tool. Each
   subagent uses Kennedy's chosen exact model through any configured
   tool-capable provider, not only the Codex harness, and begins with an
-  intentionally box-free application context: the current long descriptions of
-  Kennedy-selected canonical Kmap nodes, in Kennedy's selected order, followed
-  by Kennedy's task prompt. The backend assigns no special role to any selected
-  node; Kennedy controls whether a node's text acts as identity, system-like
-  instruction, operating knowledge, a tool manual, or ordinary task context
-  through her selection and ordering.
+  intentionally box-free application context. When the resolved child provider
+  is Codex, its first section is the exact compact Codex harness prompt; this is
+  the only static Kennedy prompt a subagent may receive. OpenAI API, Gemini, and
+  every other non-Codex child provider receive no static Kennedy prompt. The
+  current long descriptions of Kennedy-selected canonical Kmap nodes follow in
+  Kennedy's selected order, then Kennedy's task prompt. The backend assigns no
+  special role to any selected node; Kennedy controls whether a node's text acts
+  as identity, system-like instruction, operating knowledge, a tool manual, or
+  ordinary task context through her selection and ordering. This initial
+  context deliberately omits the selected nodes' fixed and recent connections.
+  If the child explicitly calls `LoadNodes` for a selected node, ordinary load
+  semantics apply and the exact result includes the full node body plus its
+  fixed and recent connection summaries. `RunSubagent` is an immediately
+  available bootstrap read tool: its
+  compact launch contract belongs in `ReadTools`, and Kennedy may launch it with
+  no selected context nodes and no prior Kmap traversal when the task prompt
+  alone is sufficient.
 - Ordinary API model identifiers keep their provider-native names:
   `gpt-*`/other OpenAI identifiers use the OpenAI API and `gemini-*` identifiers
   use Gemini. Codex-harness models use the explicit `codex/<catalog-id>`
@@ -572,11 +639,11 @@ This document records user intention with regard to Kennedy.
   API subagents to a hard-coded model allowlist: resolve model availability
   against the configured provider, and fail unavailable or ambiguous names
   explicitly.
-- A subagent does not inherit the parent Chatend, boxes, transcript,
-  automatically loaded roots or connections, ordinary Kennedy prompt layers,
-  ambient host instructions, or provider conversation state. The backend
-  resolves the exact selected nodes at launch and records an inspectable
-  context manifest.
+- Apart from the provider-gated Codex harness layer above, a subagent does not
+  inherit the parent Chatend, boxes, transcript, automatically loaded roots or
+  connections, ordinary Kennedy prompt layers, ambient host instructions, or
+  provider conversation state. The backend resolves the exact child provider
+  and selected nodes at launch and records an inspectable context manifest.
 - A Ktool invoked by a subagent must not create, revise, summarize, hydrate,
   dehydrate, or otherwise manipulate the parent agent's provider-facing
   Chatend. Keep the tool invocation, ordinary result, and any tool-owned
@@ -607,9 +674,11 @@ This document records user intention with regard to Kennedy.
   complete value to the bottom of the context after the call that produced it,
   so only one complete rendering of a tool-owned state is visible and its
   chronology is unambiguous. Do not duplicate complete old and new values, and
-  do not revise state after a failed call. This projection applies generically
-  to managed source and any other box-aware tool; exact audit history remains
-  unchanged.
+  do not revise state after a failed call. Do not replace or compact a successful
+  result merely because it crosses a local character threshold; project the
+  exact result once and let the resolved model's input capacity own the size
+  boundary. This projection applies generically to managed source and any other
+  box-aware tool; exact audit history remains unchanged.
 - A successful subagent call returns its one terminal assistant response as the
   plain Ktool result to Kennedy, followed only by a concise estimated cost line
   in pennies with three digits after the decimal point. The cost is the
@@ -673,12 +742,29 @@ This document records user intention with regard to Kennedy.
 - Kennedy conversation generation uses the provider's native turn and tool
   protocol with one `call_ktool` bridge. Preserve native call identity and raw
   tool results rather than inventing a parallel tool protocol.
-- `kcode-agent-runtime` owns the provider-round loop shared by primary and
-  delegated agents, including streamed output, native `call_ktool` parsing,
-  continuation, cancellation, captures, receipts, and the round limit. The
-  session supplies prepared context and executes authorized calls through one
-  small host interface; the runtime does not own Kennedy prompts, Kmap, tool
-  policy, or session persistence.
+- `kcode-agent-runtime` owns the primary provider-round loop and each delegated
+  agent's single native provider turn, including streamed output, native
+  `call_ktool` parsing, cancellation, captures, receipts, and safety limits.
+  Multiple delegated tool calls must proceed sequentially inside that one
+  native turn; state updates do not force a fresh provider turn. The session
+  supplies prepared context and executes authorized calls through one small
+  host interface; the runtime does not own Kennedy prompts, Kmap, tool policy,
+  or session persistence.
+- Primary Codex generation requires durable native thread affinity: one Codex
+  thread continues across tool rounds, later user messages, and restored
+  Kennedy sessions. After the first full projection, submit only context events
+  added after the last successfully synchronized journal cursor. Implicit prompt
+  caching is a secondary provider optimization, not a substitute for native
+  continuation and not evidence that affinity worked. Start a new thread only
+  when provider material changes, prior projected context was rewritten,
+  dehydrated, summarized, or reordered, the preceding provider turn was
+  interrupted or has ambiguous completion, Codex rejects the requested thread,
+  or the session ends. Record the thread action, stable provider thread ID,
+  delta-input identity, and explicit reset reason; do not label aggregate
+  cumulative token totals as a cache hit or miss. Codex usage is cumulative for
+  a native thread, so router events and durable receipts must subtract the prior
+  successful cumulative baseline and expose only the current call's checked
+  delta.
 - The provider-visible prompt should contain Kennedy's intentional Chatend, not
   ambient repository instructions, plugins, shell state, credentials, or
   unrelated host capabilities.
@@ -781,7 +867,13 @@ This document records user intention with regard to Kennedy.
   the classifier's best name, show only its zero-relative score and the
   runner-up score, provide a dropdown of known speakers and a textbox for a new
   name, and allow an explicit unknown resolution. The background score is
-  always zero and is neither persisted nor displayed. Human-review players
+  always zero and is neither persisted nor displayed. Whenever the browser
+  explicitly opens the Audio view or selects a recording, reclassify every
+  observation in its unsigned chunks against the current shared speaker
+  database and refresh the known-speaker choices. These current guesses are a
+  read-only, transient review projection: do not persist or train from them,
+  and do not alter signed chunks. Routine browser polling must reuse the stored
+  packet rather than repeating classifier work. Human-review players
   receive only their exact source intervals as native WAV slices read by
   seeking into the retained original. Do not reread the complete
   recording, resample it, or transcode it to another codec for browser review.
@@ -855,7 +947,10 @@ This document records user intention with regard to Kennedy.
   deterministic identities. The coordinator exposes transport-neutral typed
   outcomes and does not own an HTTP or serialization contract. `kcode-kennedy-app`
   retains application service construction, while `kcode-http-api` owns browser
-  transport admission and HTTP presentation.
+  transport admission and HTTP presentation. The retired pre-library
+  AudioIngress database is offline legacy data: do not retain a startup option,
+  live migration, or direct application database dependency for it, and do not
+  delete the preserved file as part of normal startup.
 - Vnote scanning should avoid rereading unchanged large recordings. Durable
   acceptance is the handoff boundary; the recording does not need to wait for
   later transcription or memory work.
@@ -898,6 +993,10 @@ This document records user intention with regard to Kennedy.
   duplicate their formats. General Kennedy orchestration and this Telegram
   runtime share one typed session-control capability rather than independently
   implementing checkpoints, stop handling, cancellation, or ingress semantics.
+- Each accepted Telegram background-ingress batch is one logical history-ingress
+  job. Preserve its transport batch identity through the immutable completion
+  receipt so polling and restart acknowledge that batch rather than creating
+  duplicate sessions, archives, Kmap work, provider calls, or notifications.
 - Telegram is an in-process Kennedy application capability, not a loopback
   microservice. Its library exposes a typed service handle plus the supervised
   Telegram polling runtime; the application must call that handle directly
@@ -1128,7 +1227,8 @@ This document records user intention with regard to Kennedy.
 - Give Kennedy a visible warning near the run deadline and enough bounded time
   to wrap up. Do not impose an unrelated short timeout on otherwise valid
   long-running research.
-- Use a threefold safety factor when setting finite production timeout
+- Use a seven-and-a-half-fold safety factor relative to the original baseline
+  when setting finite production timeout
   allowances across agent turns, descendant intelligence, managed tools,
   provider transport, and persistence lock waits, so valid long-running work
   is not cut off prematurely. Keep explicit user-selected durations exact, and
@@ -1197,13 +1297,19 @@ This document records user intention with regard to Kennedy.
 - Kennedy's managed check and publication tools own each library's validation
   and release operation. One offline operator utility may coordinate a batch of
   current managed Rust-library releases: it unlocks Kennedy's ordinary
-  credential vault for the crates.io key, skips exact versions that are already
-  published so interrupted runs resume safely, orders unpublished libraries by
-  their managed-library dependencies, and waits for each release to become
-  registry-visible before publishing its dependents. This coordinator must use
-  the managed publication operation rather than duplicate its checks, fail
-  closed while Kennedy is running, and never expose the publication credential
-  in output, arguments, or source.
+  credential vault for the crates.io key before library discovery or registry
+  inspection, skips exact versions that are already published so interrupted
+  runs resume safely, orders unpublished libraries by their managed-library
+  dependencies, and waits for each release to become registry-visible before
+  publishing its dependents. Its interactive publication confirmation accepts
+  only `y` or `n`, case-insensitively and after trimming whitespace, and repeats
+  the prompt for any other input. This coordinator must use the managed
+  publication operation rather than duplicate its checks and must never expose
+  the publication credential in output, arguments, or source.
+  Publication may run while Kennedy is running and must not reserve or probe
+  Kennedy's browser listener as an exclusion mechanism. A running process keeps
+  its already loaded Rust code until restart, and an already loaded browser URL
+  keeps its selected immutable Web release until later navigation.
 - Managed Rust checks and publications automatically apply rustfmt to their
   disposable source before the remaining validation. Formatting differences
   that rustfmt can repair must not become model-facing failures or consume
@@ -1248,22 +1354,36 @@ This document records user intention with regard to Kennedy.
   must not locate or read a configurable system-prompt directory at runtime.
   Kennedy orchestration retains selection and composition of session and
   channel layers, dynamic context, and current runtime facts; the prompt
-  library owns none of that policy.
+  library owns none of that policy. Do not retain a second checked-in or
+  editable mirror of those prompt files outside the prompt library.
 - Keep live system prompts small, layered, and single-purpose: identity, one
   session type, channel-specific context where applicable, Kmap basics,
   critical navigation tools, writable tools when allowed, the native harness
-  boundary, and dynamic runtime facts.
+  boundary, and runtime facts fixed when the logical session opens. The system
+  prompt records the selected model, reasoning mode, active failure-avoidance
+  context limit, and session-open timestamp in UTC. Those facts and bytes must
+  not refresh on later turns; current time is represented only by the durable
+  UTC timestamps already attached to user and Kennedy message boxes.
+- The compact Codex harness layer is the sole static runtime-prompt exception
+  for subagents. Inject it only when the child's resolved provider is Codex;
+  never inject it into an OpenAI API, Gemini, or other non-Codex child, and
+  never accompany it with another static Kennedy prompt layer.
 - Kennedy's strategy, detailed tool manuals, user preferences, and evolving
   operating knowledge belong in Kmap rather than an ever-growing static system
   prompt.
-- New capability manuals, including delegation and subagent tooling, must be
-  delivered as standalone ingress material for Kmap and must not be added to
-  runtime system-prompt files. Never modify any runtime system-prompt file
+- New capability manuals, including detailed delegation and subagent strategy,
+  must be delivered as standalone ingress material for Kmap and must not be
+  added to runtime system-prompt files. The compact `RunSubagent` launch and
+  `NoteToSelf` context-control contracts are deliberate bootstrap exceptions in
+  `ReadTools`, so delegation is available without Kmap traversal and Kennedy
+  can preserve private working text without emitting it to the user. Never
+  modify any runtime system-prompt file
   without the user's explicit permission; a feature implementation does not
   imply that permission. Keeping manuals in Kmap lets Kennedy revise them,
   connect them to related operating knowledge, and select them only when
   relevant. Runtime prompts may retain only the small bootstrapping and
-  navigation instructions needed for Kennedy to reach Kmap.
+  navigation instructions needed to use an immediate bootstrap tool or reach
+  Kmap.
 - The Kmap introduction must be sufficient for a model with no prior knowledge
   of Kennedy to find the automatic roots, understand canonical identifiers,
   navigate connections, and discover further manuals.

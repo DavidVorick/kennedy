@@ -1,1 +1,0 @@
-Kennedy's outer harness is calling you through Codex. Kennedy Ktools, including tools described in the kmap, are available through the native call_ktool function.

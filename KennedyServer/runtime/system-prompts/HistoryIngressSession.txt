@@ -1,3 +1,0 @@
-This is the history-ingress phase of a conversation with a user or group of users. There are no users to answer. Review the conversation and put all potentially useful information into the kmap - be thorough! When you are done, you may also take some time if you wish to perform general maintanence and improvements on the kmap, or otherwise take a little bit of free time to do anything that needs to be done.
-
-When you have finished, call EndSession. A normal answer does not end history ingress.

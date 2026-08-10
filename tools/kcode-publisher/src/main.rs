@@ -5,7 +5,6 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -19,8 +18,7 @@ const CRATES_IO_SECRET: &str = "cratesio-key";
 const PLAN_TOKEN: &str = "plan-only-placeholder";
 const DEFAULT_ROOT: &str = "data/kcode/kcode-rust-libs";
 const DEFAULT_VAULT: &str = "data/kennedy-secrets.age";
-const DEFAULT_KENNEDY_BIND: &str = "127.0.0.1:4321";
-const DEFAULT_REGISTRY_TIMEOUT_SECONDS: u64 = 600;
+const DEFAULT_REGISTRY_TIMEOUT_SECONDS: u64 = 1_500;
 const REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = "kennedy-kcode-publisher/0.1";
 
@@ -32,7 +30,6 @@ struct Args {
     yes: bool,
     root: PathBuf,
     vault: PathBuf,
-    kennedy_bind: String,
     registry_timeout: Duration,
 }
 
@@ -65,17 +62,23 @@ fn run() -> Result<()> {
         return Ok(());
     };
 
-    // Holding Kennedy's public listener is the application's existing offline
-    // maintenance exclusion boundary. Planning is read-only and does not need it.
-    let _maintenance_guard = if args.plan {
+    let vault = if args.plan {
         None
     } else {
-        Some(TcpListener::bind(&args.kennedy_bind).map_err(|error| {
-            failure(format!(
-                "could not acquire maintenance lock {}: {error}; stop Kennedy before publishing",
-                args.kennedy_bind
-            ))
-        })?)
+        let passphrase = rpassword::prompt_password("Unlock Kennedy credential vault: ")?;
+        if passphrase.is_empty() {
+            return Err(failure("the credential-vault passphrase cannot be empty"));
+        }
+        Some(
+            CredentialVault::unlock(&args.vault, SecretString::from(passphrase)).map_err(
+                |error| {
+                    failure(format!(
+                        "could not unlock {}: {error}",
+                        args.vault.display()
+                    ))
+                },
+            )?,
+        )
     };
 
     let packages = discover_packages(&args.root)?;
@@ -130,22 +133,15 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let passphrase = rpassword::prompt_password("Unlock Kennedy credential vault: ")?;
-    if passphrase.is_empty() {
-        return Err(failure("the credential-vault passphrase cannot be empty"));
-    }
-    let vault =
-        CredentialVault::unlock(&args.vault, SecretString::from(passphrase)).map_err(|error| {
+    let registry_token = vault
+        .as_ref()
+        .expect("non-plan publication unlocked the credential vault")
+        .secret(CRATES_IO_SECRET)?
+        .ok_or_else(|| {
             failure(format!(
-                "could not unlock {}: {error}",
-                args.vault.display()
+                "credential vault has no {CRATES_IO_SECRET:?} secret"
             ))
         })?;
-    let registry_token = vault.secret(CRATES_IO_SECRET)?.ok_or_else(|| {
-        failure(format!(
-            "credential vault has no {CRATES_IO_SECRET:?} secret"
-        ))
-    })?;
 
     for (index, planned) in order.iter().enumerate() {
         // A previous process may have completed this release after our initial scan.
@@ -196,7 +192,6 @@ fn parse_args() -> Result<Option<Args>> {
         yes: false,
         root: PathBuf::from(DEFAULT_ROOT),
         vault: PathBuf::from(DEFAULT_VAULT),
-        kennedy_bind: DEFAULT_KENNEDY_BIND.to_owned(),
         registry_timeout: Duration::from_secs(DEFAULT_REGISTRY_TIMEOUT_SECONDS),
     };
     let mut arguments = env::args_os().skip(1);
@@ -210,9 +205,6 @@ fn parse_args() -> Result<Option<Args>> {
             "-y" | "--yes" => parsed.yes = true,
             "--root" => parsed.root = next_path(&mut arguments, "--root")?,
             "--vault" => parsed.vault = next_path(&mut arguments, "--vault")?,
-            "--kennedy-bind" => {
-                parsed.kennedy_bind = next_string(&mut arguments, "--kennedy-bind")?
-            }
             "--registry-timeout-seconds" => {
                 let value = next_string(&mut arguments, "--registry-timeout-seconds")?;
                 let seconds = value.parse::<u64>().map_err(|_| {
@@ -273,14 +265,13 @@ fn print_usage() {
         "Usage: publish-kcode-libs [OPTIONS]\n\
          \n\
          Publish every unpublished current managed Rust library in dependency order.\n\
-         Kennedy must be stopped. Exact versions already on crates.io are skipped.\n\
+         Kennedy may remain running. Exact versions already on crates.io are skipped.\n\
          \n\
          Options:\n\
            --plan                       Show the resumable publication plan only\n\
            -y, --yes                    Publish without the confirmation prompt\n\
            --root PATH                  Managed libraries root [{DEFAULT_ROOT}]\n\
            --vault PATH                 Kennedy credential vault [{DEFAULT_VAULT}]\n\
-           --kennedy-bind ADDRESS       Maintenance lock address [{DEFAULT_KENNEDY_BIND}]\n\
            --registry-timeout-seconds N Registry propagation timeout [{DEFAULT_REGISTRY_TIMEOUT_SECONDS}]\n\
            -h, --help                   Show this help"
     );
@@ -590,11 +581,28 @@ fn confirm(count: usize) -> Result<bool> {
             "refusing to publish {count} crates without an interactive confirmation; pass --yes to confirm noninteractively"
         )));
     }
-    eprint!("Publish these {count} immutable crate versions? [y/N] ");
-    io::stderr().flush()?;
-    let mut response = String::new();
-    io::stdin().read_line(&mut response)?;
-    Ok(matches!(response.trim(), "y" | "Y" | "yes" | "YES"))
+    loop {
+        eprint!("Publish these {count} immutable crate versions? [y/n] ");
+        io::stderr().flush()?;
+        let mut response = String::new();
+        if io::stdin().read_line(&mut response)? == 0 {
+            return Err(failure(
+                "confirmation input closed before y or n was entered",
+            ));
+        }
+        match parse_confirmation(&response) {
+            Some(confirmed) => return Ok(confirmed),
+            None => eprintln!("Please enter y or n."),
+        }
+    }
+}
+
+fn parse_confirmation(response: &str) -> Option<bool> {
+    match response.trim() {
+        "y" | "Y" => Some(true),
+        "n" | "N" => Some(false),
+        _ => None,
+    }
 }
 
 fn failure(message: impl Into<String>) -> Box<dyn Error> {
@@ -701,5 +709,14 @@ publish = []
         let unpublished = packages.keys().cloned().collect();
         let error = publication_order(&packages, &unpublished).unwrap_err();
         assert!(error.to_string().contains("a, b"));
+    }
+
+    #[test]
+    fn confirmation_requires_an_explicit_y_or_n() {
+        assert_eq!(parse_confirmation(" y\n"), Some(true));
+        assert_eq!(parse_confirmation("N\n"), Some(false));
+        assert_eq!(parse_confirmation(""), None);
+        assert_eq!(parse_confirmation("yes"), None);
+        assert_eq!(parse_confirmation("no"), None);
     }
 }
